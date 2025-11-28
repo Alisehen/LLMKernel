@@ -1,5 +1,7 @@
 from __future__ import annotations
 """
+compare_and_bench.py – single-GPU benchmark (**full compile + runtime traceback**).
+
 Key features
 ------------
 * Dynamically imports two PyTorch models (reference & candidate) and **captures
@@ -23,7 +25,7 @@ import tempfile
 import traceback
 from datetime import datetime
 from pathlib import Path
-from typing import List, Tuple, Any, Dict
+from typing import List, Tuple
 
 import torch
 
@@ -66,10 +68,10 @@ def _capture_import(path: Path):
     sys.modules[mod_name] = module
     assert spec.loader is not None
 
-    # ---- Redirect Python-level stdout/stderr to StringIO -----------------
+    # ---- Python-level stdout/stderr to StringIO --------------------------
     py_buf = io.StringIO()
 
-    # ---- Redirect OS-level FD 1/2 (stdout/stderr) to a temp file --------
+    # ---- OS-level FD 1/2 (stdout/stderr) to a temp file -----------------
     with tempfile.TemporaryFile(mode="w+") as fd_buf, \
          contextlib.redirect_stdout(py_buf), \
          contextlib.redirect_stderr(py_buf):
@@ -106,40 +108,87 @@ def _capture_import(path: Path):
     return module, py_buf.getvalue() + subproc_log
 
 
-# =========================== RNG & Determinism Settings ===================
-def _seed_everything(seed: int | None, device_idx: int | None = None):
-    """Set random seeds and (optionally) enable deterministic backends.
+# =========================== timing helpers ===============================
+def _run_once(model: torch.nn.Module,
+              inp: List[torch.Tensor],
+              dev: torch.device) -> Tuple[torch.Tensor, float]:
+    model.to(dev).eval()
+    inp = [x.to(dev) for x in inp]
 
-    Notes
-    -----
-    * Also configures CUDA/CuDNN for stronger reproducibility (can be disabled
-      if not required).
-    """
+    if TORCH_DEVICE == "cpu":
+        t0 = datetime.now()
+        out = model(*inp)
+        ms = (datetime.now() - t0).total_seconds() * 1_000
+        return out, ms
+
+    start, end = torch.cuda.Event(True), torch.cuda.Event(True)
+    torch.cuda.synchronize(dev)
+    start.record()
+    out = model(*inp)
+    end.record()
+    end.synchronize()
+    return out, start.elapsed_time(end)
+
+
+def _bench(model: torch.nn.Module,
+           inp: List[torch.Tensor],
+           dev: torch.device,
+           warm: int,
+           rep: int) -> List[float]:
+    model.to(dev).eval()
+    inp = [x.to(dev) for x in inp]
+
+    for _ in range(warm):
+        model(*inp)
+
+    if TORCH_DEVICE == "cpu":
+        res = []
+        for _ in range(rep):
+            t0 = datetime.now()
+            model(*inp)
+            res.append((datetime.now() - t0).total_seconds() * 1_000)
+        return res
+
+    torch.cuda.synchronize(dev)
+    s, e = torch.cuda.Event(True), torch.cuda.Event(True)
+    times: List[float] = []
+    for _ in range(rep):
+        s.record()
+        model(*inp)
+        e.record()
+        e.synchronize()
+        times.append(s.elapsed_time(e))
+    return times
+
+
+# ====================== RNG & 确定性设置 ======================
+def _seed_everything(seed: int | None, device_idx: int | None = None):
+    """设置随机种子并（可选）启用确定性后端。"""
     import os, random
     import numpy as np
-    import torch as _torch
+    import torch
 
     if seed is None:
         return
 
     random.seed(seed)
     np.random.seed(seed)
-    _torch.manual_seed(seed)
-    if _torch.cuda.is_available():
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
         if device_idx is not None:
-            _torch.cuda.set_device(device_idx)
-        _torch.cuda.manual_seed(seed)
-        _torch.cuda.manual_seed_all(seed)
+            torch.cuda.set_device(device_idx)
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
 
-        # Stronger reproducibility (comment out if not needed)
-        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")  # or ":16:8"
-        _torch.backends.cudnn.deterministic = True
-        _torch.backends.cudnn.benchmark = False
-        # Warn (not error) when an op has no deterministic implementation
-        _torch.use_deterministic_algorithms(True, warn_only=True)
+        # 更强可复现（如不需要可注释掉）
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")  # 或 ":16:8"
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        # 某些算子无确定性实现时仅告警不报错
+        torch.use_deterministic_algorithms(True, warn_only=True)
 
 
-# = Parameter alignment (generic + class/export-name specific) =============
+# ====================== 参数对齐（通用 + 类名/导出名专用） ======================
 import torch
 import torch.nn as nn
 from collections import defaultdict
@@ -162,11 +211,11 @@ def _safe_copy_(dst: torch.Tensor, src: torch.Tensor) -> bool:
 @torch.no_grad()
 def _try_map_shape_and_copy_(dst: torch.Tensor, src: torch.Tensor) -> bool:
     """
-    Shape mapping coverage:
-      - Depthwise 2D:   (C,1,Kh,1)<->(C,Kh), (C,1,Kh,Kw)<->(C,Kh,Kw)
+    形状映射覆盖：
+      - depthwise 2D:   (C,1,Kh,1)<->(C,Kh), (C,1,Kh,Kw)<->(C,Kh,Kw)
       - PW/Linear:      (Out,In,1,1)<->(Out,In)
-      - Conv/ConvT 3D:  (Out,In,kD,kH,kW) <-> (In,Out,kD,kH,kW) (swap first two dims)
-      - Depthwise 3D:   (C,1,kD,kH,kW) <-> (C,kD,kH,kW)
+      - Conv/ConvT 3D:  (Out,In,kD,kH,kW) <-> (In,Out,kD,kH,kW) （首两维交换）
+      - depthwise 3D:   (C,1,kD,kH,kW) <-> (C,kD,kH,kW)
     """
     s = tuple(src.shape)
     d = tuple(dst.shape)
@@ -179,7 +228,7 @@ def _try_map_shape_and_copy_(dst: torch.Tensor, src: torch.Tensor) -> bool:
         dst.copy_(src.to(dtype=dst.dtype, device=dst.device).reshape(d).contiguous())
         return True
 
-    # --- depthwise 2D: (C,1,Kh,Kw) -> (C,Kh,Kw) and reverse
+    # --- depthwise 2D: (C,1,Kh,Kw) -> (C,Kh,Kw) 及其反向
     if len(s) == 4 and s[1] == 1 and len(d) == 3 and s[0] == d[0] and s[2] == d[1] and s[3] == d[2]:
         dst.copy_(src.to(dtype=dst.dtype, device=dst.device).squeeze(1).contiguous())
         return True
@@ -195,13 +244,13 @@ def _try_map_shape_and_copy_(dst: torch.Tensor, src: torch.Tensor) -> bool:
         dst.copy_(src.to(dtype=dst.dtype, device=dst.device).reshape(d).contiguous())
         return True
 
-    # --- Conv/ConvTranspose 3D: swap first two dims for 5D weights
+    # --- Conv/ConvTranspose 3D: 5D 权重首两维交换
     #     (Out, In, kD, kH, kW)  <->  (In, Out, kD, kH, kW)
     if len(s) == 5 and len(d) == 5 and s[0] == d[1] and s[1] == d[0] and s[2:] == d[2:]:
         dst.copy_(src.permute(1, 0, 2, 3, 4).contiguous().to(dtype=dst.dtype, device=dst.device))
         return True
 
-    # --- depthwise 3D: (C,1,kD,kH,kW) -> (C,kD,kH,kW) and reverse
+    # --- depthwise 3D: (C,1,kD,kH,kW) -> (C,kD,kH,kW) 及其反向
     if len(s) == 5 and s[1] == 1 and len(d) == 4 and s[0] == d[0] and s[2:] == d[1:]:
         dst.copy_(src.to(dtype=dst.dtype, device=dst.device).squeeze(1).contiguous())
         return True
@@ -219,20 +268,20 @@ def align_params_generic(ref_model: nn.Module, test_model: nn.Module) -> dict[st
     copied_same, unique_shape_copied, mapped, skipped = 0, 0, 0, 0
     aligned_test: set[str] = set()
 
-    # 1) Same name & same shape
+    # 1) 同名同形状
     for name, t_dst in test_named.items():
         t_src = ref_named.get(name, None)
         if t_src is not None and _safe_copy_(t_dst, t_src):
             copied_same += 1
             aligned_test.add(name)
 
-    # 2) Unique shape match
+    # 2) 唯一形状匹配
     shape2ref: dict[tuple, list[tuple[str, torch.Tensor]]] = defaultdict(list)
     shape2test: dict[tuple, list[tuple[str, torch.Tensor]]] = defaultdict(list)
     for n, t in ref_named.items():
         shape2ref[tuple(t.shape)].append((n, t))
     for n, t in test_named.items():
-        if n in aligned_test:
+        if n in aligned_test: 
             continue
         shape2test[tuple(t.shape)].append((n, t))
 
@@ -244,7 +293,7 @@ def align_params_generic(ref_model: nn.Module, test_model: nn.Module) -> dict[st
                 unique_shape_copied += 1
                 aligned_test.add(tname)
 
-    # 3) Shape mapping
+    # 3) 形状映射
     for name, t_dst in test_named.items():
         if name in aligned_test:
             continue
@@ -265,7 +314,7 @@ def align_params_generic(ref_model: nn.Module, test_model: nn.Module) -> dict[st
         "skipped": skipped,
     }
 
-# — (Optional) Register pair-specific aligners by class/export names: Model → ModelNew —
+# ——（可选）按类名/导出名注册“专用对齐器”：Model → ModelNew ——
 _PAIR_ALIGNERS: dict[tuple[str, str], callable] = {}
 
 def register_pair_aligner(ref_key: str, test_key: str):
@@ -288,7 +337,7 @@ def _align_Model_to_ModelNew(ref_model: nn.Module, test_model: nn.Module) -> dic
                     if n.startswith("param::") and t.ndim == dims]
         return cand
 
-    # ---- 2D: Conv / ConvTranspose (4D: same shape or swap first two dims) ----
+    # ---- 2D: Conv / ConvTranspose（4D 同形状 或 首两维交换）----
     r4 = pick(ref_named, 4); t4 = pick(test_named, 4)
     if len(r4) == 1 and len(t4) == 1:
         w_ref, w_tst = r4[0][1], t4[0][1]
@@ -310,7 +359,7 @@ def _align_Model_to_ModelNew(ref_model: nn.Module, test_model: nn.Module) -> dic
             return {"pair_aligner": 1, "copied_same_shape": int(tuple(w_ref.shape)==tuple(w_tst.shape)),
                     "mapped_shape": int(tuple(w_ref.shape)!=tuple(w_tst.shape)), "skipped": 0}
 
-    # ---- 3D: Conv3d / ConvTranspose3d (5D: same shape or swap first two dims) ----
+    # ---- 3D: Conv3d / ConvTranspose3d（5D 同形状 或 首两维交换）----
     r5 = pick(ref_named, 5); t5 = pick(test_named, 5)
     if len(r5) == 1 and len(t5) == 1:
         w_ref, w_tst = r5[0][1], t5[0][1]
@@ -332,7 +381,7 @@ def _align_Model_to_ModelNew(ref_model: nn.Module, test_model: nn.Module) -> dic
                 w_tst.copy_(w_ref.to(dtype=w_tst.dtype, device=w_tst.device).squeeze(1).contiguous())
                 return {"pair_aligner": 1, "copied_same_shape": 0, "mapped_shape": 1, "skipped": 0}
 
-    # Otherwise, fall back to the generic path
+    # 其余回退通用
     stats = align_params_generic(ref_model, test_model)
     stats["pair_aligner"] = 0
     return stats
@@ -341,13 +390,13 @@ def _align_Model_to_ModelNew(ref_model: nn.Module, test_model: nn.Module) -> dic
 def try_align_params(ref_model: nn.Module, test_model: nn.Module,
                      ref_mod=None, test_mod=None) -> dict[str, int]:
     """
-    Priority:
-      0) Dispatch by exported symbols (`_export_symbol`), e.g., ("Model", "ModelNew")
-      0b) Dispatch by instance class names
-      1) Task-defined `map_ref_to_test_params` / `align_params`
-      2) Generic automatic alignment
+    优先级：
+      0) 导出名派发（_export_symbol），如 ("Model","ModelNew")
+      0b) 实例类名派发
+      1) 任务自定义 map_ref_to_test_params / align_params
+      2) 通用自动对齐
     """
-    # 0) Exported symbol keys (if compare_and_bench set them)
+    # 0) 导出名（若 compare_and_bench 已设置）
     key_export = (getattr(ref_model, "_export_symbol", None),
                   getattr(test_model, "_export_symbol", None))
     if key_export in _PAIR_ALIGNERS:
@@ -355,14 +404,14 @@ def try_align_params(ref_model: nn.Module, test_model: nn.Module,
         stats["pair_key"] = f"{key_export[0]}->{key_export[1]}"
         return stats
 
-    # 0b) Instance class names
+    # 0b) 实例类名
     key_class = (ref_model.__class__.__name__, test_model.__class__.__name__)
     if key_class in _PAIR_ALIGNERS:
         stats = _PAIR_ALIGNERS[key_class](ref_model, test_model)
         stats["pair_key"] = f"{key_class[0]}->{key_class[1]}"
         return stats
 
-    # 1) Task-defined hooks
+    # 1) 任务自定义
     for mod in (test_mod, ref_mod):
         if mod is None:
             continue
@@ -373,14 +422,15 @@ def try_align_params(ref_model: nn.Module, test_model: nn.Module,
                 return {"pair_aligner": 0, "copied_same_shape": -1, "mapped_shape": -1,
                         "skipped": -1, "pair_key": "custom_fn"}
 
-    # 2) Generic path
+    # 2) 通用
     stats = align_params_generic(ref_model, test_model)
     stats["pair_aligner"] = 0
     stats["pair_key"] = "generic"
     return stats
 
 
-# ===== compare_and_bench (with generic alignment & seeding) ===============
+
+# ====================== compare_and_bench（带通用对齐与种子） ======================
 def compare_and_bench(
     ref_py: Path,
     test_py: Path,
@@ -390,30 +440,29 @@ def compare_and_bench(
     repeat: int = 20,
     tol: float = 1e-4,
     log_dir: str | Path | None = "run/debug",
-    seed: int = 100,  # Fixed default seed; set to None and use env to control if needed
+    seed: int = 100,  # 固定默认 seed；需要环境控制时可改成 None 并用 env 读取
 ) -> Dict[str, Any]:
     """
     Benchmark *test_py* against *ref_py*.
 
-    Only reads `get_init_inputs()` from the **reference** script and uses the
-    same initialization args/kwargs for both ref/test. Also: fix randomness &
-    align parameters (supports Model → ModelNew pair-specific alignment & generic alignment).
+    仅从 reference 脚本读取 get_init_inputs()，并对 ref/test 使用同一组初始化参数。
+    同时：固定随机性 + 参数对齐（支持 Model→ModelNew 专用对齐 & 通用对齐）。
     """
     import os
     import contextlib
     from datetime import datetime
 
-    # ------------ Device setup -------------------------------------------
+    # ------------ 设备设置 ------------
     dev = torch.device(f"cuda:{device_idx}") if TORCH_DEVICE == "cuda" else torch.device("cpu")
     if TORCH_DEVICE == "cuda":
         torch.cuda.set_device(dev)
 
-    # Optionally control seed via environment variable
+    # 若需要通过环境变量控制 seed
     if seed is None:
         env_seed = os.environ.get("KERNELBENCH_SEED")
         seed = int(env_seed) if env_seed is not None else None
 
-    # ------------ Dynamic import ----------------------------------------
+    # ------------ 动态导入 ------------
     ref_mod, _ = _capture_import(ref_py)
     test_mod, _ = _capture_import(test_py)
 
@@ -422,11 +471,11 @@ def compare_and_bench(
     ModelNew   = getattr(test_mod, "ModelNew",    None)
 
     if None in (RefModel, get_inputs):
-        raise RuntimeError(f"Reference '{ref_py}' must define Model and get_inputs().")
+        raise RuntimeError(f"Reference '{ref_py}' 必须定义 Model 与 get_inputs()。")
     if ModelNew is None:
-        raise RuntimeError(f"Candidate '{test_py}' must define class ModelNew.")
+        raise RuntimeError(f"Candidate '{test_py}' 必须定义 ModelNew 类。")
 
-    # ------------ Get init args only from reference ----------------------
+    # ------------ 仅从 ref 获取初始化参数 ------------
     init_args: List[Any] = []
     init_kwargs: Dict[str, Any] = {}
     get_init_inputs_ref = getattr(ref_mod, "get_init_inputs", None)
@@ -438,9 +487,9 @@ def compare_and_bench(
         elif isinstance(init_obj, (list, tuple)):
             init_args = list(init_obj)
         elif init_obj is not None:
-            raise TypeError("get_init_inputs() must return list/tuple (as *args) or dict (as **kwargs).")
+            raise TypeError("get_init_inputs() 必须返回 list/tuple（作为 *args）或 dict（作为 **kwargs）。")
 
-    # ------------ Run & benchmark ---------------------------------------
+    # ------------ 运行 & 基准 ------------
     def _first_tensor(x):
         if isinstance(x, torch.Tensor):
             return x
@@ -448,28 +497,32 @@ def compare_and_bench(
             for t in x:
                 if isinstance(t, torch.Tensor):
                     return t
-        raise TypeError("Model forward did not return a Tensor (or a sequence containing a Tensor).")
+        raise TypeError("Model forward 未返回 Tensor（或序列中的 Tensor）。")
 
     try:
         ctx = torch.cuda.device(dev) if TORCH_DEVICE == "cuda" else contextlib.nullcontext()
         with ctx:
-            # Fix input randomness
+            # 固定输入随机性
             _seed_everything(seed, device_idx)
             inp = get_inputs()
             if not isinstance(inp, (list, tuple)):
                 inp = [inp]
 
-            # Fix parameter initialization: set seed before constructing each side
+            # 固定参数初始化：两边构造前分别设种子
             _seed_everything(seed, device_idx)
             ref_model  = RefModel(*init_args, **init_kwargs)
-
+            # # torch.compile 加速
+            # ref_model = torch.compile(ref_model)
+            
             _seed_everything(seed, device_idx)
             test_model = ModelNew(*init_args, **init_kwargs)
-
-            # Parameter alignment (prefer Model→ModelNew pair-specific, then task custom, finally generic)
+            # # torch.compile 加速
+            # test_model = torch.compile(test_model)   
+            
+            # ★ 参数对齐（优先 Model→ModelNew 专用对齐，其次任务自定义，最后通用对齐）
             align_stats = try_align_params(ref_model, test_model, ref_mod=ref_mod, test_mod=test_mod)
 
-            # Forward pass (sync to surface errors immediately)
+            # 前向（同步确保错误就地暴露）
             if TORCH_DEVICE == "cuda":
                 torch.cuda.synchronize(dev)
             ref_out,  _ = _run_once(ref_model,  inp, dev)
@@ -477,13 +530,13 @@ def compare_and_bench(
             if TORCH_DEVICE == "cuda":
                 torch.cuda.synchronize(dev)
 
-            # Normalize to Tensor and ensure contiguous
+            # 统一取 Tensor、保证连续
             ref_out  = _first_tensor(ref_out).contiguous()
             test_out = _first_tensor(test_out).contiguous()
             if ref_out.dtype != test_out.dtype:
                 test_out = test_out.to(ref_out.dtype)
 
-            # Error & allclose
+            # 误差 & allclose
             diff = (test_out - ref_out).abs()
             max_err  = diff.max().item()
             mean_err = diff.mean().item()
@@ -494,7 +547,7 @@ def compare_and_bench(
                     f"max_abs_err={max_err:.3e}, mean_abs_err={mean_err:.3e}"
                 )
 
-            # Timing
+            # 计时
             ref_t  = _bench(ref_model,  inp, dev, warmup, repeat)
             test_t = _bench(test_model, inp, dev, warmup, repeat)
 
@@ -502,11 +555,11 @@ def compare_and_bench(
                 torch.cuda.synchronize(dev)
 
     except Exception:
-        # Re-raise full traceback (captured by the caller)
+        # 抛出完整 traceback（上层捕获）
         import traceback as _tb
         raise RuntimeError(_tb.format_exc()) from None
 
-    # ------------ Aggregate results -------------------------------------
+    # ------------ 结果汇总 ------------
     result: Dict[str, Any] = {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "reference_file": str(ref_py),
@@ -530,9 +583,12 @@ def compare_and_bench(
         "model_init_args": init_args,
         "model_init_kwargs": init_kwargs,
         "seed": seed,
-        "align_stats": align_stats,  # Alignment summary (incl. whether Model→ModelNew pair-specific aligner was used)
+        "align_stats": align_stats,  # 记录对齐信息（含是否命中 Model→ModelNew 专用对齐）
     }
     return result
+
+
+
 
 
 # =========================== CLI wrapper ==================================
@@ -564,3 +620,4 @@ def _cli():
 
 if __name__ == "__main__":
     _cli()
+
