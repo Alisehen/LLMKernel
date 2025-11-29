@@ -64,6 +64,22 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     return p
 
 
+# ---------------------- naming helpers -----------------
+def _slugify_tag(text: str, max_len: int = 80) -> str:
+	"""Collapse a string into a filesystem-friendly slug."""
+	slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", text).strip("_")
+	slug = re.sub(r"_+", "_", slug)
+	if max_len > 0:
+		slug = slug[:max_len]
+	return slug or "unknown"
+
+
+def _build_run_tag(server_type: str, model_name: str) -> str:
+	server_tag = _slugify_tag(server_type)
+	model_tag = _slugify_tag(model_name)
+	return f"{server_tag}_{model_tag}"
+
+
 # ---------------------- small utils --------------------
 def _last_n_lines(text: str, n: int = 150) -> str:
     lines = text.splitlines()
@@ -565,22 +581,24 @@ def _save_global_summary(batch_dir: Path, summary: List[Dict[str, Any]], avg_spe
 
 # --------------------------- main ----------------------
 def main():
-    args = _build_arg_parser().parse_args()
+	args = _build_arg_parser().parse_args()
 
-    all_tasks = _collect_tasks(args.arch_py)
+	all_tasks = _collect_tasks(args.arch_py)
 
-    # ---- Create ONE batch folder for this run ----
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    # batch name hints: single file uses file stem; directory uses 'batch'
-    if args.arch_py.is_file():
-        batch_name = f"{stamp}_{args.arch_py.stem}"
-    else:
-        # include sampling info for traceability
-        pick_note = f"first{args.first_n}" if (args.first_n and args.first_n > 0) else f"num{args.num_tasks}_seed{args.shuffle_seed}"
-        batch_name = f"{stamp}_batch_{pick_note}"
-    batch_dir = (args.work_dir / batch_name).resolve()
-    batch_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[BATCH] Output folder: {batch_dir}")
+	# ---- Create ONE batch folder for this run ----
+	stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+	run_tag = _build_run_tag(args.server_type, args.model_name)
+	# batch name hints: single file uses file stem; directory uses 'batch'
+	if args.arch_py.is_file():
+		batch_name = f"{stamp}_{args.arch_py.stem}_{run_tag}"
+	else:
+		# include sampling info for traceability
+		pick_note = f"first{args.first_n}" if (args.first_n and args.first_n >
+											   0) else f"num{args.num_tasks}_seed{args.shuffle_seed}"
+		batch_name = f"{stamp}_batch_{pick_note}_{run_tag}"
+	batch_dir = (args.work_dir / batch_name).resolve()
+	batch_dir.mkdir(parents=True, exist_ok=True)
+	print(f"[BATCH] Output folder: {batch_dir}")
 
     # single file → run once (still inside the same batch folder)
     if args.arch_py.is_file():
@@ -623,4 +641,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+	main()
