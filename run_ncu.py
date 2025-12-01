@@ -84,18 +84,14 @@ def profile_bench(
 
     env = os.environ.copy()
     env["PATH"] = f"{conda_bin}:{env.get('PATH', '')}"
+    tmp_ncu_dir = Path.home() / "ncu-tmp"
+    tmp_ncu_dir.mkdir(parents=True, exist_ok=True)
+    env["TMPDIR"] = str(tmp_ncu_dir)
     tmp_ext = tempfile.mkdtemp(prefix="torch_ext_")
     env["TORCH_EXTENSIONS_DIR"] = tmp_ext
 
-    preserve = ",".join([
-        "PATH", "LD_LIBRARY_PATH", "CUDA_VISIBLE_DEVICES",
-        "CONDA_PREFIX", "CONDA_DEFAULT_ENV",
-        "CUDNN_DISABLE", "PYTORCH_NO_CUDNN",
-        "TORCH_EXTENSIONS_DIR",
-    ])
 
     cmd = [
-        "sudo", "-E", f"--preserve-env={preserve}",
         ncu_bin,
         "--csv",
         "--page=raw",
