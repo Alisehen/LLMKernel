@@ -58,9 +58,13 @@ $few_new
 ‘‘‘
 
 You are given the following architecture:
-```python
 $arch_src
+
+And the kernel you need to implement is:
+```python
+$kernel_src
 ```
+
 Optimize the architecture named Model with custom CUDA operators! Name your optimized
 output architecture ModelNew. Output the new code in codeblocks. Please generate real
 code, NOT pseudocode, make sure the code compiles and is fully functional. Just output
@@ -132,6 +136,7 @@ output the code within:
 # GPU spec loader
 # ---------------------------------------------------------------------------
 
+
 def _load_gpu_spec() -> dict:  # noqa: D401
     """Import `gpu_specs.py` and return the GPU_SPEC_INFO dict (robust across Python versions)."""
     spec = importlib.util.spec_from_file_location("gpu_specs", HW_FILE)
@@ -170,18 +175,19 @@ def build_seed_prompt(
 
     info = gpu_info[gpu_name]
     gpu_arch = info.get("GPU Architecture", "Unknown")
-    gpu_items = "\n".join(
+    arch_src = "\n".join(
         f"• {k}: {v}" for k, v in info.items() if k != "GPU Architecture"
-    )
+    ) if gpu_arch != "Unknown" else "Not Specified"
 
     few_base = FEWSHOT_BASE.read_text().strip()
     few_new = FEWSHOT_NEW.read_text().strip()
-    arch_src = Path(arch_path).read_text().strip()
+    kernel_src = Path(arch_path).read_text().strip()
 
     return test.substitute(
         few_base=few_base,
         few_new=few_new,
         arch_src=arch_src,
+        kernel_src=kernel_src
     )
 
 
@@ -199,7 +205,7 @@ def _cli() -> None:  # noqa: D401
     parser.add_argument("-o", "--out", help="Save prompt to file")
     args = parser.parse_args()
 
-    prompt = build_prompt(Path(args.model_py), args.gpu)
+    prompt = build_seed_prompt(Path(args.model_py), args.gpu)
 
     if args.out:
         Path(args.out).write_text(prompt)
