@@ -9,7 +9,7 @@ HW_FILE = ROOT / "prompts/hardware/gpu_specs.py"
 from prompts.generate_custom_cuda import _load_gpu_spec  # Adjust import path as needed
 
 _OPTIMIZATION_PROMPT_TEMPLATE = Template("""\
-You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+You are a CUDA kernel optimization specialist. Generate the FASTEST possible kernel.
 
 # Target GPU
 GPU Name: $gpu_name
@@ -29,16 +29,18 @@ $NCU_METRICS
 
 **Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
 
-OUTPUT RULES (STRICT):
-1. Follow this exact order:
-   1. Imports: torch, torch.nn, triton, triton.language as tl
-   2. @triton.jit decorated kernel function(s)
-   3. Wrapper function(s) for grid calculation and kernel launch
-   4. class ModelNew(nn.Module) that calls your kernels
-2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+OUTPUT RULES (STRICT) ────────────────────────────────────────────────────────────────
+1. Inside the block, follow **exactly** this order:
+   1. Imports – `torch`, `torch.nn`, `load_inline`.
+   2. `source` – triple-quoted CUDA string(s) (kernel + host wrapper).
+   3. `cpp_src` – prototypes for *all* kernels you expose.
+   4. **One** `load_inline` call per kernel group.
+   5. `class ModelNew(nn.Module)` – mirrors original inputs/outputs but calls
+      your CUDA kernels.
+2. **Do NOT include** testing code, `if __name__ == "__main__"`, or extra prose.
 
 ```python
-# <optimized Triton code>
+# <optimized CUDA code>
 ```
 """)
 
@@ -116,66 +118,73 @@ def build_optimization_prompt(
         # Suggestions are based on NCU metrics - LLM should evaluate applicability
         stage_focus_map = {
             "grid_and_parallel": """
-**Focus**: Maximize SM utilization and parallel work distribution.
+**NCU Metric**: `sm__maximum_warps_per_active_cycle_pct` (Target: >80%)
 
-**Suggested optimizations** (evaluate based on NCU metrics):
-• If SM occupancy < 80%: adjust grid size for better GPU utilization
-• Balance workload via `tl.program_id()` mapping to avoid idle SMs
-• Consider Split-K for compute-bound kernels (requires `tl.atomic_add()`)
+**Core Principle**: Maximize SM utilization through proper grid/block configuration.
 
-**Note**: Only optimize if NCU shows SM underutilization.
+**Key Actions**:
+• Tune block size (64/128/256 threads, must be multiple of 32)
+• For 2D problems, use 2D blocks for better memory patterns
+• Balance: too small wastes SMs, too large hits resource limits
+
 """,
+
+            "memory_coalescing": """
+**NCU Metric**: `l1tex__t_sectors_pipe_lsu_mem_global_op_ld.avg.pct_of_peak_sustained_elapsed` (Target: >80%)
+
+**Core Principle**: Ensure consecutive threads access consecutive memory addresses.
+
+**CRITICAL RULE**: Within a warp, threadIdx.x must map to contiguous memory offsets.
+
+**Key Patterns to Fix**:
+• Strided access → Change to unit-stride access
+• Column-major for row-major data → Swap loop order or use threadIdx mapping
+• Transpose operations → Use shared memory as staging buffer (pad to avoid bank conflicts)
+
+""",
+
             "block_tiling": """
-**Focus**: Find optimal block size balancing data reuse and register pressure.
+**CRITICAL**: Tile size directly affects performance by orders of magnitude!
 
-**Suggested ranges** (tune based on occupancy):
-• BLOCK_M/N: 64, 128, 256 (use 16x multiples for Tensor Cores)
-• BLOCK_K: 32, 64, 128
-• If occupancy low due to registers: reduce block size
-• If occupancy high: current config is likely good
+**⚠️ NCU Metrics Can Be Misleading**:
+- If tile is too small (e.g., 16×16), NCU may show:
+  ✓ Occupancy 100% (because many small blocks)
+  ✓ L2 hit 99% (because all data fits in cache)
+  ✗ BUT actual performance is 5-10x SLOWER due to:
+    • Excessive kernel launch overhead
+    • Each thread does too little work (low compute intensity)
 
-**Note**: Use NCU metrics to guide tuning, not blind search.
+**Correct Decision Process**:
+1. Calculate actual TFLOPS from benchmark time
+   - For matmul: TFLOPS = 2×M×N×K / (time_ms / 1000) / 1e12
+2. If TFLOPS < 20% of GPU peak → Tile size is TOO SMALL
+3. Increase tile size even if it lowers occupancy (this is correct!)
+
+**Recommended Tile Sizes** (for matmul):
+• Small matrices (N<1024): 32×32
+• Medium matrices (1024≤N<4096): 64×64
+• Large matrices (N≥4096): 128×128
+
+**Key Insight**: Occupancy 50% with 128×128 tiles is MUCH faster than occupancy 100% with 16×16 tiles!
+
 """,
-            "memory_access": """
-**Focus**: Optimize memory access based on kernel characteristics and NCU bottleneck analysis.
 
-**Suggested optimizations** (evaluate applicability):
+            "memory_hierarchy": """
+**NCU Metrics** (optimize in order):
+1. `l1tex__data_bank_conflicts` (Target: <100)
+2. `lts__t_sector_hit_rate` (Target: >70%)
+3. `smsp__warp_issue_stalled_memory_dependency` (Target: <20%)
 
-**If memory stalls > 30%** (check `smsp__warp_issue_stalled_memory_dependency`):
-• Increase `num_stages` (2/3/4) in kernel decorator for software pipelining
+**Optimization Priority** (based on NCU):
 
-**If DRAM throughput > 80%** (memory-bound):
-• Use vectorized loads/stores where applicable
-• Minimize redundant memory operations
+**IF bank conflicts > 100**: Pad shared memory arrays (+1 dimension) to avoid bank conflicts
 
-**If kernel has data reuse** (e.g., matmul, conv) **AND** L2 hit < 80%:
-• Improve L2 cache hit rate via better block tiling or computation ordering
+**IF L2 hit < 70%**: Use shared memory to increase data reuse and reduce global memory access
 
-**If kernel is element-wise** (e.g., add, mul, relu):
-• L2 optimization has minimal impact (no data reuse)
-• Focus on maximizing memory throughput instead
+**IF memory stalls > 20%**: Add double buffering to hide memory latency (prefetch next tile while computing current)
 
-**Note**: Analyze your kernel's access pattern before optimizing. Not all optimizations apply to all kernels.
-""",
-            "advanced_memory": """
-**Focus**: Fine-tune memory management for final performance gains (typically 5-10%).
+**IF DRAM > 80% (memory-bound)**: Use vectorized loads/stores (float4) for higher bandwidth
 
-**Suggested optimizations** (only if NCU shows potential):
-
-**num_stages tuning**:
-• If memory stalls > 30%: try num_stages=2/3/4 to hide latency
-• If memory stalls < 10%: num_stages=1 is sufficient (saves registers)
-
-**eviction_policy** (for `tl.load`):
-• "evict_first": data will be reused soon (e.g., shared memory blocking)
-• "evict_last": streaming data with single use
-
-**Skip this stage if**:
-• Current metrics already near optimal (e.g., L2 hit > 95%, low stalls)
-• Performance already meets target
-
-**Note**: These are micro-optimizations. Major gains come from earlier stages.
-**Do NOT attempt**: Triton does not support manual shared memory swizzling or instruction reordering.
 """,
         }
 

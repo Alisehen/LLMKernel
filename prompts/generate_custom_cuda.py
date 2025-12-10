@@ -45,10 +45,12 @@ FEWSHOT_MATMUL_NEW_TRITON = ROOT / "prompts/few_shot/model_new_ex_matmul_triton.
 # ---------------------------------------------------------------------------
 test = Template(
     dedent(
-        """ 
+        """
 You write custom CUDA kernels to replace the pytorch operators in the given architecture to get speedups.You have complete freedom to choose the set of operators you want to replace. You may make the decision to replace some operators with custom CUDA kernels and leave others unchanged. You may replace multiple operators with custom implementations, consider operator fusion opportunities (combining multiple operators into a single kernel, for example, combining matmul+relu), or algorithmic changes (such as online softmax). You are only limited by your imagination.
 
-Here\’s an example to show you the syntax of inline embedding custom CUDA operators in torch: 
+IMPORTANT: First generate a CORRECT and RUNNABLE kernel.
+
+Here\'s an example to show you the syntax of inline embedding custom CUDA operators in torch: 
 The example given architecture is:
 ‘‘‘
 $few_base
@@ -66,66 +68,14 @@ And the kernel you need to implement is:
 $kernel_src
 ```
 
-Optimize the architecture named Model with custom CUDA operators! Name your optimized
-output architecture ModelNew. Output the new code in codeblocks. Please generate real
-code, NOT pseudocode, make sure the code compiles and is fully functional. Just output
-the new model code, no other text, and NO testing code!
-"""
-    )
-)
-TEMPLATE = Template(
-    dedent(
-        """
-Task
-----
-Generate **hand‑written CUDA kernels** that replace *all* PyTorch operator(s)
-inside the original `class Model` (shown later).  You may fuse multiple
-operators into a single kernel if that yields better performance.  Leave any
-non‑replaced parts of the model unchanged.
-
-OUTPUT RULES (STRICT) ────────────────────────────────────────────────
-1. Inside the block, follow **exactly** this order:
-   1. Imports – `torch`, `torch.nn`, `load_inline`.
-   2. `source` – triple‑quoted CUDA string(s) (kernel + host wrapper).
-   3. `cpp_src` – prototypes for *all* kernels you expose.
-   4. **One** `load_inline` call per kernel group.
-   5. `class ModelNew(nn.Module)` – mirrors original inputs/outputs but calls
-      your CUDA kernels.
-2. **Do NOT include** testing code, `if __name__ == "__main__"`, or extra prose.
-
-
-Few‑shot example (reference only – do **not** echo):
-**Original**
-```python
-$few_base
-```
-**Optimised**
-```python
-$few_new
-```
-
-Target architecture (to optimise):
-```python
-$arch_src
-```
-
-Optimize the architecture named Model with custom CUDA operators! Name your optimized
-output architecture ModelNew. Output the new code in codeblocks. Please generate real
-code, NOT pseudocode, make sure the code compiles and is fully functional. Just output
-the new model code, no other text, and NO testing code!
-
-Example:
-```python
-# <complete ModelNew code>
-```
-# ==========================================================
+Optimize the architecture named Model with custom CUDA operators! Name your optimized output architecture ModelNew. Output the new code in codeblocks. Please generate real code, NOT pseudocode, make sure the code compiles and is fully functional. Just output the new model code, no other text, and NO testing code!
 """
     )
 )
 default_system_prompt = """\
 You are an expert in high-performance GPU kernel optimization with CUDA.
 
-Generate the fastest possible CUDA kernels. Optimize aggressively for performance while ensuring correctness.
+Generate CORRECT and RUNNABLE CUDA kernels first. Start with simple, proven patterns.
 
 Output format:
 ```python
@@ -189,7 +139,7 @@ def build_seed_prompt(
     return test.substitute(
         few_base=few_base,
         few_new=few_new,
-        arch_src=kernel_src,
+        arch_src=arch_src,
         kernel_src=kernel_src
 
     )
