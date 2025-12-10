@@ -50,16 +50,8 @@ def main():
     if ModelNew is None:
         raise RuntimeError("Candidate must define class ModelNew")
 
-    # Get init inputs from reference module (if available)
-    get_init_inputs = getattr(ref_mod, "get_init_inputs", None)
-    if get_init_inputs is not None:
-        init_args = get_init_inputs()
-        if not isinstance(init_args, (list, tuple)):
-            init_args = [init_args]
-        model = ModelNew(*init_args).to(device).eval()
-    else:
-        # Fallback: try to instantiate without args
-        model = ModelNew().to(device).eval()
+    # Create model and move to device
+    model = ModelNew().to(device).eval()
     inputs = [x.to(device) if isinstance(x, torch.Tensor) else x for x in inputs]
 
     # Warmup

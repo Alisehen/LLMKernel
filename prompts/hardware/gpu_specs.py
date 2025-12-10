@@ -134,6 +134,23 @@ GPU_SPEC_INFO = {
         "Maximum number of thread blocks per SM": "32",
         "Shared memory capacity per SM": "164 KB",
         "Maximum shared memory per thread block": "163 KB",
+    },
+    "4090": {
+        "GPU Architecture": "Ada Lovelace",
+        "Compute Capability": "8.9",
+        "Number of SMs": "128",
+        "Memory Bandwidth": "1008 GB/s",
+        "TF32 Tensor Core TFLOPS": "82.6 with dense",
+        "BFLOAT16 Tensor Core TFLOPS": "165.2 with dense",
+        "FP16 Tensor Core TFLOPS": "165.2 with dense",
+        "Maximum number of registers per thread": "255",
+        "Maximum threads per block": "1024",
+        "Maximum threads per SM": "1536",
+        "Warp size": "32",
+        "Maximum concurrent warps per SM": "48",
+        "Shared memory capacity per SM": "100 KB",
+        "Maximum shared memory per thread block": "99 KB",
+        "L2 cache (global, all SM shared)": "72 MB",
     }
 }
 

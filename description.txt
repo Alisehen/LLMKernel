@@ -1,0 +1,25 @@
+核心流程：生成 Seed 代码后分阶段优化
+
+保留的关键优化维度：
+
+1. Parallel Mapping Strategy（并行映射策略）
+   定义：决定一个 program instance 负责哪块输出数据
+   具体内容：
+   - GEMM：(batch, head, M) vs (batch, M×N) 映射
+   - MoE：按 token 切分 vs (token, expert) 二维切分
+   - Attention：按 sequence 切分 vs 按 head 切分
+   影响：负载均衡、SM 利用率、全局同步开销
+
+2. Block Tiling（块级分块）
+   定义：确定每个 program instance 处理的 tile 大小
+   具体内容：
+   - BLOCK_M, BLOCK_N, BLOCK_K 的大小选择
+   - Tile shape 的选择（如 128×128 vs 64×256）
+   - 通过 tile size 控制 shared memory 分配和寄存器压力
+   影响：shared memory 使用量、寄存器复用
+
+优化的四个阶段：
+1. Seed 代码生成：基于问题描述生成初始 Triton kernel
+2. 并行映射优化：调整数据到 program instance 的映射策略
+3. 块级分块优化：调整 tile 大小和形状
+4. 迭代修复与精化：基于性能反馈和错误修复进行迭代优化

@@ -135,11 +135,17 @@ def save_prompt_text(text: str, out_dir: Path, *, tag: str = "repair") -> Path:
     return path
 
 def extract_cuda_kernel_names(py_path: Path) -> List[str]:
+    """Extract CUDA kernel names from a .py file (works for both CUDA and Triton)."""
     try:
         src = py_path.read_text(encoding="utf-8", errors="ignore")
     except Exception:
         return []
 
+    # Try to detect if this is Triton code
+    if "import triton" in src or "@triton.jit" in src:
+        return extract_triton_kernel_names(src)
+
+    # Otherwise, use CUDA kernel extraction
     p1 = re.compile(r"""__global__\s+void\s+([A-Za-z_]\w*)\s*\(""", re.MULTILINE)
     p2 = re.compile(
         r"""__global__\s+__launch_bounds__\s*\([^)]*\)\s*void\s+([A-Za-z_]\w*)\s*\(""",
@@ -152,4 +158,42 @@ def extract_cuda_kernel_names(py_path: Path) -> List[str]:
         if n not in seen:
             seen.add(n)
             ordered.append(n)
+    return ordered
+
+
+def extract_triton_kernel_names(src: str) -> List[str]:
+    """Extract Triton kernel names from source code.
+
+    Triton kernels are decorated with @triton.jit and compiled to CUDA.
+    The actual kernel name used by NCU will be the function name.
+    """
+    # Pattern 1: @triton.jit decorated functions
+    # def kernel_name(...)
+    p1 = re.compile(r"""@triton\.jit\s+def\s+([A-Za-z_]\w*)\s*\(""", re.MULTILINE)
+
+    # Pattern 2: @triton.autotune decorated functions
+    # These also create kernels
+    p2 = re.compile(r"""@triton\.autotune\([^)]*\)\s*@triton\.jit\s+def\s+([A-Za-z_]\w*)\s*\(""", re.MULTILINE | re.DOTALL)
+
+    names = p1.findall(src) + p2.findall(src)
+
+    # Remove duplicates while preserving order
+    seen, ordered = set(), []
+    for n in names:
+        if n not in seen:
+            seen.add(n)
+            ordered.append(n)
+
+    # If no Triton kernels found, return a generic pattern
+    # NCU will see Triton kernels with various suffixes
+    if not ordered:
+        # Fallback: look for any function that might be a kernel
+        # in ModelNew class
+        p3 = re.compile(r"""def\s+([A-Za-z_]\w*_kernel)\s*\(""", re.MULTILINE)
+        names = p3.findall(src)
+        for n in names:
+            if n not in seen:
+                seen.add(n)
+                ordered.append(n)
+
     return ordered

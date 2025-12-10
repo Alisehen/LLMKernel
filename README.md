@@ -52,4 +52,6 @@ Testing single task：
 ```bash
 python3 main.py KernelBench/level1/1_Square_matrix_multiplication_.py  --gpu "Quadro RTX 6000"   --server_type openai   --model_name o3   --device 0   --round 10   --subproc_id 0
 
+python3 main.py KernelBench/level1/1_Square_matrix_multiplication_.py  --gpu "4090" --server_type sglang --server_port 8001 --device 5
+
 ```

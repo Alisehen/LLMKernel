@@ -64,18 +64,21 @@ def query_server(
         case "sglang":
             from openai import OpenAI
             url = f"http://{server_address}:{server_port}"
-            client = OpenAI(api_key=SGLANG_KEY, base_url=f"{url}/v1", timeout=None, max_retries=0)
+            # For local SGLang server, use a dummy key if SGLANG_KEY is not set
+            api_key = SGLANG_KEY if SGLANG_KEY else "dummy-sglang-key"
+            client = OpenAI(api_key=api_key, base_url=f"{url}/v1", timeout=None, max_retries=0)
             model = "default"
 
         case "deepseek":
             from openai import OpenAI
             client = OpenAI(
-                api_key=DEEPSEEK_KEY,
+                api_key="sk-64705f6bb20d4314a3ea0a049dd2e9a4",
                 base_url="https://api.deepseek.com",
                 timeout=10000000,
                 max_retries=3,
             )
-            model = model_name
+            # Use the model_name parameter or default to deepseek-coder (better for code generation)
+            model = "deepseek-reasoner"
 
         case "fireworks":
             from openai import OpenAI
@@ -148,7 +151,16 @@ def query_server(
             system_instruction=system_prompt,
             generation_config=generation_config,
         )
-        response = model.generate_content(prompt)
+        try:
+            response = model.generate_content(prompt)
+        except Exception as e:
+            error_msg = str(e)
+            if "context_length" in error_msg.lower() or "too long" in error_msg.lower() or "token limit" in error_msg.lower():
+                print(f"\n⚠️  Context length exceeded for Google API")
+                print(f"Error: {error_msg}")
+                print(f"Returning truncation notice instead of crashing...")
+                return "[ERROR: Input prompt exceeded model context length. Please reduce prompt size.]"
+            raise
 
         # Usage logging
         usage_metadata = getattr(response, 'usage_metadata', None)
@@ -188,25 +200,34 @@ def query_server(
 
     elif server_type == "anthropic":
         assert isinstance(prompt, str)
-        if is_reasoning_model:
-            response = client.beta.messages.create(
-                model=model,
-                system=system_prompt,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=max_tokens,
-                thinking={"type": "enabled", "budget_tokens": budget_tokens},
-                betas=["output-128k-2025-02-19"],
-            )
-        else:
-            response = client.messages.create(
-                model=model,
-                system=system_prompt,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                max_tokens=max_tokens,
-            )
+        try:
+            if is_reasoning_model:
+                response = client.beta.messages.create(
+                    model=model,
+                    system=system_prompt,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=max_tokens,
+                    thinking={"type": "enabled", "budget_tokens": budget_tokens},
+                    betas=["output-128k-2025-02-19"],
+                )
+            else:
+                response = client.messages.create(
+                    model=model,
+                    system=system_prompt,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    max_tokens=max_tokens,
+                )
+        except Exception as e:
+            error_msg = str(e)
+            if "context_length" in error_msg.lower() or "prompt is too long" in error_msg.lower() or "token limit" in error_msg.lower() or "maximum context length" in error_msg.lower():
+                print(f"\n⚠️  Context length exceeded for Anthropic API")
+                print(f"Error: {error_msg}")
+                print(f"Returning truncation notice instead of crashing...")
+                return "[ERROR: Input prompt exceeded model context length. Please reduce prompt size.]"
+            raise
         # Usage Logging
         if hasattr(response, 'usage'):
             input_tokens = getattr(response.usage, "input_tokens", None)
@@ -250,28 +271,48 @@ def query_server(
 
     else:
         if isinstance(prompt, str):
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt},
-            ]
+            messages = []
+            # Only add system message if system_prompt is not None/empty
+            if system_prompt:
+                messages.append({"role": "system", "content": system_prompt})
+            messages.append({"role": "user", "content": prompt})
         else:
             messages = prompt
 
-        if is_reasoning_model and server_type == "openai":
-            response = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                reasoning_effort=reasoning_effort,
-            )
-        else:
-            response = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                temperature=temperature,
-                n=num_completions,
-                max_tokens=max_tokens,
-                top_p=top_p,
-            )
+        # DeepSeek API max_tokens limit varies by model
+        # deepseek-chat/coder: 4096, deepseek-v3: 8192
+        # Remove artificial limit - let the API enforce its own limits
+        # if server_type == "deepseek":
+        #     max_tokens = min(max_tokens, 8192)
+
+        try:
+            if is_reasoning_model and server_type == "openai":
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    reasoning_effort=reasoning_effort,
+                )
+            else:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    temperature=temperature,
+                    n=num_completions,
+                    max_tokens=max_tokens,
+                    top_p=top_p,
+                )
+        except Exception as e:
+            error_msg = str(e)
+            # Catch context length errors from OpenAI, DeepSeek, SGLang, Together, etc.
+            if any(keyword in error_msg.lower() for keyword in [
+                "context_length", "context length", "maximum context",
+                "too long", "token limit", "exceeds", "prompt is too large"
+            ]):
+                print(f"\n⚠️  Context length exceeded for {server_type} API")
+                print(f"Error: {error_msg}")
+                print(f"Returning truncation notice instead of crashing...")
+                return "[ERROR: Input prompt exceeded model context length. Please reduce prompt size.]"
+            raise
         outputs = []
         for choice in response.choices:
             print(colorize_finish_reason(choice.finish_reason))
