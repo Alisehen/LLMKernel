@@ -34,7 +34,7 @@ FEWSHOT_BASE = ROOT / "prompts/few_shot/model_ex_add.py"   # original Model
 # Choose between CUDA and Triton implementations
 FEWSHOT_NEW_CUDA = ROOT / "prompts/few_shot/model_new_ex_add.py"  # optimised with CUDA
 FEWSHOT_NEW_TRITON = ROOT / "prompts/few_shot/model_new_ex_add_triton.py"  # optimised with Triton
-FEWSHOT_NEW = FEWSHOT_NEW_TRITON  # Default to Triton
+FEWSHOT_NEW = FEWSHOT_NEW_CUDA  # Default to CUDA
 
 # Matrix multiplication examples
 FEWSHOT_MATMUL_BASE = ROOT / "prompts/few_shot/model_ex_tiled_matmul.py"
@@ -45,43 +45,31 @@ FEWSHOT_MATMUL_NEW_TRITON = ROOT / "prompts/few_shot/model_new_ex_matmul_triton.
 # ---------------------------------------------------------------------------
 test = Template(
     dedent(
-        """
-You write high-performance Triton kernels to replace PyTorch operators for maximum speedup.
+        """ 
+You write custom CUDA kernels to replace the pytorch operators in the given architecture to get speedups.You have complete freedom to choose the set of operators you want to replace. You may make the decision to replace some operators with custom CUDA kernels and leave others unchanged. You may replace multiple operators with custom implementations, consider operator fusion opportunities (combining multiple operators into a single kernel, for example, combining matmul+relu), or algorithmic changes (such as online softmax). You are only limited by your imagination.
 
-**Goal**: Generate the FASTEST possible Triton kernel while maintaining correctness.
-
-**Triton Core Principles** (avoid CUDA thinking):
-1. Use `tl.program_id(axis)` for block indices (NOT threadIdx/blockIdx)
-2. Use `tl.arange(0, BLOCK_SIZE)` to generate element indices (NO thread_idx!)
-3. Triton auto-manages shared memory and synchronization (NO manual __shared__ or syncthreads)
-4. Work with blocks of data, not individual threads
-
-OUTPUT RULES (STRICT):
-1. Follow this exact order:
-   1. Imports: torch, torch.nn, triton, triton.language as tl
-   2. @triton.jit decorated kernel function(s)
-   3. Wrapper function(s) for grid calculation and kernel launch
-   4. class ModelNew(nn.Module) that calls your kernels
-2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
-
-The example PyTorch code:
-'''
+Here\’s an example to show you the syntax of inline embedding custom CUDA operators in torch: 
+The example given architecture is:
+‘‘‘
 $few_base
-'''
-Example optimized Triton implementation:
-'''
+‘‘‘
+The example new arch with custom CUDA kernels looks like this:
+‘‘‘
 $few_new
-'''
+‘‘‘
 
-Architecture to optimize:
+You are given the following architecture:
 $arch_src
 
-Kernel to implement:
+And the kernel you need to implement is:
 ```python
 $kernel_src
 ```
 
-Generate the fastest correct Triton implementation as ModelNew.
+Optimize the architecture named Model with custom CUDA operators! Name your optimized
+output architecture ModelNew. Output the new code in codeblocks. Please generate real
+code, NOT pseudocode, make sure the code compiles and is fully functional. Just output
+the new model code, no other text, and NO testing code!
 """
     )
 )
@@ -135,13 +123,13 @@ Example:
     )
 )
 default_system_prompt = """\
-You are an expert in high-performance GPU kernel optimization with Triton.
+You are an expert in high-performance GPU kernel optimization with CUDA.
 
-Generate the fastest possible Triton kernels. Optimize aggressively for performance while ensuring correctness.
+Generate the fastest possible CUDA kernels. Optimize aggressively for performance while ensuring correctness.
 
 Output format:
 ```python
-# <complete ModelNew code with optimized Triton kernels>
+# <complete ModelNew code with optimized CUDA kernels>
 ```
 """
 # ---------------------------------------------------------------------------
@@ -195,15 +183,15 @@ def build_seed_prompt(
     kernel_src = Path(arch_path).read_text().strip()
 
     # Auto-select appropriate few-shot examples based on task content
-    kernel_lower = kernel_src.lower()
     few_base = FEWSHOT_BASE.read_text().strip()
     few_new = FEWSHOT_NEW.read_text().strip()
 
     return test.substitute(
         few_base=few_base,
         few_new=few_new,
-        arch_src=arch_src,
+        arch_src=kernel_src,
         kernel_src=kernel_src
+
     )
 
 
