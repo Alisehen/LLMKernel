@@ -82,45 +82,43 @@ OPTIMIZATION_STAGES = [
 ]
 
 # ---------------------- early exit criteria per stage -----------------
-# Define metric thresholds for skipping optimization stages when metrics are already optimal
-# Note: These are suggestions based on empirical data. Adjust based on your workload.
-# Comparisons: ">=" for metrics where higher is better, "<=" for metrics where lower is better
+# Skip optimization stage when metrics already meet thresholds
+# All metrics used here are in the core 6 NCU metrics (run_ncu.py)
 STAGE_EXIT_CRITERIA = {
     "grid_and_parallel": {
-        "metrics": ["sm__maximum_warps_per_active_cycle_pct"],
-        "thresholds": [90.0],  # SM occupancy > 90% -> skip grid optimization
-        "comparisons": [">="],  # Higher is better
-        "operator": "and",  # All conditions must be met
-        "description": "SM occupancy already optimal (>90%)"
+        # Stage 1: Skip if SM throughput is already high (good parallelism)
+        "metrics": ["sm__throughput.avg.pct_of_peak_sustained_elapsed"],
+        "thresholds": [75.0],  # SM throughput > 75% indicates good grid configuration
+        "comparisons": [">="],
+        "operator": "and",
+        "description": "SM throughput already high (>75%), grid parallelism is good"
     },
     "block_tiling": {
-        "metrics": ["sm__maximum_warps_per_active_cycle_pct"],
-        "thresholds": [85.0],  # Good occupancy suggests block config is decent
-        "comparisons": [">="],  # Higher is better
+        # Stage 2: Skip if warp occupancy is already good
+        "metrics": ["sm__warps_active.avg.pct_of_peak_sustained_active"],
+        "thresholds": [60.0],  # Occupancy > 60% suggests decent block size
+        "comparisons": [">="],
         "operator": "and",
-        "description": "Block configuration already efficient (occupancy >85%)"
+        "description": "Warp occupancy already decent (>60%), block config is reasonable"
     },
     "memory_access": {
-        # Skip if BOTH conditions are met (memory access is already good)
-        "metrics": [
-            "smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct",  # Memory stalls
-            "dram__throughput.avg.pct_of_peak_sustained_elapsed"  # DRAM utilization
-        ],
-        "thresholds": [10.0, 85.0],  # Low stalls (<10%) AND high DRAM (>85%)
-        "comparisons": ["<=", ">="],  # Lower stalls better, higher DRAM better
-        "operator": "and",  # Both conditions must be met
-        "description": "Memory access already optimized (stalls <10% and DRAM >85%)"
+        # Stage 3: Skip if memory stalls are low (latency already hidden)
+        "metrics": ["smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct"],
+        "thresholds": [15.0],  # Stalls < 15% means memory latency is well hidden
+        "comparisons": ["<="],
+        "operator": "and",
+        "description": "Memory stalls already low (<15%), memory access is efficient"
     },
     "advanced_memory": {
-        # Skip if memory is already very efficient
+        # Stage 4: Skip if both L2 cache and memory stalls are good
         "metrics": [
-            "lts__t_sector_hit_rate.pct",  # L2 cache hit rate
-            "smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct"  # Memory stalls
+            "lts__t_sector_hit_rate.pct",
+            "smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct"
         ],
-        "thresholds": [95.0, 5.0],  # High L2 (>95%) OR very low stalls (<5%)
-        "comparisons": [">=", "<="],  # Higher L2 better, lower stalls better
-        "operator": "or",  # Any condition met -> advanced tuning won't help
-        "description": "Memory system already near-optimal (L2 >95% or stalls <5%)"
+        "thresholds": [90.0, 10.0],  # L2 > 90% AND stalls < 10%
+        "comparisons": [">=", "<="],
+        "operator": "and",  # Both must be met
+        "description": "Memory system already optimal (L2 >90% and stalls <10%)"
     }
 }
 
@@ -359,12 +357,21 @@ def _bench_and_score(
     tol: float,
     phase: str = "seed",
     metrics_dir: Path | None = None,
-) -> None:
+    cached_baseline_ms: Optional[float] = None,  # Cached baseline latency (if available)
+) -> Optional[float]:
     """
     Benchmark and update the individual's metrics/score; on exception, fill in
     failure info and save metrics (if a directory is provided).
     Same functionality as the original version, but runs compare_and_bench in a
     **spawned subprocess** to isolate the CUDA context.
+
+    Args:
+        cached_baseline_ms: If provided, use this cached PyTorch baseline latency instead
+                           of the one from current benchmark. This improves consistency.
+
+    Returns:
+        The PyTorch baseline latency (avg ms) if this was the first run, None otherwise.
+        This allows caching the baseline for subsequent stages.
     """
     import os
     from multiprocessing import get_context
@@ -416,25 +423,44 @@ def _bench_and_score(
 
     # Wait for child and receive the payload
     p.join()
-    payload = parent_conn.recv() if parent_conn.poll() else None
+    try:
+        payload = parent_conn.recv() if parent_conn.poll() else None
+    except (EOFError, BrokenPipeError) as e:
+        # Child process crashed (e.g., Triton compiler assertion failure)
+        payload = ("err", {"error_type": "ProcessCrashed", "message": f"Child process crashed: {e}"})
     try:
         parent_conn.close()
     except Exception:
         pass
 
     # —— Update metrics/score based on child payload (same logic as before) ——
+    returned_baseline_ms = None  # To cache for future runs
+
+    # Handle case where payload is None (child crashed without sending data)
+    if payload is None:
+        payload = ("err", {"error_type": "ProcessCrashed", "message": "Child process crashed without sending results"})
+
     if isinstance(payload, tuple) and len(payload) == 2 and payload[0] in ("ok", "err"):
         tag, data = payload
         if tag == "ok":
             metrics = data
             metrics["runnable"] = True
             metrics["phase"] = phase
-            speedup = metrics["ref_latency_ms"]["avg"] / max(1e-9, metrics["test_latency_ms"]["avg"])
+
+            # Use cached baseline if provided, otherwise use current benchmark result
+            if cached_baseline_ms is not None:
+                baseline_ms = cached_baseline_ms
+                metrics["pytorch_baseline_ms"] = baseline_ms  # Record which baseline was used
+            else:
+                baseline_ms = metrics["ref_latency_ms"]["avg"]
+                returned_baseline_ms = baseline_ms  # Return for caching
+
+            speedup = baseline_ms / max(1e-9, metrics["test_latency_ms"]["avg"])
             metrics["score"] = speedup
 
             ind.metrics = metrics
             ind.score = speedup
-            print(f"[{phase}] score={speedup:.4f}")
+            print(f"[{phase}] score={speedup:.4f} (baseline={baseline_ms:.4f}ms)")
 
         else:
             err_type = "RuntimeError"
@@ -477,6 +503,8 @@ def _bench_and_score(
     # NOTE: Do NOT clean up CUDA in parent process!
     # Importing torch here will initialize CUDA on the wrong device.
     # Let the subprocess handle all CUDA operations.
+
+    return returned_baseline_ms  # Return baseline for caching (None if failed or cached was used)
 
 
 def _should_skip_stage(stage_name: str, metrics_df) -> tuple[bool, str]:
@@ -648,6 +676,8 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
 
     # --- per-task directories under the SAME batch_dir
     task_root = (batch_dir / task_path.stem).resolve()
+    task_root.mkdir(parents=True, exist_ok=True)  # Create task root first!
+
     code_dir = task_root / "code"
     eval_dir = task_root / "evaluation"
     fig_dir = task_root / "figures"
@@ -680,7 +710,8 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
     prompt_file.write_text(seed_prompt, encoding="utf-8")
     current_kernel = _llm_to_kernel(seed_prompt, code_dir, call_llm, io_dir,
                                     0, log_path=log_path, call_type="seed")
-    _bench_and_score(
+    # First benchmark: cache PyTorch baseline for future comparisons
+    pytorch_baseline_ms = _bench_and_score(
         current_kernel,
         ref_py=task_path,
         device_idx=args.device,
@@ -689,6 +720,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
         tol=args.tol,
         phase="seed",
         metrics_dir=eval_dir,
+        cached_baseline_ms=None,  # No cache yet, will return baseline for caching
     )
 
     # Record seed score
@@ -730,7 +762,8 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
         prompt_file.write_text(repair_prompt, encoding="utf-8")
         current_kernel = _llm_to_kernel(repair_prompt, code_dir, call_llm, io_dir,
                                         repair_attempt, log_path=log_path, call_type="seed_repair")
-        _bench_and_score(
+        # Use cached baseline if available, otherwise cache new baseline
+        baseline_result = _bench_and_score(
             current_kernel,
             ref_py=task_path,
             device_idx=args.device,
@@ -739,7 +772,11 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
             tol=args.tol,
             phase="seed_repair",
             metrics_dir=eval_dir,
+            cached_baseline_ms=pytorch_baseline_ms if pytorch_baseline_ms else None,
         )
+        # Update cached baseline if this was the first successful run
+        if pytorch_baseline_ms is None and baseline_result is not None:
+            pytorch_baseline_ms = baseline_result
 
         runnable = bool(getattr(current_kernel, "metrics", {}).get("runnable", False))
         this_score = current_kernel.score if (current_kernel.score is not None and runnable) else None
@@ -769,6 +806,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
         print("\n[Optimization] Starting 4-stage optimization process...")
         stage_round = 0
         previous_stage_score = best_score  # Track score before each stage
+        score_history = [best_score]  # Track scores from all stages for early stopping
 
         for stage_idx in range(len(OPTIMIZATION_STAGES)):
             stage = OPTIMIZATION_STAGES[stage_idx]
@@ -782,6 +820,9 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
 
             # Check if optimization is needed based on performance gain from previous stage
             print(f"Current best: {best_score:.4f}")
+
+            # ====== Early Stopping Check ======
+            # Check if we should stop optimization early based on score history
 
             # Record the score before this stage starts
             score_before_stage = best_score
@@ -805,31 +846,46 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                 f.write(best_kernel.code)
 
             # Create bench script for this process (copy from template)
-            bench_template = root_dir / "bench_ref_inputs_0.py"
+            # Always use bench_ref_inputs_template.py as source to avoid missing file issues
+            bench_template_source = root_dir / "bench_ref_inputs_template.py"
             bench_script = root_dir / f"bench_ref_inputs_{proc_id}.py"
-            if bench_template.exists() and proc_id != 0:
+
+            # Copy template to process-specific bench script if it doesn't exist or if using non-zero proc_id
+            if not bench_script.exists() or proc_id != 0:
                 import shutil
-                shutil.copy(bench_template, bench_script)
+                if bench_template_source.exists():
+                    shutil.copy(bench_template_source, bench_script)
+                else:
+                    raise FileNotFoundError(f"Bench template not found: {bench_template_source}")
 
             kernel_names = extract_cuda_kernel_names(test_kernel)
             print(f"Detected kernel names: {kernel_names}")
-            csv_path = profile_bench(
-                bench_py=f"bench_ref_inputs_{proc_id}.py",
-                out_csv=f"ncu_temp_{proc_id}.csv",
-                device_idx=args.device,
-                ref_file=str(task_path),  # Use original task file, consistent with _bench_and_score
-                test_file=f"test_kernel_{proc_id}.py")
-            metrics_df = load_ncu_metrics(csv_path, extra_keep=("Kernel Name",),
-                                          name_list=kernel_names, select="last")
-            metrics_block = metrics_to_prompt(metrics_df)
+
+            # Try to collect NCU metrics (may fail if kernel has compilation errors)
+            metrics_block = "No NCU metrics available (kernel failed to compile or run)"
+            metrics_df = None
+            try:
+                csv_path = profile_bench(
+                    bench_py=f"bench_ref_inputs_{proc_id}.py",
+                    out_csv=f"ncu_temp_{proc_id}.csv",
+                    device_idx=args.device,
+                    ref_file=str(task_path),  # Use original task file, consistent with _bench_and_score
+                    test_file=f"test_kernel_{proc_id}.py")
+                metrics_df = load_ncu_metrics(csv_path, extra_keep=("Kernel Name",),
+                                              name_list=kernel_names, select="last")
+                metrics_block = metrics_to_prompt(metrics_df)
+            except (ValueError, FileNotFoundError, Exception) as e:
+                print(f"\033[93mWarning: NCU profiling failed: {e}\033[0m")
+                print(f"Continuing optimization without NCU metrics...")
 
             # Check if stage should be skipped based on metrics
-            should_skip, skip_reason = _should_skip_stage(stage_name, metrics_df)
-            if should_skip:
-                print(f"\n⏩ [Stage {stage_idx + 1}] SKIPPED: {skip_reason}")
-                print(f"   Current metrics already meet optimization goals for this stage.")
-                print(f"   Proceeding to next stage...\n")
-                continue
+            if metrics_df is not None:
+                should_skip, skip_reason = _should_skip_stage(stage_name, metrics_df)
+                if should_skip:
+                    print(f"\n⏩ [Stage {stage_idx + 1}] SKIPPED: {skip_reason}")
+                    print(f"   Current metrics already meet optimization goals for this stage.")
+                    print(f"   Proceeding to next stage...\n")
+                    continue
 
             # Step 2: Build optimization prompt with NCU metrics and stage description
             # history_block = _build_history_block(code_dir, keep_last=0)
@@ -848,6 +904,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
             # Step 3: Generate optimized kernel
             current_kernel = _llm_to_kernel(opt_prompt, code_dir, call_llm, io_dir, stage_round,
                                             log_path=log_path, call_type=f"stage{stage_idx + 1}_{stage_name}")
+            # Use cached PyTorch baseline for consistent comparison
             _bench_and_score(
                 current_kernel,
                 ref_py=task_path,
@@ -857,6 +914,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                 tol=args.tol,
                 phase=f"stage{stage_idx + 1}_{stage_name}",
                 metrics_dir=eval_dir,
+                cached_baseline_ms=pytorch_baseline_ms,  # Use cached baseline
             )
 
             # Step 4: Check if optimization succeeded
@@ -890,6 +948,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                     prompt_file.write_text(repair_prompt, encoding="utf-8")
                     current_kernel = _llm_to_kernel(repair_prompt, code_dir, call_llm, io_dir,
                                                     stage_round, log_path=log_path, call_type=f"stage{stage_idx + 1}_repair")
+                    # Use cached PyTorch baseline for consistent comparison
                     _bench_and_score(
                         current_kernel,
                         ref_py=task_path,
@@ -899,6 +958,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                         tol=args.tol,
                         phase=f"stage{stage_idx + 1}_repair",
                         metrics_dir=eval_dir,
+                        cached_baseline_ms=pytorch_baseline_ms,  # Use cached baseline
                     )
 
                     runnable = bool(getattr(current_kernel, "metrics", {}).get("runnable", False))
@@ -951,6 +1011,9 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                 scores.append(last_score_for_curve)
                 err_flags.append(True)
                 print(f"[Stage {stage_idx + 1}] Optimization produced non-runnable kernel. Keeping best_kernel unchanged.")
+
+            # Update score_history for early stopping check
+            score_history.append(best_score)
 
             # Update previous_stage_score for next iteration
             previous_stage_score = score_before_stage

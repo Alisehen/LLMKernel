@@ -39,27 +39,28 @@ __all__ = [
     "metrics_to_prompt",
 ]
 
-# Triton-optimized: Top 4 most actionable metrics
-# Each metric directly maps to Triton optimization parameters (BLOCK_M/N/K, num_warps, num_stages)
-# Removed redundant result-only metrics (compute util, memory stalls) that can be inferred
+# Triton-optimized metrics: only include metrics that map to Triton parameters
+# Each metric can be optimized by adjusting BLOCK_M/N/K, num_warps, num_stages, GROUP_SIZE_M
 METRICS = ",".join([
-    # 1. Memory Bandwidth: DRAM throughput utilization
-    #    → Triton: BLOCK_M/N/K sizing, data reuse strategy
+    # === Stage 1: Grid & Parallel ===
+    # SM throughput - optimize via BLOCK_M/N (affects grid size)
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed",
+
+    # Grid size - controlled by BLOCK_M/N in grid calculation
+    "launch__grid_size",
+
+    # === Stage 2: Block Tiling & Occupancy ===
+    # Warp occupancy - optimize via num_warps and BLOCK_M/N/K
+    "sm__warps_active.avg.pct_of_peak_sustained_active",
+
+    # === Stage 3: Memory Access ===
+    # DRAM bandwidth - optimize via BLOCK_K and num_stages
     "dram__throughput.avg.pct_of_peak_sustained_elapsed",
 
-    # 2. Cache Efficiency: L2 cache hit rate (LTS = L2 Texture cache/shared memory subsystem)
-    #    → Triton: Block-level data reuse, computation ordering, grid layout for L2 sharing
-    #    Note: L1 cache (l1tex) is hard to control in Triton, L2 is more actionable
+    # L2 cache hit rate - optimize via block tiling and GROUP_SIZE_M
     "lts__t_sector_hit_rate.pct",
 
-    # 3. Occupancy: Theoretical occupancy achieved
-    #    → Triton: num_warps (2/4/8), block size, register pressure
-    "sm__maximum_warps_per_active_cycle_pct",
-
-    # 4. Memory Latency Hiding: Warp stalls due to memory dependency
-    #    → Triton: num_stages (1/2/3/4) for software pipelining
-    #    High stall rate (>30%) → increase num_stages to hide memory latency
-    #    Low stall rate (<10%) → num_stages=1 is sufficient, saves registers
+    # Memory stalls - optimize via num_stages (software pipelining)
     "smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct",
 ])
 
@@ -291,7 +292,11 @@ def load_ncu_metrics(
     if not csv_path.exists():
         raise FileNotFoundError(f"CSV not found: {csv_path}")
 
-    df = pd.read_csv(csv_path, comment="=", low_memory=False)
+    try:
+        df = pd.read_csv(csv_path, comment="=", low_memory=False)
+    except pd.errors.EmptyDataError:
+        # CSV is empty (benchmark script failed before NCU could collect data)
+        raise ValueError(f"NCU CSV file is empty (benchmark script likely failed): {csv_path}")
 
     metric_cols = list(columns) if columns is not None else METRIC_COLUMNS
     keep_cols: List[str] = []

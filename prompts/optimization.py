@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import Optional, Mapping, Any
 from string import Template
 import json
+
 ROOT = Path(__file__).resolve().parents[1]  # project root
 HW_FILE = ROOT / "prompts/hardware/gpu_specs.py"
 
@@ -42,32 +43,6 @@ OUTPUT RULES (STRICT):
 ```
 """)
 
-def _escape_template(s: str) -> str:
-    return s.replace("$", "$$")
-
-def _sanitize_text(s: str) -> str:
-    return s.replace("```", "`")
-
-def _format_problem(problem: Optional[Any]) -> str:
-    if problem is None or problem == "":
-        return "No prior critical problem provided."
-    if isinstance(problem, Mapping):
-        # Prefer extracting bottleneck / optimisation method / modification plan
-        bottleneck = str(problem.get("bottleneck", "")).strip()
-        opt_method = str(problem.get("optimisation method", "")).strip()
-        mod_plan   = str(problem.get("modification plan", "")).strip()
-        if bottleneck or opt_method or mod_plan:
-            return (
-                "{\n"
-                f'  "bottleneck": "{bottleneck}",\n'
-                f'  "optimisation method": "{opt_method}",\n'
-                f'  "modification plan": "{mod_plan}"\n'
-                "}"
-            )
-        # fallback to JSON dump
-        return json.dumps(problem, ensure_ascii=False, indent=2)
-    # For other types, convert to string directly
-    return str(problem)
 
 def build_optimization_prompt(
     arch_path: Path,
@@ -109,80 +84,85 @@ def build_optimization_prompt(
     arch_src = Path(arch_path).read_text().strip()
     hist = history_block or "(None)\n"
 
-    # Build stage context
+    # Build stage context with enhanced guidance
     stage_context = ""
     if stage_name and stage_description:
-        # Map stage names to specific optimization focus
-        # Suggestions are based on NCU metrics - LLM should evaluate applicability
+        # Universal stage optimization focus (适用于所有算子类型)
         stage_focus_map = {
-            "grid_and_parallel": """
-**Focus**: Maximize SM utilization and parallel work distribution.
+    "grid_and_parallel": """
+**Focus**: Optimize grid layout and parallel work distribution.
 
-**Suggested optimizations** (evaluate based on NCU metrics):
-• If SM occupancy < 80%: adjust grid size for better GPU utilization
-• Balance workload via `tl.program_id()` mapping to avoid idle SMs
-• Consider Split-K for compute-bound kernels (requires `tl.atomic_add()`)
+**NCU Metrics to Check**:
+• `sm__throughput.avg.pct_of_peak_sustained_elapsed`: Overall SM utilization (target: >60%)
+• `launch__grid_size`: Total number of blocks (controlled by BLOCK_M/N)
 
-**Note**: Only optimize if NCU shows SM underutilization.
+**Guidelines**:
+- 2D outputs → typically use 2D grid `(cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))`; simple 1D ops → 1D grid.
+- Prefer adding parallelism via batch/head/expert dims before reducing BLOCK sizes.
+- Only change grid if SM utilization is clearly low; otherwise keep the original grid.
+- Always verify that `grid = (...)` matches the indexing logic inside the kernel.
+
+**Important Safety Rule**:
+If unsure about grid mapping, do **not** modify it.
+
+**Autotune Tip (safe)**:
+If grid choices are unclear, try 2–3 small grid variants using a minimal `@autotune` on the **kernel function only**.
 """,
-            "block_tiling": """
-**Focus**: Find optimal block size balancing data reuse and register pressure.
 
-**Suggested ranges** (tune based on occupancy):
-• BLOCK_M/N: 64, 128, 256 (use 16x multiples for Tensor Cores)
-• BLOCK_K: 32, 64, 128
-• If occupancy low due to registers: reduce block size
-• If occupancy high: current config is likely good
+    "block_tiling": """
+**Focus**: Tune BLOCK_M/N/K sizes for balanced data reuse and resource usage.
 
-**Note**: Use NCU metrics to guide tuning, not blind search.
+**NCU Metrics to Check**:
+• `sm__warps_active.avg.pct_of_peak_sustained_active`: Warp occupancy (target: >50%)
+
+**Guidelines**:
+- Tensor Cores: BLOCK_M/N multiple of 16; BLOCK_K multiple of 8.
+- FP32: BLOCK_M/N in [32, 64, 128, 256], BLOCK_K in [16, 32, 64].
+- **All BLOCK_SIZE/BLOCK_* must be powers of 2** (16, 32, 64, 128, 256, 512, 1024).
+- Avoid oversized tiles (wasted masking); change BLOCK_* only when occupancy or reuse metrics indicate issues.
+- If BLOCK sizes are unclear, keep the baseline tile as a valid candidate.
+
+**Autotune Tip (safe)**:
+Use a small autotune list (2–4 configs), all being powers of two, and **decorating the @triton.jit kernel**, never the wrapper.
 """,
-            "memory_access": """
-**Focus**: Optimize memory access based on kernel characteristics and NCU bottleneck analysis.
 
-**Suggested optimizations** (evaluate applicability):
+    "memory_access": """
+**Focus**: Optimize memory access patterns and latency hiding.
 
-**If memory stalls > 30%** (check `smsp__warp_issue_stalled_memory_dependency`):
-• Increase `num_stages` (2/3/4) in kernel decorator for software pipelining
+**NCU Metrics to Check**:
+• `dram__throughput.avg.pct_of_peak_sustained_elapsed`
+• `lts__t_sector_hit_rate.pct`
+• `smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct` (target: <20%)
 
-**If DRAM throughput > 80%** (memory-bound):
-• Use vectorized loads/stores where applicable
-• Minimize redundant memory operations
+**Guidelines**:
+- Increase `num_stages` only if memory stalls are high; otherwise keep it small.
+- Improve locality or coalescing only when metrics show issues; avoid unnecessary rewrites.
+- Larger BLOCK_K increases reuse but can raise register pressure; adjust only when metrics justify it.
 
-**If kernel has data reuse** (e.g., matmul, conv) **AND** L2 hit < 80%:
-• Improve L2 cache hit rate via better block tiling or computation ordering
-
-**If kernel is element-wise** (e.g., add, mul, relu):
-• L2 optimization has minimal impact (no data reuse)
-• Focus on maximizing memory throughput instead
-
-**Note**: Analyze your kernel's access pattern before optimizing. Not all optimizations apply to all kernels.
+**Autotune Tip (safe)**:
+If unsure, try a tiny set varying `num_stages` (e.g., {1, 2, 3}) via autotune on the **kernel**.
 """,
-            "advanced_memory": """
-**Focus**: Fine-tune memory management for final performance gains (typically 5-10%).
 
-**Suggested optimizations** (only if NCU shows potential):
+    "advanced_memory": """
+**Focus**: Final micro-optimizations (small adjustments only).
 
-**num_stages tuning**:
-• If memory stalls > 30%: try num_stages=2/3/4 to hide latency
-• If memory stalls < 10%: num_stages=1 is sufficient (saves registers)
+**Parameters to Tune**:
+• `num_warps`: {2, 4, 8, 16}
+• `num_stages`: {2, 3, 4}
 
-**eviction_policy** (for `tl.load`):
-• "evict_first": data will be reused soon (e.g., shared memory blocking)
-• "evict_last": streaming data with single use
+**Guidelines**:
+- Adjust num_warps only if occupancy suggests it; otherwise keep the original.
+- Change num_stages only by ±1 from current.
+- Do not modify BLOCK sizes or grid mapping here.
 
-**Skip this stage if**:
-• Current metrics already near optimal (e.g., L2 hit > 95%, low stalls)
-• Performance already meets target
-
-**Note**: These are micro-optimizations. Major gains come from earlier stages.
-**Do NOT attempt**: Triton does not support manual shared memory swizzling or instruction reordering.
-""",
-        }
+**Autotune Tip (safe)**:
+Use 3–6 configs around the current settings; always include the original kernel config, and autotune must wrap the JIT kernel.
+"""
+}
 
         focus = stage_focus_map.get(stage_name, "")
         stage_context = f"""
 ## Current Optimization Stage
-**Stage**: {stage_description}
 {focus}
 """
 
@@ -212,3 +192,53 @@ def build_optimization_prompt(
         NCU_METRICS=ncu_section,
         FAILURE_ANALYSIS=failure_context,
     )
+
+
+# ============================================================================
+# NCU Metrics Configuration for Each Stage
+# ============================================================================
+
+def get_stage_ncu_metrics(stage_name: str) -> list[str]:
+    """Get NCU metrics to collect for a specific optimization stage.
+
+    Returns list of metric names to pass to NCU profiler.
+    """
+    # Core metrics that should always be collected (for baseline comparison)
+    core_metrics = [
+        "sm__throughput.avg.pct_of_peak_sustained_elapsed",  # SM compute utilization
+        "dram__throughput.avg.pct_of_peak_sustained_elapsed",  # Memory bandwidth
+        "lts__t_sector_hit_rate.pct",  # L2 cache hit rate
+        "sm__warps_active.avg.pct_of_peak_sustained_active",  # Warp occupancy
+        "smsp__sass_average_data_bytes_per_sector_mem_global_op_ld.pct",  # Memory coalescing
+    ]
+
+    # Stage-specific metrics
+    stage_metrics = {
+        "grid_and_parallel": [
+            "launch__grid_size",
+            "launch__block_size",
+            "launch__waves_per_multiprocessor",
+        ],
+        "block_tiling": [
+            "launch__occupancy_limit_blocks",
+            "launch__occupancy_limit_registers",
+            "launch__occupancy_limit_shared_mem",
+            "launch__registers_per_thread",
+            "launch__shared_mem_per_block_static",
+        ],
+        "memory_access": [
+            "smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct",
+            "l1tex__t_sector_hit_rate.pct",
+            "smsp__sass_average_data_bytes_per_sector_mem_global_op_st.pct",
+        ],
+        "advanced_memory": [
+            "smsp__warp_issue_stalled_short_scoreboard_per_warp_active.pct",
+            "smsp__warp_issue_stalled_barrier_per_warp_active.pct",
+            "sm__inst_executed_pipe_tensor.avg.pct_of_peak_sustained_active",
+        ],
+    }
+
+    # Combine core + stage-specific metrics
+    return core_metrics + stage_metrics.get(stage_name, [])
+
+

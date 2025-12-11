@@ -54,8 +54,9 @@ Write high-performance Triton kernels to replace PyTorch operators. Generate the
 - Triton auto-manages shared memory and sync (NO manual __shared__ or syncthreads)
 
 **Critical Constraints** (违反会导致编译错误):
+- **BLOCK_SIZE must be power of 2**: All BLOCK_* parameters (BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_SIZE, etc.) must be powers of 2: 16, 32, 64, 128, 256, 512, 1024
+- tl.arange() requires power-of-2 range: tl.arange(0, BLOCK_SIZE) will fail if BLOCK_SIZE is not a power of 2
 - tl.reshape() requires compile-time constant shapes (use tensor.reshape(-1) instead)
-- tl.arange() arguments must be constexpr or literals (NOT variables like: tl.arange(0, block_size))
 - tl.load/store: if pointer is scalar, value must be scalar; if pointer is block, value must be block
 - No tl.tanh() - use tl.exp() to implement: (e^{2x}-1)/(e^{2x}+1)
 - Type conversions: use .to(tl.float32), NOT tl.float32()
@@ -73,6 +74,9 @@ Example Triton:
 '''
 $few_new
 '''
+
+Hardware architecture:
+$arch_src
 
 Target:
 ```python
@@ -189,11 +193,10 @@ def build_seed_prompt(
         f"• {k}: {v}" for k, v in info.items() if k != "GPU Architecture"
     ) if gpu_arch != "Unknown" else "Not Specified"
 
-    # Read the kernel source to detect task type
+    # Read the kernel source
     kernel_src = Path(arch_path).read_text().strip()
 
-    # Auto-select appropriate few-shot examples based on task content
-    kernel_lower = kernel_src.lower()
+    # Load few-shot examples
     few_base = FEWSHOT_BASE.read_text().strip()
     few_new = FEWSHOT_NEW.read_text().strip()
 

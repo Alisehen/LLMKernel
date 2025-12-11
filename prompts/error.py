@@ -21,7 +21,6 @@ COMPILE_ERROR = Template(
 
 Current Error Log:
 $ERROR_LOG
-$TRITON_GUIDANCE
 
 History Error:
 $ERROR_HISTORY
