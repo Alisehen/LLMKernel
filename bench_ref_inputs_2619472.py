@@ -44,15 +44,6 @@ def main():
     if not isinstance(inputs, (list, tuple)):
         inputs = [inputs]
 
-    # Get initialization inputs (if any)
-    get_init_inputs = getattr(ref_mod, "get_init_inputs", None)
-    if get_init_inputs is not None:
-        init_inputs = get_init_inputs()
-        if not isinstance(init_inputs, (list, tuple)):
-            init_inputs = [init_inputs]
-    else:
-        init_inputs = []
-
     # Load test kernel
     test_mod = load_module(args.candidate, "test_module")
     ModelNew = getattr(test_mod, "ModelNew", None)
@@ -60,7 +51,7 @@ def main():
         raise RuntimeError("Candidate must define class ModelNew")
 
     # Create model and move to device
-    model = ModelNew(*init_inputs).to(device).eval()
+    model = ModelNew().to(device).eval()
     inputs = [x.to(device) if isinstance(x, torch.Tensor) else x for x in inputs]
 
     # Warmup

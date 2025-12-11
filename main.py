@@ -23,6 +23,16 @@ from prompts.error import build_error_prompt
 from prompts.optimization import build_optimization_prompt
 from prompts.judger_repair import build_correctness_prompts
 from prompts.judger_optimization import build_judger_optimization_prompts
+
+# Import operator categorization system
+from config.operator_categories_v2 import (
+    classify_operator,
+    OPERATOR_CATEGORIES,
+    get_key_ncu_metrics,
+    check_early_exit,
+    should_skip_stage,
+)
+
 _INVOCATION_SPLITTER = "Invoked with:"
 
 def _sanitize_error_message(exc: Exception) -> str:
@@ -304,6 +314,11 @@ def _bench_worker_entry(test_py: str,
             # device_idx is relative to CUDA_VISIBLE_DEVICES
             # If CUDA_VISIBLE_DEVICES=3, then device_idx=0 refers to GPU 3
             torch.cuda.set_device(device_idx)
+
+            # Enable expandable segments to reduce memory fragmentation
+            import os
+            os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
             # Clear any CUDA cache from parent process
             torch.cuda.empty_cache()
             gc.collect()
@@ -359,6 +374,7 @@ def _bench_and_score(
     tol: float,
     phase: str = "seed",
     metrics_dir: Path | None = None,
+    pytorch_baseline_ms: Optional[float] = None,
 ) -> None:
     """
     Benchmark and update the individual's metrics/score; on exception, fill in
@@ -429,7 +445,14 @@ def _bench_and_score(
             metrics = data
             metrics["runnable"] = True
             metrics["phase"] = phase
-            speedup = metrics["ref_latency_ms"]["avg"] / max(1e-9, metrics["test_latency_ms"]["avg"])
+
+            # Use fixed PyTorch baseline if provided, otherwise use dynamic reference
+            if pytorch_baseline_ms is not None:
+                speedup = pytorch_baseline_ms / max(1e-9, metrics["test_latency_ms"]["avg"])
+                metrics["pytorch_baseline_ms"] = pytorch_baseline_ms
+            else:
+                speedup = metrics["ref_latency_ms"]["avg"] / max(1e-9, metrics["test_latency_ms"]["avg"])
+
             metrics["score"] = speedup
 
             ind.metrics = metrics
@@ -466,7 +489,7 @@ def _bench_and_score(
         ind.score = float("-inf")
         print(f"[{phase}] failed. Subprocess crashed.")
 
-    # —— As before: try to save metrics regardless of success/failure —— 
+    # —— As before: try to save metrics regardless of success/failure ——
     if metrics_dir is not None:
         try:
             saved = ind.save_metrics(metrics_dir)
@@ -477,6 +500,10 @@ def _bench_and_score(
     # NOTE: Do NOT clean up CUDA in parent process!
     # Importing torch here will initialize CUDA on the wrong device.
     # Let the subprocess handle all CUDA operations.
+
+    # Force garbage collection to release any Python references
+    import gc
+    gc.collect()
 
 
 def _should_skip_stage(stage_name: str, metrics_df) -> tuple[bool, str]:
@@ -659,6 +686,32 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
     io_dir.mkdir(parents=True, exist_ok=True)
     log_path = task_root / "usage.csv"
 
+    # === Classify operator and get category-specific configuration ===
+    task_name = task_path.stem  # e.g., "56_Matmul_Sigmoid_Sum"
+    level = "level2" if "/level2/" in str(task_path) else "level1"
+    category = classify_operator(task_name, level)
+    category_config = OPERATOR_CATEGORIES[category]
+
+    print(f"\n{'='*80}")
+    print(f"📂 Operator Category: {category}")
+    print(f"   Description: {category_config['description']}")
+    print(f"   Total Stages: {len(category_config['stages'])}")
+    if category_config.get('early_exit_enabled'):
+        print(f"   Early Exit: Enabled")
+    print(f"{'='*80}\n")
+
+    # Save category metadata
+    category_metadata = {
+        "category": category,
+        "level": level,
+        "task_name": task_name,
+        "num_stages": len(category_config['stages']),
+        "early_exit_enabled": category_config.get('early_exit_enabled', False),
+    }
+    (task_root / "category_metadata.json").write_text(
+        json.dumps(category_metadata, indent=2)
+    )
+
     # === Create test kernel file path (ref uses task_path directly) ===
     root_dir = Path(__file__).resolve().parent
     test_kernel = root_dir / f"test_kernel_{proc_id}.py"
@@ -672,6 +725,67 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
     scores: List[float] = []
     err_flags: List[bool] = []
     last_score_for_curve = 0.0  # default baseline for plotting on early failures
+
+    # ====== Step 0: Benchmark PyTorch Baseline ONCE ======
+    print(f"\n{'='*80}")
+    print("[Baseline] Benchmarking PyTorch performance")
+    print(f"{'='*80}")
+
+    # Create a dummy kernel that wraps the reference Model as ModelNew
+    # This allows us to use the existing benchmarking infrastructure
+    ref_module_name = task_path.stem
+    dummy_code = f'''import sys
+import importlib.util
+from pathlib import Path
+
+# Import the reference Model dynamically (module name may start with digit)
+ref_path = Path("{task_path}").resolve()
+
+spec = importlib.util.spec_from_file_location("{ref_module_name}", ref_path)
+ref_module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(ref_module)
+
+# Create ModelNew as an alias to Model for baseline benchmarking
+ModelNew = ref_module.Model
+'''
+
+    dummy_kernel = KernelIndividual(dummy_code)
+    # Save the dummy kernel to a temporary file
+    dummy_kernel_path = code_dir / "baseline_dummy.py"
+    dummy_kernel_path.write_text(dummy_code, encoding="utf-8")
+    dummy_kernel.code_path = dummy_kernel_path
+
+    _bench_and_score(
+        dummy_kernel,
+        ref_py=task_path,
+        device_idx=args.device,
+        warmup=args.warmup,
+        repeat=args.repeat,
+        tol=args.tol,
+        phase="pytorch_baseline",
+        metrics_dir=eval_dir,
+    )
+
+    # Extract and save PyTorch baseline latency
+    pytorch_baseline_ms = None
+    if dummy_kernel.metrics and "ref_latency_ms" in dummy_kernel.metrics:
+        pytorch_baseline_ms = dummy_kernel.metrics["ref_latency_ms"]["avg"]
+        print(f"✅ PyTorch baseline: {pytorch_baseline_ms:.4f} ms")
+        print(f"   All subsequent scores will be calculated as: {pytorch_baseline_ms:.4f} / triton_time")
+
+        # Save baseline info
+        baseline_info = {
+            "pytorch_latency_ms": pytorch_baseline_ms,
+            "timestamp": datetime.now().isoformat(),
+            "warmup": args.warmup,
+            "repeat": args.repeat,
+        }
+        (task_root / "pytorch_baseline.json").write_text(
+            json.dumps(baseline_info, indent=2)
+        )
+    else:
+        print("⚠️  Warning: Failed to benchmark PyTorch baseline, will use dynamic comparison")
+    print(f"{'='*80}\n")
 
     # ====== Step 1: Generate Seed Program (outside loop) ======
     print("[Seed] Generating the initial kernel ...")
@@ -689,6 +803,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
         tol=args.tol,
         phase="seed",
         metrics_dir=eval_dir,
+        pytorch_baseline_ms=pytorch_baseline_ms,
     )
 
     # Record seed score
@@ -739,6 +854,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
             tol=args.tol,
             phase="seed_repair",
             metrics_dir=eval_dir,
+            pytorch_baseline_ms=pytorch_baseline_ms,
         )
 
         runnable = bool(getattr(current_kernel, "metrics", {}).get("runnable", False))
@@ -765,19 +881,21 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
     if not runnable:
         print(f"[ERROR] Failed to repair seed kernel after {max_repair} attempts. Stopping.")
     else:
-        # ====== Step 3: Four-stage Optimization Loop ======
-        print("\n[Optimization] Starting 4-stage optimization process...")
+        # ====== Step 3: Category-specific Optimization Loop ======
+        optimization_stages = category_config["stages"]
+        print(f"\n[Optimization] Starting {len(optimization_stages)}-stage optimization ({category})...")
         stage_round = 0
-        previous_stage_score = best_score  # Track score before each stage
 
-        for stage_idx in range(len(OPTIMIZATION_STAGES)):
-            stage = OPTIMIZATION_STAGES[stage_idx]
-            stage_name = stage["name"]
-            stage_description = stage["description"]
+        for stage_idx, stage_config in enumerate(optimization_stages):
+            stage_name = stage_config["name"]
+            stage_description = stage_config["description"]
+            stage_focus = stage_config["focus"]
 
             print(f"\n{'='*80}")
-            print(f"[Stage {stage_idx + 1}/{len(OPTIMIZATION_STAGES)}] {stage_name}")
-            print(f"Description: {stage_description}")
+            print(f"[Stage {stage_idx + 1}/{len(optimization_stages)}] {stage_description}")
+            print(f"Stage Name: {stage_name}")
+            print(f"Focus: {stage_focus}")
+            print(f"Category: {category}")
             print(f"{'='*80}")
 
             # Check if optimization is needed based on performance gain from previous stage
@@ -785,6 +903,37 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
 
             # Record the score before this stage starts
             score_before_stage = best_score
+
+            # === Early Exit Check ===
+            op_metadata = {
+                "op_type": task_name.lower(),
+                "score": best_score,
+            }
+            # Try to extract kernel_size for Conv operators
+            try:
+                task_code = task_path.read_text()
+                import re
+                ks_match = re.search(r'kernel_size\s*=\s*(\d+)', task_code)
+                if ks_match:
+                    op_metadata["kernel_size"] = int(ks_match.group(1))
+            except:
+                pass
+
+            should_exit, exit_reason = check_early_exit(
+                category=category,
+                stage_id=stage_idx,
+                performance_score=best_score,
+                op_metadata=op_metadata,
+            )
+
+            if should_exit:
+                print(f"\n⛔ {'='*70}")
+                print(f"⛔ EARLY EXIT TRIGGERED")
+                print(f"⛔ Reason: {exit_reason}")
+                print(f"⛔ Current best score: {best_score:.4f}")
+                print(f"⛔ Skipping remaining stages.")
+                print(f"⛔ {'='*70}\n")
+                break
 
             # Check if best_kernel is available and runnable
             if best_kernel is None:
@@ -805,11 +954,13 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                 f.write(best_kernel.code)
 
             # Create bench script for this process (copy from template)
-            bench_template = root_dir / "bench_ref_inputs_0.py"
+            bench_template = root_dir / "bench_ref_inputs_template.py"
             bench_script = root_dir / f"bench_ref_inputs_{proc_id}.py"
-            if bench_template.exists() and proc_id != 0:
+            if bench_template.exists():
                 import shutil
                 shutil.copy(bench_template, bench_script)
+            else:
+                raise FileNotFoundError(f"Bench template not found: {bench_template}")
 
             kernel_names = extract_cuda_kernel_names(test_kernel)
             print(f"Detected kernel names: {kernel_names}")
@@ -821,12 +972,56 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                 test_file=f"test_kernel_{proc_id}.py")
             metrics_df = load_ncu_metrics(csv_path, extra_keep=("Kernel Name",),
                                           name_list=kernel_names, select="last")
-            metrics_block = metrics_to_prompt(metrics_df)
 
-            # Check if stage should be skipped based on metrics
+            # === Filter NCU metrics to only key metrics for this stage ===
+            key_metrics = get_key_ncu_metrics(category, stage_idx)
+
+            print(f"\n📊 Key Metrics for {stage_name}:")
+            for metric_name, ncu_metric in key_metrics.items():
+                print(f"   • {metric_name}: {ncu_metric}")
+
+            # Filter metrics_df to only include key metrics (by column)
+            if not metrics_df.empty:
+                # Get available key metrics (columns that exist in the dataframe)
+                available_key_metrics = [m for m in key_metrics.values() if m in metrics_df.columns]
+
+                # Keep "Kernel Name" and other non-metric columns
+                extra_cols = [c for c in metrics_df.columns if not c.startswith(('sm', 'dram', 'l1', 'l2', 'lts', 'smsp'))]
+
+                # Combine: extra columns + key metrics
+                keep_cols = extra_cols + available_key_metrics
+
+                if available_key_metrics:
+                    filtered_df = metrics_df[keep_cols].copy()
+                    print(f"   Filtered: {len(metrics_df.columns)} → {len(filtered_df.columns)} columns")
+                    print(f"   Kept metrics: {', '.join(available_key_metrics)}")
+                else:
+                    print(f"⚠️  Warning: No key metrics found in dataframe, using all metrics")
+                    filtered_df = metrics_df
+
+                metrics_block = metrics_to_prompt(filtered_df)
+            else:
+                metrics_block = "No NCU metrics available"
+
+            # === Skip Stage Check (category-specific) ===
+            should_skip_cat, skip_reason_cat = should_skip_stage(
+                category=category,
+                stage_id=stage_idx,
+                op_metadata=op_metadata,
+            )
+
+            if should_skip_cat:
+                print(f"\n⏩ {'='*70}")
+                print(f"⏩ STAGE SKIPPED")
+                print(f"⏩ Reason: {skip_reason_cat}")
+                print(f"⏩ Proceeding to next stage...")
+                print(f"⏩ {'='*70}\n")
+                continue
+
+            # Check if stage should be skipped based on NCU metrics (original logic)
             should_skip, skip_reason = _should_skip_stage(stage_name, metrics_df)
             if should_skip:
-                print(f"\n⏩ [Stage {stage_idx + 1}] SKIPPED: {skip_reason}")
+                print(f"\n⏩ [Stage {stage_idx + 1}] SKIPPED (NCU): {skip_reason}")
                 print(f"   Current metrics already meet optimization goals for this stage.")
                 print(f"   Proceeding to next stage...\n")
                 continue
@@ -836,11 +1031,14 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
             opt_prompt = build_optimization_prompt(
                 arch_path=best_kernel.code_path,  # type: ignore[union-attr]
                 gpu_name=args.gpu,
-                ncu_metrics=metrics_block,  # Now contains actual profiling data
+                ncu_metrics=metrics_block,  # Filtered key metrics
                 history_block=None,#history_block,
                 stage_name=stage_name,
                 stage_description=stage_description,
                 failure_analysis="",
+                # === Pass category information ===
+                category=category,
+                stage_id=stage_idx,
             )
             prompt_file = io_dir / f"stage{stage_idx + 1}_{stage_name}_prompt.txt"
             prompt_file.write_text(opt_prompt, encoding="utf-8")
@@ -857,6 +1055,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                 tol=args.tol,
                 phase=f"stage{stage_idx + 1}_{stage_name}",
                 metrics_dir=eval_dir,
+                pytorch_baseline_ms=pytorch_baseline_ms,
             )
 
             # Step 4: Check if optimization succeeded
@@ -899,6 +1098,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                         tol=args.tol,
                         phase=f"stage{stage_idx + 1}_repair",
                         metrics_dir=eval_dir,
+                        pytorch_baseline_ms=pytorch_baseline_ms,
                     )
 
                     runnable = bool(getattr(current_kernel, "metrics", {}).get("runnable", False))
@@ -925,12 +1125,10 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                 if not runnable:
                     print(f"[Stage {stage_idx + 1}] Failed to repair after {max_repair} attempts. Keeping best_kernel unchanged.")
                     # Don't update best_kernel, keep the previous one
-                    previous_stage_score = score_before_stage
                     continue
                 else:
                     # Repair succeeded, skip Step 6 (already handled in repair loop)
                     print(f"[Stage {stage_idx + 1}] Repair succeeded.")
-                    previous_stage_score = score_before_stage
                     continue
 
             # Step 6: Update best_kernel if improved (only for optimization, not repair)
@@ -951,9 +1149,6 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                 scores.append(last_score_for_curve)
                 err_flags.append(True)
                 print(f"[Stage {stage_idx + 1}] Optimization produced non-runnable kernel. Keeping best_kernel unchanged.")
-
-            # Update previous_stage_score for next iteration
-            previous_stage_score = score_before_stage
 
     # plot per-task curve
     fig_path = fig_dir / f"{task_path.stem}_score.png"

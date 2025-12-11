@@ -1,0 +1,195 @@
+"""
+main.py 集成分类系统的具体修改
+
+在文件开头添加imports，然后修改run_one_task函数
+"""
+
+# ==================== 1. 在文件开头添加import ====================
+# 在 main.py 第24行之后添加：
+
+from config.operator_categories_v2 import (
+    classify_operator,
+    OPERATOR_CATEGORIES,
+    build_stage_prompt_section,
+    get_key_ncu_metrics,
+    check_early_exit,
+    should_skip_stage,
+)
+
+
+# ==================== 2. 在run_one_task函数开头添加分类逻辑 ====================
+# 在 run_one_task 函数的开头（大约第550行附近），在创建输出目录之后添加：
+
+def run_one_task(task_path: Path, args, call_llm):
+    """Run optimization for a single task."""
+    # ... 原有的输出目录创建代码 ...
+
+    # ===== 【新增】算子分类 =====
+    task_name = task_path.stem  # 例如: "56_Matmul_Sigmoid_Sum"
+    level = "level2" if "/level2/" in str(task_path) else "level1"
+
+    category = classify_operator(task_name, level)
+    category_config = OPERATOR_CATEGORIES[category]
+
+    print(f"\n{'='*80}")
+    print(f"📂 Operator Category: {category}")
+    print(f"   Description: {category_config['description']}")
+    print(f"   Total Stages: {len(category_config['stages'])}")
+    if category_config.get('early_exit_enabled'):
+        print(f"   Early Exit: Enabled")
+    print(f"{'='*80}\n")
+
+    # 保存分类信息到metadata
+    category_metadata = {
+        "category": category,
+        "level": level,
+        "task_name": task_name,
+        "num_stages": len(category_config['stages']),
+        "early_exit_enabled": category_config.get('early_exit_enabled', False),
+    }
+    (root_dir / "category_metadata.json").write_text(
+        json.dumps(category_metadata, indent=2)
+    )
+
+    # ... 继续原有的seed阶段代码 ...
+
+
+# ==================== 3. 替换硬编码的OPTIMIZATION_STAGES ====================
+# 找到 "for stage_idx in range(len(OPTIMIZATION_STAGES)):" 这一行（大约第773行）
+# 替换为：
+
+    # ===== 【修改】使用分类特定的stages =====
+    optimization_stages = category_config["stages"]
+
+    print(f"\n{'='*80}")
+    print(f"Starting Multi-Stage Optimization ({len(optimization_stages)} stages)")
+    print(f"Category: {category}")
+    print(f"{'='*80}\n")
+
+    for stage_idx, stage_config in enumerate(optimization_stages):
+        stage_name = stage_config["name"]
+        stage_description = stage_config["description"]
+        stage_focus = stage_config["focus"]
+
+        print(f"\n{'='*80}")
+        print(f"[Stage {stage_idx + 1}/{len(optimization_stages)}] {stage_description}")
+        print(f"Stage Name: {stage_name}")
+        print(f"Focus: {stage_focus}")
+        print(f"{'='*80}")
+
+        # ===== 【新增】Early Exit检查 =====
+        # 提取kernel_size（如果是Conv类算子）
+        op_metadata = {
+            "op_type": task_name.lower(),
+            "score": best_score,
+        }
+
+        # 尝试从task_path中提取kernel_size
+        try:
+            task_code = task_path.read_text()
+            import re
+            ks_match = re.search(r'kernel_size\s*=\s*(\d+)', task_code)
+            if ks_match:
+                op_metadata["kernel_size"] = int(ks_match.group(1))
+        except:
+            pass
+
+        should_exit, exit_reason = check_early_exit(
+            category=category,
+            stage_id=stage_idx,
+            performance_score=best_score,
+            op_metadata=op_metadata,
+        )
+
+        if should_exit:
+            print(f"\n⛔ {'='*70}")
+            print(f"⛔ EARLY EXIT TRIGGERED")
+            print(f"⛔ Reason: {exit_reason}")
+            print(f"⛔ Current best score: {best_score:.4f}")
+            print(f"⛔ Skipping remaining stages and using current best kernel.")
+            print(f"⛔ {'='*70}\n")
+            break
+
+        # ===== 继续原有的NCU profiling代码 =====
+        # ... (保持不变) ...
+
+
+# ==================== 4. 修改NCU metrics提取部分 ====================
+# 在 NCU profiling 后（大约第824行），添加关键指标过滤：
+
+        # ... profile_bench 和 load_ncu_metrics 代码保持不变 ...
+        metrics_df = load_ncu_metrics(csv_path, extra_keep=("Kernel Name",),
+                                      name_list=kernel_names, select="last")
+
+        # ===== 【新增】只提取关键指标 =====
+        key_metrics = get_key_ncu_metrics(category, stage_idx)
+
+        print(f"\n📊 Key Metrics for {stage_name}:")
+        for metric_name, ncu_metric in key_metrics.items():
+            print(f"   • {metric_name}: {ncu_metric}")
+
+        # 过滤metrics_df，只保留关键指标
+        if not metrics_df.empty:
+            filtered_df = metrics_df[
+                metrics_df["Metric Name"].isin(key_metrics.values())
+            ].copy()
+
+            if filtered_df.empty:
+                print(f"⚠️  Warning: No key metrics found, using all metrics")
+                filtered_df = metrics_df
+            else:
+                print(f"   Filtered: {len(metrics_df)} → {len(filtered_df)} metrics")
+
+            metrics_block = metrics_to_prompt(filtered_df)
+        else:
+            metrics_block = "No NCU metrics available"
+
+        # ===== 【新增】Skip Stage检查 =====
+        should_skip, skip_reason = should_skip_stage(
+            category=category,
+            stage_id=stage_idx,
+            op_metadata=op_metadata,
+        )
+
+        if should_skip:
+            print(f"\n⏩ {'='*70}")
+            print(f"⏩ STAGE SKIPPED")
+            print(f"⏩ Reason: {skip_reason}")
+            print(f"⏩ Proceeding to next stage...")
+            print(f"⏩ {'='*70}\n")
+            continue
+
+        # ===== 【修改】调用build_optimization_prompt时传入category =====
+        opt_prompt = build_optimization_prompt(
+            arch_path=best_kernel.code_path,
+            gpu_name=args.gpu,
+            ncu_metrics=metrics_block,
+            history_block=None,
+            stage_name=stage_name,
+            stage_description=stage_description,
+            failure_analysis="",
+            # 【新增】传入分类信息
+            category=category,
+            stage_id=stage_idx,
+        )
+
+        # ... 后续的LLM调用和benchmark代码保持不变 ...
+
+
+# ==================== 5. 在最后输出时添加分类信息 ====================
+# 在函数结束前（return之前）添加：
+
+    # ===== 输出最终结果 =====
+    print(f"\n{'='*80}")
+    print(f"🏁 Optimization Complete")
+    print(f"   Category: {category}")
+    print(f"   Stages Executed: {len(optimization_stages)}")
+    print(f"   Final Best Score: {best_score:.4f}")
+    print(f"{'='*80}\n")
+
+    return {
+        "best_kernel": best_kernel,
+        "best_score": best_score,
+        "category": category,
+        "stages_executed": len(optimization_stages),
+    }

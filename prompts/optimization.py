@@ -7,6 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]  # project root
 HW_FILE = ROOT / "prompts/hardware/gpu_specs.py"
 
 from prompts.generate_custom_cuda import _load_gpu_spec  # Adjust import path as needed
+from config.operator_categories_v2 import build_stage_prompt_section
 
 _OPTIMIZATION_PROMPT_TEMPLATE = Template("""\
 You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
@@ -78,6 +79,8 @@ def build_optimization_prompt(
     stage_name: str = "",
     stage_description: str = "",
     failure_analysis: str = "",
+    category: str = "Memory-Intensive",
+    stage_id: int = 0,
 ) -> str:
     """Build single-phase optimization prompt with NCU metrics.
 
@@ -89,6 +92,8 @@ def build_optimization_prompt(
         stage_name: Current optimization stage
         stage_description: Stage description
         failure_analysis: Analysis of previous failures
+        category: Operator category (Compute-Intensive, Memory-Intensive, Fusion-Compute, Fusion-Memory)
+        stage_id: Stage index (0-based)
     """
     gpu_info = _load_gpu_spec()
 
@@ -109,81 +114,28 @@ def build_optimization_prompt(
     arch_src = Path(arch_path).read_text().strip()
     hist = history_block or "(None)\n"
 
-    # Build stage context
+    # Build stage context with category-specific guidance
     stage_context = ""
     if stage_name and stage_description:
-        # Map stage names to specific optimization focus
-        # Suggestions are based on NCU metrics - LLM should evaluate applicability
-        stage_focus_map = {
-            "grid_and_parallel": """
-**Focus**: Maximize SM utilization and parallel work distribution.
-
-**Suggested optimizations** (evaluate based on NCU metrics):
-• If SM occupancy < 80%: adjust grid size for better GPU utilization
-• Balance workload via `tl.program_id()` mapping to avoid idle SMs
-• Consider Split-K for compute-bound kernels (requires `tl.atomic_add()`)
-
-**Note**: Only optimize if NCU shows SM underutilization.
-""",
-            "block_tiling": """
-**Focus**: Find optimal block size balancing data reuse and register pressure.
-
-**Suggested ranges** (tune based on occupancy):
-• BLOCK_M/N: 64, 128, 256 (use 16x multiples for Tensor Cores)
-• BLOCK_K: 32, 64, 128
-• If occupancy low due to registers: reduce block size
-• If occupancy high: current config is likely good
-
-**Note**: Use NCU metrics to guide tuning, not blind search.
-""",
-            "memory_access": """
-**Focus**: Optimize memory access based on kernel characteristics and NCU bottleneck analysis.
-
-**Suggested optimizations** (evaluate applicability):
-
-**If memory stalls > 30%** (check `smsp__warp_issue_stalled_memory_dependency`):
-• Increase `num_stages` (2/3/4) in kernel decorator for software pipelining
-
-**If DRAM throughput > 80%** (memory-bound):
-• Use vectorized loads/stores where applicable
-• Minimize redundant memory operations
-
-**If kernel has data reuse** (e.g., matmul, conv) **AND** L2 hit < 80%:
-• Improve L2 cache hit rate via better block tiling or computation ordering
-
-**If kernel is element-wise** (e.g., add, mul, relu):
-• L2 optimization has minimal impact (no data reuse)
-• Focus on maximizing memory throughput instead
-
-**Note**: Analyze your kernel's access pattern before optimizing. Not all optimizations apply to all kernels.
-""",
-            "advanced_memory": """
-**Focus**: Fine-tune memory management for final performance gains (typically 5-10%).
-
-**Suggested optimizations** (only if NCU shows potential):
-
-**num_stages tuning**:
-• If memory stalls > 30%: try num_stages=2/3/4 to hide latency
-• If memory stalls < 10%: num_stages=1 is sufficient (saves registers)
-
-**eviction_policy** (for `tl.load`):
-• "evict_first": data will be reused soon (e.g., shared memory blocking)
-• "evict_last": streaming data with single use
-
-**Skip this stage if**:
-• Current metrics already near optimal (e.g., L2 hit > 95%, low stalls)
-• Performance already meets target
-
-**Note**: These are micro-optimizations. Major gains come from earlier stages.
-**Do NOT attempt**: Triton does not support manual shared memory swizzling or instruction reordering.
-""",
-        }
-
-        focus = stage_focus_map.get(stage_name, "")
-        stage_context = f"""
+        # Use category-specific guidance
+        try:
+            category_guidance = build_stage_prompt_section(category, stage_id)
+            if category_guidance:
+                stage_context = category_guidance
+            else:
+                # Simple fallback if no category guidance available
+                stage_context = f"""
 ## Current Optimization Stage
 **Stage**: {stage_description}
-{focus}
+**Focus**: Optimize based on NCU metrics analysis.
+"""
+        except Exception as e:
+            # Fallback to simple stage description
+            print(f"[Warning] Failed to get category guidance: {e}")
+            stage_context = f"""
+## Current Optimization Stage
+**Stage**: {stage_description}
+**Focus**: Optimize based on NCU metrics analysis.
 """
 
     # Build failure analysis

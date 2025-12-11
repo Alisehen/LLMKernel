@@ -39,28 +39,33 @@ __all__ = [
     "metrics_to_prompt",
 ]
 
-# Triton-optimized: Top 4 most actionable metrics
-# Each metric directly maps to Triton optimization parameters (BLOCK_M/N/K, num_warps, num_stages)
-# Removed redundant result-only metrics (compute util, memory stalls) that can be inferred
+# Comprehensive metrics covering all optimization stages
+# Aligned with operator_categories_v2.py key_metrics across all 4 categories
 METRICS = ",".join([
-    # 1. Memory Bandwidth: DRAM throughput utilization
-    #    → Triton: BLOCK_M/N/K sizing, data reuse strategy
+    # === Compute Metrics ===
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed",
+    "sm__warps_active.avg.pct_of_peak_sustained_active",
+    "smsp__average_warps_issue_stalled_long_scoreboard_per_issue_active.pct",
+
+    # === Memory Metrics ===
     "dram__throughput.avg.pct_of_peak_sustained_elapsed",
+    "dram__bytes.sum",
+    "dram__bytes_read.sum",
+    "dram__bytes_write.sum",
 
-    # 2. Cache Efficiency: L2 cache hit rate (LTS = L2 Texture cache/shared memory subsystem)
-    #    → Triton: Block-level data reuse, computation ordering, grid layout for L2 sharing
-    #    Note: L1 cache (l1tex) is hard to control in Triton, L2 is more actionable
+    # === Cache Metrics ===
     "lts__t_sector_hit_rate.pct",
+    "l1tex__t_bytes_pipe_lsu_mem_global_op_ld.sum",
 
-    # 3. Occupancy: Theoretical occupancy achieved
-    #    → Triton: num_warps (2/4/8), block size, register pressure
-    "sm__maximum_warps_per_active_cycle_pct",
+    # === Shared Memory ===
+    "smsp__inst_executed_op_shared.sum",
+    "l1tex__data_pipe_lsu_wavefronts_mem_shared_op_ld.sum",
 
-    # 4. Memory Latency Hiding: Warp stalls due to memory dependency
-    #    → Triton: num_stages (1/2/3/4) for software pipelining
-    #    High stall rate (>30%) → increase num_stages to hide memory latency
-    #    Low stall rate (<10%) → num_stages=1 is sufficient, saves registers
-    "smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct",
+    # === Memory Access Efficiency ===
+    "smsp__sass_average_data_bytes_per_sector_mem_global_op_ld.pct",
+
+    # === Warp Efficiency ===
+    "smsp__sass_average_branch_targets_threads_uniform.pct",
 ])
 
 # Full metric set (23 metrics) - available but not used by default

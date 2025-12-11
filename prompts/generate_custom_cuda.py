@@ -73,6 +73,8 @@ Example Triton:
 '''
 $few_new
 '''
+Hardware architecture:
+$arch_src
 
 Target:
 ```python
