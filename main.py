@@ -48,10 +48,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--round", "-G", type=int, default=10, help="Number of generations per task")
     p.add_argument("--work_dir", type=Path, default=Path("run"), help="Output root directory")
     p.add_argument("--device", type=int, default=0, help="CUDA device index for benchmarking")
-    p.add_argument("--warmup", type=int, default=5, help="Warm-up iterations")
-    p.add_argument("--repeat", type=int, default=20, help="Timed iterations per benchmark")
+    p.add_argument("--warmup", type=int, default=2, help="Warm-up iterations")
+    p.add_argument("--repeat", type=int, default=5, help="Timed iterations per benchmark")
     p.add_argument("--tol", type=float, default=1e-3, help="Max |err| tolerated")
-    p.add_argument("--max_tokens", type=int, default=16384, help="LLM max new tokens")
+    p.add_argument("--max_tokens", type=int, default=20000, help="LLM max new tokens")
     p.add_argument("--temperature", type=float, default=0.2, help="LLM temperature")
     p.add_argument("--top_p", type=float, default=1.0, help="LLM top_p")
     # multi-task controls

@@ -65,7 +65,29 @@ def _detect_triton_error_patterns(error_log: str, old_code: str) -> str:
     """
     guidance_parts = []
 
-    # Pattern 0: thread_idx errors (MOST COMMON - check first!)
+    # Pattern 0: tl.reshape with non-constexpr shape (CRITICAL!)
+    if "Shape element" in error_log and "must have type `constexpr[int]`" in error_log:
+        guidance_parts.append(
+            "❌ CRITICAL: tl.reshape() requires compile-time constant shape!\n"
+            "\n"
+            "WRONG:\n"
+            "```python\n"
+            "BLOCK_HW = BLOCK_H * BLOCK_W  # This is a runtime value!\n"
+            "flat = tl.reshape(tensor_2d, (BLOCK_HW,))  # ERROR: BLOCK_HW not constexpr\n"
+            "```\n"
+            "\n"
+            "CORRECT - Use .view() with runtime shapes:\n"
+            "```python\n"
+            "# For flattening [BLOCK_H, BLOCK_W] -> [BLOCK_H*BLOCK_W]\n"
+            "flat = tensor_2d.reshape(-1)  # Auto-infer size\n"
+            "# OR directly compute flat indices without reshape:\n"
+            "h_idx = tl.arange(0, BLOCK_H)[:, None]\n"
+            "w_idx = tl.arange(0, BLOCK_W)[None, :]\n"
+            "flat_idx = h_idx * W + w_idx  # [BLOCK_H, BLOCK_W], no flatten needed\n"
+            "```\n"
+        )
+
+    # Pattern 1: thread_idx errors
     if ("thread_idx" in error_log.lower() or "thread_idx" in old_code.lower() or
         "threadidx" in error_log.lower() or "threadidx" in old_code.lower()):
         guidance_parts.append(

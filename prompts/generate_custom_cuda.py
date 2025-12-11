@@ -46,42 +46,40 @@ FEWSHOT_MATMUL_NEW_TRITON = ROOT / "prompts/few_shot/model_new_ex_matmul_triton.
 test = Template(
     dedent(
         """
-You write high-performance Triton kernels to replace PyTorch operators for maximum speedup.
+Write high-performance Triton kernels to replace PyTorch operators. Generate the FASTEST kernel while maintaining correctness.
 
-**Goal**: Generate the FASTEST possible Triton kernel while maintaining correctness.
+**Triton Essentials**:
+- Use `tl.program_id()` for block indices, `tl.arange()` for element indices
+- Work with blocks of data (NOT individual threads like CUDA)
+- Triton auto-manages shared memory and sync (NO manual __shared__ or syncthreads)
 
-**Triton Core Principles** (avoid CUDA thinking):
-1. Use `tl.program_id(axis)` for block indices (NOT threadIdx/blockIdx)
-2. Use `tl.arange(0, BLOCK_SIZE)` to generate element indices (NO thread_idx!)
-3. Triton auto-manages shared memory and synchronization (NO manual __shared__ or syncthreads)
-4. Work with blocks of data, not individual threads
+**Critical Constraints** (违反会导致编译错误):
+- tl.reshape() requires compile-time constant shapes (use tensor.reshape(-1) instead)
+- tl.arange() arguments must be constexpr or literals (NOT variables like: tl.arange(0, block_size))
+- tl.load/store: if pointer is scalar, value must be scalar; if pointer is block, value must be block
+- No tl.tanh() - use tl.exp() to implement: (e^{2x}-1)/(e^{2x}+1)
+- Type conversions: use .to(tl.float32), NOT tl.float32()
+- Always use constexpr for BLOCK sizes in function signatures
 
-OUTPUT RULES (STRICT):
-1. Follow this exact order:
-   1. Imports: torch, torch.nn, triton, triton.language as tl
-   2. @triton.jit decorated kernel function(s)
-   3. Wrapper function(s) for grid calculation and kernel launch
-   4. class ModelNew(nn.Module) that calls your kernels
+**Output Format**:
+1. Imports → 2. @triton.jit kernels → 3. Wrapper functions → 4. class ModelNew
 2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
 
-The example PyTorch code:
+Example PyTorch:
 '''
 $few_base
 '''
-Example optimized Triton implementation:
+Example Triton:
 '''
 $few_new
 '''
 
-Architecture to optimize:
-$arch_src
-
-Kernel to implement:
+Target:
 ```python
 $kernel_src
 ```
 
-Generate the fastest correct Triton implementation as ModelNew.
+Generate the fastest Triton implementation as ModelNew.
 """
     )
 )

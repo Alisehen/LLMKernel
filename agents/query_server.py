@@ -5,7 +5,7 @@ from utils.print_utils import print_bold
 
 TOGETHER_KEY = os.environ.get("TOGETHER_API_KEY")
 DEEPSEEK_KEY = os.environ.get("DEEPSEEK_API_KEY")
-OPENAI_KEY = os.environ.get("OPENAI_API_KEY")
+OPENAI_KEY = "sk_gSwJZPVjh5gAbSnM4cMrU55nCw8DJ8YblOKGyCjZv-Q"
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 SGLANG_KEY = os.environ.get("SGLANG_API_KEY")
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY")
@@ -112,8 +112,9 @@ def query_server(
 
         case "openai":
             from openai import OpenAI
-            client = OpenAI(api_key=OPENAI_KEY)
-            model = model_name
+            # client = OpenAI(api_key=OPENAI_KEY)
+            client = OpenAI(api_key=OPENAI_KEY,base_url="https://api.jiekou.ai/openai/v1")
+            model = "gpt-5.1"
 
         case _:
             raise NotImplementedError(f"Unsupported server_type: {server_type}")

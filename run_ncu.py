@@ -101,7 +101,7 @@ def profile_bench(
     kernel_names: Optional[List[str]] = None,
     conda_bin: str = "/root/miniconda3/envs/CudaForge/bin",
     out_csv: Union[str, Path] = "ncu_temp.csv",
-    repeat: int = 10,
+    repeat: int = 1,  # Reduced from 10 to 1: NCU uses replay to collect metrics, multiple iterations not needed
     use_full_metrics: bool = False,  # New: option to use full 23-metric set
     device_idx: Optional[int] = None,  # GPU device index to use
     auto_sudo: bool = True,  # Automatically retry with sudo if permission denied
@@ -196,7 +196,7 @@ def profile_bench(
             f"--log-file={str(csv_path)}",
             f"--metrics={metrics_to_use}",
             "--launch-skip=0",
-            "--launch-count=20",
+            "--launch-count=1",  # Reduced from 20 to 1 to speed up profiling
             sys.executable, bench_py,
             str(ref_file),
             str(test_file),
