@@ -53,11 +53,11 @@ Write high-performance Triton kernels to replace PyTorch operators. Generate the
 - Work with blocks of data (NOT individual threads like CUDA)
 - Triton auto-manages shared memory and sync (NO manual __shared__ or syncthreads)
 
-**Critical Constraints** (违反会导致编译错误):
+**Critical Constraints**:
 - tl.reshape() requires compile-time constant shapes (use tensor.reshape(-1) instead)
 - tl.arange() arguments must be constexpr or literals (NOT variables like: tl.arange(0, block_size))
 - tl.load/store: if pointer is scalar, value must be scalar; if pointer is block, value must be block
-- No tl.tanh() - use tl.exp() to implement: (e^{2x}-1)/(e^{2x}+1)
+- No tl.tanh() - use tl.exp() to implement: (e^{2x}-1)/(e^{2x}+1). Never use Python math, use Triton’s tl math ops only (tl.sqrt, tl.exp, etc.)
 - Type conversions: use .to(tl.float32), NOT tl.float32()
 - Always use constexpr for BLOCK sizes in function signatures
 

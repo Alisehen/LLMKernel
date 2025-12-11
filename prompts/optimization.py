@@ -7,7 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]  # project root
 HW_FILE = ROOT / "prompts/hardware/gpu_specs.py"
 
 from prompts.generate_custom_cuda import _load_gpu_spec  # Adjust import path as needed
-from config.operator_categories_v2 import build_stage_prompt_section
+from config.operator_categories_v3 import build_stage_prompt_section
 
 _OPTIMIZATION_PROMPT_TEMPLATE = Template("""\
 You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.

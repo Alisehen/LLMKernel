@@ -25,12 +25,17 @@ from prompts.judger_repair import build_correctness_prompts
 from prompts.judger_optimization import build_judger_optimization_prompts
 
 # Import operator categorization system
-from config.operator_categories_v2 import (
+from config.operator_categories_v3 import (
     classify_operator,
     OPERATOR_CATEGORIES,
     get_key_ncu_metrics,
     check_early_exit,
     should_skip_stage,
+)
+from utils.ncu_context_builder import (
+    build_enhanced_ncu_context,
+    extract_metrics_from_df,
+    CORE_NCU_METRICS,
 )
 
 _INVOCATION_SPLITTER = "Invoked with:"
@@ -886,6 +891,10 @@ ModelNew = ref_module.Model
         print(f"\n[Optimization] Starting {len(optimization_stages)}-stage optimization ({category})...")
         stage_round = 0
 
+        # Initialize Stage 1 baseline tracking (for comparison in later stages)
+        stage1_score = None
+        stage1_metrics_dict = {}
+
         for stage_idx, stage_config in enumerate(optimization_stages):
             stage_name = stage_config["name"]
             stage_description = stage_config["description"]
@@ -904,7 +913,7 @@ ModelNew = ref_module.Model
             # Record the score before this stage starts
             score_before_stage = best_score
 
-            # === Early Exit Check ===
+            # === Prepare operator metadata ===
             op_metadata = {
                 "op_type": task_name.lower(),
                 "score": best_score,
@@ -919,21 +928,25 @@ ModelNew = ref_module.Model
             except:
                 pass
 
-            should_exit, exit_reason = check_early_exit(
-                category=category,
-                stage_id=stage_idx,
-                performance_score=best_score,
-                op_metadata=op_metadata,
-            )
+            # === Early Exit Check ===
+            # Skip early exit check for Stage 0 (give it a chance to optimize)
+            # Only check early exit from Stage 1 onwards
+            if stage_idx >= 1:
+                should_exit, exit_reason = check_early_exit(
+                    category=category,
+                    stage_id=stage_idx,
+                    performance_score=best_score,
+                    op_metadata=op_metadata,
+                )
 
-            if should_exit:
-                print(f"\n⛔ {'='*70}")
-                print(f"⛔ EARLY EXIT TRIGGERED")
-                print(f"⛔ Reason: {exit_reason}")
-                print(f"⛔ Current best score: {best_score:.4f}")
-                print(f"⛔ Skipping remaining stages.")
-                print(f"⛔ {'='*70}\n")
-                break
+                if should_exit:
+                    print(f"\n⛔ {'='*70}")
+                    print(f"⛔ EARLY EXIT TRIGGERED")
+                    print(f"⛔ Reason: {exit_reason}")
+                    print(f"⛔ Current best score: {best_score:.4f}")
+                    print(f"⛔ Skipping remaining stages.")
+                    print(f"⛔ {'='*70}\n")
+                    break
 
             # Check if best_kernel is available and runnable
             if best_kernel is None:
@@ -985,21 +998,39 @@ ModelNew = ref_module.Model
                 # Get available key metrics (columns that exist in the dataframe)
                 available_key_metrics = [m for m in key_metrics.values() if m in metrics_df.columns]
 
+                # Also include CORE metrics for baseline comparison (if available)
+                available_core_metrics = [m for m in CORE_NCU_METRICS if m in metrics_df.columns and m not in available_key_metrics]
+
                 # Keep "Kernel Name" and other non-metric columns
                 extra_cols = [c for c in metrics_df.columns if not c.startswith(('sm', 'dram', 'l1', 'l2', 'lts', 'smsp'))]
 
-                # Combine: extra columns + key metrics
-                keep_cols = extra_cols + available_key_metrics
+                # Combine: extra columns + key metrics + core metrics
+                keep_cols = extra_cols + available_key_metrics + available_core_metrics
 
-                if available_key_metrics:
+                if available_key_metrics or available_core_metrics:
                     filtered_df = metrics_df[keep_cols].copy()
                     print(f"   Filtered: {len(metrics_df.columns)} → {len(filtered_df.columns)} columns")
-                    print(f"   Kept metrics: {', '.join(available_key_metrics)}")
+                    print(f"   Stage-specific: {', '.join(available_key_metrics)}")
+                    if available_core_metrics:
+                        print(f"   Core metrics: {', '.join(available_core_metrics)}")
                 else:
                     print(f"⚠️  Warning: No key metrics found in dataframe, using all metrics")
                     filtered_df = metrics_df
 
-                metrics_block = metrics_to_prompt(filtered_df)
+                # Extract metrics to dictionary for enhanced context
+                current_metrics_dict = extract_metrics_from_df(
+                    filtered_df, kernel_names[0] if kernel_names else None
+                )
+
+                # Build enhanced NCU context with baseline comparison
+                metrics_block = build_enhanced_ncu_context(
+                    current_metrics=current_metrics_dict,
+                    category=category,
+                    stage_name=stage_name,
+                    current_score=best_score,
+                    baseline_metrics=stage1_metrics_dict if stage_idx >= 1 and stage1_metrics_dict else None,
+                    baseline_score=stage1_score if stage_idx >= 1 and stage1_score else None,
+                )
             else:
                 metrics_block = "No NCU metrics available"
 
@@ -1113,6 +1144,16 @@ ModelNew = ref_module.Model
                             with open(test_kernel, "w") as f:
                                 f.write(best_kernel.code)
                             print(f"[Stage {stage_idx + 1} Repair] New best score: {best_score:.4f}")
+
+                            # Save Stage 1 baseline if repair succeeded
+                            if stage_idx == 0 and stage1_score is None:
+                                stage1_score = best_score
+                                # Use metrics extracted before this stage (current_metrics_dict may exist)
+                                if 'current_metrics_dict' in locals() and current_metrics_dict:
+                                    stage1_metrics_dict = current_metrics_dict.copy()
+                                    print(f"✅ Stage 1 baseline saved (from repair): score={stage1_score:.4f}, {len(stage1_metrics_dict)} metrics")
+                                else:
+                                    print(f"✅ Stage 1 baseline saved (from repair): score={stage1_score:.4f}, no metrics available")
                     else:
                         scores.append(last_score_for_curve)
                         err_flags.append(True)
@@ -1145,6 +1186,27 @@ ModelNew = ref_module.Model
                 else:
                     print(f"[Stage {stage_idx + 1}] Score: {this_score:.4f} (not better than best: {best_score:.4f})")
                     print(f"[Stage {stage_idx + 1}] Keeping previous best_kernel")
+
+                # Save Stage 1 baseline for future comparison (only if Stage 1 succeeds)
+                if stage_idx == 0 and stage1_score is None:
+                    stage1_score = best_score
+                    stage1_metrics_dict = current_metrics_dict.copy()
+                    print(f"✅ Stage 1 baseline saved: score={stage1_score:.4f}, {len(stage1_metrics_dict)} metrics")
+
+                # Check for performance regression after stage 1+
+                # If current stage caused >10% degradation from previous best, consider early exit
+                if stage_idx >= 1 and this_score < score_before_stage * 0.90:
+                    degradation_pct = (1 - this_score / score_before_stage) * 100
+                    print(f"\n⚠️  [Stage {stage_idx + 1}] Performance degraded by {degradation_pct:.1f}%")
+                    print(f"   Previous best: {score_before_stage:.4f} → Current: {this_score:.4f}")
+
+                    # If degradation > 15% and we're past stage 2, consider exiting
+                    if degradation_pct > 15 and stage_idx >= 2:
+                        print(f"⛔ Significant regression detected. Stopping further optimization.")
+                        print(f"⛔ Keeping best kernel from Stage {stage_idx}: score={best_score:.4f}")
+                        break
+                    else:
+                        print(f"   Continuing with next stage (will keep best kernel so far)")
             else:
                 scores.append(last_score_for_curve)
                 err_flags.append(True)
