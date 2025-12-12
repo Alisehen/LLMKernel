@@ -56,6 +56,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--top_p", type=float, default=1.0, help="LLM top_p")
     # multi-task controls
     p.add_argument("--first_n", type=int, default=0, help="When arch_py is a directory, take the first N tasks (sorted)")
+    p.add_argument("--start_idx", type=int, default=0, help="Start index for task range selection (0-based, inclusive)")
+    p.add_argument("--end_idx", type=int, default=0, help="End index for task range selection (0-based, exclusive). 0 means no range limit")
     p.add_argument("--num_tasks", type=int, default=1, help="When sampling, how many tasks to pick (if >0 and first_n=0)")
     p.add_argument("--shuffle_seed", type=int, default=0, help="Random seed for sampling (0 = time)")
     
@@ -591,18 +593,43 @@ def _should_skip_stage(stage_name: str, metrics_df) -> tuple[bool, str]:
 
 
 # ---------------------- task helpers -------------------
+def _natural_sort_key(path: Path) -> tuple:
+    """Extract leading number from filename for natural sorting (e.g., 2_xxx < 10_xxx < 31_xxx)."""
+    import re
+    name = path.stem
+    match = re.match(r'^(\d+)', name)
+    return (int(match.group(1)), name) if match else (float('inf'), name)
+
 def _collect_tasks(maybe_dir: Path) -> List[Path]:
-    """If a directory, return all .py files (sorted); if a file, return [file]."""
+    """If a directory, return all .py files (naturally sorted by leading number); if a file, return [file]."""
     if maybe_dir.is_file():
         return [maybe_dir]
     if maybe_dir.is_dir():
-        return sorted([p for p in maybe_dir.rglob("*.py") if p.is_file()])
+        return sorted([p for p in maybe_dir.rglob("*.py") if p.is_file()], key=_natural_sort_key)
     raise FileNotFoundError(f"{maybe_dir} not found")
 
 
 def _pick_first_n(tasks: List[Path], n: int) -> List[Path]:
     n = max(1, min(max(n, 0), len(tasks)))
     return tasks[:n]
+
+
+def _pick_range(tasks: List[Path], start_idx: int, end_idx: int) -> List[Path]:
+    """Pick tasks from start_idx (inclusive) to end_idx (exclusive).
+
+    Args:
+        tasks: List of task paths
+        start_idx: Start index (0-based, inclusive)
+        end_idx: End index (0-based, exclusive). If 0 or > len, use len(tasks)
+
+    Returns:
+        Slice of tasks
+    """
+    start_idx = max(0, min(start_idx, len(tasks)))
+    if end_idx <= 0 or end_idx > len(tasks):
+        end_idx = len(tasks)
+    end_idx = max(start_idx, end_idx)  # Ensure end >= start
+    return tasks[start_idx:end_idx]
 
 
 def _sample_tasks(all_tasks: List[Path], k: int, seed: int | None) -> List[Path]:
@@ -734,6 +761,27 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
         best_kernel = current_kernel
         with open(test_kernel, "w") as f:
             f.write(best_kernel.code)
+
+        # Early stopping: if score < 0.1, stop the task
+        if this_score < 0.1:
+            print(f"\n[EARLY STOP] Score {this_score:.4f} < 0.1 after seed generation. Stopping task.")
+            # Plot and save results before stopping
+            fig_path = fig_dir / f"{task_path.stem}_score.png"
+            _plot_scores(fig_path, scores, err_flags, title=f"{task_path.stem} (best={best_score:.4f}, early stopped)")
+            print(f"[{task_path.name}] Figure saved to: {fig_path}")
+            usage_totals = _append_usage_totals(log_path)
+            return {
+                "task": str(task_path),
+                "best_score": float(best_score),
+                "best_runnable": True,
+                "task_dir": str(task_root),
+                "figure": str(fig_path),
+                "input_tokens_sum": usage_totals["input_tokens"],
+                "output_tokens_sum": usage_totals["output_tokens"],
+                "total_tokens_sum": usage_totals["total_tokens"],
+                "early_stopped": True,
+                "early_stop_reason": f"Score {this_score:.4f} < 0.1 after seed"
+            }
     else:
         scores.append(0.0)
         err_flags.append(True)
@@ -790,6 +838,27 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                 best_kernel = current_kernel
                 with open(test_kernel, "w") as f:
                     f.write(best_kernel.code)
+
+            # Early stopping: if score < 0.1 after repair, stop the task
+            if this_score < 0.1:
+                print(f"\n[EARLY STOP] Score {this_score:.4f} < 0.1 after seed repair. Stopping task.")
+                # Plot and save results before stopping
+                fig_path = fig_dir / f"{task_path.stem}_score.png"
+                _plot_scores(fig_path, scores, err_flags, title=f"{task_path.stem} (best={best_score:.4f}, early stopped)")
+                print(f"[{task_path.name}] Figure saved to: {fig_path}")
+                usage_totals = _append_usage_totals(log_path)
+                return {
+                    "task": str(task_path),
+                    "best_score": float(best_score),
+                    "best_runnable": True,
+                    "task_dir": str(task_root),
+                    "figure": str(fig_path),
+                    "input_tokens_sum": usage_totals["input_tokens"],
+                    "output_tokens_sum": usage_totals["output_tokens"],
+                    "total_tokens_sum": usage_totals["total_tokens"],
+                    "early_stopped": True,
+                    "early_stop_reason": f"Score {this_score:.4f} < 0.1 after seed repair"
+                }
         else:
             scores.append(last_score_for_curve)
             err_flags.append(True)
@@ -925,7 +994,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
             if not runnable:
                 print(f"[Stage {stage_idx + 1}] Optimization failed, attempting repair...")
                 repair_attempt = 0
-                max_repair = 3
+                max_repair = 2
                 stage_error_history_list = []  # Track previous repair attempts in this stage
                 while not runnable and repair_attempt < max_repair:
                     repair_attempt += 1
@@ -1042,28 +1111,44 @@ def _save_global_summary(batch_dir: Path, summary: List[Dict[str, Any]], avg_spe
     """Save summary.json and summary.csv under the batch_dir."""
     batch_dir.mkdir(parents=True, exist_ok=True)
 
-    # JSON
+    # Calculate additional statistics for failed tasks
+    total_tasks = len(summary)
+    successful_tasks = sum(1 for s in summary if s["best_runnable"])
+    failed_tasks = total_tasks - successful_tasks
+
+    # JSON - Enhanced with failure statistics
     out_json = {
         "avg_speedup": avg_speedup,
         "accuracy": accuracy,
         "total_tokens_sum": total_tokens_sum,
-        "num_tasks": len(summary),
+        "num_tasks": total_tasks,
+        "successful_tasks": successful_tasks,
+        "failed_tasks": failed_tasks,
         "tasks": summary,
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
     (batch_dir / "summary.json").write_text(json.dumps(out_json, indent=2), encoding="utf-8")
 
-    # CSV
+    # CSV - Handle missing 'figure' field for failed tasks
     csv_path = batch_dir / "summary.csv"
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["task", "best_score", "best_runnable", "task_dir", "figure"])
+        writer.writerow(["task", "best_score", "best_runnable", "task_dir", "figure", "status", "error"])
         for s in summary:
-            writer.writerow([s["task"], f'{s["best_score"]:.6f}', int(
-                bool(s["best_runnable"])), s["task_dir"], s["figure"]])
+            writer.writerow([
+                s["task"],
+                f'{s["best_score"]:.6f}',
+                int(bool(s["best_runnable"])),
+                s["task_dir"],
+                s.get("figure", "N/A"),
+                s.get("status", "completed"),
+                s.get("error", "")[:200]  # Truncate long error messages
+            ])
         writer.writerow([])
         writer.writerow(["avg_speedup", f"{avg_speedup:.6f}"])
         writer.writerow(["accuracy", f"{accuracy:.6f}"])
+        writer.writerow(["successful_tasks", str(successful_tasks)])
+        writer.writerow(["failed_tasks", str(failed_tasks)])
         writer.writerow(["total_tokens_sum", f"{int(total_tokens_sum)}"])
 
     print(f"[GLOBAL] Saved: {batch_dir/'summary.json'}")
@@ -1084,8 +1169,13 @@ def main():
         batch_name = f"{stamp}_{args.arch_py.stem}_{run_tag}"
     else:
         # include sampling info for traceability
-        pick_note = f"first{args.first_n}" if (args.first_n and args.first_n >
-                                               0) else f"num{args.num_tasks}_seed{args.shuffle_seed}"
+        if args.start_idx > 0 or args.end_idx > 0:
+            end_note = args.end_idx if args.end_idx > 0 else "end"
+            pick_note = f"range{args.start_idx}to{end_note}"
+        elif args.first_n and args.first_n > 0:
+            pick_note = f"first{args.first_n}"
+        else:
+            pick_note = f"num{args.num_tasks}_seed{args.shuffle_seed}"
         batch_name = f"{stamp}_batch_{pick_note}_{run_tag}"
     batch_dir = (args.work_dir / batch_name).resolve()
     batch_dir.mkdir(parents=True, exist_ok=True)
@@ -1093,7 +1183,23 @@ def main():
 
     # single file → run once (still inside the same batch folder)
     if args.arch_py.is_file():
-        res = _run_single_task(all_tasks[0], args, batch_dir=batch_dir)
+        try:
+            res = _run_single_task(all_tasks[0], args, batch_dir=batch_dir)
+            print(f"[SUCCESS] Task completed successfully")
+        except Exception as e:
+            error_msg = str(e)
+            print(f"\033[91m[ERROR] Task failed: {all_tasks[0].name}\033[0m")
+            print(f"\033[91mError details: {error_msg}\033[0m")
+            # Create a failed result entry
+            res = {
+                "task": str(all_tasks[0]),
+                "best_score": 0.0,
+                "best_runnable": False,
+                "task_dir": str((batch_dir / all_tasks[0].stem).resolve()),
+                "error": error_msg,
+                "status": "failed"
+            }
+
         summary = [res]
         avg_speedup = res["best_score"]
         accuracy = 1.0 if res["best_runnable"] else 0.0
@@ -1104,8 +1210,13 @@ def main():
         _save_global_summary(batch_dir, summary, avg_speedup, accuracy, total_tokens_sum)
         return
 
-    # directory: first_n takes precedence; else optionally sample
-    if args.first_n and args.first_n > 0:
+    # directory: priority order - range selection > first_n > random sampling
+    if args.start_idx > 0 or args.end_idx > 0:
+        # Range selection has highest priority
+        picked = _pick_range(all_tasks, args.start_idx, args.end_idx)
+        end_display = args.end_idx if args.end_idx > 0 else len(all_tasks)
+        print(f"[Task Picker] Found {len(all_tasks)} tasks, selecting range [{args.start_idx}:{end_display}] = {len(picked)} tasks.")
+    elif args.first_n and args.first_n > 0:
         picked = _pick_first_n(all_tasks, args.first_n)
         print(f"[Task Picker] Found {len(all_tasks)} tasks, taking first {len(picked)} (sorted).")
     else:
@@ -1115,18 +1226,56 @@ def main():
     summary: List[Dict[str, Any]] = []
     for i, task in enumerate(picked, 1):
         print(f"\n===== [{i}/{len(picked)}] Running task: {task} =====")
-        res = _run_single_task(task, args, batch_dir=batch_dir)
-        summary.append(res)
+        try:
+            res = _run_single_task(task, args, batch_dir=batch_dir)
+            summary.append(res)
+            print(f"[SUCCESS] Task {i}/{len(picked)} completed: {task.name}")
+        except Exception as e:
+            error_msg = str(e)
+            print(f"\033[91m[ERROR] Task {i}/{len(picked)} failed: {task.name}\033[0m")
+            print(f"\033[91mError details: {error_msg}\033[0m")
+            # Record failed task in summary
+            failed_res = {
+                "task": str(task),
+                "best_score": 0.0,
+                "best_runnable": False,
+                "task_dir": str((batch_dir / task.stem).resolve()),
+                "error": error_msg,
+                "status": "failed"
+            }
+            summary.append(failed_res)
+            print(f"[CONTINUE] Moving to next task...")
 
     # global summary using each task's best kernel
     if summary:
+        # Calculate statistics
+        total_tasks = len(summary)
+        successful_tasks = sum(1 for s in summary if s["best_runnable"])
+        failed_tasks = total_tasks - successful_tasks
         avg_speedup = sum(s["best_score"] for s in summary) / len(summary)
-        accuracy = sum(1 for s in summary if s["best_runnable"]) / len(summary)
+        accuracy = successful_tasks / total_tasks
         total_tokens_sum = sum(int(s.get("total_tokens_sum", 0) or 0) for s in summary)
+
+        # Print detailed summary
         print("\n===== SUMMARY =====")
+        print(f"Total tasks: {total_tasks}")
+        print(f"Successful tasks: {successful_tasks}")
+        print(f"Failed tasks: {failed_tasks}")
+        print("\n[Task Details]")
         for s in summary:
-            print(f"{s['task']}: best_score={s['best_score']:.4f}  runnable={s['best_runnable']}  fig={s['figure']}")
-        print(f"\n[GLOBAL] Avg speedup={avg_speedup:.4f}, Accuracy={accuracy:.4f}")
+            status_mark = "✓" if s["best_runnable"] else "✗"
+            print(f"{status_mark} {s['task']}: best_score={s['best_score']:.4f}  runnable={s['best_runnable']}  fig={s.get('figure', 'N/A')}")
+
+        # List failed tasks with error details
+        if failed_tasks > 0:
+            print("\n[FAILED TASKS DETAILS]")
+            for s in summary:
+                if not s["best_runnable"]:
+                    task_name = Path(s["task"]).name
+                    error_info = s.get("error", "Unknown error")
+                    print(f"  - {task_name}: {error_info[:150]}...")
+
+        print(f"\n[GLOBAL] Avg speedup={avg_speedup:.4f}, Accuracy={accuracy:.4f} ({successful_tasks}/{total_tasks})")
 
         # ---- save under the SAME batch folder ----
         _save_global_summary(batch_dir, summary, avg_speedup, accuracy, total_tokens_sum)

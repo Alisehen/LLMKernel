@@ -92,21 +92,27 @@ def build_optimization_prompt(
     "grid_and_parallel": """
 **Focus**: Optimize grid layout and parallel work distribution.
 
-**NCU Metrics to Check**:
-• `sm__throughput.avg.pct_of_peak_sustained_elapsed`: Overall SM utilization (target: >60%)
-• `launch__grid_size`: Total number of blocks (controlled by BLOCK_M/N)
+**NCU Metrics**:
+• `sm__throughput.avg.pct_of_peak_sustained_elapsed` (target >60%)
+• `launch__grid_size` (primarily determined by grid mapping)
 
 **Guidelines**:
-- 2D outputs → typically use 2D grid `(cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))`; simple 1D ops → 1D grid.
-- Prefer adding parallelism via batch/head/expert dims before reducing BLOCK sizes.
-- Only change grid if SM utilization is clearly low; otherwise keep the original grid.
-- Always verify that `grid = (...)` matches the indexing logic inside the kernel.
+- 1D → `(cdiv(N, BLOCK))`
+- 2D → `(cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))`
+- 3D (batch×M×N) → `(batch, cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))`
+- 4D+ → flatten **independent parallel dims** to 3D
+- Prefer batch / head / expert parallelism when available, before shrinking BLOCK sizes
+- Change grid only if SM utilization is clearly low
+- Ensure `grid = (...)` matches `tl.program_id(axis)` logic
 
-**Important Safety Rule**:
-If unsure about grid mapping, do **not** modify it.
+**Safety Rules**:
+- Max 3 grid dimensions; grid rank must be static
+- If unsure about correctness, do not modify grid
 
-**Autotune Tip (safe)**:
-If grid choices are unclear, try 2–3 small grid variants using a minimal `@autotune` on the **kernel function only**.
+**Autotune (safe)**:
+- Autotune **either** BLOCK_* **or** (`num_warps`, `num_stages`)
+- If BLOCK_* are autotuned, use `grid = lambda META: (...)` with `META["BLOCK_*"]`
+- Never redefine BLOCK_* in both configs and launch
 """,
 
     "block_tiling": """

@@ -46,44 +46,47 @@ FEWSHOT_MATMUL_NEW_TRITON = ROOT / "prompts/few_shot/model_new_ex_matmul_triton.
 test = Template(
     dedent(
         """
-Write high-performance Triton kernels to replace PyTorch operators. Generate the FASTEST kernel while maintaining correctness.
+Write high-performance Triton kernels to replace PyTorch operators.
+Generate the FASTEST kernel while maintaining correctness.
 
 **Triton Essentials**:
-- Use `tl.program_id()` for block indices, `tl.arange()` for element indices
-- Work with blocks of data (NOT individual threads like CUDA)
-- Triton auto-manages shared memory and sync (NO manual __shared__ or syncthreads)
+- Use `tl.program_id(axis)` for block indices (axis=0, 1, or 2 ONLY - max 3D grid)
+- Use `tl.arange()` for element indices within blocks
+- Operate on blocks (NOT CUDA-style threads)
+- No manual shared memory or synchronization
 
-**Critical Constraints** (违反会导致编译错误):
-- **BLOCK_SIZE must be power of 2**: All BLOCK_* parameters (BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_SIZE, etc.) must be powers of 2: 16, 32, 64, 128, 256, 512, 1024
-- tl.arange() requires power-of-2 range: tl.arange(0, BLOCK_SIZE) will fail if BLOCK_SIZE is not a power of 2
-- tl.reshape() requires compile-time constant shapes (use tensor.reshape(-1) instead)
-- tl.load/store: if pointer is scalar, value must be scalar; if pointer is block, value must be block
-- No tl.tanh() - use tl.exp() to implement: (e^{2x}-1)/(e^{2x}+1)
-- Type conversions: use .to(tl.float32), NOT tl.float32()
-- Always use constexpr for BLOCK sizes in function signatures
+**Critical Constraints** (violations cause compilation errors):
+- All BLOCK_* parameters MUST be passed as `tl.constexpr` and powers of 2 (16–1024)
+- `tl.arange(0, BLOCK_SIZE)` requires BLOCK_SIZE to be power of 2
+- `tl.reshape()` requires compile-time constant shapes (do NOT use dynamic reshape/view)
+- `tl.load` / `tl.store`: scalar pointer → scalar value, block pointer → block value
+- No `tl.tanh()` (use `exp`-based formulation if needed)
+- No Python-side control flow on `tl.tensor` or BLOCK_* values
 
 **Output Format**:
-1. Imports → 2. @triton.jit kernels → 3. Wrapper functions → 4. class ModelNew
-2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+1. Imports  
+2. `@triton.jit` kernel(s)  
+3. Wrapper function(s)  
+4. `class ModelNew(nn.Module)`  
+
+Do NOT include testing code or `if __name__ == "__main__"`.
 
 Example PyTorch:
 '''
 $few_base
 '''
+
 Example Triton:
 '''
 $few_new
 '''
 
-Hardware architecture:
+Hardware:
 $arch_src
 
 Target:
 ```python
 $kernel_src
-```
-
-Generate the fastest Triton implementation as ModelNew.
 """
     )
 )

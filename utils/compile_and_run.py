@@ -540,9 +540,10 @@ def compare_and_bench(
             if ref_out.dtype != test_out.dtype:
                 test_out = test_out.to(ref_out.dtype)
 
-            # Sample-based accuracy check: only compare first N elements for efficiency
-            # This significantly speeds up validation without sacrificing accuracy detection
-            SAMPLE_SIZE = 10000  # Compare at most 10k elements
+            # Stratified sampling for accuracy check: sample from head/middle/tail to avoid bias
+            # Increased sample size for better error detection (10k -> 100k)
+            SAMPLE_SIZE = 100000  # Compare up to 100k elements (was 10k)
+            FULL_CHECK_THRESHOLD = 1000000  # Check all elements if < 1M (most kernels)
             ref_out_bytes = ref_out.element_size() * ref_out.nelement()
 
             # Check if we need to skip accuracy check entirely due to memory constraints
@@ -562,18 +563,35 @@ def compare_and_bench(
                     if TORCH_DEVICE == "cuda":
                         torch.cuda.empty_cache()
                 else:
-                    # Sample first N elements
-                    print_warning(f"Output tensor size: {ref_out_bytes / 1024**3:.2f} GB. Comparing only first {SAMPLE_SIZE} elements.")
-                    sample_size = min(SAMPLE_SIZE, ref_out.numel())
-                    ref_out = ref_out.flatten()[:sample_size].cpu()
-                    test_out = test_out.flatten()[:sample_size].cpu()
-            elif ref_out.numel() > SAMPLE_SIZE:
-                # For all tensors larger than SAMPLE_SIZE, only compare a sample
-                sample_size = SAMPLE_SIZE
-                ref_out = ref_out.flatten()[:sample_size].cpu()
-                test_out = test_out.flatten()[:sample_size].cpu()
+                    # Stratified sampling: sample from head/middle/tail
+                    print_warning(f"Output tensor size: {ref_out_bytes / 1024**3:.2f} GB. Using stratified sampling with {SAMPLE_SIZE} elements.")
+                    total_elements = ref_out.numel()
+                    sample_size = min(SAMPLE_SIZE, total_elements)
+                    # Sample indices from beginning, middle, and end
+                    third = sample_size // 3
+                    indices = list(range(third)) + \
+                              list(range(total_elements // 2 - third // 2, total_elements // 2 + third // 2)) + \
+                              list(range(total_elements - third, total_elements))
+                    indices = indices[:sample_size]  # Ensure exact sample_size
+                    ref_flat = ref_out.flatten()
+                    test_flat = test_out.flatten()
+                    ref_out = ref_flat[indices].cpu()
+                    test_out = test_flat[indices].cpu()
+            elif ref_out.numel() > FULL_CHECK_THRESHOLD:
+                # For tensors > 1M elements: stratified sampling from head/middle/tail
+                total_elements = ref_out.numel()
+                sample_size = min(SAMPLE_SIZE, total_elements)
+                third = sample_size // 3
+                indices = list(range(third)) + \
+                          list(range(total_elements // 2 - third // 2, total_elements // 2 + third // 2)) + \
+                          list(range(total_elements - third, total_elements))
+                indices = indices[:sample_size]
+                ref_flat = ref_out.flatten()
+                test_flat = test_out.flatten()
+                ref_out = ref_flat[indices].cpu()
+                test_out = test_flat[indices].cpu()
             else:
-                # Small tensors: compare all elements
+                # Small/medium tensors (< 1M elements): check all elements for maximum accuracy
                 ref_out = ref_out.cpu()
                 test_out = test_out.cpu()
 
