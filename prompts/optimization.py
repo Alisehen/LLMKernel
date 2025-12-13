@@ -90,79 +90,82 @@ def build_optimization_prompt(
         # Universal stage optimization focus (适用于所有算子类型)
         stage_focus_map = {
     "grid_and_parallel": """
-**Focus**: Optimize grid layout and parallel work distribution.
+Focus: Grid layout & parallelism.
 
-**NCU Metrics**:
-• `sm__throughput.avg.pct_of_peak_sustained_elapsed` (target >60%)
-• `launch__grid_size` (primarily determined by grid mapping)
+Metrics:
+- sm__throughput.avg.pct_of_peak_sustained_elapsed (>60%)
+- launch__grid_size
 
-**Guidelines**:
-- 1D → `(cdiv(N, BLOCK))`
-- 2D → `(cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))`
-- 3D (batch×M×N) → `(batch, cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))`
-- 4D+ → flatten **independent parallel dims** to 3D
-- Prefer batch / head / expert parallelism when available, before shrinking BLOCK sizes
+Rules:
+- 1D: (cdiv(N, BLOCK))
+- 2D: (cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))
+- 3D: (batch, cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))
+- >3D: flatten ONLY independent dims
+- Prefer batch / head / expert parallelism before shrinking BLOCK
 - Change grid only if SM utilization is clearly low
-- Ensure `grid = (...)` matches `tl.program_id(axis)` logic
 
-**Safety Rules**:
-- Max 3 grid dimensions; grid rank must be static
-- If unsure about correctness, do not modify grid
+Safety:
+- Max 3 grid dims, static rank
+- grid=(G0,G1,G2) must match tl.program_id(0/1/2)
+- If unsure about correctness, do NOT change grid
 
-**Autotune (safe)**:
-- Autotune **either** BLOCK_* **or** (`num_warps`, `num_stages`)
-- If BLOCK_* are autotuned, use `grid = lambda META: (...)` with `META["BLOCK_*"]`
-- Never redefine BLOCK_* in both configs and launch
+Autotune:
+- Autotune either BLOCK_* OR (num_warps, num_stages)
+- If autotuning BLOCK_*, use grid=lambda META: (...)
+- Never redefine BLOCK_* in both kernel and launch
 """,
 
     "block_tiling": """
-**Focus**: Tune BLOCK_M/N/K sizes for balanced data reuse and resource usage.
+Focus: BLOCK_M/N/K selection.
 
-**NCU Metrics to Check**:
-• `sm__warps_active.avg.pct_of_peak_sustained_active`: Warp occupancy (target: >50%)
+Metrics:
+- sm__warps_active.avg.pct_of_peak_sustained_active (>50%)
 
-**Guidelines**:
-- Tensor Cores: BLOCK_M/N multiple of 16; BLOCK_K multiple of 8.
-- FP32: BLOCK_M/N in [32, 64, 128, 256], BLOCK_K in [16, 32, 64].
-- **All BLOCK_SIZE/BLOCK_* must be powers of 2** (16, 32, 64, 128, 256, 512, 1024).
-- Avoid oversized tiles (wasted masking); change BLOCK_* only when occupancy or reuse metrics indicate issues.
-- If BLOCK sizes are unclear, keep the baseline tile as a valid candidate.
+Rules:
+- BLOCK_* must be powers of 2
+- Tensor Core: BLOCK_M/N multiple of 16, BLOCK_K multiple of 8 (preference)
+- FP32: M/N ∈ {32,64,128,256}, K ∈ {16,32,64}
+- Avoid oversized tiles (mask waste)
+- Keep baseline tile if unsure
 
-**Autotune Tip (safe)**:
-Use a small autotune list (2–4 configs), all being powers of two, and **decorating the @triton.jit kernel**, never the wrapper.
+Autotune:
+- 2–4 configs max
+- Autotune ONLY on @triton.jit kernel
 """,
 
     "memory_access": """
-**Focus**: Optimize memory access patterns and latency hiding.
+Focus: Memory efficiency & latency hiding.
 
-**NCU Metrics to Check**:
-• `dram__throughput.avg.pct_of_peak_sustained_elapsed`
-• `lts__t_sector_hit_rate.pct`
-• `smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct` (target: <20%)
+Metrics:
+- dram__throughput.avg.pct_of_peak_sustained_elapsed
+- lts__t_sector_hit_rate.pct
+- smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct (<20%)
 
-**Guidelines**:
-- Increase `num_stages` only if memory stalls are high; otherwise keep it small.
-- Improve locality or coalescing only when metrics show issues; avoid unnecessary rewrites.
-- Larger BLOCK_K increases reuse but can raise register pressure; adjust only when metrics justify it.
+Rules:
+- Increase num_stages only if memory stalls are high
+- Do not rewrite access patterns without metric evidence
+- Larger BLOCK_K improves reuse but increases register pressure
 
-**Autotune Tip (safe)**:
-If unsure, try a tiny set varying `num_stages` (e.g., {1, 2, 3}) via autotune on the **kernel**.
+Autotune:
+- If unsure, try num_stages ∈ {1,2,3} on kernel
 """,
 
     "advanced_memory": """
-**Focus**: Final micro-optimizations (small adjustments only).
+Focus: Final micro-tuning.
 
-**Parameters to Tune**:
-• `num_warps`: {2, 4, 8, 16}
-• `num_stages`: {2, 3, 4}
+Params:
+- num_warps ∈ {2,4,8,16}
+- num_stages ∈ {2,3,4}
 
-**Guidelines**:
-- Adjust num_warps only if occupancy suggests it; otherwise keep the original.
-- Change num_stages only by ±1 from current.
-- Do not modify BLOCK sizes or grid mapping here.
+Rules:
+- Change num_warps only if occupancy suggests it
+- Change num_stages by ±1 only
+- Do NOT modify grid or BLOCK sizes
 
-**Autotune Tip (safe)**:
-Use 3–6 configs around the current settings; always include the original kernel config, and autotune must wrap the JIT kernel.
+Autotune:
+- 3–6 nearby configs
+- Always include original config
+- Revert if gain <1–2% or unstable
 """
 }
 

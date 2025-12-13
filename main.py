@@ -51,13 +51,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--warmup", type=int, default=2, help="Warm-up iterations")
     p.add_argument("--repeat", type=int, default=5, help="Timed iterations per benchmark")
     p.add_argument("--tol", type=float, default=1e-3, help="Max |err| tolerated")
-    p.add_argument("--max_tokens", type=int, default=20000, help="LLM max new tokens")
+    p.add_argument("--max_tokens", type=int, default=16000, help="LLM max new tokens")
     p.add_argument("--temperature", type=float, default=0.2, help="LLM temperature")
     p.add_argument("--top_p", type=float, default=1.0, help="LLM top_p")
     # multi-task controls
     p.add_argument("--first_n", type=int, default=0, help="When arch_py is a directory, take the first N tasks (sorted)")
-    p.add_argument("--start_idx", type=int, default=0, help="Start index for task range selection (0-based, inclusive)")
-    p.add_argument("--end_idx", type=int, default=0, help="End index for task range selection (0-based, exclusive). 0 means no range limit")
+    p.add_argument("--start_idx", type=int, default=0, help="Start file number prefix for task selection (inclusive). E.g., --start_idx=30 selects files starting with 30_xxx.py")
+    p.add_argument("--end_idx", type=int, default=0, help="End file number prefix for task selection (inclusive). 0 means no upper limit. E.g., --end_idx=40 includes 40_xxx.py")
     p.add_argument("--num_tasks", type=int, default=1, help="When sampling, how many tasks to pick (if >0 and first_n=0)")
     p.add_argument("--shuffle_seed", type=int, default=0, help="Random seed for sampling (0 = time)")
     
@@ -615,21 +615,26 @@ def _pick_first_n(tasks: List[Path], n: int) -> List[Path]:
 
 
 def _pick_range(tasks: List[Path], start_idx: int, end_idx: int) -> List[Path]:
-    """Pick tasks from start_idx (inclusive) to end_idx (exclusive).
+    """Pick tasks by file number prefix (not list index).
 
     Args:
-        tasks: List of task paths
-        start_idx: Start index (0-based, inclusive)
-        end_idx: End index (0-based, exclusive). If 0 or > len, use len(tasks)
+        tasks: List of task paths (should be sorted by _natural_sort_key)
+        start_idx: Start file number prefix (inclusive)
+        end_idx: End file number prefix (inclusive). If 0, no upper limit.
 
     Returns:
-        Slice of tasks
+        Tasks whose leading number is in range [start_idx, end_idx]
     """
-    start_idx = max(0, min(start_idx, len(tasks)))
-    if end_idx <= 0 or end_idx > len(tasks):
-        end_idx = len(tasks)
-    end_idx = max(start_idx, end_idx)  # Ensure end >= start
-    return tasks[start_idx:end_idx]
+    result = []
+    for task in tasks:
+        match = re.match(r'^(\d+)', task.stem)
+        if match:
+            file_num = int(match.group(1))
+            # Check if file number is within range
+            if file_num >= start_idx:
+                if end_idx <= 0 or file_num <= end_idx:
+                    result.append(task)
+    return result
 
 
 def _sample_tasks(all_tasks: List[Path], k: int, seed: int | None) -> List[Path]:
@@ -994,7 +999,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
             if not runnable:
                 print(f"[Stage {stage_idx + 1}] Optimization failed, attempting repair...")
                 repair_attempt = 0
-                max_repair = 2
+                max_repair = 1
                 stage_error_history_list = []  # Track previous repair attempts in this stage
                 while not runnable and repair_attempt < max_repair:
                     repair_attempt += 1
@@ -1212,10 +1217,10 @@ def main():
 
     # directory: priority order - range selection > first_n > random sampling
     if args.start_idx > 0 or args.end_idx > 0:
-        # Range selection has highest priority
+        # Range selection has highest priority (by file number prefix, not list index)
         picked = _pick_range(all_tasks, args.start_idx, args.end_idx)
-        end_display = args.end_idx if args.end_idx > 0 else len(all_tasks)
-        print(f"[Task Picker] Found {len(all_tasks)} tasks, selecting range [{args.start_idx}:{end_display}] = {len(picked)} tasks.")
+        end_display = args.end_idx if args.end_idx > 0 else "∞"
+        print(f"[Task Picker] Found {len(all_tasks)} tasks, selecting by file number prefix [{args.start_idx}, {end_display}] = {len(picked)} tasks.")
     elif args.first_n and args.first_n > 0:
         picked = _pick_first_n(all_tasks, args.first_n)
         print(f"[Task Picker] Found {len(all_tasks)} tasks, taking first {len(picked)} (sorted).")

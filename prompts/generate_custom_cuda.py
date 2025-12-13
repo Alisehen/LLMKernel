@@ -46,28 +46,28 @@ FEWSHOT_MATMUL_NEW_TRITON = ROOT / "prompts/few_shot/model_new_ex_matmul_triton.
 test = Template(
     dedent(
         """
-Write high-performance Triton kernels to replace PyTorch operators.
-Generate the FASTEST kernel while maintaining correctness.
+Write a correct and reasonably fast Triton kernel to replace the given PyTorch operator.
+This is a SEED implementation: prioritize correctness and stable compilation.
 
-**Triton Essentials**:
-- Use `tl.program_id(axis)` for block indices (axis=0, 1, or 2 ONLY - max 3D grid)
-- Use `tl.arange()` for element indices within blocks
-- Operate on blocks (NOT CUDA-style threads)
+Rules:
+- Use `tl.program_id(axis)` (axis=0/1/2 only)
+- Use `tl.arange()` for block indices
+- Operate on blocks (no CUDA thread model)
 - No manual shared memory or synchronization
 
-**Critical Constraints** (violations cause compilation errors):
-- All BLOCK_* parameters MUST be passed as `tl.constexpr` and powers of 2 (16–1024)
-- `tl.arange(0, BLOCK_SIZE)` requires BLOCK_SIZE to be power of 2
-- `tl.reshape()` requires compile-time constant shapes (do NOT use dynamic reshape/view)
-- `tl.load` / `tl.store`: scalar pointer → scalar value, block pointer → block value
-- No `tl.tanh()` (use `exp`-based formulation if needed)
-- No Python-side control flow on `tl.tensor` or BLOCK_* values
+Hard Constraints:
+- All BLOCK_* are `tl.constexpr` and powers of 2
+- `tl.arange(0, BLOCK)` requires BLOCK to be power-of-2
+- No dynamic `tl.reshape()` or view
+- `tl.load` / `tl.store`: scalar ptr → scalar, block ptr → block
+- No Python control flow on `tl.tensor` or BLOCK_*
 
-**Output Format**:
-1. Imports  
-2. `@triton.jit` kernel(s)  
-3. Wrapper function(s)  
-4. `class ModelNew(nn.Module)`  
+
+Output Format (STRICT):
+1. Imports
+2. `@triton.jit` kernel(s)
+3. Wrapper function(s)
+4. `class ModelNew(nn.Module)`
 
 Do NOT include testing code or `if __name__ == "__main__"`.
 

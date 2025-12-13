@@ -52,6 +52,8 @@ def query_server(
     call_type: str = "unknown",
     round_idx: int = -1,
 ):
+    use_responses_api = False  # Default to Chat Completions API
+
     match server_type:
         case "local":
             llm = get_llm(model_name)  # legacy fallback
@@ -113,8 +115,9 @@ def query_server(
         case "openai":
             from openai import OpenAI
             # client = OpenAI(api_key=OPENAI_KEY)
-            client = OpenAI(api_key=OPENAI_KEY,base_url="https://api.jiekou.ai/openai/v1")
-            model = "gpt-5.1"
+            client = OpenAI(api_key=OPENAI_KEY, base_url="https://api.jiekou.ai/openai/v1")
+            model = "gpt-5.1-codex"
+            use_responses_api = True  # This API uses Responses API
 
         case _:
             raise NotImplementedError(f"Unsupported server_type: {server_type}")
@@ -270,6 +273,83 @@ def query_server(
         if finish_reason in {"length", "max_tokens"}:
             print(f"Warning: Output truncated due to max_tokens limit ({max_tokens})")
 
+    elif use_responses_api:
+        # Use Responses API (for api.jiekou.ai with gpt-5.1-codex)
+        import requests
+        assert isinstance(prompt, str), "Only string prompt supported for Responses API"
+
+        # Build input messages (Responses API uses 'input' not 'messages')
+        input_messages = []
+        input_messages.append({"role": "user", "content": prompt})
+
+        # Make request to Responses API
+        url = "https://api.jiekou.ai/openai/v1/responses"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {OPENAI_KEY}"
+        }
+        payload = {
+            "model": model,
+            "input": input_messages,
+            "max_output_tokens": max_tokens,
+        }
+        # Add system prompt as instructions if provided
+        if system_prompt:
+            payload["instructions"] = system_prompt
+
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=600)
+            if resp.status_code != 200:
+                error_detail = resp.text
+                print(f"\n⚠️  Responses API error (HTTP {resp.status_code}): {error_detail}")
+                raise Exception(f"HTTP {resp.status_code}: {error_detail}")
+            data = resp.json()
+        except requests.exceptions.RequestException as e:
+            error_msg = str(e)
+            if any(keyword in error_msg.lower() for keyword in [
+                "context_length", "context length", "maximum context",
+                "too long", "token limit", "exceeds", "prompt is too large"
+            ]):
+                print(f"\n⚠️  Context length exceeded for {server_type} API")
+                print(f"Error: {error_msg}")
+                print(f"Returning truncation notice instead of crashing...")
+                return "[ERROR: Input prompt exceeded model context length. Please reduce prompt size.]"
+            raise
+
+        # Extract text from response
+        output_text = ""
+        for output_item in data.get("output", []):
+            if output_item.get("type") == "message":
+                for content in output_item.get("content", []):
+                    if content.get("type") == "output_text":
+                        output_text += content.get("text", "")
+
+        # Log usage
+        usage = data.get("usage", {})
+        input_tokens = usage.get("input_tokens", 0)
+        output_tokens = usage.get("output_tokens", 0)
+        total_tokens = usage.get("total_tokens", input_tokens + output_tokens)
+        usage_str = f"Usage: In={input_tokens}, Out={output_tokens}, Total={total_tokens}"
+        print(usage_str)
+
+        if log_path and log_path != "":
+            try:
+                import datetime
+                file_exists = os.path.exists(log_path)
+                with open(log_path, "a", encoding="utf-8") as f:
+                    if not file_exists:
+                        f.write("timestamp,round_idx,call_type,input_tokens,output_tokens,total_tokens\n")
+                    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    f.write(f"{timestamp},{round_idx},{call_type},{input_tokens},{output_tokens},{total_tokens}\n")
+            except Exception as e:
+                print(f"Warning: Failed to write usage log to {log_path}: {e}")
+
+        # Check finish reason
+        status = data.get("status", "unknown")
+        print(colorize_finish_reason(status if status != "completed" else "stop"))
+
+        return output_text
+
     else:
         if isinstance(prompt, str):
             messages = []
@@ -279,13 +359,7 @@ def query_server(
             messages.append({"role": "user", "content": prompt})
         else:
             messages = prompt
-
-        # DeepSeek API max_tokens limit varies by model
-        # deepseek-chat/coder: 4096, deepseek-v3: 8192
-        # Remove artificial limit - let the API enforce its own limits
-        # if server_type == "deepseek":
-        #     max_tokens = min(max_tokens, 8192)
-
+            
         try:
             if is_reasoning_model and server_type == "openai":
                 response = client.chat.completions.create(

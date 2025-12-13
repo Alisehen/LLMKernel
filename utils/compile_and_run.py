@@ -114,10 +114,11 @@ def _capture_import(path: Path):
 
 # =========================== timing helpers ===============================
 def _run_once(model: torch.nn.Module,
-              inp: List[torch.Tensor],
+              inp: List,
               dev: torch.device) -> Tuple[torch.Tensor, float]:
     model.to(dev).eval()
-    inp = [x.to(dev) for x in inp]
+    # Only move tensors to device, leave other types (float, int, etc.) as-is
+    inp = [x.to(dev) if isinstance(x, torch.Tensor) else x for x in inp]
 
     if TORCH_DEVICE == "cpu":
         t0 = datetime.now()
@@ -135,12 +136,13 @@ def _run_once(model: torch.nn.Module,
 
 
 def _bench(model: torch.nn.Module,
-           inp: List[torch.Tensor],
+           inp: List,
            dev: torch.device,
            warm: int,
            rep: int) -> List[float]:
     model.to(dev).eval()
-    inp = [x.to(dev) for x in inp]
+    # Only move tensors to device, leave other types (float, int, etc.) as-is
+    inp = [x.to(dev) if isinstance(x, torch.Tensor) else x for x in inp]
 
     for _ in range(warm):
         model(*inp)
@@ -573,10 +575,14 @@ def compare_and_bench(
                               list(range(total_elements // 2 - third // 2, total_elements // 2 + third // 2)) + \
                               list(range(total_elements - third, total_elements))
                     indices = indices[:sample_size]  # Ensure exact sample_size
-                    ref_flat = ref_out.flatten()
-                    test_flat = test_out.flatten()
-                    ref_out = ref_flat[indices].cpu()
-                    test_out = test_flat[indices].cpu()
+                    # Sample and move to CPU, then delete GPU tensors immediately
+                    ref_sample = ref_out.flatten()[indices].cpu()
+                    test_sample = test_out.flatten()[indices].cpu()
+                    del ref_out, test_out  # Release GPU memory NOW
+                    if TORCH_DEVICE == "cuda":
+                        torch.cuda.empty_cache()
+                    ref_out = ref_sample
+                    test_out = test_sample
             elif ref_out.numel() > FULL_CHECK_THRESHOLD:
                 # For tensors > 1M elements: stratified sampling from head/middle/tail
                 total_elements = ref_out.numel()
@@ -586,10 +592,14 @@ def compare_and_bench(
                           list(range(total_elements // 2 - third // 2, total_elements // 2 + third // 2)) + \
                           list(range(total_elements - third, total_elements))
                 indices = indices[:sample_size]
-                ref_flat = ref_out.flatten()
-                test_flat = test_out.flatten()
-                ref_out = ref_flat[indices].cpu()
-                test_out = test_flat[indices].cpu()
+                # Sample and move to CPU, then delete GPU tensors immediately
+                ref_sample = ref_out.flatten()[indices].cpu()
+                test_sample = test_out.flatten()[indices].cpu()
+                del ref_out, test_out  # Release GPU memory NOW
+                if TORCH_DEVICE == "cuda":
+                    torch.cuda.empty_cache()
+                ref_out = ref_sample
+                test_out = test_sample
             else:
                 # Small/medium tensors (< 1M elements): check all elements for maximum accuracy
                 ref_out = ref_out.cpu()
@@ -603,13 +613,35 @@ def compare_and_bench(
             else:
                 diff = (test_out - ref_out).abs()
                 max_err  = diff.max().item()
-                mean_err = diff.mean().item()
+                # Convert to float for mean() if dealing with integer dtypes
+                mean_err = diff.float().mean().item()
 
-                if not torch.allclose(ref_out, test_out, atol=tol, rtol=tol):
+                # Convert to float for allclose if dealing with integer dtypes
+                ref_cmp = ref_out.float() if ref_out.dtype in (torch.long, torch.int, torch.int32, torch.int64) else ref_out
+                test_cmp = test_out.float() if test_out.dtype in (torch.long, torch.int, torch.int32, torch.int64) else test_out
+                if not torch.allclose(ref_cmp, test_cmp, atol=tol, rtol=tol):
                     raise ValueError(
                         f"Outputs are not close (atol={tol}, rtol={tol}). "
                         f"max_abs_err={max_err:.3e}, mean_abs_err={mean_err:.3e}"
                     )
+
+            # Release output tensors before benchmarking to free GPU memory
+            try:
+                del ref_out
+            except NameError:
+                pass
+            try:
+                del test_out
+            except NameError:
+                pass
+            try:
+                del diff
+            except NameError:
+                pass
+            import gc
+            gc.collect()
+            if TORCH_DEVICE == "cuda":
+                torch.cuda.empty_cache()
 
             # 计时
             ref_t  = _bench(ref_model,  inp, dev, warmup, repeat)
