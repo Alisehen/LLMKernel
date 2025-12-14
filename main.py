@@ -68,6 +68,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--num_steps", type=int, default=4, help="Number of optimization steps (stages)")
     p.add_argument("--max_repair_attempts", type=int, default=3, help="Max repair attempts per failure")
 
+    # Fusion operator flag
+    p.add_argument("--fusion", action="store_true", help="Enable fusion operator mode (for level2 multi-op kernels)")
+
     return p
 
 
@@ -742,7 +745,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
 
     # ====== Step 1: Generate Seed Program (outside loop) ======
     print("[Seed] Generating the initial kernel ...")
-    seed_prompt = build_seed_prompt(arch_path=task_path, gpu_name=args.gpu)
+    seed_prompt = build_seed_prompt(arch_path=task_path, gpu_name=args.gpu, fusion=args.fusion)
     prompt_file = io_dir / "seed_prompt.txt"
     prompt_file.write_text(seed_prompt, encoding="utf-8")
     current_kernel = _llm_to_kernel(seed_prompt, code_dir, call_llm, io_dir,
@@ -809,10 +812,41 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
         # Use error history from PREVIOUS attempts (not including current)
         error_history = "\n\n".join(error_history_list[-3:]) if error_history_list else ""
 
+        # ====== Phase 1: Analyze the problem using judger_repair ======
+        print(f"[Seed Repair {repair_attempt}/{max_repair}] Phase 1: Analyzing error...")
+        analysis_prompt = build_correctness_prompts(
+            error_log=error_log,
+            arch_path=task_path,
+            cuda_code=current_kernel.code,
+        )
+        analysis_prompt_file = io_dir / f"seed_repair_{repair_attempt}_analysis_prompt.txt"
+        analysis_prompt_file.write_text(analysis_prompt, encoding="utf-8")
+
+        analysis_response = call_llm(
+            analysis_prompt,
+            sys_prompt=None,
+            log_path=log_path,
+            call_type="seed_repair_analysis",
+            round_idx=repair_attempt * 1000,
+        )
+        analysis_file = io_dir / f"seed_repair_{repair_attempt}_analysis_response.txt"
+        analysis_file.write_text(analysis_response, encoding="utf-8")
+
+        # Parse JSON response
+        problem_dict = None
+        try:
+            problem_dict = extract_json(analysis_response)
+            print(f"[Seed Repair {repair_attempt}/{max_repair}] Analysis: {problem_dict.get('critical_issue', 'N/A')}")
+        except Exception as e:
+            print(f"[Seed Repair {repair_attempt}/{max_repair}] Warning: Failed to parse analysis JSON: {e}")
+            problem_dict = None
+
+        # ====== Phase 2: Generate repair based on analysis ======
+        print(f"[Seed Repair {repair_attempt}/{max_repair}] Phase 2: Generating fix...")
         repair_prompt = build_error_prompt(
             old_code=current_kernel.code,
             error_log=error_log,
-            problem=None,
+            problem=problem_dict,
             gpu_name=args.gpu,
             error_history=error_history,
             arch_path=task_path,
@@ -978,6 +1012,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                 stage_name=stage_name,
                 stage_description=stage_description,
                 failure_analysis="",
+                fusion=args.fusion,
             )
             prompt_file = io_dir / f"stage{stage_idx + 1}_{stage_name}_prompt.txt"
             prompt_file.write_text(opt_prompt, encoding="utf-8")
@@ -1018,10 +1053,41 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                     # Use error history from PREVIOUS attempts (not including current)
                     stage_error_history = "\n\n".join(stage_error_history_list[-3:]) if stage_error_history_list else ""
 
+                    # ====== Phase 1: Analyze the problem using judger_repair ======
+                    print(f"[Stage {stage_idx + 1} Repair {repair_attempt}/{max_repair}] Phase 1: Analyzing error...")
+                    analysis_prompt = build_correctness_prompts(
+                        error_log=error_log,
+                        arch_path=task_path,
+                        cuda_code=current_kernel.code,
+                    )
+                    analysis_prompt_file = io_dir / f"stage{stage_idx + 1}_repair_{repair_attempt}_analysis_prompt.txt"
+                    analysis_prompt_file.write_text(analysis_prompt, encoding="utf-8")
+
+                    analysis_response = call_llm(
+                        analysis_prompt,
+                        sys_prompt=None,
+                        log_path=log_path,
+                        call_type=f"stage{stage_idx + 1}_repair_analysis",
+                        round_idx=stage_round * 1000,
+                    )
+                    analysis_file = io_dir / f"stage{stage_idx + 1}_repair_{repair_attempt}_analysis_response.txt"
+                    analysis_file.write_text(analysis_response, encoding="utf-8")
+
+                    # Parse JSON response
+                    problem_dict = None
+                    try:
+                        problem_dict = extract_json(analysis_response)
+                        print(f"[Stage {stage_idx + 1} Repair {repair_attempt}/{max_repair}] Analysis: {problem_dict.get('critical_issue', 'N/A')}")
+                    except Exception as e:
+                        print(f"[Stage {stage_idx + 1} Repair {repair_attempt}/{max_repair}] Warning: Failed to parse analysis JSON: {e}")
+                        problem_dict = None
+
+                    # ====== Phase 2: Generate repair based on analysis ======
+                    print(f"[Stage {stage_idx + 1} Repair {repair_attempt}/{max_repair}] Phase 2: Generating fix...")
                     repair_prompt = build_error_prompt(
                         old_code=current_kernel.code,
                         error_log=error_log,
-                        problem=None,
+                        problem=problem_dict,
                         gpu_name=args.gpu,
                         error_history=stage_error_history,
                         arch_path=task_path,

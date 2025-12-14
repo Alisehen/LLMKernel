@@ -22,13 +22,8 @@ COMPILE_ERROR = Template(
 Current Error Log:
 $ERROR_LOG
 
-History Error:
-$ERROR_HISTORY
-
-PyTorch Reference:
-```python
-$PYTORCH_CODE
-```
+Main Critical Problem Analysis:
+$PROBLEM_ANALYSIS
 
 Broken Code:
 ```python
@@ -141,9 +136,22 @@ def build_error_prompt(
     else:
         history_section = "None\n"
 
+    # Format problem analysis if provided
+    problem_section = ""
+    if problem is not None and problem != "":
+        formatted_problem = _format_problem(problem)
+        problem_section = f"""Problem Analysis (from expert diagnosis):
+{formatted_problem}
+
+Focus your fix on addressing the identified critical issue.
+"""
+    else:
+        problem_section = ""
+
     # Substitute all fields
     return COMPILE_ERROR.substitute(
         ERROR_HISTORY=history_section,
+        PROBLEM_ANALYSIS=problem_section,
         PYTORCH_CODE=pytorch_code,
         ERROR_LOG=error_log.strip(),
         OLD_CODE=old_code.strip(),

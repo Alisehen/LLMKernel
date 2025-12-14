@@ -89,11 +89,6 @@ instruction_tmpl = Template(
     dedent(
         """You are a senior Triton kernel optimization engineer. Read the target GPU spec, the PyTorch reference code, the current Triton candidate, and the Nsight Compute metrics. Then identify **exactly one** highest-impact speed bottleneck, propose **exactly one** optimisation method and propose a modification plan. Be surgical and metrics-driven.
 
-# Target GPU
-GPU Name: $gpu_name
-Architecture: $gpu_arch
-Details:
-$gpu_items
 
 
 # PyTorch Reference
