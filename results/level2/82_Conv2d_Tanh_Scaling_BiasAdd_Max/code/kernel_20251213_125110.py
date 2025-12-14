@@ -1,0 +1,146 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+from typing import Tuple
+
+
+@triton.jit
+def fused_activation_kernel(
+    x_ptr,
+    bias_ptr,
+    output_ptr,
+    scaling_factor,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    
+    x = tl.load(x_ptr + offsets, mask=mask)
+    # Compute bias index correctly for channel-wise broadcasting
+    bias_index = (offsets // (x_ptr.shape[1] * x_ptr.shape[2] * x_ptr.shape[3])) % bias_ptr.shape[0]
+    bias = tl.load(bias_ptr + bias_index, mask=mask)
+    
+    # tanh implementation using exponential form for stability
+    exp_2x = tl.exp(2.0 * x)
+    tanh_x = (exp_2x - 1.0) / (exp_2x + 1.0)
+    
+    activated = tanh_x * scaling_factor + bias
+    tl.store(output_ptr + offsets, activated, mask=mask)
+
+
+@triton.jit
+def max_pool_2d_kernel(
+    input_ptr,
+    output_ptr,
+    B, C, H, W,
+    pool_h, pool_w,
+    stride_h, stride_w,
+    output_h, output_w,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    num_programs = tl.num_programs(axis=0)
+    
+    # Each program processes multiple output positions
+    output_size = B * C * output_h * output_w
+    positions_per_program = tl.cdiv(output_size, num_programs)
+    start_pos = pid * positions_per_program
+    end_pos = min(start_pos + positions_per_program, output_size)
+    
+    for pos in range(start_pos, end_pos, BLOCK_SIZE):
+        offsets = pos + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < end_pos
+        
+        # Compute output indices
+        w_idx = offsets % output_w
+        h_idx = (offsets // output_w) % output_h
+        c_idx = (offsets // (output_w * output_h)) % C
+        b_idx = offsets // (output_w * output_h * C)
+        
+        # Input indices
+        h_start = h_idx * stride_h
+        w_start = w_idx * stride_w
+        h_end = min(h_start + pool_h, H)
+        w_end = min(w_start + pool_w, W)
+        
+        # Initialize with minimum float value
+        max_val = tl.full((BLOCK_SIZE,), float('-inf'), dtype=tl.float32)
+        
+        # Unrolled pooling window
+        for ph in range(pool_h):
+            ph_actual = h_start + ph
+            for pw in range(pool_w):
+                pw_actual = w_start + pw
+                
+                within_bounds = (ph_actual < H) & (pw_actual < W) & mask
+                input_idx = ((b_idx * C + c_idx) * H + ph_actual) * W + pw_actual
+                
+                val = tl.load(input_ptr + input_idx, mask=within_bounds, other=float('-inf'))
+                max_val = tl.maximum(max_val, val)
+        
+        output_idx = ((b_idx * C + c_idx) * output_h + h_idx) * output_w + w_idx
+        tl.store(output_ptr + output_idx, max_val, mask=mask)
+
+
+def triton_fused_activation(x: torch.Tensor, scaling_factor: float, bias: torch.Tensor) -> torch.Tensor:
+    output = torch.empty_like(x)
+    n_elements = output.numel()
+    
+    # Use 1D grid for elementwise operations
+    BLOCK_SIZE = 1024
+    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
+    
+    fused_activation_kernel[grid](
+        x, bias, output, scaling_factor, n_elements,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
+    return output
+
+
+def triton_max_pool2d(x: torch.Tensor, kernel_size: int) -> torch.Tensor:
+    B, C, H, W = x.shape
+    stride = kernel_size
+    pool_h = pool_w = kernel_size
+    
+    output_h = H // stride
+    output_w = W // stride
+    output = torch.empty((B, C, output_h, output_w), device=x.device, dtype=x.dtype)
+    
+    # Use 1D grid with each program handling multiple output positions
+    BLOCK_SIZE = 256
+    grid = (min(128, triton.cdiv(B * C * output_h * output_w, BLOCK_SIZE)),)
+    
+    max_pool_2d_kernel[grid](
+        x, output,
+        B, C, H, W,
+        pool_h, pool_w,
+        stride, stride,
+        output_h, output_w,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
+    return output
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, scaling_factor, bias_shape, pool_kernel_size):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.scaling_factor = scaling_factor
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.pool_kernel_size = pool_kernel_size
+        
+    def forward(self, x):
+        # Keep PyTorch convolution for stable compilation
+        x = self.conv(x)
+        
+        # Fused activation with Triton
+        x = triton_fused_activation(x, self.scaling_factor, self.bias)
+        
+        # Max pooling with Triton
+        x = triton_max_pool2d(x, self.pool_kernel_size)
+        
+        return x

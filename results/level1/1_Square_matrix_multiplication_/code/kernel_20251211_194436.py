@@ -1,0 +1,143 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def matmul_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    # 2D grid layout
+    pid = tl.program_id(axis=0)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    
+    # Group program IDs for better L2 cache utilization
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+    
+    # Compute offsets
+    rm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    rn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    rk = tl.arange(0, BLOCK_SIZE_K)
+    
+    # Pointers to blocks of A and B
+    A = a_ptr + (rm[:, None] * stride_am + rk[None, :] * stride_ak)
+    B = b_ptr + (rk[:, None] * stride_bk + rn[None, :] * stride_bn)
+    
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    
+    # Main computation loop
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        # Load blocks with masking for boundary conditions
+        a_mask = (rm[:, None] < M) & (rk[None, :] + k * BLOCK_SIZE_K < K)
+        b_mask = (rk[:, None] + k * BLOCK_SIZE_K < K) & (rn[None, :] < N)
+        
+        a = tl.load(A, mask=a_mask, other=0.0)
+        b = tl.load(B, mask=b_mask, other=0.0)
+        
+        # Convert to fp16 for Tensor Cores
+        if not tl.constexpr(tl.math.allow_fp32_to_fp16()):  # Check if tf32 is enabled
+            a = a.to(tl.float16)
+            b = b.to(tl.float16)
+        
+        acc += tl.dot(a, b, allow_tf32=tl.constexpr(tl.math.allow_fp32_to_fp16()))
+        
+        A += BLOCK_SIZE_K * stride_ak
+        B += BLOCK_SIZE_K * stride_bk
+    
+    # Store result
+    C = c_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn
+    mask = (rm[:, None] < M) & (rn[None, :] < N)
+    tl.store(C, acc, mask=mask)
+
+
+def triton_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    assert a.dim() == 2 and b.dim() == 2
+    M, K = a.shape
+    K2, N = b.shape
+    assert K == K2, f"Dimension mismatch: {K} != {K2}"
+    
+    c = torch.empty((M, N), device=a.device, dtype=torch.float32)
+    
+    if a.dtype == torch.float32 and b.dtype == torch.float32:
+        # Configuration optimized for A100/H100
+        configs = [
+            triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 4}, num_stages=3, num_warps=8),
+            triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 4}, num_stages=3, num_warps=8),
+            triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+            triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+            triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        ]
+        
+        # Autotune implementation
+        @triton.autotune(
+            configs=configs,
+            key=['M', 'N', 'K'],
+        )
+        def tuned_matmul(
+            a_ptr, b_ptr, c_ptr,
+            M, N, K,
+            stride_am, stride_ak,
+            stride_bk, stride_bn,
+            stride_cm, stride_cn,
+            BLOCK_SIZE_M: tl.constexpr,
+            BLOCK_SIZE_N: tl.constexpr,
+            BLOCK_SIZE_K: tl.constexpr,
+            GROUP_SIZE_M: tl.constexpr,
+        ):
+            matmul_kernel(
+                a_ptr, b_ptr, c_ptr,
+                M, N, K,
+                stride_am, stride_ak,
+                stride_bk, stride_bn,
+                stride_cm, stride_cn,
+                BLOCK_SIZE_M, BLOCK_SIZE_N,
+                BLOCK_SIZE_K, GROUP_SIZE_M
+            )
+        
+        # Grid calculation
+        def grid(META):
+            return (triton.cdiv(M, META['BLOCK_SIZE_M']) * 
+                    triton.cdiv(N, META['BLOCK_SIZE_N']),)
+        
+        tuned_matmul[grid](
+            a, b, c,
+            M, N, K,
+            a.stride(0), a.stride(1),
+            b.stride(0), b.stride(1),
+            c.stride(0), c.stride(1),
+        )
+    else:
+        c = torch.matmul(a, b)
+    
+    return c
+
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super(ModelNew, self).__init__()
+    
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        return triton_matmul(A, B)

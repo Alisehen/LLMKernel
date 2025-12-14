@@ -1,0 +1,289 @@
+Fix the Triton kernel errors. Generate correct, high-performance code.
+
+Current Error Log:
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 538, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251214_042551_batch_range87to87_openai_deepseek/87_conv_pointwise_2D/code/kernel_20251214_042653.py", line 199, in forward
+    return triton_pointwise_conv2d_1x1(x, self.conv.weight, self.conv.bias)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251214_042551_batch_range87to87_openai_deepseek/87_conv_pointwise_2D/code/kernel_20251214_042653.py", line 121, in triton_pointwise_conv2d_1x1
+    y = torch.empty((N, C_out, H, W), device=x.device, dtype=x.dtype)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 8.00 GiB. GPU 0 has a total capacity of 23.52 GiB of which 7.05 GiB is free. Including non-PyTorch memory, this process has 16.44 GiB memory in use. Of the allocated memory 16.00 GiB is allocated by PyTorch, and 1.94 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+
+History Error:
+None
+
+
+PyTorch Reference:
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Performs a pointwise 2D convolution operation.
+
+    Args:
+        in_channels (int): Number of channels in the input tensor.
+        out_channels (int): Number of channels produced by the convolution.
+        bias (bool, optional): If `True`, adds a learnable bias to the output. Defaults to `False`.
+    """
+    def __init__(self, in_channels: int, out_channels: int, bias: bool = False):
+        super(Model, self).__init__()
+        self.conv1d = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0, bias=bias)
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Performs the pointwise 2D convolution.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_channels, height, width).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_channels, height, width).
+        """
+        return self.conv1d(x)
+
+# Test code
+batch_size = 16
+in_channels = 64
+out_channels = 128
+width = 1024
+height = 1024
+
+def get_inputs():
+    x = torch.rand(batch_size, in_channels, height, width)
+    return [x]
+
+def get_init_inputs():
+    return [in_channels, out_channels]
+```
+
+Broken Code:
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def conv1x1_fwd_kernel(
+    x_ptr,  # *[N, C_in, H, W]
+    w_ptr,  # *[C_out, C_in, 1, 1]
+    b_ptr,  # *[C_out] (or dummy if no bias)
+    y_ptr,  # *[N, C_out, H, W]
+    N, C_in, H, W, C_out,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_wn, stride_wc,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    BLOCK_M: tl.constexpr,  # tile over spatial positions (N*H*W)
+    BLOCK_N: tl.constexpr,  # tile over out_channels
+    BLOCK_K: tl.constexpr,  # tile over in_channels (reduction)
+    HAS_BIAS: tl.constexpr,
+):
+    # Program IDs
+    pid_m = tl.program_id(axis=0)  # along M = N*H*W
+    pid_n = tl.program_id(axis=1)  # along C_out
+
+    # Offsets in M and N dimensions
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # [BM]
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # [BN]
+
+    M = N * H * W
+    mask_m = offs_m < M
+    mask_n = offs_n < C_out
+
+    # Decode m -> (n_idx, oh, ow)
+    ohw = H * W
+    n_idx = offs_m // ohw
+    tmp = offs_m % ohw
+    oh = tmp // W
+    ow = tmp % W
+
+    # Reshape for broadcasting to [BM, BN] / [BM, BK] / [BK, BN]
+    n_idx = n_idx[:, None]
+    oh = oh[:, None]
+    ow = ow[:, None]
+    offs_n_b = offs_n[None, :]
+
+    # Accumulator
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Reduction over input channels (C_in)
+    for k0 in range(0, C_in, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)  # [BK]
+        mask_k = offs_k < C_in
+
+        offs_k_b_row = offs_k[:, None]   # [BK, 1]
+        offs_k_b_col = offs_k[None, :]   # [1, BK]
+
+        # Pointers for input x: x[n_idx, offs_k, oh, ow]
+        ptrs_x = (
+            x_ptr
+            + n_idx * stride_xn
+            + offs_k_b_col * stride_xc
+            + oh * stride_xh
+            + ow * stride_xw
+        )  # [BM, BK]
+
+        # Pointers for weights w: w[offs_n, offs_k]
+        ptrs_w = (
+            w_ptr
+            + offs_n_b * stride_wn
+            + offs_k_b_row * stride_wc
+        )  # [BK, BN]
+
+        mask_x = mask_m[:, None] & mask_k[None, :]
+        mask_w = mask_k[:, None] & mask_n[None, :]
+
+        a = tl.load(ptrs_x, mask=mask_x, other=0.0)
+        b = tl.load(ptrs_w, mask=mask_w, other=0.0)
+
+        acc += tl.dot(a, b)
+
+    # Add bias if present
+    if HAS_BIAS:
+        bias_vals = tl.load(b_ptr + offs_n, mask=mask_n, other=0.0)
+        bias_vals = bias_vals.to(tl.float32)
+        acc += bias_vals[None, :]
+
+    # Write back to y[n_idx, offs_n, oh, ow]
+    ptrs_y = (
+        y_ptr
+        + n_idx * stride_yn
+        + offs_n_b * stride_yc
+        + oh * stride_yh
+        + ow * stride_yw
+    )
+    mask_y = mask_m[:, None] & mask_n[None, :]
+    tl.store(ptrs_y, acc, mask=mask_y)
+
+
+def triton_pointwise_conv2d_1x1(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor = None,
+) -> torch.Tensor:
+    """
+    Pointwise 1x1 Conv2d implemented as a fused GEMM over (N*H*W, C_in) x (C_in, C_out).
+
+    x:      [N, C_in, H, W]
+    weight: [C_out, C_in, 1, 1]
+    bias:   [C_out] or None
+    """
+    assert x.is_cuda, "Input must be on CUDA for Triton kernel."
+    assert weight.is_cuda, "Weight must be on CUDA for Triton kernel."
+    assert x.ndim == 4
+    assert weight.ndim == 4
+    N, C_in, H, W = x.shape
+    C_out = weight.shape[0]
+    assert weight.shape[1] == C_in
+    assert weight.shape[2] == 1 and weight.shape[3] == 1
+
+    y = torch.empty((N, C_out, H, W), device=x.device, dtype=x.dtype)
+
+    M = N * H * W
+    BLOCK_M = 128
+    BLOCK_N = 128
+    BLOCK_K = 32
+
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_M"]),
+        triton.cdiv(C_out, META["BLOCK_N"]),
+    )
+
+    has_bias = bias is not None
+    # Dummy pointer if no bias; won't be accessed when HAS_BIAS=False
+    b_ptr = bias if has_bias else x
+
+    conv1x1_fwd_kernel[grid](
+        x,
+        weight,
+        b_ptr,
+        y,
+        N,
+        C_in,
+        H,
+        W,
+        C_out,
+        x.stride(0),
+        x.stride(1),
+        x.stride(2),
+        x.stride(3),
+        weight.stride(0),
+        weight.stride(1),
+        y.stride(0),
+        y.stride(1),
+        y.stride(2),
+        y.stride(3),
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        HAS_BIAS=has_bias,
+        num_warps=8,
+        num_stages=2,
+    )
+
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-accelerated pointwise 1x1 Conv2d replacement.
+
+    Args:
+        in_channels (int): Number of channels in the input tensor.
+        out_channels (int): Number of channels produced by the convolution.
+        bias (bool, optional): If True, includes a learnable bias. Defaults to False.
+    """
+
+    def __init__(self, in_channels: int, out_channels: int, bias: bool = False):
+        super().__init__()
+        # Use nn.Conv2d to manage parameters (weights & bias)
+        self.conv = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+            bias=bias,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: [batch_size, in_channels, height, width]
+        Returns: [batch_size, out_channels, height, width]
+        """
+        # Fallback to PyTorch implementation on CPU
+        if not x.is_cuda:
+            return self.conv(x)
+
+        return triton_pointwise_conv2d_1x1(x, self.conv.weight, self.conv.bias)
+```
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl, AND any other modules used (e.g., import math if using math.sqrt)
+   2. @triton.jit decorated kernel function(s) — NO continue/break/return inside loops (use masking)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels — THIS CLASS IS REQUIRED
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+3. Learn from previous repair attempts to avoid repeating the same mistakes
+4. Ensure ALL imports are included at the top (common mistake: forgetting `import math`)
+
+```python
+# <corrected code>
+```

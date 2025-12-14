@@ -1,0 +1,205 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU
+GPU Name: 4090
+Architecture: Ada Lovelace
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+[OPTIMIZATION STAGE]
+
+## Current Optimization Stage
+
+**Focus**: Optimize grid layout and parallel work distribution.
+
+**NCU Metrics**:
+• `sm__throughput.avg.pct_of_peak_sustained_elapsed` (target >60%)
+• `launch__grid_size` (primarily determined by grid mapping)
+
+**Guidelines**:
+- 1D → `(cdiv(N, BLOCK))`
+- 2D → `(cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))`
+- 3D (batch×M×N) → `(batch, cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))`
+- 4D+ → flatten **independent parallel dims** to 3D
+- Prefer batch / head / expert parallelism when available, before shrinking BLOCK sizes
+- Change grid only if SM utilization is clearly low
+- Ensure `grid = (...)` matches `tl.program_id(axis)` logic
+
+**Safety Rules**:
+- Max 3 grid dimensions; grid rank must be static
+- If unsure about correctness, do not modify grid
+
+**Autotune (safe)**:
+- Autotune **either** BLOCK_* **or** (`num_warps`, `num_stages`)
+- If BLOCK_* are autotuned, use `grid = lambda META: (...)` with `META["BLOCK_*"]`
+- Never redefine BLOCK_* in both configs and launch
+
+
+
+[CURRENT CODE]
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def swish_kernel(
+    x_ptr,
+    output_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Swish activation: x * sigmoid(x) with stable formulation."""
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    
+    # Load input with mask
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    
+    # Stable sigmoid implementation: 1/(1 + exp(-x))
+    # For positive x: 1/(1 + exp(-x))
+    # For negative x: exp(x)/(1 + exp(x))
+    # Use sign-based optimization for numerical stability
+    abs_x = tl.abs(x)
+    exp_neg_abs_x = tl.exp(-abs_x)  # exp(-|x|)
+    
+    # Compute denominator: 1 + exp(-|x|)
+    denom = 1.0 + exp_neg_abs_x
+    
+    # Compute numerator based on sign
+    # For x >= 0: numerator = 1, so sigmoid = 1/denom = 1/(1 + exp(-x))
+    # For x < 0: numerator = exp(x) = exp(-|x|), so sigmoid = exp(-|x|)/(1 + exp(-|x|))
+    numerator = tl.where(x >= 0, 1.0, exp_neg_abs_x)
+    sigmoid_x = numerator / denom
+    
+    # Swish: x * sigmoid(x)
+    output = x * sigmoid_x
+    
+    # Store with mask
+    tl.store(output_ptr + offsets, output, mask=mask)
+
+@triton.jit
+def swish_fast_kernel(
+    x_ptr,
+    output_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+    USE_FAST_MATH: tl.constexpr,
+):
+    """Swish activation with optional fast math approximation."""
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    
+    if USE_FAST_MATH:
+        # Fast approximation: x * (0.5 + 0.5 * tanh(x/2))
+        # tanh(x/2) = (exp(x) - 1)/(exp(x) + 1) with numerical stability
+        half_x = x * 0.5
+        # Compute exp(x) with clipping for stability
+        exp_x = tl.exp(tl.where(half_x > 10.0, 10.0, tl.where(half_x < -10.0, -10.0, half_x)))
+        tanh_half_x = (exp_x - 1.0) / (exp_x + 1.0)
+        sigmoid_approx = 0.5 + 0.5 * tanh_half_x
+        output = x * sigmoid_approx
+    else:
+        # Standard stable implementation
+        abs_x = tl.abs(x)
+        exp_neg_abs_x = tl.exp(-abs_x)
+        denom = 1.0 + exp_neg_abs_x
+        numerator = tl.where(x >= 0, 1.0, exp_neg_abs_x)
+        sigmoid_x = numerator / denom
+        output = x * sigmoid_x
+    
+    tl.store(output_ptr + offsets, output, mask=mask)
+
+def triton_swish(x: torch.Tensor, fast_math: bool = False) -> torch.Tensor:
+    """Triton-optimized Swish activation."""
+    output = torch.empty_like(x)
+    n_elements = output.numel()
+    
+    # Choose optimal block size based on input size
+    if n_elements <= 4096:
+        BLOCK_SIZE = 128
+    elif n_elements <= 65536:
+        BLOCK_SIZE = 256
+    elif n_elements <= 262144:
+        BLOCK_SIZE = 512
+    else:
+        BLOCK_SIZE = 1024  # Max threads per block
+    
+    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
+    
+    if fast_math:
+        swish_fast_kernel[grid](x, output, n_elements, 
+                               BLOCK_SIZE=BLOCK_SIZE, USE_FAST_MATH=True)
+    else:
+        swish_kernel[grid](x, output, n_elements, BLOCK_SIZE=BLOCK_SIZE)
+    
+    return output
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs Swish activation using Triton kernels.
+    """
+    def __init__(self, use_fast_math: bool = False):
+        super(ModelNew, self).__init__()
+        self.use_fast_math = use_fast_math
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies Swish activation using optimized Triton kernel.
+        
+        Args:
+            x (torch.Tensor): Input tensor of any shape.
+            
+        Returns:
+            torch.Tensor: Output tensor with Swish applied, same shape as input.
+        """
+        # Reshape to 1D for kernel processing if not already contiguous
+        if not x.is_contiguous():
+            x = x.contiguous()
+        
+        return triton_swish(x, self.use_fast_math)
+```
+
+[NCU PROFILING METRICS]
+{
+  "swish_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 5.59,
+    "launch__grid_size": 1572864,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 81.66,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 92.92,
+    "lts__t_sector_hit_rate.pct": 50.0
+  }
+}
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

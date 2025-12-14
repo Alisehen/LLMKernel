@@ -1,0 +1,188 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU
+GPU Name: 4090
+Architecture: Ada Lovelace
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+[OPTIMIZATION STAGE]
+
+## Current Optimization Stage
+
+Focus: Memory efficiency & latency hiding.
+
+Metrics:
+- dram__throughput.avg.pct_of_peak_sustained_elapsed
+- lts__t_sector_hit_rate.pct
+- smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct (<20%)
+
+Rules:
+- Increase num_stages only if memory stalls are high
+- Do not rewrite access patterns without metric evidence
+- Larger BLOCK_K improves reuse but increases register pressure
+
+Autotune:
+- If unsure, try num_stages ∈ {1,2,3} on kernel
+
+
+
+[CURRENT CODE]
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE_SPATIAL': 256}, num_warps=8),
+        triton.Config({'BLOCK_SIZE_SPATIAL': 512}, num_warps=16),
+        triton.Config({'BLOCK_SIZE_SPATIAL': 1024}, num_warps=32),
+    ],
+    key=['spatial_size'],
+)
+@triton.jit
+def bias_add_kernel_2d(
+    input_ptr,
+    bias_ptr,
+    output_ptr,
+    batch_size,
+    channels,
+    spatial_size,
+    BLOCK_SIZE_SPATIAL: tl.constexpr,
+):
+    """
+    Optimized 2D kernel for bias addition.
+    
+    Grid dimensions:
+    - pid_bc: flattened batch * channels index
+    - pid_spatial: spatial block index
+    
+    Each thread block processes a contiguous spatial block for a specific
+    (batch, channel) pair, enabling better memory coalescing.
+    """
+    pid_bc = tl.program_id(axis=0)
+    pid_spatial = tl.program_id(axis=1)
+    
+    # Reconstruct batch and channel indices
+    batch_idx = pid_bc // channels
+    channel_idx = pid_bc % channels
+    
+    # Spatial indices for this block
+    spatial_offsets = pid_spatial * BLOCK_SIZE_SPATIAL + tl.arange(0, BLOCK_SIZE_SPATIAL)
+    spatial_mask = spatial_offsets < spatial_size
+    
+    # Base pointer for this (batch, channel) pair
+    base_offset = (batch_idx * channels + channel_idx) * spatial_size
+    input_block_ptr = input_ptr + base_offset
+    output_block_ptr = output_ptr + base_offset
+    
+    # Load bias for this channel (single value, broadcast)
+    bias = tl.load(bias_ptr + channel_idx)
+    
+    # Load input block, add bias, and store
+    input_vals = tl.load(input_block_ptr + spatial_offsets, mask=spatial_mask, other=0.0)
+    output_vals = input_vals + bias
+    tl.store(output_block_ptr + spatial_offsets, output_vals, mask=spatial_mask)
+
+
+def triton_bias_add_optimized(input_tensor: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    Optimized wrapper function for bias addition.
+    
+    Args:
+        input_tensor: Shape [batch, channels, height, width]
+        bias: Shape [channels, 1, 1]
+    
+    Returns:
+        Tensor with same shape as input_tensor
+    """
+    # Ensure tensors are contiguous
+    input_tensor = input_tensor.contiguous()
+    bias = bias.contiguous()
+    
+    # Get dimensions
+    batch_size, channels, height, width = input_tensor.shape
+    spatial_size = height * width
+    
+    # Reshape bias to 1D
+    bias_1d = bias.view(channels)
+    
+    # Allocate output
+    output = torch.empty_like(input_tensor)
+    
+    # Grid configuration
+    grid = lambda META: (
+        batch_size * channels,  # flattened batch*channel dimension
+        triton.cdiv(spatial_size, META['BLOCK_SIZE_SPATIAL']),
+    )
+    
+    # Launch optimized kernel
+    bias_add_kernel_2d[grid](
+        input_tensor,
+        bias_1d,
+        output,
+        batch_size,
+        channels,
+        spatial_size,
+    )
+    
+    return output
+
+
+class ModelNew(nn.Module):
+    """
+    Simple model that performs a convolution, applies ReLU, and adds a bias term.
+    Uses optimized 2D Triton kernel for bias addition.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, bias_shape):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = torch.relu(x)
+        # Use optimized Triton kernel for bias addition
+        x = triton_bias_add_optimized(x, self.bias)
+        return x
+```
+
+[NCU PROFILING METRICS]
+{
+  "bias_add_kernel_2d": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 12.23,
+    "launch__grid_size": 1032192,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 77.74,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 81.98,
+    "lts__t_sector_hit_rate.pct": 52.3
+  }
+}
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

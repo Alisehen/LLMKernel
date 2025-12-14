@@ -1,0 +1,133 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU
+GPU Name: 4090
+Architecture: Ada Lovelace
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+[OPTIMIZATION STAGE]
+
+## Current Optimization Stage
+
+**Focus**: Optimize grid layout and parallel work distribution.
+
+**NCU Metrics to Check**:
+• `sm__throughput.avg.pct_of_peak_sustained_elapsed`: Overall SM utilization (target: >60%)
+• `launch__grid_size`: Total number of blocks (controlled by BLOCK_M/N)
+
+**Guidelines**:
+- 2D outputs → 2D grid `(cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))`; 1D ops → 1D grid
+- 3D outputs (e.g., batch×M×N) → 3D grid `(batch, cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))`
+- 4D+ outputs → **flatten** to 3D: `(batch*dim1, dim2, dim3)` or `(cdiv(batch*dim1, BLOCK), dim2, dim3)`
+- Prefer adding parallelism via batch/head/expert dims before reducing BLOCK sizes
+- Only change grid if SM utilization is clearly low; otherwise keep original
+- Always verify `grid = (...)` matches kernel indexing logic
+
+**Important Safety Rule**:
+If unsure about grid mapping, do **not** modify it. Never use more than 3 dimensions!
+
+**Autotune Tip (safe)**:
+Try 2–3 small grid variants using minimal `@autotune` on **kernel function only**.
+
+
+
+[CURRENT CODE]
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def elu_kernel(
+    x_ptr,
+    output_ptr,
+    alpha_val,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+
+    x = tl.load(x_ptr + offsets, mask=mask)
+    
+    # ELU: x if x > 0 else alpha * (exp(x) - 1)
+    exp_x = tl.exp(x)
+    elu_x = tl.where(x > 0, x, alpha_val * (exp_x - 1.0))
+    
+    tl.store(output_ptr + offsets, elu_x, mask=mask)
+
+
+def triton_elu(x: torch.Tensor, alpha: float = 1.0) -> torch.Tensor:
+    output = torch.empty_like(x)
+    n_elements = output.numel()
+    
+    # Heuristic for optimal block size based on tensor size
+    if n_elements < 8192:
+        BLOCK_SIZE = 128
+    elif n_elements < 65536:
+        BLOCK_SIZE = 256
+    elif n_elements < 1048576:
+        BLOCK_SIZE = 512
+    else:
+        BLOCK_SIZE = 1024
+    
+    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
+    
+    # Convert alpha to the same dtype as x for kernel
+    alpha_val = torch.tensor(alpha, dtype=x.dtype, device=x.device).item()
+    
+    elu_kernel[grid](x, output, alpha_val, n_elements, BLOCK_SIZE=BLOCK_SIZE)
+    
+    return output
+
+
+class ModelNew(nn.Module):
+    def __init__(self, alpha: float = 1.0):
+        super().__init__()
+        self.alpha = alpha
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_elu(x, alpha=self.alpha)
+```
+
+[NCU PROFILING METRICS]
+{
+  "elu_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 3.47,
+    "launch__grid_size": 1572864,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 81.8,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 92.5,
+    "lts__t_sector_hit_rate.pct": 50.0
+  }
+}
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

@@ -1,0 +1,133 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 1024, 'num_warps': 8, 'num_stages': 3}),
+        triton.Config({'BLOCK_SIZE': 1024, 'num_warps': 4, 'num_stages': 4}),
+        triton.Config({'BLOCK_SIZE': 1024, 'num_warps': 16, 'num_stages': 2}),
+        triton.Config({'BLOCK_SIZE': 512, 'num_warps': 8, 'num_stages': 3}),
+        triton.Config({'BLOCK_SIZE': 512, 'num_warps': 4, 'num_stages': 4}),
+        triton.Config({'BLOCK_SIZE': 512, 'num_warps': 16, 'num_stages': 2}),
+        triton.Config({'BLOCK_SIZE': 256, 'num_warps': 8, 'num_stages': 3}),
+        triton.Config({'BLOCK_SIZE': 256, 'num_warps': 4, 'num_stages': 4}),
+        triton.Config({'BLOCK_SIZE': 256, 'num_warps': 16, 'num_stages': 2}),
+    ],
+    key=['n_elements'],
+)
+@triton.jit
+def smooth_l1_loss_kernel(
+    predictions_ptr,
+    targets_ptr,
+    output_ptr,
+    n_elements,
+    beta: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+
+    preds = tl.load(predictions_ptr + offsets, mask=mask)
+    targets = tl.load(targets_ptr + offsets, mask=mask)
+    
+    diff = preds - targets
+    abs_diff = tl.abs(diff)
+    
+    # Smooth L1 Loss: 0.5 * x^2 / beta if |x| < beta else |x| - 0.5 * beta
+    is_small = abs_diff < beta
+    smooth_loss = 0.5 * diff * diff / beta
+    linear_loss = abs_diff - 0.5 * beta
+    
+    loss = tl.where(is_small, smooth_loss, linear_loss)
+    loss = tl.where(mask, loss, 0.0)
+    
+    # Efficient tree reduction within block
+    block_sum = tl.sum(loss, axis=0)
+    
+    # Store block sum to global memory for final reduction
+    partial_sum_ptr = output_ptr + pid
+    tl.store(partial_sum_ptr, block_sum)
+
+@triton.jit
+def smooth_l1_loss_final_kernel(
+    partial_sum_ptr,
+    n_elements,
+    num_partials,
+    output_ptr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < num_partials
+    
+    # Load partial sums
+    partials = tl.load(partial_sum_ptr + offsets, mask=mask, other=0.0)
+    
+    # Reduce partial sums to total sum
+    total_sum = tl.sum(partials, axis=0)
+    
+    # Only first thread writes final result
+    if pid == 0:
+        # Avoid division by zero
+        n_elements_val = tl.where(n_elements > 0, n_elements, 1)
+        final_loss = total_sum / n_elements_val
+        tl.store(output_ptr, final_loss)
+
+def triton_smooth_l1_loss(predictions: torch.Tensor, targets: torch.Tensor, beta: float = 1.0) -> torch.Tensor:
+    assert predictions.shape == targets.shape, "Predictions and targets must have same shape"
+    
+    # Ensure tensors are contiguous
+    predictions = predictions.contiguous()
+    targets = targets.contiguous()
+    
+    n_elements = predictions.numel()
+    
+    # Allocate output tensors on the same device
+    device = predictions.device
+    dtype = predictions.dtype
+    
+    # Calculate grid size for first phase using lambda to access config
+    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
+    
+    # Allocate partial sums array
+    partial_sums = torch.empty(grid({'BLOCK_SIZE': 1024})[0], device=device, dtype=dtype)
+    output = torch.zeros(1, device=device, dtype=dtype)
+    
+    # Phase 1: Compute partial sums with autotuned kernel
+    smooth_l1_loss_kernel[grid](
+        predictions,
+        targets,
+        partial_sums,
+        n_elements,
+        beta=beta,
+    )
+    
+    # Phase 2: Final reduction and division
+    num_partials = partial_sums.shape[0]
+    final_grid = (triton.cdiv(num_partials, 1024),)
+    
+    smooth_l1_loss_final_kernel[final_grid](
+        partial_sums,
+        n_elements,
+        num_partials,
+        output,
+        BLOCK_SIZE=1024,
+    )
+    
+    return output
+
+class ModelNew(nn.Module):
+    """
+    A model that computes Smooth L1 (Huber) Loss for regression tasks.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+
+    def forward(self, predictions, targets):
+        return triton_smooth_l1_loss(predictions, targets)
+```

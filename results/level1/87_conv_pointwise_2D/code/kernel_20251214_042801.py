@@ -1,0 +1,212 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def conv1x1_fwd_kernel(
+    x_ptr,  # *[N, C_in, H, W]
+    w_ptr,  # *[C_out, C_in, 1, 1]
+    b_ptr,  # *[C_out] (ignored if HAS_BIAS == False)
+    y_ptr,  # *[N, C_out, H, W]
+    N, C_in, H, W, C_out,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_wn, stride_wc,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    BLOCK_M: tl.constexpr,  # tile over M = N * H * W
+    BLOCK_N: tl.constexpr,  # tile over C_out
+    BLOCK_K: tl.constexpr,  # tile over C_in (reduction)
+    HAS_BIAS: tl.constexpr,
+):
+    # Program IDs for 2D launch grid
+    pid_m = tl.program_id(axis=0)  # along M (N*H*W)
+    pid_n = tl.program_id(axis=1)  # along C_out
+
+    # Offsets
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # [BM]
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # [BN]
+
+    M = N * H * W
+    mask_m = offs_m < M
+    mask_n = offs_n < C_out
+
+    # Decode flat M index -> (n_idx, oh, ow)
+    ohw = H * W
+    n_idx = offs_m // ohw
+    hw_idx = offs_m % ohw
+    oh = hw_idx // W
+    ow = hw_idx % W
+
+    # Shape them for broadcast: [BM, 1] / [1, BN]
+    n_idx = n_idx[:, None]
+    oh = oh[:, None]
+    ow = ow[:, None]
+    offs_n_b = offs_n[None, :]
+
+    # Accumulator in FP32 for better accuracy
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Loop over input channels (reduction dimension)
+    for k0 in range(0, C_in, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)  # [BK]
+        mask_k = offs_k < C_in
+
+        offs_k_col = offs_k[None, :]   # [1, BK]  (for x, varying across columns)
+        offs_k_row = offs_k[:, None]   # [BK, 1]  (for w, varying across rows)
+
+        # x[n_idx, offs_k, oh, ow] -> [BM, BK]
+        ptrs_x = (
+            x_ptr
+            + n_idx * stride_xn
+            + oh * stride_xh
+            + ow * stride_xw
+            + offs_k_col * stride_xc
+        )
+
+        # w[offs_n, offs_k] -> [BK, BN]
+        ptrs_w = (
+            w_ptr
+            + offs_n_b * stride_wn
+            + offs_k_row * stride_wc
+        )
+
+        mask_x = mask_m[:, None] & mask_k[None, :]
+        mask_w = mask_k[:, None] & mask_n[None, :]
+
+        a = tl.load(ptrs_x, mask=mask_x, other=0.0)
+        b = tl.load(ptrs_w, mask=mask_w, other=0.0)
+
+        # GEMM: [BM, BK] x [BK, BN] -> [BM, BN]
+        acc += tl.dot(a, b)
+
+    # Optional bias add: y += bias[cout]
+    if HAS_BIAS:
+        bias_vals = tl.load(b_ptr + offs_n, mask=mask_n, other=0.0)
+        bias_vals = bias_vals.to(tl.float32)
+        acc += bias_vals[None, :]
+
+    # Store to y[n_idx, offs_n, oh, ow]
+    ptrs_y = (
+        y_ptr
+        + n_idx * stride_yn
+        + offs_n_b * stride_yc
+        + oh * stride_yh
+        + ow * stride_yw
+    )
+    mask_y = mask_m[:, None] & mask_n[None, :]
+    tl.store(ptrs_y, acc, mask=mask_y)
+
+
+def triton_pointwise_conv2d_1x1(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """
+    Pointwise 1x1 Conv2d implemented as a fused GEMM over (N*H*W, C_in) x (C_in, C_out).
+
+    x:      [N, C_in, H, W]  (CUDA tensor)
+    weight: [C_out, C_in, 1, 1] (CUDA tensor)
+    bias:   [C_out] or None
+    """
+    assert x.is_cuda, "Input must be on CUDA for Triton kernel."
+    assert weight.is_cuda, "Weight must be on CUDA for Triton kernel."
+    assert x.ndim == 4
+    assert weight.ndim == 4
+    N, C_in, H, W = x.shape
+    C_out = weight.shape[0]
+    assert weight.shape[1] == C_in
+    assert weight.shape[2] == 1 and weight.shape[3] == 1
+
+    # Try to mitigate fragmentation-related OOM by clearing unused cached blocks
+    # before allocating a very large output buffer.
+    try:
+        y = torch.empty((N, C_out, H, W), device=x.device, dtype=x.dtype)
+    except RuntimeError as e:
+        # If OOM, clear cache once and retry allocation
+        if "out of memory" in str(e):
+            torch.cuda.empty_cache()
+            y = torch.empty((N, C_out, H, W), device=x.device, dtype=x.dtype)
+        else:
+            raise
+
+    M = N * H * W
+
+    # Tile sizes tuned for typical large conv1x1 workloads
+    BLOCK_M = 128
+    BLOCK_N = 128
+    BLOCK_K = 32
+
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_M"]),
+        triton.cdiv(C_out, META["BLOCK_N"]),
+    )
+
+    has_bias = bias is not None
+    # Dummy pointer if no bias; it's never dereferenced when HAS_BIAS=False
+    b_ptr = bias if has_bias else x
+
+    conv1x1_fwd_kernel[grid](
+        x,
+        weight,
+        b_ptr,
+        y,
+        N,
+        C_in,
+        H,
+        W,
+        C_out,
+        x.stride(0),
+        x.stride(1),
+        x.stride(2),
+        x.stride(3),
+        weight.stride(0),
+        weight.stride(1),
+        y.stride(0),
+        y.stride(1),
+        y.stride(2),
+        y.stride(3),
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        HAS_BIAS=has_bias,
+        num_warps=8,
+        num_stages=2,
+    )
+
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-accelerated pointwise 1x1 Conv2d replacement.
+
+    Args:
+        in_channels (int): Number of channels in the input tensor.
+        out_channels (int): Number of channels produced by the convolution.
+        bias (bool, optional): If True, includes a learnable bias. Defaults to False.
+    """
+
+    def __init__(self, in_channels: int, out_channels: int, bias: bool = False):
+        super().__init__()
+        # Use nn.Conv2d to manage parameters (weights & bias)
+        self.conv = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+            bias=bias,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: [batch_size, in_channels, height, width]
+        Returns: [batch_size, out_channels, height, width]
+        """
+        # Fallback to PyTorch implementation on CPU
+        if not x.is_cuda:
+            return self.conv(x)
+
+        return triton_pointwise_conv2d_1x1(x, self.conv.weight, self.conv.bias)

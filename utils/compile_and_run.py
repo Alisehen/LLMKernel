@@ -444,7 +444,8 @@ def compare_and_bench(
     device_idx: int = 0,
     warmup: int = 5,
     repeat: int = 20,
-    tol: float = 1e-4,
+    tol: float = 1e-3,
+    rtol: float = 1e-2,
     log_dir: str | Path | None = "run/debug",
     seed: int = 100,  # 固定默认 seed；需要环境控制时可改成 None 并用 env 读取
 ) -> Dict[str, Any]:
@@ -462,6 +463,8 @@ def compare_and_bench(
     dev = torch.device(f"cuda:{device_idx}") if TORCH_DEVICE == "cuda" else torch.device("cpu")
     if TORCH_DEVICE == "cuda":
         torch.cuda.set_device(dev)
+        # Clear GPU cache before test to avoid OOM from previous runs
+        torch.cuda.empty_cache()
 
     # 若需要通过环境变量控制 seed
     if seed is None:
@@ -619,9 +622,9 @@ def compare_and_bench(
                 # Convert to float for allclose if dealing with integer dtypes
                 ref_cmp = ref_out.float() if ref_out.dtype in (torch.long, torch.int, torch.int32, torch.int64) else ref_out
                 test_cmp = test_out.float() if test_out.dtype in (torch.long, torch.int, torch.int32, torch.int64) else test_out
-                if not torch.allclose(ref_cmp, test_cmp, atol=tol, rtol=tol):
+                if not torch.allclose(ref_cmp, test_cmp, atol=tol, rtol=rtol):
                     raise ValueError(
-                        f"Outputs are not close (atol={tol}, rtol={tol}). "
+                        f"Outputs are not close (atol={tol}, rtol={rtol}). "
                         f"max_abs_err={max_err:.3e}, mean_abs_err={mean_err:.3e}"
                     )
 

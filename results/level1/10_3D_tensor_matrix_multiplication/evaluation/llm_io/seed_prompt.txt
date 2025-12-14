@@ -1,0 +1,146 @@
+
+Write high-performance Triton kernels to replace PyTorch operators. Generate the FASTEST kernel while maintaining correctness.
+
+**Triton Essentials**:
+- Use `tl.program_id()` for block indices, `tl.arange()` for element indices
+- Work with blocks of data (NOT individual threads like CUDA)
+- Triton auto-manages shared memory and sync (NO manual __shared__ or syncthreads)
+
+**Critical Constraints** (违反会导致编译错误):
+- **BLOCK_SIZE must be power of 2**: All BLOCK_* parameters (BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_SIZE, etc.) must be powers of 2: 16, 32, 64, 128, 256, 512, 1024
+- tl.arange() requires power-of-2 range: tl.arange(0, BLOCK_SIZE) will fail if BLOCK_SIZE is not a power of 2
+- tl.reshape() requires compile-time constant shapes (use tensor.reshape(-1) instead)
+- tl.load/store: if pointer is scalar, value must be scalar; if pointer is block, value must be block
+- No tl.tanh() - use tl.exp() to implement: (e^{2x}-1)/(e^{2x}+1)
+- Type conversions: use .to(tl.float32), NOT tl.float32()
+- Always use constexpr for BLOCK sizes in function signatures
+
+**Output Format**:
+1. Imports → 2. @triton.jit kernels → 3. Wrapper functions → 4. class ModelNew
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+Example PyTorch:
+'''
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class Model(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, a, b):
+        return a + b
+
+
+def get_inputs():
+    # randomly generate input tensors based on the model architecture
+    a = torch.randn(1, 128).cuda()
+    b = torch.randn(1, 128).cuda()
+    return [a, b]
+
+
+def get_init_inputs():
+    # randomly generate tensors required for initialization based on the model architecture
+    return []
+'''
+Example Triton:
+'''
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def add_kernel(
+    x_ptr,
+    y_ptr,
+    output_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+
+    x = tl.load(x_ptr + offsets, mask=mask)
+    y = tl.load(y_ptr + offsets, mask=mask)
+
+    output = x + y
+    tl.store(output_ptr + offsets, output, mask=mask)
+
+def triton_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    output = torch.empty_like(x)
+    n_elements = output.numel()
+    BLOCK_SIZE = 1024
+    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
+    add_kernel[grid](x, y, output, n_elements, BLOCK_SIZE=BLOCK_SIZE)
+
+    return output
+
+class ModelNew(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, a, b):
+        return triton_add(a, b)
+'''
+
+Hardware architecture:
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+Target:
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Performs 3D tensor-matrix multiplication.
+    """
+    def __init__(self):
+        super(Model, self).__init__()
+    
+    def forward(self, A, B):
+        """
+        Performs 3D tensor-matrix multiplication.
+
+        Args:
+            A (torch.Tensor): Input 3D tensor of shape (N, M, K).
+            B (torch.Tensor): Input matrix of shape (K, L).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (N, M, L), resulting from the multiplication of A and B along the last dimension of A.
+        """
+        return torch.matmul(A, B)
+
+N = 16
+M = 1024
+K = 2048
+L = 768
+
+def get_inputs():
+    A = torch.rand(N, M, K)
+    B = torch.rand(K, L)
+    return [A, B]
+
+def get_init_inputs():
+    return []  # No special initialization inputs needed
+```
+
+Generate the fastest Triton implementation as ModelNew.

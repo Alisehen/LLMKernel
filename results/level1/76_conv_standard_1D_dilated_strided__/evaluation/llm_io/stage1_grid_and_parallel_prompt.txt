@@ -1,0 +1,317 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU
+GPU Name: 4090
+Architecture: Ada Lovelace
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+
+
+[OPTIMIZATION STAGE]
+
+## Current Optimization Stage
+
+Focus: Grid layout & parallelism.
+
+**Special Consideration for Transposed Convolution**:
+⚠️ For ConvTranspose operations:
+- Do NOT use naive output-only parallelism (can cause write conflicts if multiple inputs map to same output)
+- Recommended grid: (batch * out_spatial, out_channels // groups, groups)
+  * Example 3D: grid=(N * OD * OH * OW // BLOCK, C_out // groups, groups)
+- Each thread should compute a unique subset of output elements
+- If using scatter pattern, ensure no overlapping writes OR use atomic operations
+
+Metrics:
+- sm__throughput.avg.pct_of_peak_sustained_elapsed (>60%)
+- launch__grid_size
+
+Rules:
+- 1D: (cdiv(N, BLOCK))
+- 2D: (cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))
+- 3D: (batch, cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))
+- >3D: flatten ONLY independent dims
+- Prefer batch / head / expert / group parallelism before shrinking BLOCK
+- For grouped operations: ensure group dimension is in grid (e.g., program_id(2) for groups)
+- Change grid only if SM utilization is clearly low
+
+Safety:
+- Max 3 grid dims, static rank
+- grid=(G0,G1,G2) must match tl.program_id(0/1/2)
+- For grouped ops: verify group indexing is correct
+- If unsure about correctness, do NOT change grid
+
+Autotune:
+- Autotune either BLOCK_* OR (num_warps, num_stages)
+- If autotuning BLOCK_*, use grid=lambda META: (...)
+- Never redefine BLOCK_* in both kernel and launch
+
+
+
+[CURRENT CODE]
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def conv1d_fwd_kernel(
+    x_ptr,  # (N, Cin, L_in)
+    w_ptr,  # (Cout, Cin, K)
+    b_ptr,  # (Cout,) or dummy
+    y_ptr,  # (N, Cout, L_out)
+    N,      # batch size
+    L_in,   # input length
+    L_out,  # output length
+    stride,
+    dilation,
+    x_bs, x_cs, x_ls,
+    w_os, w_cs, w_ks,
+    y_bs, y_cs, y_ls,
+    has_bias,
+    Cin: tl.constexpr,
+    Cout: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """
+    Implicit GEMM 1D convolution: treats output as (M = N*L_out, Cout),
+    reduction dimension Ktot = Cin * K.
+    """
+
+    # Total rows (output positions over batch & length)
+    M = N * L_out
+    Ktot = Cin * K
+
+    pid_m = tl.program_id(axis=0)  # tile over M dimension
+    pid_n = tl.program_id(axis=1)  # tile over Cout dimension
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # [BLOCK_M]
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # [BLOCK_N]
+
+    mask_m = offs_m < M
+    mask_n = offs_n < Cout
+
+    # Decode offs_m → (n, l_out)
+    n_idx = offs_m // L_out           # [BLOCK_M]
+    l_out_idx = offs_m % L_out        # [BLOCK_M]
+
+    # Accumulator
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Reduction over Ktot = Cin * K in tiles of BLOCK_K
+    for k0 in range(0, Ktot, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)  # [BLOCK_K]
+        mask_k = offs_k < Ktot
+
+        ci = offs_k // K  # input channel index, [BLOCK_K]
+        kw = offs_k % K   # kernel position,      [BLOCK_K]
+
+        # Broadcast indices
+        n_b = n_idx[:, None]          # [BM, 1]
+        l_out_b = l_out_idx[:, None]  # [BM, 1]
+        ci_row = ci[None, :]          # [1, BK]
+        kw_row = kw[None, :]          # [1, BK]
+
+        # Compute input positions l_in = l_out*stride + kw*dilation
+        l_in = l_out_b * stride + kw_row * dilation  # [BM, BK]
+
+        # Bounds mask for input
+        in_bounds = (l_in >= 0) & (l_in < L_in)
+        in_mask = (mask_m[:, None]) & (mask_k[None, :]) & in_bounds  # [BM, BK]
+
+        # Input pointers: x[n, ci, l_in]
+        x_ptrs = (
+            x_ptr
+            + n_b * x_bs
+            + ci_row * x_cs
+            + l_in * x_ls
+        )
+        x_tile = tl.load(x_ptrs, mask=in_mask, other=0.0)  # [BM, BK]
+
+        # Weight pointers: w[co, ci, kw]
+        ci_col = ci[:, None]  # [BK, 1]
+        kw_col = kw[:, None]  # [BK, 1]
+        w_ptrs = (
+            w_ptr
+            + offs_n[None, :] * w_os
+            + ci_col * w_cs
+            + kw_col * w_ks
+        )  # [BK, BN]
+        w_mask = (mask_k[:, None]) & (mask_n[None, :])
+        w_tile = tl.load(w_ptrs, mask=w_mask, other=0.0)  # [BK, BN]
+
+        # GEMM accumulation
+        acc += tl.dot(x_tile, w_tile)  # [BM, BN]
+
+    # Add bias if present
+    if has_bias != 0:
+        bias_vals = tl.load(b_ptr + offs_n, mask=mask_n, other=0.0)  # [BN]
+        acc = acc + bias_vals[None, :]  # broadcast add
+
+    # Store output: y[n, co, l_out]
+    n_b = n_idx[:, None]         # [BM, 1]
+    l_out_b = l_out_idx[:, None] # [BM, 1]
+    y_ptrs = (
+        y_ptr
+        + n_b * y_bs
+        + offs_n[None, :] * y_cs
+        + l_out_b * y_ls
+    )
+    out_mask = (mask_m[:, None]) & (mask_n[None, :])
+    tl.store(y_ptrs, acc, mask=out_mask)
+
+
+def conv1d_triton(x: torch.Tensor,
+                  weight: torch.Tensor,
+                  bias: torch.Tensor,
+                  stride: int,
+                  dilation: int) -> torch.Tensor:
+    """
+    x:      (N, Cin, L_in)
+    weight: (Cout, Cin, K)
+    bias:   (Cout,) or None
+    """
+    # CPU fallback for safety
+    if not x.is_cuda:
+        return torch.nn.functional.conv1d(
+            x, weight, bias, stride=stride, dilation=dilation
+        )
+
+    assert x.ndim == 3
+    assert weight.ndim == 3
+    N, Cin, L_in = x.shape
+    Cout, Cin_w, K = weight.shape
+    assert Cin == Cin_w
+
+    padding = 0
+    L_out = (L_in + 2 * padding - dilation * (K - 1) - 1) // stride + 1
+    assert L_out > 0
+
+    x_ = x.contiguous()
+    w_ = weight.contiguous()
+
+    y = torch.empty((N, Cout, L_out), device=x.device, dtype=x.dtype)
+
+    x_bs, x_cs, x_ls = x_.stride()  # (N, Cin, L_in)
+    w_os, w_cs, w_ks = w_.stride()  # (Cout, Cin, K)
+    y_bs, y_cs, y_ls = y.stride()   # (N, Cout, L_out)
+
+    has_bias = 1 if bias is not None else 0
+    if bias is not None:
+        b_ = bias.contiguous()
+    else:
+        # Dummy tensor; won't be read when has_bias == 0
+        b_ = torch.empty(1, device=x.device, dtype=x.dtype)
+
+    # Tile sizes (powers of 2, constexpr)
+    BLOCK_M = 64  # rows over N*L_out
+    BLOCK_N = 64  # output channels
+    BLOCK_K = 32  # reduction over Cin*K
+
+    M = N * L_out
+
+    grid = lambda meta: (
+        triton.cdiv(M, meta["BLOCK_M"]),
+        triton.cdiv(Cout, meta["BLOCK_N"]),
+    )
+
+    conv1d_fwd_kernel[grid](
+        x_, w_, b_, y,
+        N, L_in, L_out,
+        stride, dilation,
+        x_bs, x_cs, x_ls,
+        w_os, w_cs, w_ks,
+        y_bs, y_cs, y_ls,
+        has_bias,
+        Cin=Cin,
+        Cout=Cout,
+        K=K,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        num_warps=4,
+        num_stages=2,
+    )
+
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-accelerated replacement for the given Conv1d-based model.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        stride: int = 1,
+        dilation: int = 1,
+        bias: bool = False,
+    ) -> None:
+        super().__init__()
+        # Use PyTorch to manage parameters; bypass its forward with our Triton kernel
+        self.conv1d = nn.Conv1d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            dilation=dilation,
+            bias=bias,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # CPU / non-CUDA fallback
+        if not x.is_cuda:
+            return self.conv1d(x)
+
+        weight = self.conv1d.weight
+        bias = self.conv1d.bias
+        stride = self.conv1d.stride[0]
+        dilation = self.conv1d.dilation[0]
+
+        return conv1d_triton(x, weight, bias, stride, dilation)
+```
+
+[NCU PROFILING METRICS]
+{
+  "conv1d_fwd_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 23.15,
+    "launch__grid_size": 149516,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 16.54,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 94.85,
+    "lts__t_sector_hit_rate.pct": 58.73
+  }
+}
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

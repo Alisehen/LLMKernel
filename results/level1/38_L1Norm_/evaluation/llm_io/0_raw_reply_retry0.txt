@@ -1,0 +1,239 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def l1_norm_kernel(
+    x_ptr,
+    output_ptr,
+    stride_x0, stride_x1,
+    stride_out0, stride_out1,
+    B, D,
+    BLOCK_SIZE_D: tl.constexpr,
+    D_POW2: tl.constexpr,
+):
+    """
+    Fused L1 normalization kernel that computes absolute mean along dim=1 and divides.
+    Optimized for 2D tensors (B, D) where D is large.
+    """
+    # Parallelize over rows (batch dimension)
+    pid_b = tl.program_id(axis=0)
+    
+    # Each block processes BLOCK_SIZE_D columns from one row
+    offsets_d = tl.arange(0, BLOCK_SIZE_D)
+    mask_d = offsets_d < D
+    
+    # Base pointer for this row
+    row_ptr = x_ptr + pid_b * stride_x0
+    out_row_ptr = output_ptr + pid_b * stride_out0
+    
+    # Load block of data from this row
+    x_block = tl.load(row_ptr + offsets_d * stride_x1, mask=mask_d, other=0.0)
+    
+    # Compute absolute values
+    x_abs = tl.abs(x_block)
+    
+    # Parallel reduction for sum of absolute values
+    # Using multiple reductions with tree reduction pattern
+    sum_abs = tl.sum(x_abs, axis=0)
+    
+    # Handle remainder elements with reduction across warps
+    # Use tl.reduce to get final sum for this block
+    # For large D, we need to process multiple blocks per row
+    if BLOCK_SIZE_D < D:
+        # Use shared memory-like pattern with program-local reduction
+        # Store partial sums and do final reduction across blocks
+        # This requires launching with 2D grid
+        pid_d = tl.program_id(axis=1)
+        num_blocks_d = tl.cdiv(D, BLOCK_SIZE_D)
+        
+        # Create tensor for storing partial sums
+        # We'll use atomic add for final reduction
+        # First compute local sum
+        local_sum = tl.sum(x_abs)
+        
+        # Store to global memory for final reduction
+        # Use program_id to compute unique storage location
+        # We'll accumulate in a temporary buffer
+        tmp_buffer_ptr = output_ptr + B * D  # Reuse output memory for temp storage
+        tmp_idx = pid_b * num_blocks_d + pid_d
+        tl.store(tmp_buffer_ptr + tmp_idx, local_sum)
+        
+        # Synchronization point - wait for all blocks to finish
+        tl.device_assert(False, "Need to synchronize before final reduction")
+        # Note: In actual code, we would need two kernels or use atomic operations
+        # For simplicity, we'll implement the simple case where BLOCK_SIZE_D >= D
+    else:
+        # Simple case: one block processes entire row
+        # Compute mean from sum
+        mean_abs = sum_abs / D
+        
+        # Normalize and store
+        output = tl.where(mask_d, x_block / mean_abs, 0.0)
+        tl.store(out_row_ptr + offsets_d * stride_out1, output, mask=mask_d)
+
+@triton.jit
+def l1_norm_2pass_kernel(
+    x_ptr,
+    output_ptr,
+    temp_sum_ptr,  # Temporary buffer for sums (B,)
+    stride_x0, stride_x1,
+    stride_out0, stride_out1,
+    B, D,
+    BLOCK_SIZE_D: tl.constexpr,
+):
+    """
+    Two-pass L1 normalization optimized for large D.
+    First pass: Compute sum of absolute values per row
+    Second pass: Normalize using computed sums
+    """
+    pid = tl.program_id(axis=0)
+    
+    # First pass: compute sum of absolute values for each row
+    if pid < B:
+        # Process row pid
+        row_ptr = x_ptr + pid * stride_x0
+        sum_abs = 0.0
+        
+        # Process row in chunks
+        for d_start in range(0, D, BLOCK_SIZE_D):
+            offsets = d_start + tl.arange(0, BLOCK_SIZE_D)
+            mask = offsets < D
+            
+            x_chunk = tl.load(row_ptr + offsets * stride_x1, mask=mask, other=0.0)
+            sum_abs += tl.sum(tl.abs(x_chunk), axis=0)
+        
+        # Store row sum
+        tl.store(temp_sum_ptr + pid, sum_abs / D)
+    
+    # Second pass: normalize
+    elif pid < B + tl.cdiv(D, BLOCK_SIZE_D):
+        # Process columns for all rows
+        col_block_idx = pid - B
+        d_start = col_block_idx * BLOCK_SIZE_D
+        offsets = d_start + tl.arange(0, BLOCK_SIZE_D)
+        mask = offsets < D
+        
+        # Process all rows for this column block
+        for b in range(B):
+            row_ptr = x_ptr + b * stride_x0
+            out_row_ptr = output_ptr + b * stride_out0
+            mean_abs = tl.load(temp_sum_ptr + b)
+            
+            x_chunk = tl.load(row_ptr + offsets * stride_x1, mask=mask, other=0.0)
+            normalized = tl.where(mask, x_chunk / mean_abs, 0.0)
+            tl.store(out_row_ptr + offsets * stride_out1, normalized, mask=mask)
+
+@triton.jit
+def l1_norm_fast_kernel(
+    x_ptr,
+    output_ptr,
+    stride_x0, stride_x1,
+    stride_out0, stride_out1,
+    B, D,
+    BLOCK_SIZE_B: tl.constexpr,
+    BLOCK_SIZE_D: tl.constexpr,
+):
+    """
+    Optimized L1 normalization with 2D tiling for better memory access patterns.
+    Each block processes BLOCK_SIZE_B rows and BLOCK_SIZE_D columns.
+    """
+    pid_b = tl.program_id(axis=0)
+    pid_d = tl.program_id(axis=1)
+    
+    # Compute row and column indices
+    row_start = pid_b * BLOCK_SIZE_B
+    col_start = pid_d * BLOCK_SIZE_D
+    
+    # Create masks
+    row_offsets = row_start + tl.arange(0, BLOCK_SIZE_B)
+    col_offsets = col_start + tl.arange(0, BLOCK_SIZE_D)
+    
+    row_mask = row_offsets < B
+    col_mask = col_offsets < D
+    
+    # Create 2D mask
+    mask = row_mask[:, None] & col_mask[None, :]
+    
+    # Load tile
+    x_ptrs = (
+        x_ptr + 
+        row_offsets[:, None] * stride_x0 + 
+        col_offsets[None, :] * stride_x1
+    )
+    x_tile = tl.load(x_ptrs, mask=mask, other=0.0)
+    
+    # Compute absolute values
+    abs_tile = tl.abs(x_tile)
+    
+    # Reduce along columns to get sum per row
+    # Use tree reduction within the block
+    sum_abs = tl.sum(abs_tile, axis=1)
+    
+    # Normalize tile
+    mean_abs = sum_abs / D
+    normalized_tile = tl.where(mask, x_tile / mean_abs[:, None], 0.0)
+    
+    # Store tile
+    out_ptrs = (
+        output_ptr + 
+        row_offsets[:, None] * stride_out0 + 
+        col_offsets[None, :] * stride_out1
+    )
+    tl.store(out_ptrs, normalized_tile, mask=mask)
+
+def triton_l1_norm(x: torch.Tensor) -> torch.Tensor:
+    """
+    Wrapper function for L1 normalization using Triton kernels.
+    """
+    B, D = x.shape
+    
+    # Prefer fast kernel for optimal performance
+    output = torch.empty_like(x)
+    
+    # Choose block sizes based on input dimensions
+    if B <= 1024 and D <= 1024:
+        # Use simple fused kernel
+        BLOCK_SIZE_D = 1024
+        grid = (B,)
+        l1_norm_kernel[grid](
+            x, output,
+            x.stride(0), x.stride(1),
+            output.stride(0), output.stride(1),
+            B, D,
+            BLOCK_SIZE_D=BLOCK_SIZE_D,
+            D_POW2=1 << (D - 1).bit_length()
+        )
+    else:
+        # Use 2D tiled kernel for better performance
+        BLOCK_SIZE_B = min(128, B)
+        BLOCK_SIZE_D = min(256, D)
+        
+        grid = (
+            triton.cdiv(B, BLOCK_SIZE_B),
+            triton.cdiv(D, BLOCK_SIZE_D)
+        )
+        
+        l1_norm_fast_kernel[grid](
+            x, output,
+            x.stride(0), x.stride(1),
+            output.stride(0), output.stride(1),
+            B, D,
+            BLOCK_SIZE_B=BLOCK_SIZE_B,
+            BLOCK_SIZE_D=BLOCK_SIZE_D
+        )
+    
+    return output
+
+class ModelNew(nn.Module):
+    """
+    Optimized L1 normalization layer using Triton kernels.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_l1_norm(x)
+```

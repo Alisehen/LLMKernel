@@ -1,0 +1,208 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_B': 128, 'BLOCK_D': 256, 'NUM_STAGES': 3}, num_warps=8),
+        triton.Config({'BLOCK_B': 64, 'BLOCK_D': 512, 'NUM_STAGES': 3}, num_warps=8),
+        triton.Config({'BLOCK_B': 256, 'BLOCK_D': 128, 'NUM_STAGES': 2}, num_warps=8),
+        triton.Config({'BLOCK_B': 128, 'BLOCK_D': 512, 'NUM_STAGES': 2}, num_warps=4),
+        triton.Config({'BLOCK_B': 64, 'BLOCK_D': 1024, 'NUM_STAGES': 4}, num_warps=8),
+    ],
+    key=['batch_size', 'dim']
+)
+@triton.jit
+def l2_norm_kernel(
+    x_ptr,
+    norm_ptr,
+    batch_size,
+    dim,
+    stride_x_batch,
+    stride_x_dim,
+    stride_norm_batch,
+    BLOCK_B: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+):
+    """Compute L2 norm by summing squared values across dimension."""
+    pid_batch = tl.program_id(0)
+    pid_dim = tl.program_id(1)
+    
+    batch_start = pid_batch * BLOCK_B
+    dim_start = pid_dim * BLOCK_D
+    
+    batch_offsets = batch_start + tl.arange(0, BLOCK_B)
+    batch_mask = batch_offsets < batch_size
+    
+    local_sum = tl.zeros((BLOCK_B,), dtype=tl.float32)
+    
+    # Process dimension in chunks for better memory access
+    for d_chunk_start in range(0, BLOCK_D, 32):
+        dim_chunk = dim_start + d_chunk_start + tl.arange(0, 32)
+        dim_mask = dim_chunk < dim
+        
+        if tl.sum(dim_mask) > 0:
+            # Create pointers for this chunk
+            x_ptrs = x_ptr + (
+                batch_offsets[:, None] * stride_x_batch +
+                dim_chunk[None, :] * stride_x_dim
+            )
+            
+            # Load with proper masking
+            mask = batch_mask[:, None] & dim_mask[None, :]
+            x_chunk = tl.load(x_ptrs, mask=mask, other=0.0)
+            
+            # Accumulate sum of squares
+            local_sum += tl.sum(x_chunk * x_chunk, axis=1)
+    
+    # Atomic add to global norm tensor with proper masking
+    if tl.sum(batch_mask) > 0:
+        norm_ptrs = norm_ptr + batch_offsets * stride_norm_batch
+        tl.atomic_add(norm_ptrs, local_sum, mask=batch_mask)
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_B': 128, 'BLOCK_D': 256, 'NUM_STAGES': 3}, num_warps=8),
+        triton.Config({'BLOCK_B': 64, 'BLOCK_D': 512, 'NUM_STAGES': 3}, num_warps=8),
+        triton.Config({'BLOCK_B': 256, 'BLOCK_D': 128, 'NUM_STAGES': 2}, num_warps=8),
+        triton.Config({'BLOCK_B': 128, 'BLOCK_D': 512, 'NUM_STAGES': 2}, num_warps=4),
+        triton.Config({'BLOCK_B': 64, 'BLOCK_D': 1024, 'NUM_STAGES': 4}, num_warps=8),
+    ],
+    key=['batch_size', 'dim']
+)
+@triton.jit
+def normalize_kernel(
+    x_ptr,
+    norm_ptr,
+    output_ptr,
+    batch_size,
+    dim,
+    epsilon,
+    stride_x_batch,
+    stride_x_dim,
+    stride_norm_batch,
+    stride_out_batch,
+    stride_out_dim,
+    BLOCK_B: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+):
+    """Normalize input by computed L2 norms."""
+    pid_batch = tl.program_id(0)
+    pid_dim = tl.program_id(1)
+    
+    batch_start = pid_batch * BLOCK_B
+    dim_start = pid_dim * BLOCK_D
+    
+    batch_offsets = batch_start + tl.arange(0, BLOCK_B)
+    dim_offsets = dim_start + tl.arange(0, BLOCK_D)
+    
+    batch_mask = batch_offsets < batch_size
+    dim_mask = dim_offsets < dim
+    
+    # Load and compute inverse norm
+    norm_ptrs = norm_ptr + batch_offsets * stride_norm_batch
+    norm_values = tl.load(norm_ptrs, mask=batch_mask, other=0.0)
+    inv_norm = 1.0 / (tl.sqrt(norm_values + epsilon))
+    
+    # Process dimension in chunks for better memory access
+    for d_chunk_start in range(0, BLOCK_D, 64):
+        dim_chunk = dim_start + d_chunk_start + tl.arange(0, 64)
+        dim_chunk_mask = dim_chunk < dim
+        
+        if tl.sum(dim_chunk_mask) > 0:
+            # Input pointers
+            x_ptrs = x_ptr + (
+                batch_offsets[:, None] * stride_x_batch +
+                dim_chunk[None, :] * stride_x_dim
+            )
+            
+            # Output pointers
+            out_ptrs = output_ptr + (
+                batch_offsets[:, None] * stride_out_batch +
+                dim_chunk[None, :] * stride_out_dim
+            )
+            
+            # Load, normalize, and store
+            mask = batch_mask[:, None] & dim_chunk_mask[None, :]
+            x_chunk = tl.load(x_ptrs, mask=mask, other=0.0)
+            normalized = x_chunk * inv_norm[:, None]
+            tl.store(out_ptrs, normalized, mask=mask)
+
+def triton_l2_norm(x: torch.Tensor, epsilon: float = 1e-8) -> torch.Tensor:
+    assert x.is_cuda, "Input must be on CUDA device"
+    assert x.dim() == 2, "Input must have exactly 2 dimensions (batch, dim)"
+    
+    batch_size, dim = x.shape
+    output = torch.empty_like(x)
+    
+    # Ensure contiguous memory layout
+    x = x.contiguous()
+    output = output.contiguous()
+    
+    stride_x_batch = x.stride(0)
+    stride_x_dim = x.stride(1)
+    stride_out_batch = output.stride(0)
+    stride_out_dim = output.stride(1)
+    
+    # Allocate norm tensor for accumulation
+    norm_sums = torch.zeros(batch_size, device=x.device, dtype=torch.float32)
+    
+    # Calculate grid dimensions - use conservative block sizes for grid calculation
+    grid_batch = triton.cdiv(batch_size, 128)
+    grid_dim = triton.cdiv(dim, 256)
+    
+    # Launch norm computation kernel
+    l2_norm_kernel[(
+        grid_batch,
+        grid_dim,
+        1
+    )](
+        x,
+        norm_sums,
+        batch_size,
+        dim,
+        stride_x_batch,
+        stride_x_dim,
+        norm_sums.stride(0),
+    )
+    
+    # Launch normalization kernel
+    normalize_kernel[(
+        grid_batch,
+        grid_dim,
+        1
+    )](
+        x,
+        norm_sums,
+        output,
+        batch_size,
+        dim,
+        epsilon,
+        stride_x_batch,
+        stride_x_dim,
+        norm_sums.stride(0),
+        stride_out_batch,
+        stride_out_dim,
+    )
+    
+    return output
+
+class ModelNew(nn.Module):
+    """L2 normalization layer with optimized Triton kernels."""
+    def __init__(self, epsilon: float = 1e-8):
+        super(ModelNew, self).__init__()
+        self.epsilon = epsilon
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Handle multi-dimensional tensors by flattening to 2D
+        if x.dim() > 2:
+            original_shape = x.shape
+            x = x.view(-1, original_shape[-1])
+            result = triton_l2_norm(x, self.epsilon)
+            return result.view(original_shape)
+        return triton_l2_norm(x, self.epsilon)
+```

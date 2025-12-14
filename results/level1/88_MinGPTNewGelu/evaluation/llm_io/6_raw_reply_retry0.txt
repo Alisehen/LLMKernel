@@ -1,0 +1,73 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+import math
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 256}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 512}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 2048}, num_warps=16, num_stages=3),
+    ],
+    key=['n_elements'],
+)
+@triton.jit
+def gelu_kernel(
+    x_ptr,
+    output_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Optimized GELU kernel using exact mathematical formulation."""
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    
+    # Load input
+    x = tl.load(x_ptr + offsets, mask=mask)
+    
+    # GELU constants
+    a = 0.7978845608028654  # sqrt(2/π)
+    b = 0.044715
+    
+    # Compute GELU using Triton's built-in tanh for accuracy
+    x_sq = x * x
+    x_cu = x_sq * x
+    inner = x + b * x_cu
+    t = a * inner
+    tanh_t = tl.tanh(t)
+    
+    # Final GELU
+    output = 0.5 * x * (1.0 + tanh_t)
+    
+    # Store result
+    tl.store(output_ptr + offsets, output, mask=mask)
+
+def triton_gelu(x: torch.Tensor) -> torch.Tensor:
+    """Optimized Triton-accelerated GELU activation."""
+    output = torch.empty_like(x)
+    n_elements = output.numel()
+    
+    if n_elements == 0:
+        return output
+    
+    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
+    
+    gelu_kernel[grid](
+        x, output, n_elements
+    )
+    
+    return output
+
+class ModelNew(nn.Module):
+    """Optimized GELU implementation with autotuned Triton kernels."""
+    def __init__(self) -> None:
+        super().__init__()
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_gelu(x)
+```

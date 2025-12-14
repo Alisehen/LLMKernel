@@ -1,0 +1,305 @@
+```python
+# Optimized Triton code for implicit-GEMM conv2d on RTX 4090 (Ada)
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        # High-occupancy, smaller tiles
+        triton.Config(
+            {'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+        # More compute-dense tiles for large problems
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=3,
+        ),
+        triton.Config(
+            {'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_warps=8,
+            num_stages=3,
+        ),
+    ],
+    key=['N', 'OC', 'OH', 'OW', 'K_TOTAL'],
+)
+@triton.jit
+def conv2d_implicit_gemm_kernel(
+    x_ptr,        # *f32 / *f16, shape: [N, C_in, H_in, W_in] (group slice)
+    w_ptr,        # *f32 / *f16, shape: [OC, K_TOTAL]        (group slice, flattened)
+    bias_ptr,     # *f32 / *f16, shape: [OC]                 (group slice) or dummy
+    y_ptr,        # *f32 / *f16, shape: [N, OC, OH, OW]      (group slice)
+    N,            # batch size
+    C_IN,         # in-channels per group
+    H_IN, W_IN,   # input spatial dims
+    OC,           # out-channels per group
+    KH, KW,       # kernel size
+    STRIDE_H, STRIDE_W,
+    PAD_H, PAD_W,
+    DIL_H, DIL_W,
+    OH, OW,       # output spatial dims
+    STRIDE_XN, STRIDE_XC, STRIDE_XH, STRIDE_XW,
+    STRIDE_YN, STRIDE_YC, STRIDE_YH, STRIDE_YW,
+    HAS_BIAS: tl.constexpr,
+    K_TOTAL: tl.constexpr,        # = C_IN * KH * KW
+    BLOCK_M: tl.constexpr,        # power of 2
+    BLOCK_N: tl.constexpr,        # power of 2
+    BLOCK_K: tl.constexpr,        # power of 2
+):
+    # Program IDs
+    pid_m = tl.program_id(axis=0)  # along M = N * OH * OW
+    pid_n = tl.program_id(axis=1)  # along N = OC
+
+    # Offsets along M and N
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    M = N * OH * OW
+
+    m_mask = offs_m < M
+    n_mask = offs_n < OC
+
+    # Decode M index -> (n, oh, ow)
+    HW_OUT = OH * OW
+    n_idx = offs_m // HW_OUT
+    rem = offs_m % HW_OUT
+    oh_idx = rem // OW
+    ow_idx = rem % OW
+
+    # 2D broadcasted indices for M dimension
+    n_b = n_idx[:, None]         # [BM, 1]
+    oh_b = oh_idx[:, None]       # [BM, 1]
+    ow_b = ow_idx[:, None]       # [BM, 1]
+
+    # Prepare accumulator
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    KH_KW = KH * KW
+
+    # Loop along K dimension (im2col K = C_in * KH * KW)
+    for k0 in tl.static_range(0, K_TOTAL, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)  # [BK]
+        k_mask = offs_k < K_TOTAL
+
+        # Decode K index -> (ic, kh, kw)
+        ic_idx = offs_k // KH_KW           # [BK]
+        kk = offs_k % KH_KW
+        kh_idx = kk // KW                  # [BK]
+        kw_idx = kk % KW                   # [BK]
+
+        # 2D broadcasted K indices
+        ic_b = ic_idx[None, :]             # [1, BK]
+        kh_b = kh_idx[None, :]             # [1, BK]
+        kw_b = kw_idx[None, :]             # [1, BK]
+
+        # Input spatial positions
+        h_in = oh_b * STRIDE_H - PAD_H + kh_b * DIL_H  # [BM, BK]
+        w_in = ow_b * STRIDE_W - PAD_W + kw_b * DIL_W  # [BM, BK]
+
+        # Build pointers for A (im2col(x))
+        ptrs_x = (
+            x_ptr
+            + n_b * STRIDE_XN
+            + ic_b * STRIDE_XC
+            + h_in * STRIDE_XH
+            + w_in * STRIDE_XW
+        )
+
+        # Validity mask for input load
+        in_bounds = (
+            (h_in >= 0) & (h_in < H_IN) &
+            (w_in >= 0) & (w_in < W_IN)
+        )
+        mask_a = m_mask[:, None] & k_mask[None, :] & in_bounds
+
+        a = tl.load(ptrs_x, mask=mask_a, other=0.0)
+
+        # Build pointers for B (weight) – treat w as [K_TOTAL, OC]
+        k_b = offs_k[:, None]              # [BK, 1]
+        n_b2 = offs_n[None, :]             # [1, BN]
+        ptrs_w = w_ptr + k_b + n_b2 * K_TOTAL
+
+        mask_b = k_mask[:, None] & n_mask[None, :]
+        b = tl.load(ptrs_w, mask=mask_b, other=0.0)
+
+        # Multiply-accumulate (tensor-core friendly for fp16/bf16/tf32)
+        acc += tl.dot(a, b, out_dtype=tl.float32)
+
+    # Add bias if present
+    if HAS_BIAS:
+        bias = tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0)
+        acc = acc + bias[None, :]
+
+    # Store back to y: layout [N, OC, OH, OW]
+    oc_b = offs_n[None, :]   # [1, BN]
+    ptrs_y = (
+        y_ptr
+        + n_b * STRIDE_YN
+        + oc_b * STRIDE_YC
+        + oh_b * STRIDE_YH
+        + ow_b * STRIDE_YW
+    )
+
+    mask_out = m_mask[:, None] & n_mask[None, :]
+    tl.store(ptrs_y, acc, mask=mask_out)
+
+
+def conv2d_triton(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    stride: int,
+    padding: int,
+    dilation: int,
+    groups: int,
+) -> torch.Tensor:
+    """
+    x:      [N, C_in, H_in, W_in]
+    weight: [OC, C_in/groups, KH, KW]
+    bias:   [OC] or None
+    """
+    assert x.is_cuda and weight.is_cuda, "Inputs must be CUDA tensors for Triton kernel."
+    assert x.dtype == weight.dtype, "Input and weight must have same dtype."
+
+    N, C_in, H_in, W_in = x.shape
+    OC, C_per_group, KH, KW = weight.shape
+    assert C_in == C_per_group * groups
+    assert OC % groups == 0
+    OC_per_group = OC // groups
+
+    stride_h = stride_w = stride
+    pad_h = pad_w = padding
+    dil_h = dil_w = dilation
+
+    # Output dimensions (same as PyTorch conv2d)
+    OH = (H_in + 2 * pad_h - dil_h * (KH - 1) - 1) // stride_h + 1
+    OW = (W_in + 2 * pad_w - dil_w * (KW - 1) - 1) // stride_w + 1
+
+    y = torch.empty((N, OC, OH, OW), device=x.device, dtype=x.dtype)
+
+    has_bias = bias is not None
+
+    def grid(meta):
+        # meta contains BLOCK_M/BLOCK_N selected by autotune
+        return (
+            triton.cdiv(N * OH * OW, meta['BLOCK_M']),
+            triton.cdiv(OC_per_group, meta['BLOCK_N']),
+        )
+
+    for g in range(groups):
+        c_start = g * C_per_group
+        c_end = (g + 1) * C_per_group
+        oc_start = g * OC_per_group
+        oc_end = (g + 1) * OC_per_group
+
+        # Group slices (views, no copies)
+        x_g = x[:, c_start:c_end, :, :]
+        y_g = y[:, oc_start:oc_end, :, :]
+        w_g = weight[oc_start:oc_end, :, :, :].reshape(OC_per_group, -1)
+        if has_bias:
+            b_g = bias[oc_start:oc_end]
+        else:
+            # Dummy; won't be used when HAS_BIAS=False
+            b_g = y_g.view(-1)
+
+        stride_xn, stride_xc, stride_xh, stride_xw = x_g.stride()
+        stride_yn, stride_yc, stride_yh, stride_yw = y_g.stride()
+
+        K_total = C_per_group * KH * KW
+
+        conv2d_implicit_gemm_kernel[grid](
+            x_g,
+            w_g,
+            b_g,
+            y_g,
+            N,
+            C_per_group,
+            H_in,
+            W_in,
+            OC_per_group,
+            KH,
+            KW,
+            stride_h,
+            stride_w,
+            pad_h,
+            pad_w,
+            dil_h,
+            dil_w,
+            OH,
+            OW,
+            stride_xn,
+            stride_xc,
+            stride_xh,
+            stride_xw,
+            stride_yn,
+            stride_yc,
+            stride_yh,
+            stride_yw,
+            HAS_BIAS=has_bias,
+            K_TOTAL=K_total,
+        )
+
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-accelerated 2D convolution using implicit GEMM.
+    API-compatible with the original Model.
+    """
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        stride: int = 1,
+        padding: int = 0,
+        dilation: int = 1,
+        groups: int = 1,
+        bias: bool = False,
+    ) -> None:
+        super().__init__()
+        self.conv2d = nn.Conv2d(
+            in_channels,
+            out_channels,
+            (kernel_size, kernel_size),
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            groups=groups,
+            bias=bias,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Fallback to PyTorch implementation on CPU for correctness
+        if not x.is_cuda:
+            return self.conv2d(x)
+
+        w = self.conv2d.weight
+        b = self.conv2d.bias
+        stride = self.conv2d.stride[0]
+        padding = self.conv2d.padding[0]
+        dilation = self.conv2d.dilation[0]
+        groups = self.conv2d.groups
+
+        return conv2d_triton(
+            x,
+            w,
+            b,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            groups=groups,
+        )
+```

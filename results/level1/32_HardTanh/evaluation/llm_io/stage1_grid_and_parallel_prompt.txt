@@ -1,0 +1,139 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU
+GPU Name: 4090
+Architecture: Ada Lovelace
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+[OPTIMIZATION STAGE]
+
+## Current Optimization Stage
+
+**Focus**: Optimize grid layout and parallel work distribution.
+
+**NCU Metrics to Check**:
+• `sm__throughput.avg.pct_of_peak_sustained_elapsed`: Overall SM utilization (target: >60%)
+• `launch__grid_size`: Total number of blocks (controlled by BLOCK_M/N)
+
+**Guidelines**:
+- 2D outputs → 2D grid `(cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))`; 1D ops → 1D grid
+- 3D outputs (e.g., batch×M×N) → 3D grid `(batch, cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))`
+- 4D+ outputs → **flatten** to 3D: `(batch*dim1, dim2, dim3)` or `(cdiv(batch*dim1, BLOCK), dim2, dim3)`
+- Prefer adding parallelism via batch/head/expert dims before reducing BLOCK sizes
+- Only change grid if SM utilization is clearly low; otherwise keep original
+- Always verify `grid = (...)` matches kernel indexing logic
+
+**Important Safety Rule**:
+If unsure about grid mapping, do **not** modify it. Never use more than 3 dimensions!
+
+**Autotune Tip (safe)**:
+Try 2–3 small grid variants using minimal `@autotune` on **kernel function only**.
+
+
+
+[CURRENT CODE]
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def hardtanh_kernel(
+    x_ptr,
+    out_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    
+    # Load input data
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    
+    # HardTanh: clamp to [-1, 1]
+    # Use min/max for direct computation - more efficient than conditional branching
+    # First compute lower bound: max(x, -1)
+    lower = tl.maximum(x, -1.0)
+    # Then compute upper bound: min(lower, 1)
+    out = tl.minimum(lower, 1.0)
+    
+    # Store result
+    tl.store(out_ptr + offsets, out, mask=mask)
+
+def triton_hardtanh(x: torch.Tensor) -> torch.Tensor:
+    """Triton-accelerated HardTanh activation function."""
+    output = torch.empty_like(x)
+    n_elements = output.numel()
+    
+    # Use optimal block size for A100
+    # 1024 threads maximizes occupancy while staying within register limits
+    BLOCK_SIZE = 1024
+    
+    # Calculate grid size - 1D grid covering all elements
+    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
+    
+    # Launch kernel
+    hardtanh_kernel[grid](
+        x, output, n_elements,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
+    
+    return output
+
+class ModelNew(nn.Module):
+    """Optimized model using Triton kernels for HardTanh activation."""
+    def __init__(self):
+        super(ModelNew, self).__init__()
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies HardTanh activation using optimized Triton kernel.
+        
+        Args:
+            x (torch.Tensor): Input tensor of any shape.
+            
+        Returns:
+            torch.Tensor: Output tensor with HardTanh applied.
+        """
+        return triton_hardtanh(x)
+```
+
+[NCU PROFILING METRICS]
+{
+  "hardtanh_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 1.6,
+    "launch__grid_size": 1572864,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 82.04,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 92.53,
+    "lts__t_sector_hit_rate.pct": 50.0
+  }
+}
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

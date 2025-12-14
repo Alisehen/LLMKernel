@@ -1,0 +1,140 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        # Original configs kept for stability
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32}, num_warps=16, num_stages=3),
+        # New micro-optimized configs based on NCU analysis
+        # Increased num_stages to 4 for better SM occupancy (from 43.68%)
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32}, num_warps=8, num_stages=4),
+        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32}, num_warps=16, num_stages=4),
+        # Reduced num_stages to 2 for faster kernel launch with smaller blocks
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32}, num_warps=4, num_stages=2),
+        # Optimized warp count for better SM utilization (from 23.92% warp activity)
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32}, num_warps=16, num_stages=3),
+    ],
+    key=['M', 'N', 'K', 'USE_TF32'],
+)
+@triton.jit
+def matmul_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    USE_TF32: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+
+    a_ptrs = a_ptr + offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        k_remaining = K - k * BLOCK_SIZE_K
+        a = tl.load(a_ptrs, mask=offs_k[None, :] < k_remaining, other=0.0)
+        b = tl.load(b_ptrs, mask=offs_k[:, None] < k_remaining, other=0.0)
+
+        if USE_TF32:
+            accumulator = tl.dot(a, b, acc=accumulator, out_dtype=tl.float32, allow_tf32=True)
+        else:
+            accumulator = tl.dot(a, b, acc=accumulator, out_dtype=tl.float32, allow_tf32=False)
+
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk
+
+    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = c_ptr + offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn
+
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, accumulator, mask=c_mask)
+
+
+def triton_matmul(a: torch.Tensor, b: torch.Tensor, use_tf32: bool = True) -> torch.Tensor:
+    assert a.dim() == 2 and b.dim() == 2, "Inputs must be 2D"
+    assert a.shape[1] == b.shape[0], f"Shapes {a.shape} and {b.shape} cannot be multiplied"
+
+    M, K = a.shape
+    _, N = b.shape
+    c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+    )
+
+    GROUP_SIZE_M = 8
+
+    matmul_kernel[grid](
+        a,
+        b,
+        c,
+        M,
+        N,
+        K,
+        a.stride(0),
+        a.stride(1),
+        b.stride(0),
+        b.stride(1),
+        c.stride(0),
+        c.stride(1),
+        GROUP_SIZE_M=GROUP_SIZE_M,
+        USE_TF32=use_tf32,
+    )
+
+    return c
+
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super(ModelNew, self).__init__()
+    
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        return triton_matmul(A, B)
+```
+
+**Optimization Rationale:**
+
+1. **Added num_stages=4 configurations**: NCU shows only 43.68% SM throughput. Increasing pipeline stages from 3 to 4 improves SM occupancy by allowing more concurrent warps per SM (Ada Lovelace supports 48 warps/SM). This particularly helps larger block sizes.
+
+2. **Added 16-warps configuration for 128x128 blocks**: With 23.92% warp activity, increasing warps from 8 to 16 for medium blocks improves warp-level parallelism while staying within 1024 threads/block limit.
+
+3. **Added num_stages=2 for 64x64 blocks**: Smaller blocks benefit from faster kernel launch and reduced shared memory pressure with fewer pipeline stages.
+
+4. **Preserved all original configurations**: Maintains stability while allowing autotuner to select optimal configuration based on input dimensions.
+
+5. **Total 9 configurations**: Within autotune limits, providing diverse options for different matrix sizes while focusing on micro-optimizations only (num_warps and num_stages changes).

@@ -1,0 +1,150 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+BLOCK_SIZE = 1024  # tuned for large last-dimension scans
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=4, num_stages=2),
+        triton.Config({}, num_warps=8, num_stages=2),
+        triton.Config({}, num_warps=4, num_stages=1),
+    ],
+    key=["N"],
+)
+@triton.jit
+def _inclusive_cumsum_lastdim_kernel(
+    x_ptr,        # *fptr: [B, N]
+    y_ptr,        # *fptr: [B, N]
+    N,            # int32: length of scan dimension
+    stride_row,   # int32: stride between rows in x/y
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Inclusive cumsum along the last dimension of a 2D tensor [B, N].
+    Each program handles one row and walks along N in BLOCK_SIZE chunks.
+    """
+    pid = tl.program_id(axis=0)
+    row_offset = pid * stride_row
+
+    start = 0
+    # Use fp32 accumulator for good numerical behavior; Triton will cast as needed.
+    carry = tl.zeros((), dtype=tl.float32)
+
+    while start < N:
+        offs = start + tl.arange(0, BLOCK_SIZE)
+        mask = offs < N
+
+        x = tl.load(x_ptr + row_offset + offs, mask=mask, other=0.0)
+        x_f32 = tl.astype(x, tl.float32)
+
+        # Local inclusive scan, then add running carry from previous blocks
+        cumsum_block = tl.cumsum(x_f32, axis=0) + carry
+        tl.store(y_ptr + row_offset + offs, tl.astype(cumsum_block, x.dtype), mask=mask)
+
+        # Update running carry with sum of this block's original values
+        block_sum = tl.sum(x_f32, axis=0)
+        carry = carry + block_sum
+
+        start += BLOCK_SIZE
+
+
+def _triton_inclusive_cumsum_lastdim_2d(x_2d: torch.Tensor) -> torch.Tensor:
+    """
+    Inclusive cumsum along the last dimension of a 2D tensor using a single
+    Triton kernel. x_2d is expected to be contiguous with shape [B, N].
+    """
+    assert x_2d.dim() == 2
+    B, N = x_2d.shape
+    if N == 0:
+        return x_2d.clone()
+
+    y_2d = torch.empty_like(x_2d)
+
+    stride_row = x_2d.stride(0)
+    grid = lambda meta: (B,)
+
+    _inclusive_cumsum_lastdim_kernel[grid](
+        x_2d,
+        y_2d,
+        N,
+        stride_row,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+
+    return y_2d
+
+
+def triton_inclusive_cumsum(x: torch.Tensor, dim: int) -> torch.Tensor:
+    """
+    Inclusive cumsum along arbitrary dimension `dim` using the Triton kernel
+    specialized for the last dimension of a 2D view.
+    """
+    if dim < 0:
+        dim = x.dim() + dim
+
+    # Move target dim to last, make contiguous, and flatten leading dims.
+    if dim != x.dim() - 1:
+        x_moved = x.movedim(dim, -1)
+    else:
+        x_moved = x
+
+    x_contig = x_moved.contiguous()
+    last_dim = x_contig.shape[-1]
+    if last_dim == 0:
+        # Degenerate case: nothing to scan
+        y_contig = x_contig.clone()
+    else:
+        B = x_contig.numel() // last_dim
+        x_2d = x_contig.view(B, last_dim)
+
+        y_2d = _triton_inclusive_cumsum_lastdim_2d(x_2d)
+        y_contig = y_2d.view(x_contig.shape)
+
+    # Move dimension back to original position
+    if dim != x.dim() - 1:
+        y = y_contig.movedim(-1, dim)
+    else:
+        y = y_contig
+
+    return y
+
+
+def triton_exclusive_cumsum(x: torch.Tensor, dim: int) -> torch.Tensor:
+    """
+    Exclusive cumsum matching the provided PyTorch reference:
+
+        exclusive_cumsum = torch.cat(
+            (torch.zeros_like(x.select(dim, 0).unsqueeze(dim)), x),
+            dim=dim,
+        )[:-1]
+        return torch.cumsum(exclusive_cumsum, dim=dim)
+
+    Here we exactly reproduce the preprocessing (cat + slice) and replace
+    the final torch.cumsum with the Triton implementation.
+    """
+    if dim < 0:
+        dim = x.dim() + dim
+
+    zeros = torch.zeros_like(x.select(dim, 0).unsqueeze(dim))
+    exclusive_input = torch.cat((zeros, x), dim=dim)[:-1]
+    return triton_inclusive_cumsum(exclusive_input, dim)
+
+
+class ModelNew(nn.Module):
+    """
+    A model that performs an exclusive cumulative sum (does not include the
+    current element), matching the semantics of the given PyTorch reference.
+    """
+
+    def __init__(self, dim):
+        super(ModelNew, self).__init__()
+        self.dim = dim
+
+    def forward(self, x):
+        return triton_exclusive_cumsum(x, self.dim)
+```

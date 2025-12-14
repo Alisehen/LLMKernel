@@ -1,0 +1,150 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.autotune(
+    configs=[
+        # Original configs for baseline
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'num_stages': 3, 'num_warps': 8}),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'num_stages': 4, 'num_warps': 8}),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32, 'BLOCK_K': 32, 'num_stages': 3, 'num_warps': 8}),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32, 'BLOCK_K': 32, 'num_stages': 4, 'num_warps': 8}),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32, 'num_stages': 3, 'num_warps': 8}),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32, 'num_stages': 4, 'num_warps': 8}),
+        
+        # Optimized configs based on NCU analysis: lower stages for better L2 cache utilization
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'num_stages': 2, 'num_warps': 8}),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32, 'BLOCK_K': 32, 'num_stages': 2, 'num_warps': 8}),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32, 'num_stages': 2, 'num_warps': 8}),
+        
+        # Try higher warp counts for better memory coalescing (DRAM throughput is high)
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'num_stages': 2, 'num_warps': 16}),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'num_stages': 3, 'num_warps': 16}),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32, 'BLOCK_K': 32, 'num_stages': 2, 'num_warps': 16}),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32, 'num_stages': 2, 'num_warps': 16}),
+    ],
+    key=['M', 'N'],
+)
+@triton.jit
+def matmul_kernel_tall_skinny(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    M,
+    N,
+    stride_am,
+    stride_an,
+    stride_bn,
+    stride_bm,
+    stride_cm,
+    stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    num_stages: tl.constexpr,
+):
+    # 2D block grid - each block computes a BLOCK_M x BLOCK_N tile of C
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    
+    # Offsets for the output tile
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    
+    # Create block pointers for A and B with proper dimensions
+    a_block_ptr = tl.make_block_ptr(
+        base=a_ptr,
+        shape=(M, N),
+        strides=(stride_am, stride_an),
+        offsets=(pid_m * BLOCK_M, 0),
+        block_shape=(BLOCK_M, BLOCK_K),
+        order=(1, 0)
+    )
+    
+    b_block_ptr = tl.make_block_ptr(
+        base=b_ptr,
+        shape=(N, M),
+        strides=(stride_bn, stride_bm),
+        offsets=(0, pid_n * BLOCK_N),
+        block_shape=(BLOCK_K, BLOCK_N),
+        order=(1, 0)
+    )
+    
+    # Initialize accumulator
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    # Compute matrix multiplication using blocked approach
+    for k in range(0, tl.cdiv(N, BLOCK_K)):
+        # Load A tile
+        a_tile = tl.load(a_block_ptr, boundary_check=(0, 1))
+        # Load B tile  
+        b_tile = tl.load(b_block_ptr, boundary_check=(0, 1))
+        
+        # Update block pointers for next iteration
+        a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_K))
+        b_block_ptr = tl.advance(b_block_ptr, (BLOCK_K, 0))
+        
+        # Accumulate matrix multiplication
+        acc += tl.dot(a_tile, b_tile, out_dtype=tl.float32)
+    
+    # Offsets for storing C tile
+    offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    
+    # Store result tile with coalesced access pattern
+    c_ptrs = c_ptr + (offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn)
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < M)
+    tl.store(c_ptrs, acc, mask=c_mask)
+
+def triton_matmul(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    M = A.size(0)
+    N = A.size(1)
+    assert B.size(0) == N and B.size(1) == M, "Matrix dimensions don't match"
+    
+    # Preallocate output
+    C = torch.empty((M, M), device=A.device, dtype=A.dtype)
+    
+    # Grid calculation remains dynamic based on autotuned BLOCK_M, BLOCK_N
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta['BLOCK_M']),
+            triton.cdiv(M, meta['BLOCK_N']),
+        )
+    
+    # Launch kernel with autotuned parameters
+    matmul_kernel_tall_skinny[grid](
+        A,
+        B,
+        C,
+        M,
+        N,
+        A.stride(0),
+        A.stride(1),
+        B.stride(0),
+        B.stride(1),
+        C.stride(0),
+        C.stride(1),
+    )
+    
+    return C
+
+class ModelNew(nn.Module):
+    """
+    Optimized model using Triton kernels for tall-skinny matrix multiplication.
+    """
+    def __init__(self) -> None:
+        super().__init__()
+    
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        """
+        Performs matrix multiplication using optimized Triton kernel.
+        
+        Args:
+            A (torch.Tensor): Input matrix of shape (M, N) where M >> N
+            B (torch.Tensor): Input matrix of shape (N, M) where M >> N
+        
+        Returns:
+            torch.Tensor: Output matrix of shape (M, M)
+        """
+        return triton_matmul(A, B)

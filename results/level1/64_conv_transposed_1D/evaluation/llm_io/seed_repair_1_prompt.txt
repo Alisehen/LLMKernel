@@ -1,0 +1,470 @@
+Fix the Triton kernel errors. Generate correct, high-performance code.
+
+Current Error Log:
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 524, in compare_and_bench
+    test_model = ModelNew(*init_args, **init_kwargs)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251212_170112_batch_range40to70_deepseek_deepseek/64_conv_transposed_1D/code/kernel_20251213_011317.py", line 357, in __init__
+    self.reset_parameters()
+  File "/home/hyc/LLMKernel/run/20251212_170112_batch_range40to70_deepseek_deepseek/64_conv_transposed_1D/code/kernel_20251213_011317.py", line 361, in reset_parameters
+    nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+                                            ^^^^
+NameError: name 'math' is not defined
+
+History Error:
+None
+
+
+PyTorch Reference:
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Performs a transposed 1D convolution operation.
+
+    Args:
+        in_channels (int): Number of channels in the input tensor.
+        out_channels (int): Number of channels produced by the convolution.
+        kernel_size (int): Size of the convolution kernel.
+        stride (int, optional): Stride of the convolution. Defaults to 1.
+        padding (int, optional): Padding applied to the input. Defaults to 0.
+        output_padding (int, optional): Additional size added to one side of the output shape. Defaults to 0.
+        groups (int, optional): Number of blocked connections from input channels to output channels. Defaults to 1.
+        bias (bool, optional): If `True`, adds a learnable bias to the output. Defaults to `False`.
+    """
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, stride: int = 1, padding: int = 0, output_padding: int = 0, groups: int = 1, bias: bool = False):
+        super(Model, self).__init__()
+        self.conv1d_transpose = nn.ConvTranspose1d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, output_padding=output_padding, groups=groups, bias=bias)
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Performs the transposed 1D convolution.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_channels, length).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_channels, length_out).
+        """
+        return self.conv1d_transpose(x)
+
+# Test code
+batch_size = 64
+in_channels = 128
+out_channels = 128
+kernel_size = 3
+# much larger signal length for heavier workload
+length = 65536
+
+def get_inputs():
+    x = torch.rand(batch_size, in_channels, length)
+    return [x]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size]  # Provide in_channels, out_channels, kernel_size for initialization
+```
+
+Broken Code:
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def conv_transpose1d_kernel(
+    # Pointers to tensors
+    input_ptr,
+    weight_ptr,
+    bias_ptr,
+    output_ptr,
+    # Tensor dimensions
+    batch_size,
+    in_channels,
+    out_channels,
+    length_in,
+    length_out,
+    kernel_size,
+    stride,
+    padding,
+    output_padding,
+    # Meta-parameters
+    BLOCK_SIZE_IN_CHANNELS: tl.constexpr,
+    BLOCK_SIZE_LENGTH_OUT: tl.constexpr,
+    BLOCK_SIZE_KERNEL: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+):
+    # Program ID mapping
+    pid_batch = tl.program_id(axis=0)
+    pid_out_ch = tl.program_id(axis=1)
+    pid_len_out = tl.program_id(axis=2)
+
+    # Block ranges
+    out_ch_range = pid_out_ch * BLOCK_SIZE_IN_CHANNELS + tl.arange(0, BLOCK_SIZE_IN_CHANNELS)
+    len_out_range = pid_len_out * BLOCK_SIZE_LENGTH_OUT + tl.arange(0, BLOCK_SIZE_LENGTH_OUT)
+
+    # Mask for out_channels
+    out_ch_mask = out_ch_range < out_channels
+    # Mask for length_out (broadcast across out_channels)
+    len_out_mask = tl.expand_dims(len_out_range < length_out, axis=0)
+
+    # Accumulator initialization
+    acc = tl.zeros((BLOCK_SIZE_IN_CHANNELS, BLOCK_SIZE_LENGTH_OUT), dtype=tl.float32)
+
+    # Loop over kernel positions
+    for k in range(0, kernel_size, BLOCK_SIZE_KERNEL):
+        k_range = k + tl.arange(0, BLOCK_SIZE_KERNEL)
+        k_mask = k_range < kernel_size
+
+        # Compute corresponding input positions
+        # For transposed conv: input_pos = (output_pos - kernel_pos + padding) / stride
+        len_in_float = (len_out_range.to(tl.float32) - k_range.to(tl.float32) + padding) / stride
+        len_in = len_in_float.to(tl.int32)
+        valid_mask = (len_in_float == len_in.to(tl.float32)) & (len_in >= 0) & (len_in < length_in)
+        valid_mask = tl.expand_dims(valid_mask, axis=0)  # Broadcast across channels
+
+        # Loop over input channels
+        for c_in in range(0, in_channels, BLOCK_SIZE_IN_CHANNELS):
+            in_ch_range = c_in + tl.arange(0, BLOCK_SIZE_IN_CHANNELS)
+            in_ch_mask = in_ch_range < in_channels
+
+            # Load weight block
+            # weight shape: [in_channels, out_channels//groups, kernel_size]
+            # Since groups=1 in this case
+            w_offset = (in_ch_range[:, None] * out_channels + out_ch_range[None, :]) * kernel_size + k_range[None, None, :]
+            w_mask = in_ch_mask[:, None] & out_ch_mask[None, :] & k_mask[None, None, :]
+            weight = tl.load(
+                weight_ptr + w_offset,
+                mask=w_mask,
+                other=0.0
+            )
+
+            # Load input block
+            # input shape: [batch_size, in_channels, length_in]
+            b_offset = pid_batch * in_channels * length_in
+            input_offset = b_offset + (in_ch_range[:, None] * length_in + len_in[None, :])
+            input_mask = in_ch_mask[:, None] & valid_mask
+            x = tl.load(
+                input_ptr + input_offset,
+                mask=input_mask,
+                other=0.0
+            )
+
+            # Reshape for matrix multiplication
+            # weight: [BLOCK_IN, BLOCK_OUT, BLOCK_K] -> [BLOCK_IN, BLOCK_OUT * BLOCK_K]
+            # input: [BLOCK_IN, BLOCK_L] -> [BLOCK_IN, BLOCK_L]
+            # We want: acc[BLOCK_OUT, BLOCK_L] += sum_k(weight[BLOCK_IN, BLOCK_OUT, k] * input[BLOCK_IN, BLOCK_L])
+            
+            # Reshape weight to [BLOCK_IN, BLOCK_OUT * BLOCK_K]
+            weight_flat = tl.reshape(weight, (BLOCK_SIZE_IN_CHANNELS, BLOCK_SIZE_IN_CHANNELS * BLOCK_SIZE_KERNEL))
+            # Reshape input to [BLOCK_IN, BLOCK_L] -> [BLOCK_IN, BLOCK_L * 1]
+            x_expanded = tl.expand_dims(x, axis=-1)
+            # Matmul: [BLOCK_OUT, BLOCK_K] x [BLOCK_K, BLOCK_L] via reshaping
+            # We'll do this by iterating over k dimension
+            for k_idx in range(BLOCK_SIZE_KERNEL):
+                if k + k_idx < kernel_size:
+                    w_slice = weight[:, :, k_idx]
+                    # For each k position, we need to shift the input accordingly
+                    # The input position for this k is already accounted for in len_in calculation
+                    # We use the corresponding slice of valid_mask
+                    k_valid_mask = valid_mask[:, :, k_idx]
+                    x_slice = x * tl.expand_dims(k_valid_mask, axis=0).to(tl.float32)
+                    acc += tl.dot(w_slice, x_slice, allow_tf32=True)
+
+    # Add bias if present
+    if HAS_BIAS:
+        bias = tl.load(bias_ptr + out_ch_range, mask=out_ch_mask, other=0.0)
+        acc += bias[:, None]
+
+    # Store output
+    # output shape: [batch_size, out_channels, length_out]
+    output_offset = (pid_batch * out_channels * length_out + 
+                     out_ch_range[:, None] * length_out + 
+                     len_out_range[None, :])
+    output_mask = out_ch_mask[:, None] & len_out_mask
+    tl.store(output_ptr + output_offset, acc, mask=output_mask)
+
+
+@triton.jit
+def conv_transpose1d_kernel_fast(
+    # Pointers to tensors
+    input_ptr,
+    weight_ptr,
+    bias_ptr,
+    output_ptr,
+    # Tensor dimensions
+    batch_size,
+    in_channels,
+    out_channels,
+    length_in,
+    length_out,
+    kernel_size,
+    stride,
+    padding,
+    output_padding,
+    # Meta-parameters
+    BLOCK_SIZE_LENGTH_OUT: tl.constexpr,
+    BLOCK_SIZE_OUT_CHANNELS: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+):
+    """Optimized kernel with better memory access patterns."""
+    
+    # Program IDs
+    pid_batch = tl.program_id(axis=0)
+    pid_out_ch_block = tl.program_id(axis=1)
+    pid_len_block = tl.program_id(axis=2)
+    
+    # Block ranges
+    out_ch_range = pid_out_ch_block * BLOCK_SIZE_OUT_CHANNELS + tl.arange(0, BLOCK_SIZE_OUT_CHANNELS)
+    len_out_range = pid_len_block * BLOCK_SIZE_LENGTH_OUT + tl.arange(0, BLOCK_SIZE_LENGTH_OUT)
+    
+    # Masks
+    out_ch_mask = out_ch_range < out_channels
+    len_out_mask = len_out_range < length_out
+    
+    # Initialize accumulator
+    acc = tl.zeros((BLOCK_SIZE_OUT_CHANNELS, BLOCK_SIZE_LENGTH_OUT), dtype=tl.float32)
+    
+    # Precompute input positions for all output positions in the block
+    # [BLOCK_L, K]
+    k_positions = tl.arange(0, kernel_size)
+    
+    # Compute input positions for each output position
+    # input_pos = (output_pos - k + padding) / stride
+    len_out_expanded = tl.expand_dims(len_out_range, axis=1)
+    len_in_float = (len_out_expanded.to(tl.float32) - k_positions.to(tl.float32) + padding) / stride
+    len_in_int = len_in_float.to(tl.int32)
+    valid_mask = (len_in_float == len_in_int.to(tl.float32)) & (len_in_int >= 0) & (len_in_int < length_in)
+    
+    # Convert valid_mask to float for multiplication
+    valid_mask_float = valid_mask.to(tl.float32)
+    
+    # Process input channels in blocks
+    BLOCK_SIZE_IN_CHANNELS = 32  # Fixed for better performance
+    
+    for c_in_start in range(0, in_channels, BLOCK_SIZE_IN_CHANNELS):
+        c_in_range = c_in_start + tl.arange(0, BLOCK_SIZE_IN_CHANNELS)
+        in_ch_mask = c_in_range < in_channels
+        
+        # Load weight block [BLOCK_IN, BLOCK_OUT, K]
+        w_offset = ((c_in_range[:, None, None] * out_channels + 
+                     out_ch_range[None, :, None]) * kernel_size + 
+                     k_positions[None, None, :])
+        w_mask = in_ch_mask[:, None, None] & out_ch_mask[None, :, None]
+        weight_block = tl.load(weight_ptr + w_offset, mask=w_mask, other=0.0)
+        
+        # Process each kernel position
+        for k_idx in tl.arange(kernel_size):
+            # Get weight slice for this kernel position [BLOCK_IN, BLOCK_OUT]
+            w_slice = weight_block[:, :, k_idx]
+            
+            # Get input positions for this kernel position
+            len_in_for_k = len_in_int[:, k_idx]
+            valid_for_k = valid_mask_float[:, k_idx]
+            
+            # Load input block [BLOCK_IN, BLOCK_L]
+            input_offset = (pid_batch * in_channels * length_in + 
+                           c_in_range[:, None] * length_in + 
+                           len_in_for_k[None, :])
+            input_mask = in_ch_mask[:, None] & (valid_for_k[None, :] > 0)
+            x_block = tl.load(input_ptr + input_offset, mask=input_mask, other=0.0)
+            
+            # Apply valid mask
+            x_block = x_block * valid_for_k[None, :]
+            
+            # Accumulate: [BLOCK_OUT, BLOCK_L] += [BLOCK_IN, BLOCK_OUT]^T @ [BLOCK_IN, BLOCK_L]
+            acc += tl.dot(tl.trans(w_slice), x_block, allow_tf32=True)
+    
+    # Add bias if present
+    if HAS_BIAS:
+        bias = tl.load(bias_ptr + out_ch_range, mask=out_ch_mask, other=0.0)
+        acc += bias[:, None]
+    
+    # Store result
+    output_offset = (pid_batch * out_channels * length_out + 
+                     out_ch_range[:, None] * length_out + 
+                     len_out_range[None, :])
+    output_mask = out_ch_mask[:, None] & len_out_mask
+    tl.store(output_ptr + output_offset, acc, mask=output_mask)
+
+
+def triton_conv_transpose1d(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor = None,
+    stride: int = 1,
+    padding: int = 0,
+    output_padding: int = 0,
+    groups: int = 1,
+) -> torch.Tensor:
+    """Triton implementation of ConvTranspose1d."""
+    
+    # Ensure tensors are contiguous
+    x = x.contiguous()
+    weight = weight.contiguous()
+    if bias is not None:
+        bias = bias.contiguous()
+    
+    # Get dimensions
+    batch_size, in_channels, length_in = x.shape
+    out_channels = weight.shape[1] * groups
+    kernel_size = weight.shape[2]
+    
+    # Calculate output length
+    length_out = (length_in - 1) * stride - 2 * padding + kernel_size + output_padding
+    
+    # Allocate output tensor
+    output = torch.empty(
+        batch_size, 
+        out_channels, 
+        length_out, 
+        device=x.device, 
+        dtype=x.dtype
+    )
+    
+    # For groups > 1, we would need to split the computation
+    # For simplicity, we assume groups=1 for this implementation
+    # In practice, you would need to handle groups by splitting the tensors
+    
+    # Choose kernel based on dimensions
+    # Use faster kernel for typical sizes
+    if in_channels >= 64 and out_channels >= 64:
+        BLOCK_SIZE_LENGTH_OUT = 64
+        BLOCK_SIZE_OUT_CHANNELS = 64
+        grid = (
+            batch_size,
+            triton.cdiv(out_channels, BLOCK_SIZE_OUT_CHANNELS),
+            triton.cdiv(length_out, BLOCK_SIZE_LENGTH_OUT),
+        )
+        
+        conv_transpose1d_kernel_fast[grid](
+            x, weight, bias, output,
+            batch_size, in_channels, out_channels,
+            length_in, length_out, kernel_size,
+            stride, padding, output_padding,
+            BLOCK_SIZE_LENGTH_OUT=BLOCK_SIZE_LENGTH_OUT,
+            BLOCK_SIZE_OUT_CHANNELS=BLOCK_SIZE_OUT_CHANNELS,
+            HAS_BIAS=bias is not None,
+        )
+    else:
+        # Use simpler kernel for smaller sizes
+        BLOCK_SIZE_IN_CHANNELS = 32
+        BLOCK_SIZE_LENGTH_OUT = 64
+        BLOCK_SIZE_KERNEL = min(kernel_size, 8)
+        
+        grid = (
+            batch_size,
+            triton.cdiv(out_channels, BLOCK_SIZE_IN_CHANNELS),
+            triton.cdiv(length_out, BLOCK_SIZE_LENGTH_OUT),
+        )
+        
+        conv_transpose1d_kernel[grid](
+            x, weight, bias, output,
+            batch_size, in_channels, out_channels,
+            length_in, length_out, kernel_size,
+            stride, padding, output_padding,
+            BLOCK_SIZE_IN_CHANNELS=BLOCK_SIZE_IN_CHANNELS,
+            BLOCK_SIZE_LENGTH_OUT=BLOCK_SIZE_LENGTH_OUT,
+            BLOCK_SIZE_KERNEL=BLOCK_SIZE_KERNEL,
+            HAS_BIAS=bias is not None,
+        )
+    
+    return output
+
+
+class ModelNew(nn.Module):
+    """
+    Performs a transposed 1D convolution operation using Triton kernels.
+
+    Args:
+        in_channels (int): Number of channels in the input tensor.
+        out_channels (int): Number of channels produced by the convolution.
+        kernel_size (int): Size of the convolution kernel.
+        stride (int, optional): Stride of the convolution. Defaults to 1.
+        padding (int, optional): Padding applied to the input. Defaults to 0.
+        output_padding (int, optional): Additional size added to one side of the output shape. Defaults to 0.
+        groups (int, optional): Number of blocked connections from input channels to output channels. Defaults to 1.
+        bias (bool, optional): If `True`, adds a learnable bias to the output. Defaults to `False`.
+    """
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        stride: int = 1,
+        padding: int = 0,
+        output_padding: int = 0,
+        groups: int = 1,
+        bias: bool = False,
+    ):
+        super().__init__()
+        
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.output_padding = output_padding
+        self.groups = groups
+        
+        # Initialize weights
+        self.weight = nn.Parameter(
+            torch.empty(
+                in_channels,
+                out_channels // groups,
+                kernel_size,
+            )
+        )
+        
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_channels))
+        else:
+            self.register_parameter('bias', None)
+            
+        self.reset_parameters()
+    
+    def reset_parameters(self):
+        # Use Kaiming initialization for weights
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+            bound = 1 / math.sqrt(fan_in)
+            nn.init.uniform_(self.bias, -bound, bound)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Performs the transposed 1D convolution using Triton kernels.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_channels, length).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_channels, length_out).
+        """
+        return triton_conv_transpose1d(
+            x,
+            self.weight,
+            self.bias,
+            self.stride,
+            self.padding,
+            self.output_padding,
+            self.groups,
+        )
+```
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+3. Learn from previous repair attempts to avoid repeating the same mistakes
+
+```python
+# <corrected code>
+```

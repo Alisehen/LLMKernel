@@ -1,0 +1,144 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU
+GPU Name: 4090
+Architecture: Ada Lovelace
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+[OPTIMIZATION STAGE]
+
+## Current Optimization Stage
+
+Focus: Memory efficiency & latency hiding.
+
+Metrics:
+- dram__throughput.avg.pct_of_peak_sustained_elapsed
+- lts__t_sector_hit_rate.pct
+- smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct (<20%)
+
+Rules:
+- Increase num_stages only if memory stalls are high
+- Do not rewrite access patterns without metric evidence
+- Larger BLOCK_K improves reuse but increases register pressure
+
+Autotune:
+- If unsure, try num_stages ∈ {1,2,3} on kernel
+
+
+
+[CURRENT CODE]
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def cumprod_kernel(
+    x_ptr,
+    y_ptr,
+    axis_len,
+    inner,
+    seq_count,
+):
+    pid = tl.program_id(axis=0)
+    if pid >= seq_count:
+        return
+
+    inner_val = inner
+    outer_idx = pid // inner_val
+    inner_idx = pid % inner_val
+    base_offset = outer_idx * axis_len * inner_val + inner_idx
+
+    if axis_len <= 0:
+        return
+
+    offset = base_offset
+    running = tl.load(x_ptr + offset)
+    tl.store(y_ptr + offset, running)
+
+    i = 1
+    offset += inner_val
+    while i < axis_len:
+        val = tl.load(x_ptr + offset)
+        running = running * val
+        tl.store(y_ptr + offset, running)
+        i += 1
+        offset += inner_val
+
+
+def triton_cumprod(x: torch.Tensor, dim: int) -> torch.Tensor:
+    if not x.is_cuda:
+        raise RuntimeError("Input must be a CUDA tensor.")
+    x_contig = x.contiguous()
+    out = torch.empty_like(x_contig)
+
+    dim = dim if dim >= 0 else dim + x_contig.ndim
+    axis_len = x_contig.shape[dim]
+
+    if axis_len == 0:
+        return out
+
+    inner = x_contig.stride(dim)
+    seq_count = x_contig.numel() // axis_len
+
+    grid = (seq_count,)
+    cumprod_kernel[grid](
+        x_contig,
+        out,
+        axis_len,
+        inner,
+        seq_count,
+        num_warps=1,
+        num_stages=1,
+    )
+    return out
+
+
+class ModelNew(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x):
+        return triton_cumprod(x, self.dim)
+```
+
+[NCU PROFILING METRICS]
+{
+  "cumprod_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 40.06,
+    "launch__grid_size": 32768,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 49.5,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 23.24,
+    "lts__t_sector_hit_rate.pct": 88.16
+  }
+}
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

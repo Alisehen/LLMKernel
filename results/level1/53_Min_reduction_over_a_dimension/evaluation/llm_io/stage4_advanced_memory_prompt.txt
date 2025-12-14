@@ -1,0 +1,237 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU
+GPU Name: 4090
+Architecture: Ada Lovelace
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+
+
+[OPTIMIZATION STAGE]
+
+## Current Optimization Stage
+
+Focus: Final micro-tuning.
+
+Params:
+- num_warps ∈ {2,4,8,16}
+- num_stages ∈ {2,3,4}
+
+Rules:
+- Change num_warps only if occupancy suggests it
+- Change num_stages by ±1 only
+- Do NOT modify grid or BLOCK sizes
+
+Autotune:
+- 3–6 nearby configs
+- Always include original config
+- Revert if gain <1–2% or unstable
+
+
+
+[CURRENT CODE]
+```python
+# <optimized Triton code>
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        # Balanced tiles
+        triton.Config({"BLOCK_M": 32, "BLOCK_N": 64}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_M": 32, "BLOCK_N": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_M": 32, "BLOCK_N": 64}, num_warps=4, num_stages=3),
+
+        # Wide in N (contiguous dim for contiguous tensors)
+        triton.Config({"BLOCK_M": 32, "BLOCK_N": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_M": 32, "BLOCK_N": 128}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_M": 32, "BLOCK_N": 128}, num_warps=8, num_stages=3),
+
+        # Taller tiles
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=8, num_stages=2),
+
+        # Narrow N for very skinny outputs
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 32}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 32}, num_warps=4, num_stages=2),
+    ],
+    key=["OUT0", "OUT1", "reduce_size", "DIM"],
+)
+@triton.jit
+def min_reduce_3d_kernel(
+    x_ptr,
+    out_ptr,
+    B, M, N,
+    strideB, strideM, strideN,
+    OUT0, OUT1,          # output shape: (OUT0, OUT1), row-major
+    reduce_size,         # length of reduced dimension
+    DIM: tl.constexpr,   # 0, 1, or 2
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """
+    3D min-reduction over a chosen dimension (DIM) with 2D output tiling.
+
+    DIM = 0: reduce over B,   output shape (M, N)  -> (OUT0, OUT1) = (M, N)
+    DIM = 1: reduce over M,   output shape (B, N)  -> (OUT0, OUT1) = (B, N)
+    DIM = 2: reduce over N,   output shape (B, M)  -> (OUT0, OUT1) = (B, M)
+    """
+
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    mask_m = offs_m < OUT0
+    mask_n = offs_n < OUT1
+    mask_out = mask_m[:, None] & mask_n[None, :]
+
+    # Compute base pointers and stride along reduced dimension.
+    if DIM == 0:
+        # reduce over B, output (M, N) -> tile over (m, n)
+        m_idx = offs_m[:, None]
+        n_idx = offs_n[None, :]
+        base_ptrs = x_ptr + m_idx * strideM + n_idx * strideN
+        stride_k = strideB
+    elif DIM == 1:
+        # reduce over M, output (B, N) -> tile over (b, n)
+        b_idx = offs_m[:, None]
+        n_idx = offs_n[None, :]
+        base_ptrs = x_ptr + b_idx * strideB + n_idx * strideN
+        stride_k = strideM
+    else:
+        # DIM == 2: reduce over N, output (B, M) -> tile over (b, m)
+        b_idx = offs_m[:, None]
+        m_idx = offs_n[None, :]
+        base_ptrs = x_ptr + b_idx * strideB + m_idx * strideM
+        stride_k = strideN
+
+    # Early exit for degenerate case
+    if reduce_size <= 0:
+        min_val = tl.full((BLOCK_M, BLOCK_N), float("inf"), dtype=tl.float32)
+    else:
+        # Initialize running minima with the first slice along the reduced dim
+        ptrs = base_ptrs
+        min_val = tl.load(ptrs, mask=mask_out, other=float("inf"))
+
+        # Online reduction along the reduced dimension with pointer increment
+        k = 1
+        while k < reduce_size:
+            ptrs += stride_k
+            vals = tl.load(ptrs, mask=mask_out, other=float("inf"))
+            min_val = tl.minimum(min_val, vals)
+            k += 1
+
+    # Store results to contiguous (OUT0, OUT1) output
+    out_row = offs_m[:, None]
+    out_col = offs_n[None, :]
+    out_indices = out_row * OUT1 + out_col
+    tl.store(out_ptr + out_indices, min_val, mask=mask_out)
+
+
+def triton_min_reduce_3d(x: torch.Tensor, dim: int) -> torch.Tensor:
+    """
+    Triton-based min reduction over a specified dimension for 3D tensors.
+
+    Supports CUDA float32 3D tensors; falls back to torch.min otherwise.
+    """
+    if x.dim() != 3 or not x.is_cuda or x.dtype != torch.float32:
+        return torch.min(x, dim=dim)[0]
+
+    dim = dim % x.dim()
+
+    B, M, N = x.shape
+    strideB, strideM, strideN = x.stride()
+
+    if dim == 0:
+        # reduce over B -> output (M, N)
+        OUT0, OUT1 = M, N
+        reduce_size = B
+        DIM = 0
+    elif dim == 1:
+        # reduce over M -> output (B, N)
+        OUT0, OUT1 = B, N
+        reduce_size = M
+        DIM = 1
+    else:
+        # reduce over N -> output (B, M)
+        OUT0, OUT1 = B, M
+        reduce_size = N
+        DIM = 2
+
+    out = torch.empty((OUT0, OUT1), device=x.device, dtype=x.dtype)
+
+    def grid(meta):
+        return (
+            triton.cdiv(OUT0, meta["BLOCK_M"]),
+            triton.cdiv(OUT1, meta["BLOCK_N"]),
+        )
+
+    min_reduce_3d_kernel[grid](
+        x,
+        out,
+        B, M, N,
+        strideB, strideM, strideN,
+        OUT0, OUT1,
+        reduce_size,
+        DIM=DIM,
+    )
+
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    Model performing min reduction over a specific dimension,
+    accelerated with an optimized Triton kernel for 3D CUDA float32 inputs.
+    """
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_min_reduce_3d(x, self.dim)
+```
+
+[NCU PROFILING METRICS]
+{
+  "min_reduce_3d_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 13.05,
+    "launch__grid_size": 128,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 16.67,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 97.31,
+    "lts__t_sector_hit_rate.pct": 5.09
+  }
+}
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

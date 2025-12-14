@@ -1,0 +1,91 @@
+```python
+# import order (torch, torch.nn, triton, triton.language as tl)
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK": 1}, num_warps=1, num_stages=2),
+        triton.Config({"BLOCK": 2}, num_warps=1, num_stages=2),
+        triton.Config({"BLOCK": 4}, num_warps=1, num_stages=2),
+        triton.Config({"BLOCK": 8}, num_warps=1, num_stages=2),
+        triton.Config({"BLOCK": 16}, num_warps=1, num_stages=2),
+    ],
+    key=["axis_len"],
+)
+@triton.jit
+def cumprod_kernel(
+    x_ptr,
+    y_ptr,
+    axis_len,
+    inner,
+    seq_count,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    if pid >= seq_count:
+        return
+
+    axis_len_val = axis_len
+    if axis_len_val <= 0:
+        return
+
+    inner_val = inner
+    seq_stride = axis_len_val * inner_val
+    outer_idx = pid // inner_val
+    inner_idx = pid % inner_val
+    base_offset = outer_idx * seq_stride + inner_idx
+
+    first = tl.load(x_ptr + base_offset)
+    tl.store(y_ptr + base_offset, first)
+    running = first
+
+    start = 1
+    while start < axis_len_val:
+        for i in tl.static_range(0, BLOCK):
+            idx = start + i
+            mask = idx < axis_len_val
+            offset = base_offset + idx * inner_val
+            val = tl.load(x_ptr + offset, mask=mask, other=1)
+            running = tl.where(mask, running * val, running)
+            tl.store(y_ptr + offset, running, mask=mask)
+        start += BLOCK
+
+
+def triton_cumprod(x: torch.Tensor, dim: int) -> torch.Tensor:
+    if not x.is_cuda:
+        raise RuntimeError("Input must be a CUDA tensor.")
+    x_contig = x.contiguous()
+    out = torch.empty_like(x_contig)
+
+    ndim = x_contig.ndim
+    dim = dim if dim >= 0 else dim + ndim
+    axis_len = x_contig.shape[dim]
+    if axis_len == 0:
+        return out
+
+    inner = x_contig.stride(dim)
+    seq_count = x_contig.numel() // axis_len
+    grid = (seq_count,)
+
+    cumprod_kernel[grid](
+        x_contig,
+        out,
+        axis_len,
+        inner,
+        seq_count,
+    )
+    return out
+
+
+class ModelNew(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x):
+        return triton_cumprod(x, self.dim)
+```

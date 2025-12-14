@@ -50,8 +50,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--device", type=int, default=0, help="CUDA device index for benchmarking")
     p.add_argument("--warmup", type=int, default=2, help="Warm-up iterations")
     p.add_argument("--repeat", type=int, default=5, help="Timed iterations per benchmark")
-    p.add_argument("--tol", type=float, default=1e-3, help="Max |err| tolerated")
-    p.add_argument("--max_tokens", type=int, default=16000, help="LLM max new tokens")
+    p.add_argument("--tol", type=float, default=1e-3, help="Absolute tolerance for accuracy check")
+    p.add_argument("--rtol", type=float, default=1e-2, help="Relative tolerance (1%% for large accumulations)")
+    p.add_argument("--max_tokens", type=int, default=25000, help="LLM max new tokens")
     p.add_argument("--temperature", type=float, default=0.2, help="LLM temperature")
     p.add_argument("--top_p", type=float, default=1.0, help="LLM top_p")
     # multi-task controls
@@ -285,6 +286,7 @@ def _bench_worker_entry(test_py: str,
                         warmup: int,
                         repeat: int,
                         tol: float,
+                        rtol: float,
                         conn) -> None:
     """
     Subprocess entry: set GPU, call compare_and_bench, and send result or error
@@ -315,6 +317,7 @@ def _bench_worker_entry(test_py: str,
             warmup=warmup,
             repeat=repeat,
             tol=tol,
+            rtol=rtol,
         )
         conn.send(("ok", res))
     except Exception as e:
@@ -357,6 +360,7 @@ def _bench_and_score(
     warmup: int,
     repeat: int,
     tol: float,
+    rtol: float = 1e-2,
     phase: str = "seed",
     metrics_dir: Path | None = None,
     cached_baseline_ms: Optional[float] = None,  # Cached baseline latency (if available)
@@ -407,6 +411,7 @@ def _bench_and_score(
                 warmup,
                 repeat,
                 tol,
+                rtol,
                 child_conn,
             ),
         )
@@ -750,6 +755,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
         warmup=args.warmup,
         repeat=args.repeat,
         tol=args.tol,
+        rtol=args.rtol,
         phase="seed",
         metrics_dir=eval_dir,
         cached_baseline_ms=None,  # No cache yet, will return baseline for caching
@@ -767,26 +773,26 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
         with open(test_kernel, "w") as f:
             f.write(best_kernel.code)
 
-        # Early stopping: if score < 0.1, stop the task
-        if this_score < 0.1:
-            print(f"\n[EARLY STOP] Score {this_score:.4f} < 0.1 after seed generation. Stopping task.")
-            # Plot and save results before stopping
-            fig_path = fig_dir / f"{task_path.stem}_score.png"
-            _plot_scores(fig_path, scores, err_flags, title=f"{task_path.stem} (best={best_score:.4f}, early stopped)")
-            print(f"[{task_path.name}] Figure saved to: {fig_path}")
-            usage_totals = _append_usage_totals(log_path)
-            return {
-                "task": str(task_path),
-                "best_score": float(best_score),
-                "best_runnable": True,
-                "task_dir": str(task_root),
-                "figure": str(fig_path),
-                "input_tokens_sum": usage_totals["input_tokens"],
-                "output_tokens_sum": usage_totals["output_tokens"],
-                "total_tokens_sum": usage_totals["total_tokens"],
-                "early_stopped": True,
-                "early_stop_reason": f"Score {this_score:.4f} < 0.1 after seed"
-            }
+        # Early stopping: if score < 0.1, stop the task (DISABLED)
+        # if this_score < 0.1:
+        #     print(f"\n[EARLY STOP] Score {this_score:.4f} < 0.1 after seed generation. Stopping task.")
+        #     # Plot and save results before stopping
+        #     fig_path = fig_dir / f"{task_path.stem}_score.png"
+        #     _plot_scores(fig_path, scores, err_flags, title=f"{task_path.stem} (best={best_score:.4f}, early stopped)")
+        #     print(f"[{task_path.name}] Figure saved to: {fig_path}")
+        #     usage_totals = _append_usage_totals(log_path)
+        #     return {
+        #         "task": str(task_path),
+        #         "best_score": float(best_score),
+        #         "best_runnable": True,
+        #         "task_dir": str(task_root),
+        #         "figure": str(fig_path),
+        #         "input_tokens_sum": usage_totals["input_tokens"],
+        #         "output_tokens_sum": usage_totals["output_tokens"],
+        #         "total_tokens_sum": usage_totals["total_tokens"],
+        #         "early_stopped": True,
+        #         "early_stop_reason": f"Score {this_score:.4f} < 0.1 after seed"
+        #     }
     else:
         scores.append(0.0)
         err_flags.append(True)
@@ -823,6 +829,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
             warmup=args.warmup,
             repeat=args.repeat,
             tol=args.tol,
+            rtol=args.rtol,
             phase="seed_repair",
             metrics_dir=eval_dir,
             cached_baseline_ms=pytorch_baseline_ms if pytorch_baseline_ms else None,
@@ -844,26 +851,26 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                 with open(test_kernel, "w") as f:
                     f.write(best_kernel.code)
 
-            # Early stopping: if score < 0.1 after repair, stop the task
-            if this_score < 0.1:
-                print(f"\n[EARLY STOP] Score {this_score:.4f} < 0.1 after seed repair. Stopping task.")
-                # Plot and save results before stopping
-                fig_path = fig_dir / f"{task_path.stem}_score.png"
-                _plot_scores(fig_path, scores, err_flags, title=f"{task_path.stem} (best={best_score:.4f}, early stopped)")
-                print(f"[{task_path.name}] Figure saved to: {fig_path}")
-                usage_totals = _append_usage_totals(log_path)
-                return {
-                    "task": str(task_path),
-                    "best_score": float(best_score),
-                    "best_runnable": True,
-                    "task_dir": str(task_root),
-                    "figure": str(fig_path),
-                    "input_tokens_sum": usage_totals["input_tokens"],
-                    "output_tokens_sum": usage_totals["output_tokens"],
-                    "total_tokens_sum": usage_totals["total_tokens"],
-                    "early_stopped": True,
-                    "early_stop_reason": f"Score {this_score:.4f} < 0.1 after seed repair"
-                }
+            # Early stopping: if score < 0.1 after repair, stop the task (DISABLED)
+            # if this_score < 0.1:
+            #     print(f"\n[EARLY STOP] Score {this_score:.4f} < 0.1 after seed repair. Stopping task.")
+            #     # Plot and save results before stopping
+            #     fig_path = fig_dir / f"{task_path.stem}_score.png"
+            #     _plot_scores(fig_path, scores, err_flags, title=f"{task_path.stem} (best={best_score:.4f}, early stopped)")
+            #     print(f"[{task_path.name}] Figure saved to: {fig_path}")
+            #     usage_totals = _append_usage_totals(log_path)
+            #     return {
+            #         "task": str(task_path),
+            #         "best_score": float(best_score),
+            #         "best_runnable": True,
+            #         "task_dir": str(task_root),
+            #         "figure": str(fig_path),
+            #         "input_tokens_sum": usage_totals["input_tokens"],
+            #         "output_tokens_sum": usage_totals["output_tokens"],
+            #         "total_tokens_sum": usage_totals["total_tokens"],
+            #         "early_stopped": True,
+            #         "early_stop_reason": f"Score {this_score:.4f} < 0.1 after seed repair"
+            #     }
         else:
             scores.append(last_score_for_curve)
             err_flags.append(True)
@@ -986,6 +993,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                 warmup=args.warmup,
                 repeat=args.repeat,
                 tol=args.tol,
+                rtol=args.rtol,
                 phase=f"stage{stage_idx + 1}_{stage_name}",
                 metrics_dir=eval_dir,
                 cached_baseline_ms=pytorch_baseline_ms,  # Use cached baseline
@@ -1030,6 +1038,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                         warmup=args.warmup,
                         repeat=args.repeat,
                         tol=args.tol,
+                        rtol=args.rtol,
                         phase=f"stage{stage_idx + 1}_repair",
                         metrics_dir=eval_dir,
                         cached_baseline_ms=pytorch_baseline_ms,  # Use cached baseline

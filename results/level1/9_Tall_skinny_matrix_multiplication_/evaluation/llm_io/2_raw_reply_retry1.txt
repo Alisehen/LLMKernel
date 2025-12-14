@@ -1,0 +1,89 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_warps=8),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_warps=8),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128}, num_warps=8),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128}, num_warps=8),
+    ],
+    key=['M']
+)
+@triton.jit
+def matmul_kernel_optimized(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    M,
+    N,
+    stride_am,
+    stride_an,
+    stride_bn,
+    stride_bm,
+    stride_cm,
+    stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+    
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    for k in range(0, N):
+        a_offs = offs_m * stride_am + k * stride_an
+        a_mask = offs_m < M
+        a = tl.load(a_ptr + a_offs, mask=a_mask, other=0.0)
+        
+        b_offs = k * stride_bn + offs_n * stride_bm
+        b_mask = offs_n < M
+        b = tl.load(b_ptr + b_offs, mask=b_mask, other=0.0)
+        
+        acc += a[:, None] * b[None, :]
+    
+    c_offs = offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < M)
+    tl.store(c_ptr + c_offs, acc, mask=c_mask)
+
+def triton_matmul_optimized(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    M = A.size(0)
+    N = A.size(1)
+    assert B.size(0) == N and B.size(1) == M
+    
+    C = torch.empty((M, M), device=A.device, dtype=A.dtype)
+    
+    grid = lambda meta: (
+        triton.cdiv(M, meta['BLOCK_M']),
+        triton.cdiv(M, meta['BLOCK_N']),
+    )
+    
+    matmul_kernel_optimized[grid](
+        A,
+        B,
+        C,
+        M,
+        N,
+        A.stride(0),
+        A.stride(1),
+        B.stride(0),
+        B.stride(1),
+        C.stride(0),
+        C.stride(1),
+    )
+    
+    return C
+
+class ModelNew(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+    
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        return triton_matmul_optimized(A, B)
+```

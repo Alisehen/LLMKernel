@@ -1,0 +1,144 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 4}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 8}, num_warps=4, num_stages=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 16}, num_warps=2, num_stages=5),
+    ],
+    key=['spatial_size', 'channels'],
+)
+@triton.jit
+def bias_add_kernel_2d_optimized(
+    input_ptr,
+    bias_ptr,
+    output_ptr,
+    batch_size,
+    channels,
+    spatial_size,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """
+    Optimized 2D bias addition with vectorized channel processing.
+    
+    Grid dimensions:
+    - pid_b: batch index
+    - pid_c: channel block index
+    - pid_s: spatial block index
+    
+    Each thread block processes:
+    - BLOCK_N channels (vectorized)
+    - BLOCK_M spatial elements
+    """
+    # 3D grid indices
+    pid_b = tl.program_id(axis=0)
+    pid_c = tl.program_id(axis=1)
+    pid_s = tl.program_id(axis=2)
+    
+    # Channel block processing - vectorized
+    channel_offsets = pid_c * BLOCK_N + tl.arange(0, BLOCK_N)
+    channel_mask = channel_offsets < channels
+    
+    # Spatial block processing
+    spatial_offsets = pid_s * BLOCK_M + tl.arange(0, BLOCK_M)
+    spatial_mask = spatial_offsets < spatial_size
+    
+    # Load biases for channel block
+    bias_vals = tl.load(bias_ptr + channel_offsets, mask=channel_mask, other=0.0)
+    
+    # Process multiple channels in parallel
+    for c_idx in tl.range(0, BLOCK_N, 1):
+        # Skip if beyond actual channels
+        channel_idx = pid_c * BLOCK_N + c_idx
+        if channel_idx >= channels:
+            break
+            
+        # Calculate base pointer for this channel
+        base_offset = (pid_b * channels + channel_idx) * spatial_size
+        
+        # Load input block for this channel
+        input_vals = tl.load(
+            input_ptr + base_offset + spatial_offsets,
+            mask=spatial_mask,
+            other=0.0
+        )
+        
+        # Add broadcasted bias
+        output_vals = input_vals + bias_vals[c_idx]
+        
+        # Store output
+        tl.store(
+            output_ptr + base_offset + spatial_offsets,
+            output_vals,
+            mask=spatial_mask
+        )
+
+
+def triton_bias_add_optimized(input_tensor: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    Optimized wrapper function for bias addition.
+    
+    Args:
+        input_tensor: Shape [batch, channels, height, width]
+        bias: Shape [channels, 1, 1]
+    
+    Returns:
+        Tensor with same shape as input_tensor
+    """
+    # Ensure tensors are contiguous
+    input_tensor = input_tensor.contiguous()
+    bias = bias.contiguous()
+    
+    # Get dimensions
+    batch_size, channels, height, width = input_tensor.shape
+    spatial_size = height * width
+    
+    # Reshape bias to 1D
+    bias_1d = bias.view(channels)
+    
+    # Allocate output
+    output = torch.empty_like(input_tensor)
+    
+    # Grid configuration
+    grid = lambda META: (
+        batch_size,
+        triton.cdiv(channels, META['BLOCK_N']),
+        triton.cdiv(spatial_size, META['BLOCK_M']),
+    )
+    
+    # Launch optimized kernel
+    bias_add_kernel_2d_optimized[grid](
+        input_tensor,
+        bias_1d,
+        output,
+        batch_size,
+        channels,
+        spatial_size,
+    )
+    
+    return output
+
+
+class ModelNew(nn.Module):
+    """
+    Simple model that performs a convolution, applies ReLU, and adds a bias term.
+    Uses optimized 2D Triton kernel for bias addition.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, bias_shape):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = torch.relu(x)
+        # Use optimized Triton kernel for bias addition
+        x = triton_bias_add_optimized(x, self.bias)
+        return x
+```

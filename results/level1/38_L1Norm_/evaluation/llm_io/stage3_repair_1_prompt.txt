@@ -1,0 +1,284 @@
+Fix the Triton kernel errors. Generate correct, high-performance code.
+
+Current Error Log:
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 609, in compare_and_bench
+    raise ValueError(
+ValueError: Outputs are not close (atol=0.001, rtol=0.001). max_abs_err=1.594e-02, mean_abs_err=7.883e-03
+
+History Error:
+None
+
+
+PyTorch Reference:
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs L1 normalization.
+    """
+    def __init__(self):
+        """
+        Initializes the L1 normalization layer.
+        """
+        super(Model, self).__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies L1 normalization to the input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (..., dim, ...).
+
+        Returns:
+            torch.Tensor: Output tensor with L1 normalization applied, same shape as input.
+        """
+        return x / torch.mean(torch.abs(x), dim=1, keepdim=True)
+
+batch_size = 32768
+# choose dim so total <2^31
+dim = 65535
+
+def get_inputs():
+    x = torch.rand(batch_size, dim)
+    return [x]
+
+def get_init_inputs():
+    return []
+```
+
+Broken Code:
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def l1_norm_fused_kernel_optimized(
+    x_ptr,
+    output_ptr,
+    stride_x0, stride_x1,
+    stride_out0, stride_out1,
+    B, D,
+    BLOCK_SIZE_B: tl.constexpr,
+    BLOCK_SIZE_D: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+):
+    """
+    Optimized 2D tile kernel with improved memory access patterns and latency hiding.
+    Each block processes BLOCK_SIZE_B rows and BLOCK_SIZE_D columns.
+    """
+    # 2D program IDs for better parallelism
+    pid_b = tl.program_id(axis=0)
+    pid_d = tl.program_id(axis=1)
+    
+    # Calculate tile boundaries
+    b_start = pid_b * BLOCK_SIZE_B
+    d_start = pid_d * BLOCK_SIZE_D
+    
+    # Create masks for boundary checking
+    b_offsets = b_start + tl.arange(0, BLOCK_SIZE_B)
+    d_offsets = d_start + tl.arange(0, BLOCK_SIZE_D)
+    
+    b_mask = b_offsets < B
+    d_mask = d_offsets < D
+    
+    # Initialize accumulators for row sums
+    row_sums = tl.zeros((BLOCK_SIZE_B,), dtype=tl.float32)
+    
+    # Pre-fetch first chunk to hide memory latency
+    d_chunk = 0
+    d_chunk_offsets = d_chunk + tl.arange(0, BLOCK_SIZE_D)
+    d_chunk_mask = d_chunk_offsets < D
+    x_ptrs = x_ptr + b_offsets[:, None] * stride_x0 + d_chunk_offsets[None, :] * stride_x1
+    x_chunk = tl.load(x_ptrs, mask=b_mask[:, None] & d_chunk_mask[None, :], other=0.0)
+    
+    # Main loop with software pipelining
+    for d_chunk in range(BLOCK_SIZE_D, D, BLOCK_SIZE_D):
+        # Pre-fetch next chunk
+        next_d_chunk = d_chunk + BLOCK_SIZE_D
+        next_offsets = next_d_chunk + tl.arange(0, BLOCK_SIZE_D)
+        next_mask = next_offsets < D
+        next_ptrs = x_ptr + b_offsets[:, None] * stride_x0 + next_offsets[None, :] * stride_x1
+        next_chunk = tl.load(next_ptrs, mask=b_mask[:, None] & next_mask[None, :], other=0.0)
+        
+        # Compute on current chunk
+        abs_chunk = tl.abs(x_chunk)
+        row_sums += tl.sum(abs_chunk, axis=1)
+        
+        # Swap buffers
+        x_chunk = next_chunk
+    
+    # Process last chunk
+    abs_chunk = tl.abs(x_chunk)
+    row_sums += tl.sum(abs_chunk, axis=1)
+    
+    # Compute mean for each row
+    mean_vals = row_sums / D
+    
+    # Normalize and store the assigned column chunk
+    if pid_d * BLOCK_SIZE_D < D:
+        x_ptrs = x_ptr + b_offsets[:, None] * stride_x0 + d_offsets[None, :] * stride_x1
+        out_ptrs = output_ptr + b_offsets[:, None] * stride_out0 + d_offsets[None, :] * stride_out1
+        
+        x_chunk = tl.load(x_ptrs, mask=b_mask[:, None] & d_mask[None, :], other=0.0)
+        normalized = x_chunk / mean_vals[:, None]
+        tl.store(out_ptrs, normalized, mask=b_mask[:, None] & d_mask[None, :])
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE_D': 256, 'NUM_STAGES': 1}, num_warps=4),
+        triton.Config({'BLOCK_SIZE_D': 512, 'NUM_STAGES': 2}, num_warps=4),
+        triton.Config({'BLOCK_SIZE_D': 1024, 'NUM_STAGES': 3}, num_warps=8),
+        triton.Config({'BLOCK_SIZE_D': 2048, 'NUM_STAGES': 4}, num_warps=8),
+    ],
+    key=['D'],
+)
+@triton.jit
+def l1_norm_fused_kernel_large_b(
+    x_ptr,
+    output_ptr,
+    stride_x0, stride_x1,
+    stride_out0, stride_out1,
+    B, D,
+    BLOCK_SIZE_D: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+):
+    """
+    Optimized 1D grid kernel for large B with software pipelining and improved memory access.
+    Each block processes one row.
+    """
+    pid_b = tl.program_id(axis=0)
+    
+    if pid_b >= B:
+        return
+    
+    row_ptr = x_ptr + pid_b * stride_x0
+    out_row_ptr = output_ptr + pid_b * stride_out0
+    
+    # Initialize sum
+    row_sum = 0.0
+    
+    # Pre-fetch first chunk
+    d_start = 0
+    offsets = d_start + tl.arange(0, BLOCK_SIZE_D)
+    mask = offsets < D
+    x_chunk = tl.load(row_ptr + offsets * stride_x1, mask=mask, other=0.0)
+    
+    # Main loop with software pipelining
+    for d_start in range(BLOCK_SIZE_D, D, BLOCK_SIZE_D):
+        # Pre-fetch next chunk
+        next_start = d_start + BLOCK_SIZE_D
+        next_offsets = next_start + tl.arange(0, BLOCK_SIZE_D)
+        next_mask = next_offsets < D
+        next_chunk = tl.load(row_ptr + next_offsets * stride_x1, mask=next_mask, other=0.0)
+        
+        # Compute on current chunk
+        abs_chunk = tl.abs(x_chunk)
+        row_sum += tl.sum(abs_chunk, axis=0)
+        
+        # Swap buffers
+        x_chunk = next_chunk
+    
+    # Process last chunk
+    abs_chunk = tl.abs(x_chunk)
+    row_sum += tl.sum(abs_chunk, axis=0)
+    
+    # Compute mean
+    mean_val = row_sum / D
+    
+    # Second pass: normalize and store with vectorized access
+    for d_start in range(0, D, BLOCK_SIZE_D):
+        offsets = d_start + tl.arange(0, BLOCK_SIZE_D)
+        mask = offsets < D
+        
+        x_chunk = tl.load(row_ptr + offsets * stride_x1, mask=mask, other=0.0)
+        normalized = x_chunk / mean_val
+        tl.store(out_row_ptr + offsets * stride_out1, normalized, mask=mask)
+
+def triton_l1_norm_optimized(x: torch.Tensor) -> torch.Tensor:
+    """
+    Optimized wrapper function with intelligent kernel selection.
+    """
+    B, D = x.shape
+    
+    # Ensure float32 for computation
+    if x.dtype != torch.float32:
+        x = x.float()
+    
+    output = torch.empty_like(x)
+    
+    # Heuristic for kernel selection based on tensor size
+    total_elements = B * D
+    
+    if total_elements <= 1048576:  # Small tensors: use 2D grid
+        # Optimized block sizes for Ada Lovelace
+        BLOCK_SIZE_B = min(32, triton.next_power_of_2(B))
+        BLOCK_SIZE_D = min(512, triton.next_power_of_2(D))
+        
+        grid_b = triton.cdiv(B, BLOCK_SIZE_B)
+        grid_d = triton.cdiv(D, BLOCK_SIZE_D)
+        
+        # Ensure sufficient parallelism for 128 SMs
+        total_blocks = grid_b * grid_d
+        if total_blocks < 256:
+            grid_b = max(grid_b, min(16, triton.cdiv(256, grid_d)))
+        
+        grid = (grid_b, grid_d)
+        
+        # Adjust num_stages based on D size
+        num_stages = 3 if D > 16384 else (2 if D > 4096 else 1)
+        num_warps = 8 if D > 8192 else 4
+        
+        l1_norm_fused_kernel_optimized[grid](
+            x, output,
+            x.stride(0), x.stride(1),
+            output.stride(0), output.stride(1),
+            B, D,
+            BLOCK_SIZE_B=BLOCK_SIZE_B,
+            BLOCK_SIZE_D=BLOCK_SIZE_D,
+            NUM_STAGES=num_stages,
+            num_warps=num_warps,
+        )
+    else:  # Large tensors: use autotuned 1D kernel
+        grid = (B,)
+        
+        # Launch autotuned kernel
+        l1_norm_fused_kernel_large_b[grid](
+            x, output,
+            x.stride(0), x.stride(1),
+            output.stride(0), output.stride(1),
+            B, D,
+        )
+    
+    return output
+
+class ModelNew(nn.Module):
+    """
+    Optimized L1 normalization layer using high-performance Triton kernels.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Ensure contiguous memory layout
+        if not x.is_contiguous():
+            x = x.contiguous()
+        return triton_l1_norm_optimized(x)
+```
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+3. Learn from previous repair attempts to avoid repeating the same mistakes
+
+```python
+# <corrected code>
+```

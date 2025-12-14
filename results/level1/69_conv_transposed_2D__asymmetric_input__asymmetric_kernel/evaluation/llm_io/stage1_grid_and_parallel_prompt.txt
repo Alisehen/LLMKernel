@@ -1,0 +1,377 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU
+GPU Name: 4090
+Architecture: Ada Lovelace
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+# Algorithm-Level Optimization (for complex ops)
+For Conv2D/Conv3D kernels with poor performance (e.g., slower than PyTorch):
+- **Root cause**: Naive nested loops over kernel dimensions (for kh: for kw: ...) have very low compute density
+- **Solution**: Use **implicit GEMM** approach:
+  * Treat output as matrix: (N*OH*OW, OC) for 2D, (N*OD*OH*OW, OC) for 3D
+  * Treat weight as matrix: (OC, IC*KH*KW) for 2D, (OC, IC*KD*KH*KW) for 3D
+  * K dimension = IC * kernel_elements, tile over K with BLOCK_K
+  * Compute input position from (output_pos, k_offset) on-the-fly
+  * Use `tl.dot()` for matrix multiply to leverage Tensor Cores
+- **Key pattern**:
+  ```
+  for k in range(0, K, BLOCK_K):
+      # Decode k -> (ic, kd, kh, kw)
+      # Compute input address from output position + kernel offset
+      # Load input tile [BLOCK_M, BLOCK_K] and weight tile [BLOCK_K, BLOCK_N]
+      acc += tl.dot(a_tile, b_tile)
+  ```
+
+[OPTIMIZATION STAGE]
+
+## Current Optimization Stage
+
+Focus: Grid layout & parallelism.
+
+Metrics:
+- sm__throughput.avg.pct_of_peak_sustained_elapsed (>60%)
+- launch__grid_size
+
+Rules:
+- 1D: (cdiv(N, BLOCK))
+- 2D: (cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))
+- 3D: (batch, cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))
+- >3D: flatten ONLY independent dims
+- Prefer batch / head / expert parallelism before shrinking BLOCK
+- Change grid only if SM utilization is clearly low
+
+Safety:
+- Max 3 grid dims, static rank
+- grid=(G0,G1,G2) must match tl.program_id(0/1/2)
+- If unsure about correctness, do NOT change grid
+
+Autotune:
+- Autotune either BLOCK_* OR (num_warps, num_stages)
+- If autotuning BLOCK_*, use grid=lambda META: (...)
+- Never redefine BLOCK_* in both kernel and launch
+
+
+
+[CURRENT CODE]
+```python
+import math
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+def _torch_dtype_to_triton(dtype: torch.dtype):
+    if dtype == torch.float16:
+        return tl.float16
+    if dtype == torch.bfloat16:
+        return tl.bfloat16
+    if dtype == torch.float32:
+        return tl.float32
+    raise ValueError(f"Unsupported dtype: {dtype}")
+
+
+@triton.jit
+def conv_transpose2d_kernel(
+    x_ptr,
+    w_ptr,
+    b_ptr,
+    y_ptr,
+    in_stride_n,
+    in_stride_c,
+    in_stride_h,
+    in_stride_w,
+    out_stride_n,
+    out_stride_c,
+    out_stride_h,
+    out_stride_w,
+    w_stride_ic,
+    w_stride_oc,
+    w_stride_h,
+    w_stride_w,
+    N,
+    IC,
+    OC,
+    H,
+    W,
+    OH,
+    OW,
+    stride_h,
+    stride_w,
+    pad_h,
+    pad_w,
+    dilation_h,
+    dilation_w,
+    ic_per_group,
+    oc_per_group,
+    NUM_K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    KH: tl.constexpr,
+    KW: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    OUT_DTYPE: tl.constexpr,
+):
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    total_positions = N * OH * OW
+    mask_m = offs_m < total_positions
+    mask_n = offs_n < OC
+
+    ohow = OH * OW
+    n_idx = offs_m // ohow
+    n_idx = tl.where(mask_m, n_idx, 0)
+    rem = offs_m - n_idx * ohow
+    oh_idx = rem // OW
+    oh_idx = tl.where(mask_m, oh_idx, 0)
+    ow_idx = rem - oh_idx * OW
+    ow_idx = tl.where(mask_m, ow_idx, 0)
+
+    oc_group = offs_n // oc_per_group
+    oc_group = tl.where(mask_n, oc_group, 0)
+    oc_in_group = offs_n - oc_group * oc_per_group
+    oc_in_group = tl.where(mask_n, oc_in_group, 0)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k_iter in tl.static_range(0, NUM_K):
+        ic_idx = k_iter * BLOCK_K + tl.arange(0, BLOCK_K)
+        ic_mask = ic_idx < IC
+        ic_idx = tl.where(ic_mask, ic_idx, 0)
+        ic_group = ic_idx // ic_per_group
+
+        for kh in tl.static_range(0, KH):
+            dilated_kh = kh * dilation_h
+            num_h = oh_idx + pad_h - dilated_kh
+            ih_candidate = tl.where(num_h >= 0, num_h // stride_h, 0)
+            num_h_mod = num_h - ih_candidate * stride_h
+            mask_h = (num_h >= 0) & (num_h_mod == 0) & (ih_candidate < H)
+            ih = tl.where(mask_h, ih_candidate, 0)
+
+            for kw in tl.static_range(0, KW):
+                dilated_kw = kw * dilation_w
+                num_w = ow_idx + pad_w - dilated_kw
+                iw_candidate = tl.where(num_w >= 0, num_w // stride_w, 0)
+                num_w_mod = num_w - iw_candidate * stride_w
+                mask_w = (num_w >= 0) & (num_w_mod == 0) & (iw_candidate < W)
+                iw = tl.where(mask_w, iw_candidate, 0)
+
+                valid_pos = mask_m & mask_h & mask_w
+                pos_mask = valid_pos[:, None] & ic_mask[None, :]
+                same_group = ic_group[:, None] == oc_group[None, :]
+                weight_mask = ic_mask[:, None] & mask_n[None, :] & same_group
+
+                in_ptrs = (
+                    x_ptr
+                    + n_idx[:, None] * in_stride_n
+                    + ic_idx[None, :] * in_stride_c
+                    + ih[:, None] * in_stride_h
+                    + iw[:, None] * in_stride_w
+                )
+                inp_vals = tl.load(in_ptrs, mask=pos_mask, other=0.0)
+
+                w_ptrs = (
+                    w_ptr
+                    + ic_idx[:, None] * w_stride_ic
+                    + oc_in_group[None, :] * w_stride_oc
+                    + kh * w_stride_h
+                    + kw * w_stride_w
+                )
+                weight_vals = tl.load(w_ptrs, mask=weight_mask, other=0.0)
+
+                acc += tl.dot(inp_vals.to(tl.float32), weight_vals.to(tl.float32))
+
+    if HAS_BIAS:
+        bias_vals = tl.load(b_ptr + offs_n, mask=mask_n, other=0.0)
+        acc += bias_vals[None, :]
+
+    out_ptrs = (
+        y_ptr
+        + n_idx[:, None] * out_stride_n
+        + offs_n[None, :] * out_stride_c
+        + oh_idx[:, None] * out_stride_h
+        + ow_idx[:, None] * out_stride_w
+    )
+    tl.store(out_ptrs, acc.to(OUT_DTYPE), mask=mask_m[:, None] & mask_n[None, :])
+
+
+def triton_conv_transpose2d(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor = None,
+    stride=(1, 1),
+    padding=(0, 0),
+    output_padding=(0, 0),
+    dilation=(1, 1),
+    groups: int = 1,
+):
+    x = x.contiguous()
+    weight = weight.contiguous()
+    if bias is not None:
+        bias = bias.contiguous()
+
+    N, IC, H, W = x.shape
+    _, OC_per_group, KH, KW = weight.shape
+    OC = OC_per_group * groups
+
+    stride_h, stride_w = stride
+    pad_h, pad_w = padding
+    op_h, op_w = output_padding
+    dilation_h, dilation_w = dilation
+
+    OH = (H - 1) * stride_h - 2 * pad_h + dilation_h * (KH - 1) + op_h + 1
+    OW = (W - 1) * stride_w - 2 * pad_w + dilation_w * (KW - 1) + op_w + 1
+
+    out = torch.empty((N, OC, OH, OW), device=x.device, dtype=x.dtype)
+
+    in_stride_n, in_stride_c, in_stride_h, in_stride_w = x.stride()
+    out_stride_n, out_stride_c, out_stride_h, out_stride_w = out.stride()
+    w_stride_ic, w_stride_oc, w_stride_h, w_stride_w = weight.stride()
+
+    BLOCK_M = 64
+    BLOCK_N = 64
+    BLOCK_K = 32
+
+    grid = (
+        triton.cdiv(N * OH * OW, BLOCK_M),
+        triton.cdiv(OC, BLOCK_N),
+    )
+    num_k = triton.cdiv(IC, BLOCK_K)
+
+    conv_transpose2d_kernel[grid](
+        x,
+        weight,
+        bias if bias is not None else weight,
+        out,
+        in_stride_n,
+        in_stride_c,
+        in_stride_h,
+        in_stride_w,
+        out_stride_n,
+        out_stride_c,
+        out_stride_h,
+        out_stride_w,
+        w_stride_ic,
+        w_stride_oc,
+        w_stride_h,
+        w_stride_w,
+        N,
+        IC,
+        OC,
+        H,
+        W,
+        OH,
+        OW,
+        stride_h,
+        stride_w,
+        pad_h,
+        pad_w,
+        dilation_h,
+        dilation_w,
+        IC // groups,
+        OC_per_group,
+        NUM_K=num_k,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        KH=KH,
+        KW=KW,
+        HAS_BIAS=bias is not None,
+        OUT_DTYPE=_torch_dtype_to_triton(out.dtype),
+    )
+    return out
+
+
+class ModelNew(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: tuple,
+        stride: tuple = (1, 1),
+        padding: tuple = (0, 0),
+        output_padding: tuple = (0, 0),
+        dilation: tuple = (1, 1),
+        groups: int = 1,
+        bias: bool = False,
+    ) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(
+            torch.empty(
+                in_channels,
+                out_channels // groups,
+                kernel_size[0],
+                kernel_size[1],
+            )
+        )
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if bias:
+            fan_in = in_channels * kernel_size[0] * kernel_size[1]
+            bound = 1 / math.sqrt(fan_in)
+            self.bias = nn.Parameter(torch.empty(out_channels))
+            nn.init.uniform_(self.bias, -bound, bound)
+        else:
+            self.register_parameter("bias", None)
+
+        self.stride = stride
+        self.padding = padding
+        self.output_padding = output_padding
+        self.dilation = dilation
+        self.groups = groups
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_conv_transpose2d(
+            x,
+            self.weight,
+            self.bias,
+            stride=self.stride,
+            padding=self.padding,
+            output_padding=self.output_padding,
+            dilation=self.dilation,
+            groups=self.groups,
+        )
+```
+
+[NCU PROFILING METRICS]
+{
+  "conv_transpose2d_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 10.58,
+    "launch__grid_size": 67600,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 16.66,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 16.32,
+    "lts__t_sector_hit_rate.pct": 99.37
+  }
+}
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

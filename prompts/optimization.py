@@ -7,7 +7,7 @@ import json
 ROOT = Path(__file__).resolve().parents[1]  # project root
 HW_FILE = ROOT / "prompts/hardware/gpu_specs.py"
 
-from prompts.generate_custom_cuda import _load_gpu_spec  # Adjust import path as needed
+from prompts.generate_custom_cuda import _load_gpu_spec, _detect_operator_type, _build_operator_guidance
 
 _OPTIMIZATION_PROMPT_TEMPLATE = Template("""\
 You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
@@ -84,6 +84,10 @@ def build_optimization_prompt(
     arch_src = Path(arch_path).read_text().strip()
     hist = history_block or "(None)\n"
 
+    # Detect operator type and build guidance
+    guidance_keys = _detect_operator_type(arch_path)
+    operator_guidance = _build_operator_guidance(guidance_keys)
+
     # Build stage context with enhanced guidance
     stage_context = ""
     if stage_name and stage_description:
@@ -101,12 +105,14 @@ Rules:
 - 2D: (cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))
 - 3D: (batch, cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))
 - >3D: flatten ONLY independent dims
-- Prefer batch / head / expert parallelism before shrinking BLOCK
+- Prefer batch / head / expert / group parallelism before shrinking BLOCK
+- For grouped operations: ensure group dimension is in grid (e.g., program_id(2) for groups)
 - Change grid only if SM utilization is clearly low
 
 Safety:
 - Max 3 grid dims, static rank
 - grid=(G0,G1,G2) must match tl.program_id(0/1/2)
+- For grouped ops: verify group indexing is correct
 - If unsure about correctness, do NOT change grid
 
 Autotune:
@@ -197,6 +203,7 @@ Autotune:
         gpu_items=gpu_items,
         arch_src=arch_src,
         history_block=hist,
+        OPERATOR_SPECIFIC_GUIDANCE=operator_guidance,
         STAGE_CONTEXT=stage_context,
         NCU_METRICS=ncu_section,
         FAILURE_ANALYSIS=failure_context,

@@ -1,0 +1,115 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def cross_entropy_kernel_optimized(
+    predictions_ptr,
+    targets_ptr,
+    loss_ptr,
+    batch_size,
+    num_classes,
+    BLOCK_SIZE: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+):
+    """Optimized cross-entropy kernel with parallel reduction."""
+    pid = tl.program_id(0)
+    
+    # Early exit if out of bounds
+    if pid >= batch_size:
+        return
+    
+    # Precompute row start
+    row_start = pid * num_classes
+    
+    # Thread-local accumulators for max and sum
+    thread_max = -float('inf')
+    thread_sum = 0.0
+    
+    # First: parallel reduction for max across the row
+    for start in tl.range(0, num_classes, BLOCK_SIZE, num_stages=NUM_STAGES):
+        offsets = start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < num_classes
+        chunk = tl.load(predictions_ptr + row_start + offsets, mask=mask, other=-float('inf'))
+        chunk_max = tl.max(chunk, axis=0)
+        thread_max = tl.maximum(thread_max, chunk_max)
+    
+    # Second: parallel reduction for sum(exp(x - max))
+    for start in tl.range(0, num_classes, BLOCK_SIZE, num_stages=NUM_STAGES):
+        offsets = start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < num_classes
+        chunk = tl.load(predictions_ptr + row_start + offsets, mask=mask, other=0.0)
+        chunk_stable = chunk - thread_max
+        exp_val = tl.exp(chunk_stable)
+        chunk_sum = tl.sum(exp_val, axis=0)
+        thread_sum += chunk_sum
+    
+    # Compute loss for this row
+    target_idx = tl.load(targets_ptr + pid)
+    target_pred = tl.load(predictions_ptr + row_start + target_idx)
+    
+    log_sum_exp = tl.log(thread_sum + 1e-12)
+    log_softmax_target = target_pred - thread_max - log_sum_exp
+    loss = -log_softmax_target / batch_size
+    
+    # Atomic add to accumulate total loss
+    tl.atomic_add(loss_ptr, loss)
+
+def triton_cross_entropy_optimized(predictions: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    """Optimized fused cross entropy loss with autotuning."""
+    batch_size, num_classes = predictions.shape[0], predictions.shape[1]
+    
+    # Allocate output
+    loss = torch.zeros(1, device=predictions.device, dtype=predictions.dtype)
+    
+    # Define kernel function with autotune decorator
+    configs = [
+        triton.Config({'BLOCK_SIZE': 256, 'NUM_STAGES': 1}, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 512, 'NUM_STAGES': 1}, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 1024, 'NUM_STAGES': 1}, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 256, 'NUM_STAGES': 2}, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 512, 'NUM_STAGES': 2}, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 1024, 'NUM_STAGES': 2}, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 256, 'NUM_STAGES': 3}, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 512, 'NUM_STAGES': 3}, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 1024, 'NUM_STAGES': 3}, num_warps=4),
+    ]
+    
+    @triton.autotune(configs=configs, key=['batch_size', 'num_classes'])
+    @triton.jit
+    def _cross_entropy_kernel(
+        predictions_ptr,
+        targets_ptr,
+        loss_ptr,
+        batch_size,
+        num_classes,
+        BLOCK_SIZE: tl.constexpr,
+        NUM_STAGES: tl.constexpr,
+    ):
+        cross_entropy_kernel_optimized(
+            predictions_ptr, targets_ptr, loss_ptr,
+            batch_size, num_classes, BLOCK_SIZE, NUM_STAGES
+        )
+    
+    # Launch kernel
+    grid = (batch_size,)
+    _cross_entropy_kernel[grid](
+        predictions, targets, loss,
+        batch_size, num_classes,
+    )
+    
+    return loss
+
+class ModelNew(nn.Module):
+    """
+    A model that computes Cross Entropy Loss for multi-class classification tasks.
+    Optimized implementation using Triton kernels.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+
+    def forward(self, predictions, targets):
+        return triton_cross_entropy_optimized(predictions, targets)
+```

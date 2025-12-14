@@ -1,0 +1,226 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU
+GPU Name: 4090
+Architecture: Ada Lovelace
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+[OPTIMIZATION STAGE]
+
+## Current Optimization Stage
+
+Focus: Final micro-tuning.
+
+Params:
+- num_warps ∈ {2,4,8,16}
+- num_stages ∈ {2,3,4}
+
+Rules:
+- Change num_warps only if occupancy suggests it
+- Change num_stages by ±1 only
+- Do NOT modify grid or BLOCK sizes
+
+Autotune:
+- 3–6 nearby configs
+- Always include original config
+- Revert if gain <1–2% or unstable
+
+
+
+[CURRENT CODE]
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def logsumexp_relu_kernel_optimized(
+    input_ptr,
+    output_ptr,
+    n_batch,
+    n_channel,
+    n_depth,
+    n_height,
+    n_width,
+    BLOCK_SIZE: tl.constexpr,
+    SPATIAL_BLOCK: tl.constexpr,
+):
+    """
+    Optimized kernel with 2D grid layout and increased work per thread block.
+    Each thread block handles SPATIAL_BLOCK spatial positions and reduces over channels.
+    """
+    pid_batch = tl.program_id(0)
+    pid_spatial_block = tl.program_id(1)
+    
+    num_spatial_positions = n_depth * n_height * n_width
+    spatial_block_start = pid_spatial_block * SPATIAL_BLOCK
+    
+    # Thread IDs for channel dimension
+    tid = tl.arange(0, BLOCK_SIZE)
+    # Spatial offsets within block
+    spatial_offsets = tl.arange(0, SPATIAL_BLOCK)
+    spatial_indices = spatial_block_start + spatial_offsets
+    valid_spatial_mask = spatial_indices < num_spatial_positions
+    
+    # Convert linear spatial index to 3D coordinates
+    spatial_idx = tl.where(valid_spatial_mask, spatial_indices, 0)
+    width_idx = spatial_idx % n_width
+    height_idx = (spatial_idx // n_width) % n_height
+    depth_idx = spatial_idx // (n_height * n_width)
+    
+    # Initialize max_vals and sum_exps for each spatial position
+    max_vals = tl.full((SPATIAL_BLOCK,), float('-inf'), dtype=tl.float32)
+    sum_exps = tl.zeros((SPATIAL_BLOCK,), dtype=tl.float32)
+    
+    # First pass: compute max for each spatial position across channels
+    for channel_block_start in range(0, n_channel, BLOCK_SIZE):
+        channel_indices = channel_block_start + tid
+        channel_mask = channel_indices < n_channel
+        
+        # Compute offsets for all spatial positions in the block
+        offsets = (pid_batch * n_channel * num_spatial_positions +
+                  channel_indices[:, None] * num_spatial_positions +
+                  depth_idx[None, :] * n_height * n_width +
+                  height_idx[None, :] * n_width +
+                  width_idx[None, :])
+        
+        # Load values with proper masking
+        values = tl.load(input_ptr + offsets, 
+                        mask=channel_mask[:, None] & valid_spatial_mask[None, :],
+                        other=float('-inf'))
+        
+        # Update max values - use max reduction across channels
+        block_max = tl.max(values, axis=0)
+        max_vals = tl.maximum(max_vals, block_max)
+    
+    # Second pass: compute sum of exponentials using global max
+    for channel_block_start in range(0, n_channel, BLOCK_SIZE):
+        channel_indices = channel_block_start + tid
+        channel_mask = channel_indices < n_channel
+        
+        offsets = (pid_batch * n_channel * num_spatial_positions +
+                  channel_indices[:, None] * num_spatial_positions +
+                  depth_idx[None, :] * n_height * n_width +
+                  height_idx[None, :] * n_width +
+                  width_idx[None, :])
+        
+        values = tl.load(input_ptr + offsets,
+                        mask=channel_mask[:, None] & valid_spatial_mask[None, :],
+                        other=0.0)
+        
+        # Compute exp(values - max_vals) with proper broadcasting
+        exp_values = tl.exp(values - max_vals[None, :])
+        # Mask out invalid channels before summing
+        exp_values = tl.where(channel_mask[:, None] & valid_spatial_mask[None, :], exp_values, 0.0)
+        block_sum = tl.sum(exp_values, axis=0)
+        sum_exps += block_sum
+    
+    # Compute logsumexp and apply ReLU
+    # Handle edge case where sum_exps might be 0 (log(0) = -inf)
+    log_sum_exps = tl.log(tl.maximum(sum_exps, 1e-10)) + max_vals
+    results = tl.maximum(log_sum_exps, 0.0)
+    
+    # Store results - reshape to proper output format
+    output_offsets = (pid_batch * num_spatial_positions + spatial_indices)
+    tl.store(output_ptr + output_offsets, results, mask=valid_spatial_mask)
+
+def triton_logsumexp_relu_optimized(x: torch.Tensor) -> torch.Tensor:
+    """
+    Optimized wrapper function with 2D grid layout.
+    """
+    n_batch, n_channel, n_depth, n_height, n_width = x.shape
+    num_spatial_positions = n_depth * n_height * n_width
+    
+    # Output shape: (batch_size, 1, depth, height, width)
+    output = torch.empty(n_batch, 1, n_depth, n_height, n_width,
+                        device=x.device, dtype=x.dtype)
+    
+    # Configuration optimized for RTX 4090 (Ada Lovelace)
+    BLOCK_SIZE = 256  # Channel dimension block size
+    SPATIAL_BLOCK = 4  # Spatial positions per thread block
+    
+    # Calculate 2D grid
+    grid_batch = n_batch
+    grid_spatial = triton.cdiv(num_spatial_positions, SPATIAL_BLOCK)
+    
+    # Flatten output for kernel storage
+    output_flat = output.view(n_batch, -1)
+    
+    # Launch optimized kernel
+    logsumexp_relu_kernel_optimized[(grid_batch, grid_spatial)](
+        x,
+        output_flat,
+        n_batch,
+        n_channel,
+        n_depth,
+        n_height,
+        n_width,
+        BLOCK_SIZE=BLOCK_SIZE,
+        SPATIAL_BLOCK=SPATIAL_BLOCK,
+        num_warps=8,
+        num_stages=3
+    )
+    
+    return output
+
+class ModelNew(nn.Module):
+    """
+    Model that performs a 3D convolution, max pooling, log sum exp, and ReLU activation.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size,
+                             stride=stride, padding=padding)
+        self.max_pool = nn.MaxPool3d(kernel_size=2, stride=2)
+
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor of shape (batch_size, in_channels, depth, height, width)
+        Returns:
+            Output tensor of shape (batch_size, out_channels, depth', height', width')
+        """
+        x = self.conv(x)
+        x = self.max_pool(x)
+        x = triton_logsumexp_relu_optimized(x)
+        return x
+```
+
+[NCU PROFILING METRICS]
+{
+  "logsumexp_relu_kernel_optimized": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 70.38,
+    "launch__grid_size": 65536,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 95.63,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 17.2,
+    "lts__t_sector_hit_rate.pct": 52.24
+  }
+}
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

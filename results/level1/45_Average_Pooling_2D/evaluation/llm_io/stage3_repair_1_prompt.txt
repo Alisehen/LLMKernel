@@ -1,0 +1,285 @@
+Fix the Triton kernel errors. Generate correct, high-performance code.
+
+Current Error Log:
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 536, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251213_163638_batch_range45to45_openai_deepseek/45_Average_Pooling_2D/code/kernel_20251213_170238.py", line 174, in forward
+    return triton_avg_pool2d(x, self.kernel_size, self.stride, self.padding)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251213_163638_batch_range45to45_openai_deepseek/45_Average_Pooling_2D/code/kernel_20251213_170238.py", line 141, in triton_avg_pool2d
+    avgpool2d_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 347, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 192, in run
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 192, in <dictcomp>
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 170, in _bench
+    return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/testing.py", line 146, in do_bench
+    di.synchronize()
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/cuda/__init__.py", line 1040, in synchronize
+    return torch._C._cuda_synchronize()
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: CUDA error: an illegal memory access was encountered
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+History Error:
+None
+
+
+PyTorch Reference:
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs 2D Average Pooling.
+    """
+    def __init__(self, kernel_size: int, stride: int = None, padding: int = 0):
+        """
+        Initializes the Average Pooling layer.
+
+        Args:
+            kernel_size (int): Size of the pooling window.
+            stride (int, optional): Stride of the pooling operation. Defaults to None (same as kernel_size).
+            padding (int, optional): Padding applied to the input tensor. Defaults to 0.
+        """
+        super(Model, self).__init__()
+        self.avg_pool = nn.AvgPool2d(kernel_size=kernel_size, stride=stride, padding=padding)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies 2D Average Pooling to the input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, channels, height, width).
+
+        Returns:
+            torch.Tensor: Output tensor with Average Pooling applied.
+        """
+        return self.avg_pool(x)
+
+batch_size = 16
+channels = 64
+height = 2048
+width = 2048
+kernel_size = 11
+
+def get_inputs():
+    x = torch.rand(batch_size, channels, height, width)
+    return [x]
+
+def get_init_inputs():
+    return [kernel_size]
+```
+
+Broken Code:
+```python
+# <optimized Triton code>
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_W": 64}, num_warps=2, num_stages=1),
+        triton.Config({"BLOCK_W": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_W": 128}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_W": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_W": 128}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_W": 256}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_W": 256}, num_warps=8, num_stages=3),
+    ],
+    key=["N", "C", "H", "W", "OH", "OW"],
+)
+@triton.jit
+def avgpool2d_kernel(
+    x_ptr,  # *f32, [N, C, H, W] contiguous
+    y_ptr,  # *f32, [N, C, OH, OW] contiguous
+    N, C, H, W,
+    OH, OW,
+    STRIDE_H, STRIDE_W,
+    PAD_H, PAD_W,
+    KERNEL_H: tl.constexpr,
+    KERNEL_W: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+):
+    # ---- program ids ----
+    # pid_nc_oh spans N * C * OH
+    pid_nc_oh = tl.program_id(axis=0)
+    pid_w_blk = tl.program_id(axis=1)
+
+    # ---- decode pid_nc_oh -> (n, c, oh) ----
+    oh = pid_nc_oh % OH
+    tmp = pid_nc_oh // OH
+    c = tmp % C
+    n = tmp // C
+
+    # ---- output W indices for this block ----
+    offs_w = pid_w_blk * BLOCK_W + tl.arange(0, BLOCK_W)
+    mask_ow = offs_w < OW
+    tl.multiple_of(offs_w, BLOCK_W)
+    tl.max_contiguous(offs_w, BLOCK_W)
+
+    # ---- precompute strides (contiguous NCHW) ----
+    HW = H * W
+    sC = HW
+    sN = C * HW
+
+    # base offset for (n, c, 0, 0)
+    base_nc = n * sN + c * sC
+
+    # accumulator
+    acc = tl.zeros((BLOCK_W,), dtype=tl.float32)
+
+    stride_h = STRIDE_H
+    stride_w = STRIDE_W
+    pad_h = PAD_H
+    pad_w = PAD_W
+
+    # base input h coordinate for this output row
+    base_ih = oh * stride_h - pad_h
+
+    # base iw for all kernel positions (vector)
+    base_iw = offs_w * stride_w - pad_w
+
+    # loop over kernel window (unrolled by Triton)
+    for kh in tl.static_range(KERNEL_H):
+        ih = base_ih + kh
+        valid_h = (ih >= 0) & (ih < H)
+
+        # row offset for this ih
+        row_offset = base_nc + ih * W
+
+        # mask independent of kw except for iw range
+        mask_h = mask_ow & valid_h
+
+        for kw in tl.static_range(KERNEL_W):
+            iw = base_iw + kw
+            mask = mask_h & (iw >= 0) & (iw < W)
+
+            ptrs = x_ptr + row_offset + iw
+            vals = tl.load(ptrs, mask=mask, other=0.0)
+            acc += vals
+
+    # average
+    inv_denom = 1.0 / (KERNEL_H * KERNEL_W)
+    acc *= inv_denom
+
+    # ---- write output ----
+    # contiguous [N, C, OH, OW]
+    OH_OW = OH * OW
+    sC_out = OH_OW
+    sN_out = C * OH_OW
+
+    base_nc_out = n * sN_out + c * sC_out
+    row_out_offset = base_nc_out + oh * OW
+
+    out_ptrs = y_ptr + row_out_offset + offs_w
+    tl.store(out_ptrs, acc, mask=mask_ow)
+
+
+def triton_avg_pool2d(
+    x: torch.Tensor,
+    kernel_size: int,
+    stride: int = None,
+    padding: int = 0,
+) -> torch.Tensor:
+    """
+    Average Pooling 2D using Triton (NCHW, count_include_pad=True, ceil_mode=False).
+    """
+    assert x.is_cuda, "Input must be on CUDA device"
+    assert x.dtype == torch.float32, "This implementation currently supports float32 only"
+    assert x.dim() == 4, "Input must be 4D NCHW"
+
+    if stride is None:
+        stride = kernel_size
+
+    N, C, H, W = x.shape
+    kh = kw = int(kernel_size)
+    sh = sw = int(stride)
+    ph = pw = int(padding)
+
+    # PyTorch AvgPool2d output size (ceil_mode=False)
+    OH = (H + 2 * ph - kh) // sh + 1
+    OW = (W + 2 * pw - kw) // sw + 1
+
+    y = torch.empty((N, C, OH, OW), device=x.device, dtype=x.dtype)
+
+    def grid(meta):
+        block_w = meta["BLOCK_W"]
+        return (
+            N * C * OH,                 # pid_nc_oh
+            triton.cdiv(OW, block_w),   # pid_w_blk
+        )
+
+    avgpool2d_kernel[grid](
+        x,
+        y,
+        N,
+        C,
+        H,
+        W,
+        OH,
+        OW,
+        sh,
+        sw,
+        ph,
+        pw,
+        KERNEL_H=kh,
+        KERNEL_W=kw,
+    )
+
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-backed 2D Average Pooling (NCHW) matching nn.AvgPool2d
+    for kernel_size, stride, padding, count_include_pad=True, ceil_mode=False.
+    """
+
+    def __init__(self, kernel_size: int, stride: int = None, padding: int = 0) -> None:
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_avg_pool2d(x, self.kernel_size, self.stride, self.padding)
+```
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl, AND any other modules used (e.g., import math if using math.sqrt)
+   2. @triton.jit decorated kernel function(s) — NO continue/break/return inside loops (use masking)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels — THIS CLASS IS REQUIRED
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+3. Learn from previous repair attempts to avoid repeating the same mistakes
+4. Ensure ALL imports are included at the top (common mistake: forgetting `import math`)
+
+```python
+# <corrected code>
+```

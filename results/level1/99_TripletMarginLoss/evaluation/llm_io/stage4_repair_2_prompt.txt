@@ -1,0 +1,227 @@
+Fix the Triton kernel errors. Generate correct, high-performance code.
+
+Current Error Log:
+Traceback (most recent call last):
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 34, in wrapper
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 2000, in store
+    return semantic.store(pointer, value, mask, boundary_check, cache_modifier, eviction_policy, _builder)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/semantic.py", line 1361, in store
+    return _store_legacy(ptr, val, mask, boundary_check, cache, eviction, builder)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/semantic.py", line 1317, in _store_legacy
+    raise ValueError("Value argument cannot be block type if pointer argument is not a block")
+ValueError: Value argument cannot be block type if pointer argument is not a block
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 535, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251212_170115_batch_range70to100_deepseek_deepseek/99_TripletMarginLoss/code/kernel_20251213_035331.py", line 92, in forward
+    return triton_triplet_margin_loss(anchor, positive, negative, self.margin)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251212_170115_batch_range70to100_deepseek_deepseek/99_TripletMarginLoss/code/kernel_20251213_035331.py", line 73, in triton_triplet_margin_loss
+    triplet_margin_loss_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 347, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 192, in run
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 192, in <dictcomp>
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 170, in _bench
+    return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/testing.py", line 145, in do_bench
+    fn()
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 156, in kernel_call
+    self.fn.run(
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 569, in run
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 278, in compile
+    module = src.make_ir(options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 81, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 39:4:
+
+        pos_diff = anchor - positive
+        neg_diff = anchor - negative
+
+        pos_sum_sq += tl.sum(pos_diff * pos_diff)
+        pos_sum_sq += tl.sum(neg_diff * neg_diff)
+
+    pos_dist = tl.sqrt(pos_sum_sq / 2.0 + 1e-8)
+    neg_dist = tl.sqrt(pos_sum_sq / 2.0 + 1e-8)
+
+    loss_val = tl.maximum(pos_dist - neg_dist + margin, 0.0)
+    tl.store(loss_ptr + pid_batch, loss_val)
+    ^
+
+History Error:
+Previous Repair Attempts (avoid repeating these errors):
+Attempt 1:
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 145, in _bench
+    raise ValueError(f"Conflicting meta-parameters: {', '.join(conflicts)}."
+ValueError: Conflicting meta-parameters: BLOCK_SIZE_FEAT. Make sure that you don't re-define auto-tuned symbols.
+
+
+
+PyTorch Reference:
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    A model that computes Triplet Margin Loss for metric learning tasks.
+
+    Parameters:
+        margin (float): The margin between the positive and negative samples.
+    """
+    def __init__(self, margin=1.0):
+        super(Model, self).__init__()
+        self.loss_fn = torch.nn.TripletMarginLoss(margin=margin)
+
+    def forward(self, anchor, positive, negative):
+        return self.loss_fn(anchor, positive, negative)
+
+batch_size = 32768
+input_shape = (8192,)
+dim = 1
+
+def get_inputs():
+    scale = torch.rand(())
+    return [torch.rand(batch_size, *input_shape)*scale, torch.rand(batch_size, *input_shape), torch.rand(batch_size, *input_shape)]
+    
+def get_init_inputs():
+    return [1.0]  # Default margin
+```
+
+Broken Code:
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 128}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 256}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 512}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 128}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 256}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 512}, num_warps=8, num_stages=3),
+    ],
+    key=['n_elements']
+)
+@triton.jit
+def triplet_margin_loss_kernel(
+    anchor_ptr,
+    positive_ptr,
+    negative_ptr,
+    loss_ptr,
+    margin,
+    n_elements,
+    stride_batch,
+    stride_feat,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid_batch = tl.program_id(axis=0)
+    
+    if pid_batch >= stride_batch:
+        return
+    
+    base_offset = pid_batch * stride_feat
+    pos_sum_sq = tl.zeros([1], dtype=tl.float32)
+    
+    for i in range(0, n_elements, BLOCK_SIZE):
+        offsets = i + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        
+        # Load with correct strides
+        anchor = tl.load(anchor_ptr + base_offset + offsets, mask=mask, other=0.0)
+        positive = tl.load(positive_ptr + base_offset + offsets, mask=mask, other=0.0)
+        negative = tl.load(negative_ptr + base_offset + offsets, mask=mask, other=0.0)
+        
+        pos_diff = anchor - positive
+        neg_diff = anchor - negative
+        
+        pos_sum_sq += tl.sum(pos_diff * pos_diff)
+        pos_sum_sq += tl.sum(neg_diff * neg_diff)
+    
+    pos_dist = tl.sqrt(pos_sum_sq / 2.0 + 1e-8)
+    neg_dist = tl.sqrt(pos_sum_sq / 2.0 + 1e-8)
+    
+    loss_val = tl.maximum(pos_dist - neg_dist + margin, 0.0)
+    tl.store(loss_ptr + pid_batch, loss_val)
+
+def triton_triplet_margin_loss(
+    anchor: torch.Tensor,
+    positive: torch.Tensor,
+    negative: torch.Tensor,
+    margin: float = 1.0
+) -> torch.Tensor:
+    assert anchor.shape == positive.shape == negative.shape
+    assert anchor.is_cuda and positive.is_cuda and negative.is_cuda
+    
+    batch_size, feature_size = anchor.shape
+    
+    sample_losses = torch.empty(batch_size, device=anchor.device, dtype=anchor.dtype)
+    
+    grid = (batch_size,)
+    
+    triplet_margin_loss_kernel[grid](
+        anchor,
+        positive,
+        negative,
+        sample_losses,
+        margin,
+        feature_size,
+        batch_size,
+        feature_size,
+    )
+    
+    return sample_losses.mean()
+
+class ModelNew(nn.Module):
+    def __init__(self, margin: float = 1.0):
+        super(ModelNew, self).__init__()
+        self.margin = margin
+
+    def forward(self, anchor: torch.Tensor, positive: torch.Tensor, negative: torch.Tensor) -> torch.Tensor:
+        return triton_triplet_margin_loss(anchor, positive, negative, self.margin)
+```
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+3. Learn from previous repair attempts to avoid repeating the same mistakes
+
+```python
+# <corrected code>
+```

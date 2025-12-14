@@ -1,0 +1,193 @@
+# import torch
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_M": 256, "BLOCK_N": 64, "BLOCK_K": 32}, num_warps=8, num_stages=3),
+    ],
+    key=["B", "C_OUT", "L_OUT", "K_TOTAL"],
+)
+@triton.jit
+def conv1d_kernel(
+    x_ptr,
+    w_ptr,
+    bias_ptr,
+    y_ptr,
+    B,
+    C_IN,
+    L_IN,
+    C_OUT,
+    L_OUT,
+    KERNEL_SIZE,
+    STRIDE,
+    PADDING,
+    DILATION,
+    K_TOTAL,
+    BATCH_STRIDE_IN,
+    BATCH_STRIDE_OUT,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    total_m = B * L_OUT
+    mask_m = offs_m < total_m
+    mask_n = offs_n < C_OUT
+
+    b_idx = offs_m // L_OUT
+    l_out_idx = offs_m - b_idx * L_OUT
+    in_pos = l_out_idx * STRIDE - PADDING
+
+    batch_in_offsets = b_idx * BATCH_STRIDE_IN
+    out_batch_offsets = b_idx * BATCH_STRIDE_OUT
+    w_col_offsets = offs_n * K_TOTAL
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k_start in range(0, K_TOTAL, BLOCK_K):
+        k_range = tl.arange(0, BLOCK_K)
+        k_offsets = k_start + k_range
+        k_mask = k_offsets < K_TOTAL
+
+        ci = k_offsets // KERNEL_SIZE
+        kk = k_offsets - ci * KERNEL_SIZE
+
+        pos = in_pos[:, None] + kk[None, :] * DILATION
+        valid_pos = (pos >= 0) & (pos < L_IN)
+        pos_safe = tl.where(valid_pos, pos, 0)
+
+        x_offsets = batch_in_offsets[:, None] + ci[None, :] * L_IN + pos_safe
+        x_mask = mask_m[:, None] & k_mask[None, :] & valid_pos
+        x_vals = tl.load(x_ptr + x_offsets, mask=x_mask, other=0.0)
+
+        w_offsets = w_col_offsets[None, :] + k_offsets[:, None]
+        w_mask = mask_n[None, :] & k_mask[:, None]
+        w_vals = tl.load(w_ptr + w_offsets, mask=w_mask, other=0.0)
+
+        acc += tl.dot(x_vals, w_vals)
+
+    if HAS_BIAS:
+        bias = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0)
+        acc += bias[None, :]
+
+    y_offsets = out_batch_offsets[:, None] + offs_n[None, :] * L_OUT + l_out_idx[:, None]
+    y_mask = mask_m[:, None] & mask_n[None, :]
+    tl.store(y_ptr + y_offsets, acc, mask=y_mask)
+
+
+def triton_conv1d(x, weight, bias=None, stride=1, padding=0, dilation=1):
+    assert x.is_cuda and weight.is_cuda, "Inputs must be CUDA tensors."
+    assert x.dtype == torch.float32 and weight.dtype == torch.float32, "Only float32 is supported."
+
+    stride = int(stride)
+    padding = int(padding)
+    dilation = int(dilation)
+
+    x_contig = x.contiguous()
+    w_contig = weight.contiguous()
+
+    B, C_IN, L_IN = x_contig.shape
+    C_OUT, C_W, KERNEL_SIZE = w_contig.shape
+    assert C_W == C_IN, "Weight shape mismatch."
+
+    L_OUT = (L_IN + 2 * padding - dilation * (KERNEL_SIZE - 1) - 1) // stride + 1
+    assert L_OUT > 0, "Invalid output length."
+
+    y = torch.empty((B, C_OUT, L_OUT), device=x.device, dtype=x.dtype)
+    K_TOTAL = C_IN * KERNEL_SIZE
+
+    bias_contig = bias.contiguous() if bias is not None else None
+
+    grid = (
+        triton.cdiv(B * L_OUT, max(1, min(256, 128))),
+        triton.cdiv(C_OUT, max(1, min(128, 128))),
+    )
+
+    def grid_fn(meta):
+        return (
+            triton.cdiv(B * L_OUT, meta["BLOCK_M"]),
+            triton.cdiv(C_OUT, meta["BLOCK_N"]),
+        )
+
+    conv1d_kernel[grid_fn](
+        x_contig,
+        w_contig,
+        bias_contig if bias_contig is not None else y,
+        y,
+        B,
+        C_IN,
+        L_IN,
+        C_OUT,
+        L_OUT,
+        KERNEL_SIZE,
+        stride,
+        padding,
+        dilation,
+        K_TOTAL,
+        C_IN * L_IN,
+        C_OUT * L_OUT,
+        HAS_BIAS=bias_contig is not None,
+    )
+
+    return y
+
+
+class ModelNew(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size,
+        stride=1,
+        padding=0,
+        dilation=1,
+        groups=1,
+        bias=False,
+    ):
+        super().__init__()
+        if groups != 1:
+            raise NotImplementedError("groups != 1 is not supported.")
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+
+        self.weight = nn.Parameter(torch.empty(out_channels, in_channels, kernel_size))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_channels))
+        else:
+            self.register_parameter("bias", None)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.kaiming_uniform_(self.weight, a=5 ** 0.5)
+        if self.bias is not None:
+            fan_in = self.in_channels * self.kernel_size
+            bound = 1.0 / (fan_in ** 0.5)
+            nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x):
+        return triton_conv1d(
+            x,
+            self.weight,
+            self.bias,
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation,
+        )

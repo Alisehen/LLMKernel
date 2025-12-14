@@ -1,0 +1,108 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def fro_norm_partial_kernel(
+    x_ptr,
+    partial_sums_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """First pass: compute partial sums of squares for each block."""
+    pid = tl.program_id(axis=0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    
+    # Load data
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    
+    # Compute sum of squares for this block
+    local_sum = tl.sum(x * x)
+    
+    # Store partial sum
+    tl.store(partial_sums_ptr + pid, local_sum)
+
+
+@triton.jit
+def fro_norm_normalize_kernel(
+    x_ptr,
+    output_ptr,
+    partial_sums_ptr,
+    norm_val_ptr,
+    n_elements,
+    num_blocks,
+    EPS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Second pass: reduce partial sums, compute norm, and normalize."""
+    pid = tl.program_id(axis=0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    
+    # All threads load the pre-computed norm value
+    norm_val = tl.load(norm_val_ptr)
+    
+    # Normalize elements in this block
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    normalized = x / norm_val
+    tl.store(output_ptr + offsets, normalized, mask=mask)
+
+
+def triton_fro_norm_normalize(x: torch.Tensor) -> torch.Tensor:
+    output = torch.empty_like(x)
+    
+    # Flatten input for kernel processing
+    x_flat = x.reshape(-1)
+    output_flat = output.reshape(-1)
+    n_elements = x_flat.numel()
+    
+    # Configuration optimized for performance
+    BLOCK_SIZE = 1024
+    num_blocks = triton.cdiv(n_elements, BLOCK_SIZE)
+    
+    # Allocate buffer for partial sums (global memory, not shared)
+    partial_sums = torch.zeros(num_blocks, device=x.device, dtype=torch.float32)
+    
+    # First pass: compute partial sums
+    fro_norm_partial_kernel[(num_blocks,)](
+        x_flat,
+        partial_sums,
+        n_elements,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=8,
+    )
+    
+    # Compute norm on host (device) - this is efficient for small num_blocks
+    total_sum = partial_sums.sum()
+    norm_val = torch.sqrt(total_sum) + 1e-8
+    
+    # Store norm in a tensor for the kernel
+    norm_tensor = torch.tensor([norm_val], device=x.device, dtype=torch.float32)
+    
+    # Second pass: normalize using pre-computed norm
+    fro_norm_normalize_kernel[(num_blocks,)](
+        x_flat,
+        output_flat,
+        partial_sums,
+        norm_tensor,
+        n_elements,
+        num_blocks,
+        EPS=1e-8,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=8,
+    )
+    
+    return output
+
+
+class ModelNew(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_fro_norm_normalize(x)
+```

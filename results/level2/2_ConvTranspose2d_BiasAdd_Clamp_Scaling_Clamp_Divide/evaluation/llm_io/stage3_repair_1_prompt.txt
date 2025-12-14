@@ -1,0 +1,236 @@
+Fix the Triton kernel errors. Generate correct, high-performance code.
+
+Current Error Log:
+Traceback (most recent call last):
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 34, in wrapper
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 1707, in reshape
+    shape = _shape_check_impl(_unwrap_iterable(shape))
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 1474, in _shape_check_impl
+    validate_block_shape(shape)
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/_utils.py", line 16, in validate_block_shape
+    raise ValueError(f"Shape element {i} must be a power of 2")
+ValueError: Shape element 0 must be a power of 2
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 535, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251213_080709_batch_range1to40_deepseek_deepseek/2_ConvTranspose2d_BiasAdd_Clamp_Scaling_Clamp_Divide/code/kernel_20251213_091152.py", line 98, in forward
+    return triton_post_process(x, self.bias, self.scaling_factor)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251213_080709_batch_range1to40_deepseek_deepseek/2_ConvTranspose2d_BiasAdd_Clamp_Scaling_Clamp_Divide/code/kernel_20251213_091152.py", line 78, in triton_post_process
+    post_process_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 347, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 192, in run
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 192, in <dictcomp>
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 170, in _bench
+    return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/testing.py", line 145, in do_bench
+    fn()
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 156, in kernel_call
+    self.fn.run(
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 569, in run
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 278, in compile
+    module = src.make_ir(options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 81, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 22:14:
+    pid = tl.program_id(0)
+    bc_id = tl.program_id(1)
+
+    spatial_size = H * W
+    batch_id = bc_id // C
+    channel_id = bc_id % C
+    base_offset = batch_id * C * spatial_size + channel_id * spatial_size
+
+    # Vectorized processing
+    spatial_start = pid * BLOCK_SIZE * VEC_SIZE
+    offsets = base_offset + spatial_start + tl.arange(0, BLOCK_SIZE)[:, None] * VEC_SIZE + tl.arange(0, VEC_SIZE)[None, :]
+    offsets = tl.reshape(offsets, -1)
+              ^
+
+History Error:
+None
+
+
+PyTorch Reference:
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs a transposed convolution, adds a bias term, clamps, scales, clamps, and divides.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, bias_shape, scaling_factor):
+        super(Model, self).__init__()
+        self.conv_transpose = nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, output_padding=output_padding)
+        self.bias = nn.Parameter(torch.randn(bias_shape)) 
+        self.scaling_factor = scaling_factor
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = x + self.bias
+        x = torch.clamp(x, min=0.0, max=1.0)
+        x = x * self.scaling_factor
+        x = torch.clamp(x, min=0.0, max=1.0)
+        x = x / self.scaling_factor
+        return x
+
+batch_size = 128
+in_channels  = 64  
+out_channels = 64  
+height = width = 128 
+kernel_size = 3
+stride = 2
+padding = 1
+output_padding = 1
+bias_shape = (out_channels, 1, 1)
+scaling_factor = 2.0
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, stride, padding, output_padding, bias_shape, scaling_factor]
+```
+
+Broken Code:
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 256, 'VEC_SIZE': 4}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 512, 'VEC_SIZE': 4}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 1024, 'VEC_SIZE': 4}, num_warps=8, num_stages=1),
+        triton.Config({'BLOCK_SIZE': 2048, 'VEC_SIZE': 2}, num_warps=8, num_stages=1),
+    ],
+    key=['spatial_size']
+)
+@triton.jit
+def post_process_kernel(
+    x_ptr,
+    bias_ptr,
+    output_ptr,
+    scaling_factor,
+    B, C, H, W,
+    BLOCK_SIZE: tl.constexpr,
+    VEC_SIZE: tl.constexpr,
+):
+    # 2D grid: (spatial_blocks, batch*channel)
+    pid = tl.program_id(0)
+    bc_id = tl.program_id(1)
+    
+    spatial_size = H * W
+    batch_id = bc_id // C
+    channel_id = bc_id % C
+    base_offset = batch_id * C * spatial_size + channel_id * spatial_size
+    
+    # Vectorized processing
+    spatial_start = pid * BLOCK_SIZE * VEC_SIZE
+    offsets = base_offset + spatial_start + tl.arange(0, BLOCK_SIZE)[:, None] * VEC_SIZE + tl.arange(0, VEC_SIZE)[None, :]
+    offsets = tl.reshape(offsets, -1)
+    
+    mask_base = spatial_start + tl.arange(0, BLOCK_SIZE * VEC_SIZE)
+    mask = mask_base < spatial_size
+    
+    # Vectorized load
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    
+    # Load bias and broadcast
+    bias = tl.load(bias_ptr + channel_id)
+    x = x + bias
+    
+    # Fused operations with improved numerical stability
+    scale_inv = 1.0 / scaling_factor
+    x = tl.minimum(tl.maximum(x, 0.0), 1.0)
+    x_scaled = x * scaling_factor
+    x = tl.minimum(tl.maximum(x_scaled, 0.0), 1.0) * scale_inv
+    
+    # Vectorized store
+    tl.store(output_ptr + offsets, x, mask=mask)
+
+def triton_post_process(
+    x: torch.Tensor,
+    bias: torch.Tensor,
+    scaling_factor: float
+) -> torch.Tensor:
+    assert x.is_contiguous(), "Input tensor must be contiguous"
+    assert bias.is_contiguous(), "Bias tensor must be contiguous"
+    
+    B, C, H, W = x.shape
+    spatial_size = H * W
+    output = torch.empty_like(x)
+    
+    # 2D grid for better cache locality
+    grid = lambda META: (
+        triton.cdiv(spatial_size, META['BLOCK_SIZE'] * META['VEC_SIZE']),
+        B * C
+    )
+    
+    bias_reshaped = bias.view(-1)
+    
+    post_process_kernel[grid](
+        x, bias_reshaped, output,
+        scaling_factor,
+        B, C, H, W,
+    )
+    
+    return output
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, bias_shape, scaling_factor):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose2d(
+            in_channels, out_channels, kernel_size, 
+            stride=stride, padding=padding, output_padding=output_padding
+        )
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.scaling_factor = scaling_factor
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        return triton_post_process(x, self.bias, self.scaling_factor)
+```
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+3. Learn from previous repair attempts to avoid repeating the same mistakes
+
+```python
+# <corrected code>
+```

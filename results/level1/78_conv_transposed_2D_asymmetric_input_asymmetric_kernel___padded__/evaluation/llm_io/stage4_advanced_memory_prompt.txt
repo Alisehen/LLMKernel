@@ -1,0 +1,214 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU
+GPU Name: 4090
+Architecture: Ada Lovelace
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+[OPTIMIZATION STAGE]
+
+## Current Optimization Stage
+
+Focus: Final micro-tuning.
+
+Params:
+- num_warps ∈ {2,4,8,16}
+- num_stages ∈ {2,3,4}
+
+Rules:
+- Change num_warps only if occupancy suggests it
+- Change num_stages by ±1 only
+- Do NOT modify grid or BLOCK sizes
+
+Autotune:
+- 3–6 nearby configs
+- Always include original config
+- Revert if gain <1–2% or unstable
+
+
+
+[CURRENT CODE]
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def conv_transpose2d_kernel(
+    x_ptr,
+    w_ptr,
+    b_ptr,
+    out_ptr,
+    B,
+    H_in,
+    W_in,
+    H_out,
+    W_out,
+    total_out,
+    Cin: tl.constexpr,
+    Cout: tl.constexpr,
+    Kh: tl.constexpr,
+    Kw: tl.constexpr,
+    stride_h: tl.constexpr,
+    stride_w: tl.constexpr,
+    pad_h: tl.constexpr,
+    pad_w: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < total_out
+
+    ow = offsets % W_out
+    tmp = offsets // W_out
+    oh = tmp % H_out
+    tmp = tmp // H_out
+    co = tmp % Cout
+    b = tmp // Cout
+
+    acc = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+
+    for ci in range(Cin):
+        bc = b * Cin + ci
+        for kh in range(Kh):
+            oh_k = oh + pad_h - kh
+            cond_h = (oh_k % stride_h) == 0
+            ih = oh_k // stride_h
+            cond_h = cond_h & (ih >= 0) & (ih < H_in)
+            ih_val = tl.where(cond_h, ih, 0)
+            for kw in range(Kw):
+                ow_k = ow + pad_w - kw
+                cond_w = (ow_k % stride_w) == 0
+                iw = ow_k // stride_w
+                cond_w = cond_w & (iw >= 0) & (iw < W_in)
+                iw_val = tl.where(cond_w, iw, 0)
+                cond = mask & cond_h & cond_w
+
+                in_idx = (((bc * H_in) + ih_val) * W_in) + iw_val
+                inp = tl.load(x_ptr + in_idx, mask=cond, other=0.0)
+
+                w_idx = (((ci * Cout) + co) * Kh + kh) * Kw + kw
+                weight = tl.load(w_ptr + w_idx, mask=mask, other=0.0)
+
+                acc += inp * weight
+
+    if HAS_BIAS:
+        bias = tl.load(b_ptr + co, mask=mask, other=0.0)
+        acc += bias
+
+    tl.store(out_ptr + offsets, acc, mask=mask)
+
+
+def triton_conv_transpose2d(x, weight, bias, stride, padding):
+    B, Cin, H_in, W_in = x.shape
+    Cout = weight.shape[1]
+    Kh, Kw = weight.shape[2], weight.shape[3]
+    stride_h, stride_w = stride
+    pad_h, pad_w = padding
+
+    H_out = (H_in - 1) * stride_h - 2 * pad_h + Kh
+    W_out = (W_in - 1) * stride_w - 2 * pad_w + Kw
+
+    out = torch.empty((B, Cout, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    total_out = B * Cout * H_out * W_out
+    BLOCK_SIZE = 256
+    grid = lambda meta: (triton.cdiv(total_out, meta['BLOCK_SIZE']),)
+
+    conv_transpose2d_kernel[grid](
+        x,
+        weight,
+        bias if bias is not None else out,
+        out,
+        B,
+        H_in,
+        W_in,
+        H_out,
+        W_out,
+        total_out,
+        Cin=Cin,
+        Cout=Cout,
+        Kh=Kh,
+        Kw=Kw,
+        stride_h=stride_h,
+        stride_w=stride_w,
+        pad_h=pad_h,
+        pad_w=pad_w,
+        HAS_BIAS=bias is not None,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+
+    return out
+
+
+class ModelNew(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: tuple,
+        stride: tuple = (1, 1),
+        padding: tuple = (0, 0),
+        bias: bool = False,
+    ):
+        super().__init__()
+        self.conv_transpose2d = nn.ConvTranspose2d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            bias=bias,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_conv_transpose2d(
+            x,
+            self.conv_transpose2d.weight,
+            self.conv_transpose2d.bias,
+            self.conv_transpose2d.stride,
+            self.conv_transpose2d.padding,
+        )
+```
+
+[NCU PROFILING METRICS]
+{
+  "conv_transpose2d_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 94.08,
+    "launch__grid_size": 524288,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 74.77,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 2.68,
+    "lts__t_sector_hit_rate.pct": 98.98
+  }
+}
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

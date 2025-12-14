@@ -1,0 +1,218 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def matmul_transposed_kernel(
+    A_ptr,
+    B_ptr,
+    C_ptr,
+    M,
+    N,
+    K,
+    stride_ak,
+    stride_am,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    USE_TF32: tl.constexpr,
+):
+    """Optimized matrix multiplication kernel for A.T @ B."""
+    pid = tl.program_id(0)
+    pid_m = pid // tl.cdiv(N, BLOCK_SIZE_N)
+    pid_n = pid % tl.cdiv(N, BLOCK_SIZE_N)
+    
+    # Offsets for block of C
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    
+    # Create pointers to blocks of A and B
+    a_block_ptr = tl.make_block_ptr(
+        base=A_ptr,
+        shape=(K, M),
+        strides=(stride_ak, stride_am),
+        offsets=(0, pid_m * BLOCK_SIZE_M),
+        block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_M),
+        order=(1, 0)
+    )
+    
+    b_block_ptr = tl.make_block_ptr(
+        base=B_ptr,
+        shape=(K, N),
+        strides=(stride_bk, stride_bn),
+        offsets=(0, pid_n * BLOCK_SIZE_N),
+        block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_N),
+        order=(1, 0)
+    )
+    
+    # Initialize accumulator
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    
+    # Loop over K dimension
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        # Load A block (transposed access pattern)
+        a = tl.load(a_block_ptr, boundary_check=(0, 1))
+        # Load B block
+        b = tl.load(b_block_ptr, boundary_check=(0, 1))
+        
+        # Matrix multiply with TF32 precision if enabled
+        if USE_TF32:
+            a = a.to(tl.float32)
+            b = b.to(tl.float32)
+        
+        acc += tl.dot(a.T, b, allow_tf32=USE_TF32)
+        
+        # Update block pointers
+        a_block_ptr = tl.advance(a_block_ptr, (BLOCK_SIZE_K, 0))
+        b_block_ptr = tl.advance(b_block_ptr, (BLOCK_SIZE_K, 0))
+    
+    # Store result
+    c_block_ptr = tl.make_block_ptr(
+        base=C_ptr,
+        shape=(M, N),
+        strides=(stride_cm, stride_cn),
+        offsets=(pid_m * BLOCK_SIZE_M, pid_n * BLOCK_SIZE_N),
+        block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N),
+        order=(1, 0)
+    )
+    
+    tl.store(c_block_ptr, acc, boundary_check=(0, 1))
+
+
+@triton.jit
+def matmul_transposed_kernel_small(
+    A_ptr,
+    B_ptr,
+    C_ptr,
+    M,
+    N,
+    K,
+    stride_ak,
+    stride_am,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+):
+    """Alternative kernel for small matrices with fused transpose."""
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    
+    # Offsets for block of C
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    
+    # Initialize accumulator
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    
+    # Loop over K dimension with block K
+    for k_block in range(0, K, BLOCK_SIZE_K):
+        offs_k = k_block + tl.arange(0, BLOCK_SIZE_K)
+        
+        # Load blocks with bounds checking
+        mask_k = offs_k < K
+        mask_m = offs_m < M
+        mask_n = offs_n < N
+        
+        # Load A block with transpose: A[k, m] -> want A[m, k] for dot product
+        a_ptrs = A_ptr + (offs_k[:, None] * stride_ak + offs_m[None, :] * stride_am)
+        a = tl.load(a_ptrs, mask=mask_k[:, None] & mask_m[None, :])
+        
+        # Load B block
+        b_ptrs = B_ptr + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
+        b = tl.load(b_ptrs, mask=mask_k[:, None] & mask_n[None, :])
+        
+        # Transpose A block and accumulate
+        acc += tl.dot(a.T.to(tl.float16), b.to(tl.float16), allow_tf32=False)
+    
+    # Store result
+    mask_store = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    c_ptrs = C_ptr + (offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn)
+    tl.store(c_ptrs, acc, mask=mask_store)
+
+
+def triton_matmul_transposed(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    """Wrapper for optimized matrix multiplication A.T @ B."""
+    M, K = A.shape[1], A.shape[0]
+    N = B.shape[1]
+    
+    # Ensure tensors are contiguous and on correct device
+    assert A.is_cuda and B.is_cuda, "Tensors must be on CUDA device"
+    A = A.contiguous()
+    B = B.contiguous()
+    
+    # Create output tensor
+    C = torch.empty((M, N), device=A.device, dtype=A.dtype)
+    
+    # Choose kernel based on problem size
+    total_size = M * N * K
+    if total_size > 128 * 1024 * 1024:  # Large problem
+        BLOCK_SIZE_M = 128
+        BLOCK_SIZE_N = 128
+        BLOCK_SIZE_K = 64
+        USE_TF32 = True
+        
+        grid = (triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),)
+        
+        matmul_transposed_kernel[grid](
+            A, B, C,
+            M, N, K,
+            A.stride(0), A.stride(1),
+            B.stride(0), B.stride(1),
+            C.stride(0), C.stride(1),
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            BLOCK_SIZE_K=BLOCK_SIZE_K,
+            USE_TF32=USE_TF32,
+        )
+    else:
+        BLOCK_SIZE_M = 64
+        BLOCK_SIZE_N = 64
+        BLOCK_SIZE_K = 32
+        
+        grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
+        
+        matmul_transposed_kernel_small[grid](
+            A, B, C,
+            M, N, K,
+            A.stride(0), A.stride(1),
+            B.stride(0), B.stride(1),
+            C.stride(0), C.stride(1),
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            BLOCK_SIZE_K=BLOCK_SIZE_K,
+        )
+    
+    return C
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model with Triton kernels for matrix multiplication.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+    
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        """
+        Performs optimized matrix multiplication A.T @ B using Triton kernels.
+        
+        Args:
+            A: Input tensor of shape (K, M).
+            B: Input tensor of shape (K, N).
+            
+        Returns:
+            Output tensor of shape (M, N).
+        """
+        return triton_matmul_transposed(A, B)
+```

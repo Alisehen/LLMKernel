@@ -1,0 +1,59 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def elu_kernel(
+    x_ptr,
+    output_ptr,
+    alpha,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+
+    x = tl.load(x_ptr + offsets, mask=mask)
+    
+    # ELU: x if x > 0 else alpha * (exp(x) - 1)
+    exp_x = tl.exp(x)
+    elu_x = tl.where(x > 0, x, alpha * (exp_x - 1.0))
+    
+    tl.store(output_ptr + offsets, elu_x, mask=mask)
+
+
+def triton_elu(x: torch.Tensor, alpha: float = 1.0) -> torch.Tensor:
+    output = torch.empty_like(x)
+    n_elements = output.numel()
+    
+    # Heuristic for optimal block size based on tensor size
+    if n_elements < 8192:
+        BLOCK_SIZE = 128
+    elif n_elements < 65536:
+        BLOCK_SIZE = 256
+    elif n_elements < 1048576:
+        BLOCK_SIZE = 512
+    else:
+        BLOCK_SIZE = 1024
+    
+    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
+    
+    # Convert alpha to the same dtype as x for kernel
+    alpha_tensor = torch.tensor(alpha, dtype=x.dtype, device=x.device)
+    
+    elu_kernel[grid](x, output, alpha_tensor, n_elements, BLOCK_SIZE=BLOCK_SIZE)
+    
+    return output
+
+
+class ModelNew(nn.Module):
+    def __init__(self, alpha: float = 1.0):
+        super().__init__()
+        self.alpha = alpha
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_elu(x, alpha=self.alpha)

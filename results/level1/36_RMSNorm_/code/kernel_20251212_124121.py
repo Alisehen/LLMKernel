@@ -1,0 +1,143 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_FEAT': 32, 'BLOCK_H': 8, 'BLOCK_W': 8}, num_warps=2),
+        triton.Config({'BLOCK_FEAT': 32, 'BLOCK_H': 16, 'BLOCK_W': 16}, num_warps=4),
+        triton.Config({'BLOCK_FEAT': 64, 'BLOCK_H': 8, 'BLOCK_W': 8}, num_warps=4),
+        triton.Config({'BLOCK_FEAT': 64, 'BLOCK_H': 16, 'BLOCK_W': 16}, num_warps=8),
+        triton.Config({'BLOCK_FEAT': 128, 'BLOCK_H': 8, 'BLOCK_W': 8}, num_warps=8),
+    ],
+    key=['N', 'C', 'H', 'W']
+)
+@triton.jit
+def rms_norm_kernel(
+    x_ptr,
+    output_ptr,
+    N,  # batch size
+    C,  # features
+    H,  # height
+    W,  # width
+    eps,
+    stride_n,
+    stride_c,
+    stride_h,
+    stride_w,
+    BLOCK_FEAT: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+):
+    # Calculate program ID for batch and spatial location
+    pid_n = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    pid_w = tl.program_id(2)
+    
+    # Check batch bounds
+    if pid_n >= N:
+        return
+    
+    # Calculate spatial offsets with bounds checking
+    offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    offs_w = pid_w * BLOCK_W + tl.arange(0, BLOCK_W)
+    
+    # Create masks for spatial dimensions
+    mask_h = offs_h < H
+    mask_w = offs_w < W
+    spatial_mask = mask_h[:, None] & mask_w[None, :]
+    
+    # Initialize sum of squares for this spatial location
+    sum_sq = tl.zeros((BLOCK_H, BLOCK_W), dtype=tl.float32)
+    
+    # First pass: compute sum of squares across features
+    for feat_block in range(0, C, BLOCK_FEAT):
+        offs_c = feat_block + tl.arange(0, BLOCK_FEAT)
+        feat_mask = offs_c < C
+        
+        # Load input block with proper broadcasting
+        x_ptrs = (
+            x_ptr + 
+            pid_n * stride_n + 
+            offs_c[:, None, None] * stride_c + 
+            offs_h[None, :, None] * stride_h + 
+            offs_w[None, None, :] * stride_w
+        )
+        
+        load_mask = feat_mask[:, None, None] & spatial_mask[None, :, :]
+        x_block = tl.load(x_ptrs, mask=load_mask, other=0.0)
+        
+        # Accumulate sum of squares
+        sum_sq += tl.sum(x_block * x_block, axis=0)
+    
+    # Compute RMS normalization factor
+    inv_feat = 1.0 / C
+    mean_sq = sum_sq * inv_feat
+    rms_inv = tl.rsqrt(mean_sq + eps)
+    
+    # Second pass: apply normalization
+    for feat_block in range(0, C, BLOCK_FEAT):
+        offs_c = feat_block + tl.arange(0, BLOCK_FEAT)
+        feat_mask = offs_c < C
+        
+        # Load input block again
+        x_ptrs = (
+            x_ptr + 
+            pid_n * stride_n + 
+            offs_c[:, None, None] * stride_c + 
+            offs_h[None, :, None] * stride_h + 
+            offs_w[None, None, :] * stride_w
+        )
+        
+        load_mask = feat_mask[:, None, None] & spatial_mask[None, :, :]
+        x_block = tl.load(x_ptrs, mask=load_mask, other=0.0)
+        
+        # Apply normalization and store
+        normalized = x_block * rms_inv[None, :, :]
+        
+        output_ptrs = (
+            output_ptr + 
+            pid_n * stride_n + 
+            offs_c[:, None, None] * stride_c + 
+            offs_h[None, :, None] * stride_h + 
+            offs_w[None, None, :] * stride_w
+        )
+        tl.store(output_ptrs, normalized, mask=load_mask)
+
+
+def triton_rms_norm(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+    output = torch.empty_like(x)
+    N, C, H, W = x.shape
+    
+    # Calculate grid dimensions
+    grid = (
+        N,
+        triton.cdiv(H, 8),  # Start with conservative block size
+        triton.cdiv(W, 8),
+    )
+    
+    # Launch kernel
+    rms_norm_kernel[grid](
+        x,
+        output,
+        N, C, H, W,
+        eps,
+        x.stride(0),
+        x.stride(1),
+        x.stride(2),
+        x.stride(3),
+    )
+    
+    return output
+
+
+class ModelNew(nn.Module):
+    def __init__(self, num_features: int, eps: float = 1e-5):
+        super(ModelNew, self).__init__()
+        self.num_features = num_features
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_rms_norm(x, self.eps)

@@ -1,0 +1,175 @@
+Looking at the error, the issue is with numerical instability in the kernel. The large error (8.184e+03) suggests the kernel isn't properly handling the log-sum-exp computation. Here's a corrected and optimized version:
+
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 256, 'num_warps': 4, 'num_stages': 3}),
+        triton.Config({'BLOCK_SIZE': 512, 'num_warps': 8, 'num_stages': 3}),
+        triton.Config({'BLOCK_SIZE': 1024, 'num_warps': 8, 'num_stages': 2}),
+        triton.Config({'BLOCK_SIZE': 1024, 'num_warps': 16, 'num_stages': 2}),
+        triton.Config({'BLOCK_SIZE': 2048, 'num_warps': 16, 'num_stages': 2}),
+    ],
+    key=['num_classes'],
+)
+@triton.jit
+def cross_entropy_kernel(
+    predictions_ptr,
+    targets_ptr,
+    loss_ptr,
+    batch_size,
+    num_classes,
+    BLOCK_SIZE: tl.constexpr,
+    num_warps: tl.constexpr,
+    num_stages: tl.constexpr,
+):
+    """Optimized cross-entropy kernel using stable log-sum-exp."""
+    pid = tl.program_id(0)
+    if pid >= batch_size:
+        return
+    
+    # Base pointer for this batch element
+    row_start = pid * num_classes
+    
+    # Initialize accumulators
+    row_max = -float('inf')
+    row_sum_exp = 0.0
+    
+    # First pass: find maximum for numerical stability
+    for start in range(0, num_classes, BLOCK_SIZE):
+        offsets = start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < num_classes
+        
+        x = tl.load(predictions_ptr + row_start + offsets, mask=mask, other=-float('inf'))
+        # Use tl.max with axis=None for reduction
+        chunk_max = tl.max(x, axis=0)
+        row_max = tl.maximum(row_max, chunk_max)
+    
+    # Second pass: compute sum of exp(x - max)
+    for start in range(0, num_classes, BLOCK_SIZE):
+        offsets = start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < num_classes
+        
+        x = tl.load(predictions_ptr + row_start + offsets, mask=mask, other=-float('inf'))
+        
+        # Compute exp(x - max) with numerical stability
+        x_stable = tl.where(mask, x - row_max, -float('inf'))
+        exp_val = tl.exp(x_stable)
+        # Use tl.sum for proper reduction
+        chunk_sum = tl.sum(exp_val, axis=0)
+        row_sum_exp += chunk_sum
+    
+    # Load target class and its prediction
+    target_idx = tl.load(targets_ptr + pid)
+    target_pred = tl.load(predictions_ptr + row_start + target_idx)
+    
+    # Compute log_softmax with numerical stability
+    log_sum_exp = tl.log(row_sum_exp + 1e-12)  # Add small epsilon
+    log_softmax_target = target_pred - row_max - log_sum_exp
+    
+    # Cross-entropy loss
+    loss = -log_softmax_target
+    
+    # Store loss for this sample (we'll average later)
+    tl.store(loss_ptr + pid, loss)
+
+
+@triton.jit
+def reduce_loss_kernel(
+    loss_ptr,
+    output_ptr,
+    batch_size,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Reduce per-sample losses to final average loss."""
+    pid = tl.program_id(0)
+    
+    # Accumulate losses in shared memory
+    shared = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+    
+    # Load and accumulate
+    for i in range(pid * BLOCK_SIZE, batch_size, BLOCK_SIZE * tl.num_programs(0)):
+        idx = i + tl.arange(0, BLOCK_SIZE)
+        mask = idx < batch_size
+        val = tl.load(loss_ptr + idx, mask=mask, other=0.0)
+        shared += tl.sum(val, axis=0)
+    
+    # Reduce within block
+    acc = tl.sum(shared, axis=0)
+    
+    # Final reduction using atomic add
+    if pid == 0:
+        total = tl.zeros((1,), dtype=tl.float32)
+        for i in range(0, tl.num_programs(0)):
+            total += tl.load(loss_ptr + batch_size + i)
+        tl.store(output_ptr, total / batch_size)
+
+
+def triton_cross_entropy(predictions: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    """Fused cross entropy loss implementation using Triton."""
+    batch_size, num_classes = predictions.shape[0], predictions.shape[1]
+    
+    # Ensure tensors are on the same device and contiguous
+    predictions = predictions.contiguous()
+    targets = targets.contiguous()
+    
+    # Allocate per-sample losses and final output
+    device = predictions.device
+    dtype = predictions.dtype
+    per_sample_losses = torch.zeros(batch_size, device=device, dtype=dtype)
+    final_loss = torch.zeros(1, device=device, dtype=dtype)
+    
+    # Launch per-sample kernel
+    grid = (triton.cdiv(batch_size, 1),)  # One thread per sample
+    cross_entropy_kernel[grid](
+        predictions,
+        targets,
+        per_sample_losses,
+        batch_size,
+        num_classes,
+    )
+    
+    # Launch reduction kernel
+    BLOCK_SIZE = 256
+    grid_reduce = (triton.cdiv(batch_size, BLOCK_SIZE),)
+    reduce_loss_kernel[grid_reduce](
+        per_sample_losses,
+        final_loss,
+        batch_size,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    
+    return final_loss
+
+
+class ModelNew(nn.Module):
+    """
+    A model that computes Cross Entropy Loss for multi-class classification tasks.
+    Optimized implementation using Triton kernels.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+
+    def forward(self, predictions, targets):
+        return triton_cross_entropy(predictions, targets)
+```
+
+Key fixes and optimizations:
+
+1. **Fixed numerical instability**: The main issue was in the log-sum-exp computation. Added proper handling for masked values and used `tl.where` to only compute exponentials for valid positions.
+
+2. **Separated reduction**: Split into two kernels - one for per-sample loss computation and another for reduction. This is more efficient and avoids atomic operation issues.
+
+3. **Proper reduction patterns**: Used `tl.sum` and `tl.max` correctly for reductions across vectors.
+
+4. **Better autotune configs**: Adjusted block sizes based on typical workload sizes.
+
+5. **Added epsilon**: Added small epsilon (1e-12) in log computation to prevent log(0).
+
+6. **Memory layout**: Ensured tensors are contiguous before kernel launch.
+
+The kernel now properly computes the cross-entropy loss with numerical stability and should match PyTorch's implementation within tolerance.

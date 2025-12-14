@@ -1,0 +1,103 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+import math
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8, num_stages=4),
+        triton.Config({'BLOCK_SIZE': 4096}, num_warps=16, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 8192}, num_warps=32, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 16384}, num_warps=32, num_stages=1),
+    ],
+    key=['n_elements'],
+)
+@triton.jit
+def gelu_kernel(
+    x_ptr,
+    output_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Optimized GELU with improved memory access patterns and latency hiding."""
+    pid = tl.program_id(axis=0)
+    
+    # Use vectorized loads/stores for better memory throughput
+    ELEMENTS_PER_THREAD = 4
+    BLOCK_ELEMENTS = BLOCK_SIZE * ELEMENTS_PER_THREAD
+    
+    # Calculate base offset for this block
+    block_start = pid * BLOCK_ELEMENTS
+    offsets = block_start + tl.arange(0, BLOCK_SIZE) * ELEMENTS_PER_THREAD
+    
+    # Create mask for vectorized load - use tl.constexpr for arange
+    mask = offsets[:, None] + tl.arange(0, ELEMENTS_PER_THREAD)[None, :] < n_elements
+    
+    # Load input with vectorized loads
+    x_vectors = tl.load(
+        x_ptr + offsets[:, None] + tl.arange(0, ELEMENTS_PER_THREAD)[None, :],
+        mask=mask,
+        other=0.0
+    )
+    
+    # Process each element in the vector
+    SQRT_2_OVER_PI = 0.7978845608028654
+    GELU_CONST = 0.044715
+    
+    # Compute GELU efficiently with reduced register pressure
+    # Fused GELU computation with minimal intermediate values
+    x_sq = x_vectors * x_vectors
+    inner = x_vectors + GELU_CONST * x_sq * x_vectors
+    scaled = SQRT_2_OVER_PI * inner
+    
+    # Optimized tanh approximation
+    exp_2x = tl.exp(2.0 * scaled)
+    tanh_result = 1.0 - 2.0 / (1.0 + exp_2x)
+    
+    output_vectors = 0.5 * x_vectors * (1.0 + tanh_result)
+    
+    # Store with vectorized stores
+    tl.store(
+        output_ptr + offsets[:, None] + tl.arange(0, ELEMENTS_PER_THREAD)[None, :],
+        output_vectors,
+        mask=mask
+    )
+
+def triton_gelu(x: torch.Tensor) -> torch.Tensor:
+    """Wrapper function for optimized GELU activation."""
+    output = torch.empty_like(x)
+    n_elements = output.numel()
+    
+    # Calculate optimal grid size - ensure at least 128 blocks for good occupancy
+    max_blocks = 128 * 128  # Based on 128 SMs
+    grid = lambda META: (min(max_blocks, triton.cdiv(n_elements, META['BLOCK_SIZE'] * 4)),)
+    
+    gelu_kernel[grid](
+        x,
+        output,
+        n_elements,
+    )
+    
+    return output
+
+class ModelNew(nn.Module):
+    """
+    Optimized model with Triton GELU activation using improved memory access patterns.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies GELU activation using optimized Triton kernel.
+        
+        Args:
+            x (torch.Tensor): Input tensor of any shape.
+            
+        Returns:
+            torch.Tensor: Output tensor with GELU applied, same shape as input.
+        """
+        return triton_gelu(x)
+```

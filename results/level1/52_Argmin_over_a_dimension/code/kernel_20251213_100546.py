@@ -1,0 +1,129 @@
+# import section
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_INNER": 64, "CHUNK_M": 16}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_INNER": 128, "CHUNK_M": 16}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_INNER": 128, "CHUNK_M": 32}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_INNER": 256, "CHUNK_M": 16}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_INNER": 256, "CHUNK_M": 32}, num_warps=8, num_stages=4),
+    ],
+    key=["M", "K"],
+)
+@triton.jit
+def argmin_kernel(
+    values_ptr,
+    indices_out_ptr,
+    N,
+    M,
+    K,
+    stride_n,
+    stride_m,
+    stride_k,
+    stride_out_n,
+    stride_out_k,
+    BLOCK_INNER: tl.constexpr,
+    CHUNK_M: tl.constexpr,
+):
+    pid_n = tl.program_id(0)
+    pid_inner = tl.program_id(1)
+
+    if pid_n >= N:
+        return
+
+    inner_offsets = pid_inner * BLOCK_INNER + tl.arange(0, BLOCK_INNER)
+    inner_mask = inner_offsets < K
+
+    base_vals_ptr = values_ptr + pid_n * stride_n
+    base_out_ptr = indices_out_ptr + pid_n * stride_out_n + inner_offsets * stride_out_k
+
+    best_vals = tl.full((BLOCK_INNER,), float("inf"), dtype=tl.float32)
+    best_idx = tl.full((BLOCK_INNER,), 0, dtype=tl.int32)
+
+    m_iter = 0
+    while m_iter < M:
+        row_offsets = m_iter + tl.arange(0, CHUNK_M)
+        row_mask = row_offsets < M
+
+        ptrs = base_vals_ptr + row_offsets[:, None] * stride_m + inner_offsets[None, :] * stride_k
+        vals = tl.load(
+            ptrs,
+            mask=row_mask[:, None] & inner_mask[None, :],
+            cache_modifier=".ca",
+            eviction_policy="evict_last",
+            other=float("inf"),
+        )
+
+        for r in range(CHUNK_M):
+            row_vals = vals[r, :]
+            row_id = row_offsets[r]
+            valid_row = row_mask[r]
+            row_idx_vec = tl.full((BLOCK_INNER,), row_id, dtype=tl.int32)
+            better = (row_vals < best_vals) & inner_mask & valid_row
+            best_vals = tl.where(better, row_vals, best_vals)
+            best_idx = tl.where(better, row_idx_vec, best_idx)
+
+        m_iter += CHUNK_M
+
+    tl.store(base_out_ptr, best_idx, mask=inner_mask)
+
+
+def triton_argmin(x: torch.Tensor, dim: int) -> torch.Tensor:
+    if (not x.is_cuda) or (x.dtype != torch.float32):
+        return torch.argmin(x, dim=dim)
+
+    dim = dim if dim >= 0 else dim + x.ndim
+    if dim < 0 or dim >= x.ndim:
+        raise ValueError("Invalid dimension for argmin.")
+
+    shape = x.shape
+    reduction = shape[dim]
+    output_shape = tuple(shape[:dim] + shape[dim + 1 :])
+
+    if reduction == 0:
+        raise RuntimeError("Argmin cannot operate on zero-length dimension.")
+    if reduction == 1:
+        return torch.zeros(output_shape, dtype=torch.int64, device=x.device)
+
+    outer = math.prod(shape[:dim]) if dim > 0 else 1
+    inner = math.prod(shape[dim + 1 :]) if dim + 1 < x.ndim else 1
+
+    x_work = x.contiguous().view(outer, reduction, inner)
+    out_idx = torch.empty((outer, inner), dtype=torch.int32, device=x.device)
+
+    stride_n, stride_m, stride_k = x_work.stride()
+    stride_out_n, stride_out_k = out_idx.stride()
+
+    grid = lambda META: (
+        outer,
+        triton.cdiv(inner, META["BLOCK_INNER"]),
+    )
+
+    argmin_kernel[grid](
+        x_work,
+        out_idx,
+        outer,
+        reduction,
+        inner,
+        stride_n,
+        stride_m,
+        stride_k,
+        stride_out_n,
+        stride_out_k,
+    )
+
+    return out_idx.view(output_shape).to(torch.int64)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_argmin(x, self.dim)

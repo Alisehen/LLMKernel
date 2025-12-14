@@ -1,0 +1,145 @@
+
+Write high-performance Triton kernels to replace PyTorch operators.
+Generate the FASTEST kernel while maintaining correctness.
+
+**Triton Essentials**:
+- Use `tl.program_id(axis)` for block indices (axis=0, 1, or 2 ONLY - max 3D grid)
+- Use `tl.arange()` for element indices within blocks
+- Operate on blocks (NOT CUDA-style threads)
+- No manual shared memory or synchronization
+
+**Critical Constraints** (violations cause compilation errors):
+- All BLOCK_* parameters MUST be passed as `tl.constexpr` and powers of 2 (16–1024)
+- `tl.arange(0, BLOCK_SIZE)` requires BLOCK_SIZE to be power of 2
+- `tl.reshape()` requires compile-time constant shapes (do NOT use dynamic reshape/view)
+- `tl.load` / `tl.store`: scalar pointer → scalar value, block pointer → block value
+- No `tl.tanh()` (use `exp`-based formulation if needed)
+- No Python-side control flow on `tl.tensor` or BLOCK_* values
+
+**Output Format**:
+1. Imports  
+2. `@triton.jit` kernel(s)  
+3. Wrapper function(s)  
+4. `class ModelNew(nn.Module)`  
+
+Do NOT include testing code or `if __name__ == "__main__"`.
+
+Example PyTorch:
+'''
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class Model(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, a, b):
+        return a + b
+
+
+def get_inputs():
+    # randomly generate input tensors based on the model architecture
+    a = torch.randn(1, 128).cuda()
+    b = torch.randn(1, 128).cuda()
+    return [a, b]
+
+
+def get_init_inputs():
+    # randomly generate tensors required for initialization based on the model architecture
+    return []
+'''
+
+Example Triton:
+'''
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def add_kernel(
+    x_ptr,
+    y_ptr,
+    output_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+
+    x = tl.load(x_ptr + offsets, mask=mask)
+    y = tl.load(y_ptr + offsets, mask=mask)
+
+    output = x + y
+    tl.store(output_ptr + offsets, output, mask=mask)
+
+def triton_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    output = torch.empty_like(x)
+    n_elements = output.numel()
+    BLOCK_SIZE = 1024
+    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
+    add_kernel[grid](x, y, output, n_elements, BLOCK_SIZE=BLOCK_SIZE)
+
+    return output
+
+class ModelNew(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, a, b):
+        return triton_add(a, b)
+'''
+
+Hardware:
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+Target:
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs a Softmax activation.
+    """
+    def __init__(self):
+        super(Model, self).__init__()
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies Softmax activation to the input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, num_features).
+
+        Returns:
+            torch.Tensor: Output tensor with Softmax applied, same shape as input.
+        """
+        return torch.softmax(x, dim=1)
+
+batch_size = 4096
+dim = 393216
+
+def get_inputs():
+    x = torch.rand(batch_size, dim)
+    return [x]
+
+def get_init_inputs():
+    return []  # No special initialization inputs needed

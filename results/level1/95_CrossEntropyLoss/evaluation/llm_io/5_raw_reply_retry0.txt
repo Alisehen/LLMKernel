@@ -1,0 +1,164 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def cross_entropy_kernel_optimized(
+    predictions_ptr,
+    targets_ptr,
+    loss_ptr,
+    batch_size,
+    num_classes,
+    BLOCK_SIZE: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+):
+    """Optimized cross-entropy kernel with parallel reduction and shared memory."""
+    pid = tl.program_id(0)
+    
+    # Early exit if out of bounds
+    if pid >= batch_size:
+        return
+    
+    # Precompute row start
+    row_start = pid * num_classes
+    
+    # Allocate shared memory for reduction (2 arrays: max and sum_exp)
+    shmem_max = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+    shmem_sum = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+    
+    # Thread-local accumulators
+    thread_max = -float('inf')
+    thread_sum = 0.0
+    
+    # First: parallel reduction for max
+    for start in tl.range(0, num_classes, BLOCK_SIZE, num_stages=NUM_STAGES):
+        offsets = start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < num_classes
+        chunk = tl.load(predictions_ptr + row_start + offsets, mask=mask, other=-float('inf'))
+        chunk_max = tl.max(chunk, axis=0)
+        thread_max = tl.maximum(thread_max, chunk_max)
+    
+    # Store local max to shared memory
+    thread_id = tl.program_id(0) % BLOCK_SIZE
+    shmem_max[thread_id] = thread_max
+    tl.debug_barrier()
+    
+    # Parallel reduction in shared memory for global max
+    offset = BLOCK_SIZE // 2
+    while offset > 0:
+        if thread_id < offset:
+            other_max = shmem_max[thread_id + offset]
+            shmem_max[thread_id] = tl.maximum(shmem_max[thread_id], other_max)
+        offset //= 2
+        tl.debug_barrier()
+    
+    # Broadcast global max to all threads
+    global_max = shmem_max[0]
+    tl.debug_barrier()
+    
+    # Second: parallel reduction for sum(exp(x - max))
+    for start in tl.range(0, num_classes, BLOCK_SIZE, num_stages=NUM_STAGES):
+        offsets = start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < num_classes
+        chunk = tl.load(predictions_ptr + row_start + offsets, mask=mask, other=0.0)
+        chunk_stable = chunk - global_max
+        exp_val = tl.exp(chunk_stable)
+        chunk_sum = tl.sum(exp_val, axis=0)
+        thread_sum += chunk_sum
+    
+    # Store local sum to shared memory
+    shmem_sum[thread_id] = thread_sum
+    tl.debug_barrier()
+    
+    # Parallel reduction in shared memory for global sum
+    offset = BLOCK_SIZE // 2
+    while offset > 0:
+        if thread_id < offset:
+            other_sum = shmem_sum[thread_id + offset]
+            shmem_sum[thread_id] += other_sum
+        offset //= 2
+        tl.debug_barrier()
+    
+    global_sum = shmem_sum[0]
+    
+    # Compute loss for this row
+    target_idx = tl.load(targets_ptr + pid)
+    target_pred = tl.load(predictions_ptr + row_start + target_idx)
+    
+    log_sum_exp = tl.log(global_sum + 1e-12)
+    log_softmax_target = target_pred - global_max - log_sum_exp
+    loss = -log_softmax_target / batch_size
+    
+    # Atomic add only from thread 0 per row
+    if thread_id == 0:
+        tl.atomic_add(loss_ptr, loss)
+
+def triton_cross_entropy_optimized(predictions: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    """Optimized fused cross entropy loss with autotuning."""
+    batch_size, num_classes = predictions.shape[0], predictions.shape[1]
+    
+    # Allocate output
+    loss = torch.zeros(1, device=predictions.device, dtype=predictions.dtype)
+    
+    # Autotuned configurations
+    configs = [
+        {'BLOCK_SIZE': 256, 'NUM_STAGES': 1},
+        {'BLOCK_SIZE': 512, 'NUM_STAGES': 1},
+        {'BLOCK_SIZE': 1024, 'NUM_STAGES': 1},
+        {'BLOCK_SIZE': 256, 'NUM_STAGES': 2},
+        {'BLOCK_SIZE': 512, 'NUM_STAGES': 2},
+        {'BLOCK_SIZE': 1024, 'NUM_STAGES': 2},
+        {'BLOCK_SIZE': 256, 'NUM_STAGES': 3},
+        {'BLOCK_SIZE': 512, 'NUM_STAGES': 3},
+        {'BLOCK_SIZE': 1024, 'NUM_STAGES': 3},
+    ]
+    
+    # Launch kernel with autotuning
+    @triton.autotune(configs=configs, key=['batch_size', 'num_classes'])
+    def launch_kernel(**kwargs):
+        grid = (batch_size,)
+        cross_entropy_kernel_optimized[grid](**kwargs)
+    
+    launch_kernel(
+        predictions_ptr=predictions,
+        targets_ptr=targets,
+        loss_ptr=loss,
+        batch_size=batch_size,
+        num_classes=num_classes,
+    )
+    
+    return loss
+
+class ModelNew(nn.Module):
+    """
+    A model that computes Cross Entropy Loss for multi-class classification tasks.
+    Optimized implementation using Triton kernels.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+
+    def forward(self, predictions, targets):
+        return triton_cross_entropy_optimized(predictions, targets)
+```
+
+## Key Optimizations Applied:
+
+1. **Parallel Row Processing**: Each row is processed by a block of threads (`BLOCK_SIZE`) instead of a single thread, enabling parallel reduction.
+
+2. **Shared Memory Reduction**: Uses shared memory for efficient parallel reductions of `max` and `sum(exp)` values, reducing global memory traffic.
+
+3. **Autotuning**: Includes autotuning for `BLOCK_SIZE` (256, 512, 1024) and `NUM_STAGES` (1, 2, 3) to adapt to different input sizes and memory patterns.
+
+4. **Staged Memory Loading**: Uses `tl.range` with configurable `NUM_STAGES` to pipeline memory loads and improve latency hiding.
+
+5. **Coalesced Memory Access**: Threads within a warp access contiguous memory locations, improving memory throughput.
+
+6. **Efficient Synchronization**: Uses `tl.debug_barrier()` only where necessary for correctness.
+
+7. **Minimal Atomic Operations**: Only thread 0 in each block performs the atomic add to the global loss.
+
+8. **Register Pressure Management**: By using shared memory for intermediate reductions, we keep register usage low.
+
+This implementation should significantly improve memory access patterns and reduce stalls, addressing the high DRAM throughput (95.75%) and moderate L1 hit rate (50.7%) observed in the NCU metrics.

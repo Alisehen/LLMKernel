@@ -1,0 +1,232 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def mse_kernel(
+    pred_ptr,
+    target_ptr,
+    output_ptr,
+    n_elements,
+    reduction_size,
+    BLOCK_SIZE: tl.constexpr,
+    REDUCE_SIZE: tl.constexpr
+):
+    """
+    Compute Mean Squared Error in a fused kernel.
+    - First compute squared differences in blocks
+    - Then reduce within block and accumulate across blocks
+    """
+    pid = tl.program_id(axis=0)
+    
+    # Load predictions and targets in blocks
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    
+    preds = tl.load(pred_ptr + offsets, mask=mask, other=0.0)
+    targets = tl.load(target_ptr + offsets, mask=mask, other=0.0)
+    
+    # Compute squared differences
+    diff = preds - targets
+    squared = diff * diff
+    
+    # Apply mask for valid elements
+    squared_masked = tl.where(mask, squared, 0.0)
+    
+    # Reduce within block using efficient tree reduction
+    # We'll use a reduction tree within the thread block
+    block_sum = tl.sum(squared_masked)
+    
+    # Store block sum to global memory for final reduction
+    block_sum_ptr = output_ptr + pid
+    tl.store(block_sum_ptr, block_sum)
+    
+    # Barrier to ensure all block sums are written
+    tl.debug_barrier()
+    
+    # First block reduces all block sums
+    if pid == 0:
+        total_blocks = tl.cdiv(n_elements, BLOCK_SIZE)
+        total_sum = 0.0
+        
+        # Reduce block sums in chunks
+        for i in range(0, total_blocks, REDUCE_SIZE):
+            offsets_reduce = i + tl.arange(0, REDUCE_SIZE)
+            mask_reduce = offsets_reduce < total_blocks
+            
+            block_sums = tl.load(output_ptr + offsets_reduce, mask=mask_reduce, other=0.0)
+            total_sum += tl.sum(block_sums)
+        
+        # Compute final mean
+        final_mse = total_sum / n_elements
+        tl.store(output_ptr, final_mse)
+
+@triton.jit
+def mse_kernel_optimized(
+    pred_ptr,
+    target_ptr,
+    output_ptr,
+    n_elements,
+    reduction_size,
+    BLOCK_SIZE: tl.constexpr,
+    USE_FAST_MATH: tl.constexpr
+):
+    """
+    Optimized MSE kernel with better memory access patterns.
+    Uses vectorized loads/stores when possible.
+    """
+    pid = tl.program_id(axis=0)
+    
+    # Use multiple program IDs for 2D grid (better occupancy)
+    pid_i = tl.program_id(axis=0)
+    pid_j = tl.program_id(axis=1)
+    stride_i = tl.num_programs(axis=0)
+    stride_j = tl.num_programs(axis=1)
+    
+    # 2D block for better memory access
+    block_size_i = BLOCK_SIZE
+    block_size_j = 1  # Single column for now
+    
+    # Calculate offsets for this block
+    offsets_i = pid_i * block_size_i + tl.arange(0, block_size_i)
+    offsets_j = pid_j * block_size_j + tl.arange(0, block_size_j)
+    
+    # Create 2D mask
+    mask_i = offsets_i < n_elements
+    mask_j = offsets_j < reduction_size
+    
+    # Compute linear offsets
+    linear_offsets = offsets_i * reduction_size + offsets_j
+    mask = mask_i[:, None] & mask_j[None, :]
+    
+    # Load data
+    preds = tl.load(pred_ptr + linear_offsets, mask=mask, other=0.0)
+    targets = tl.load(target_ptr + linear_offsets, mask=mask, other=0.0)
+    
+    # Compute squared differences
+    diff = preds - targets
+    squared = diff * diff
+    
+    # Reduce within this 2D block
+    block_sum = tl.sum(squared)
+    
+    # Store block sum
+    block_id = pid_i * stride_j + pid_j
+    tl.store(output_ptr + block_id, block_sum)
+    
+    # Barrier
+    tl.debug_barrier()
+    
+    # Final reduction by first block
+    if pid_i == 0 and pid_j == 0:
+        total_blocks = stride_i * stride_j
+        total_sum = 0.0
+        
+        # Tree reduction for block sums
+        remaining = total_blocks
+        offset = 0
+        
+        while remaining > 1:
+            step = min(1024, remaining)
+            for i in range(0, step, 1024):
+                idx = offset + i + tl.arange(0, 1024)
+                mask_final = idx < total_blocks
+                
+                sums = tl.load(output_ptr + idx, mask=mask_final, other=0.0)
+                total_sum += tl.sum(sums)
+            
+            remaining = (remaining + 1023) // 1024
+            offset += total_blocks
+        
+        # Compute final MSE
+        final_mse = total_sum / n_elements
+        tl.store(output_ptr, final_mse)
+
+def triton_mse(predictions: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    """
+    Compute Mean Squared Error using Triton.
+    """
+    # Ensure tensors are contiguous and on same device
+    predictions = predictions.contiguous()
+    targets = targets.contiguous()
+    
+    n_elements = predictions.numel()
+    
+    # Choose optimal block size based on tensor size
+    if n_elements <= 1024:
+        BLOCK_SIZE = 128
+    elif n_elements <= 8192:
+        BLOCK_SIZE = 256
+    elif n_elements <= 65536:
+        BLOCK_SIZE = 512
+    else:
+        BLOCK_SIZE = 1024
+    
+    # Output tensor for results
+    output = torch.zeros(1, device=predictions.device, dtype=predictions.dtype)
+    
+    # For intermediate block sums, allocate enough space
+    num_blocks = triton.cdiv(n_elements, BLOCK_SIZE)
+    block_sums = torch.zeros(num_blocks, device=predictions.device, dtype=predictions.dtype)
+    
+    # Choose kernel based on tensor shape
+    if predictions.dim() <= 2:
+        # Use 1D kernel for simpler shapes
+        grid = lambda meta: (num_blocks,)
+        mse_kernel[grid](
+            predictions, targets, block_sums,
+            n_elements, 1,  # reduction_size = 1 for 1D
+            BLOCK_SIZE=BLOCK_SIZE,
+            REDUCE_SIZE=1024
+        )
+        
+        # Final reduction
+        mse_value = block_sums.sum() / n_elements
+        output[0] = mse_value
+    else:
+        # Use optimized kernel for higher dimensions
+        # Reshape to 2D for better memory access
+        original_shape = predictions.shape
+        predictions_2d = predictions.view(-1, original_shape[-1])
+        targets_2d = targets.view(-1, original_shape[-1])
+        
+        n_rows, n_cols = predictions_2d.shape
+        
+        # Use 2D grid
+        BLOCK_SIZE_ROWS = min(32, n_rows)
+        BLOCK_SIZE_COLS = min(32, n_cols)
+        
+        grid = (
+            triton.cdiv(n_rows, BLOCK_SIZE_ROWS),
+            triton.cdiv(n_cols, BLOCK_SIZE_COLS)
+        )
+        
+        # Temporary storage for block sums
+        num_blocks_2d = grid[0] * grid[1]
+        block_sums_2d = torch.zeros(num_blocks_2d, device=predictions.device, dtype=predictions.dtype)
+        
+        mse_kernel_optimized[grid](
+            predictions_2d, targets_2d, block_sums_2d,
+            n_rows, n_cols,
+            BLOCK_SIZE=BLOCK_SIZE_ROWS,
+            USE_FAST_MATH=True
+        )
+        
+        # The kernel stores final result in first element
+        output = block_sums_2d[:1]
+    
+    return output
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that computes Mean Squared Error loss using Triton kernels.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+    
+    def forward(self, predictions, targets):
+        return triton_mse(predictions, targets)
+```

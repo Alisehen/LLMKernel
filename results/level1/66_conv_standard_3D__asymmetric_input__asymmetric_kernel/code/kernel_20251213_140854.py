@@ -1,0 +1,233 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 32},
+            num_warps=8,
+            num_stages=3,
+        ),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32},
+            num_warps=8,
+            num_stages=4,
+        ),
+    ],
+    key=["M", "OC", "Kdim"],
+)
+@triton.jit
+def conv3d_implicit_gemm_kernel(
+    x_ptr,
+    w_ptr,
+    b_ptr,
+    out_ptr,
+    N,
+    IC,
+    ID,
+    IH,
+    IW,
+    OC,
+    KD,
+    KH,
+    KW,
+    OD,
+    OH,
+    OW,
+    stride_d,
+    stride_h,
+    stride_w,
+    pad_d,
+    pad_h,
+    pad_w,
+    dil_d,
+    dil_h,
+    dil_w,
+    M,
+    Kdim,
+    HAS_BIAS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    m_idxs = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    n_idxs = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    mask_m = m_idxs < M
+    mask_n = n_idxs < OC
+
+    ow = (m_idxs % OW).to(tl.int32)
+    tmp = m_idxs // OW
+    oh = (tmp % OH).to(tl.int32)
+    tmp = tmp // OH
+    od = (tmp % OD).to(tl.int32)
+    n_batch = (tmp // OD).to(tl.int32)
+
+    ow = ow[:, None]
+    oh = oh[:, None]
+    od = od[:, None]
+    n_batch = n_batch[:, None]
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    k_range = tl.arange(0, BLOCK_K)
+
+    for k_start in range(0, Kdim, BLOCK_K):
+        k_idx = k_start + k_range
+        mask_k = k_idx < Kdim
+
+        kw = (k_idx % KW).to(tl.int32)
+        tmp_k = k_idx // KW
+        kh = (tmp_k % KH).to(tl.int32)
+        tmp_k = tmp_k // KH
+        kd = (tmp_k % KD).to(tl.int32)
+        ic = (tmp_k // KD).to(tl.int32)
+
+        kw = kw[None, :]
+        kh = kh[None, :]
+        kd = kd[None, :]
+        ic = ic[None, :]
+
+        id_idx = od * stride_d - pad_d + kd * dil_d
+        ih_idx = oh * stride_h - pad_h + kh * dil_h
+        iw_idx = ow * stride_w - pad_w + kw * dil_w
+
+        valid_d = (0 <= id_idx) & (id_idx < ID)
+        valid_h = (0 <= ih_idx) & (ih_idx < IH)
+        valid_w = (0 <= iw_idx) & (iw_idx < IW)
+        valid = valid_d & valid_h & valid_w
+
+        valid = valid & mask_m[:, None] & mask_k[None, :]
+
+        id_safe = tl.where(valid_d, id_idx, 0)
+        ih_safe = tl.where(valid_h, ih_idx, 0)
+        iw_safe = tl.where(valid_w, iw_idx, 0)
+
+        x_offset = (
+            (((n_batch * IC + ic) * ID + id_safe) * IH + ih_safe) * IW + iw_safe
+        )
+        x_offset = tl.where(valid, x_offset, 0)
+
+        x_vals = tl.load(x_ptr + x_offset, mask=valid, other=0.0)
+
+        weight_mask = mask_k[:, None] & mask_n[None, :]
+        w_offset = n_idxs[None, :] * Kdim + k_idx[:, None]
+        w_vals = tl.load(w_ptr + w_offset, mask=weight_mask, other=0.0)
+
+        acc += tl.dot(x_vals.to(tl.float32), w_vals.to(tl.float32))
+
+    if HAS_BIAS:
+        bias_vals = tl.load(b_ptr + n_idxs, mask=mask_n, other=0.0)
+        acc += bias_vals[None, :]
+
+    out_offset = (
+        ((((n_batch * OC + n_idxs[None, :]) * OD + od) * OH + oh) * OW + ow)
+    )
+    tl.store(out_ptr + out_offset, acc, mask=mask_m[:, None] & mask_n[None, :])
+
+
+def triton_conv3d(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    stride: tuple[int, int, int],
+    padding: tuple[int, int, int],
+    dilation: tuple[int, int, int],
+) -> torch.Tensor:
+    assert x.is_contiguous()
+    assert weight.is_contiguous()
+    assert x.dtype == weight.dtype == torch.float32
+
+    N, IC, ID, IH, IW = x.shape
+    OC, _, KD, KH, KW = weight.shape
+    stride_d, stride_h, stride_w = stride
+    pad_d, pad_h, pad_w = padding
+    dil_d, dil_h, dil_w = dilation
+
+    OD = (ID + 2 * pad_d - dil_d * (KD - 1) - 1) // stride_d + 1
+    OH = (IH + 2 * pad_h - dil_h * (KH - 1) - 1) // stride_h + 1
+    OW = (IW + 2 * pad_w - dil_w * (KW - 1) - 1) // stride_w + 1
+
+    out = torch.empty((N, OC, OD, OH, OW), device=x.device, dtype=x.dtype)
+
+    M = N * OD * OH * OW
+    Kdim = IC * KD * KH * KW
+
+    grid = (triton.cdiv(M, triton.next_power_of_2(64)), triton.cdiv(OC, triton.next_power_of_2(64)))
+
+    bias_ptr = bias if bias is not None else x.new_empty(1)
+
+    conv3d_implicit_gemm_kernel[grid](
+        x,
+        weight.flatten(0),
+        bias_ptr,
+        out,
+        N,
+        IC,
+        ID,
+        IH,
+        IW,
+        OC,
+        KD,
+        KH,
+        KW,
+        OD,
+        OH,
+        OW,
+        stride_d,
+        stride_h,
+        stride_w,
+        pad_d,
+        pad_h,
+        pad_w,
+        dil_d,
+        dil_h,
+        dil_w,
+        M,
+        Kdim,
+        HAS_BIAS=bias is not None,
+    )
+
+    return out
+
+
+class ModelNew(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: tuple,
+        stride: tuple = (1, 1, 1),
+        padding: tuple = (0, 0, 0),
+        dilation: tuple = (1, 1, 1),
+        groups: int = 1,
+        bias: bool = False,
+    ) -> None:
+        super().__init__()
+        assert groups == 1, "Grouped convolutions are not supported."
+        self.conv = nn.Conv3d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            groups=groups,
+            bias=bias,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_conv3d(
+            x,
+            self.conv.weight,
+            self.conv.bias,
+            self.conv.stride,
+            self.conv.padding,
+            self.conv.dilation,
+        )

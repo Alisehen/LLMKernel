@@ -1,0 +1,143 @@
+
+Write a correct and reasonably fast Triton kernel to replace the given PyTorch operator.
+This is a SEED implementation: prioritize correctness and stable compilation.
+
+Rules:
+- Use `tl.program_id(axis)` (axis=0/1/2 only)
+- Use `tl.arange()` for block indices
+- Operate on blocks (no CUDA thread model)
+- No manual shared memory or synchronization
+
+Hard Constraints:
+- All BLOCK_* are `tl.constexpr` and powers of 2
+- `tl.arange(0, BLOCK)` requires BLOCK to be power-of-2
+- No dynamic `tl.reshape()` or view
+- `tl.load` / `tl.store`: scalar ptr → scalar, block ptr → block
+- No Python control flow on `tl.tensor` or BLOCK_*
+- Triton does NOT support `continue`, `break`, or `return` inside loops — use masking instead
+- Import ALL modules you use (e.g., `import math` if using `math.sqrt`)
+- Do NOT index tensors with loop variables: `tensor[:, i]` or `tensor[i, :]` where i is a loop var is INVALID
+- Shared memory limit ~100KB: for matmul, BLOCK_M*BLOCK_K + BLOCK_K*BLOCK_N < 25000 floats
+
+
+
+Output Format (STRICT):
+1. Imports (torch, torch.nn, triton, triton.language, and any other needed modules like math)
+2. `@triton.jit` kernel(s)
+3. Wrapper function(s)
+4. `class ModelNew(nn.Module)` — this class is REQUIRED
+
+Do NOT include testing code or `if __name__ == "__main__"`.
+
+Example PyTorch:
+'''
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class Model(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, a, b):
+        return a + b
+
+
+def get_inputs():
+    # randomly generate input tensors based on the model architecture
+    a = torch.randn(1, 128).cuda()
+    b = torch.randn(1, 128).cuda()
+    return [a, b]
+
+
+def get_init_inputs():
+    # randomly generate tensors required for initialization based on the model architecture
+    return []
+'''
+
+Example Triton:
+'''
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def add_kernel(
+    x_ptr,
+    y_ptr,
+    output_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+
+    x = tl.load(x_ptr + offsets, mask=mask)
+    y = tl.load(y_ptr + offsets, mask=mask)
+
+    output = x + y
+    tl.store(output_ptr + offsets, output, mask=mask)
+
+def triton_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    output = torch.empty_like(x)
+    n_elements = output.numel()
+    BLOCK_SIZE = 1024
+    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
+    add_kernel[grid](x, y, output, n_elements, BLOCK_SIZE=BLOCK_SIZE)
+
+    return output
+
+class ModelNew(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, a, b):
+        return triton_add(a, b)
+'''
+
+Hardware:
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+Target:
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    def __init__(self):
+        super(Model, self).__init__()
+
+    def forward(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
+        out = torch.nn.functional.scaled_dot_product_attention(Q, K, V)
+        return out
+
+batch_size = 32
+num_heads = 32
+sequence_length = 512
+embedding_dimension = 1024
+
+def get_inputs():
+    Q = torch.rand(batch_size, num_heads, sequence_length, embedding_dimension, device='cuda', dtype=torch.float16)
+    K = torch.rand(batch_size, num_heads, sequence_length, embedding_dimension, device='cuda', dtype=torch.float16)
+    V = torch.rand(batch_size, num_heads, sequence_length, embedding_dimension, device='cuda', dtype=torch.float16)
+    return [Q, K, V]
+
+def get_init_inputs():
+    return []

@@ -1,0 +1,227 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU
+GPU Name: 4090
+Architecture: Ada Lovelace
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+[OPTIMIZATION STAGE]
+
+## Current Optimization Stage
+
+Focus: Grid layout & parallelism.
+
+Metrics:
+- sm__throughput.avg.pct_of_peak_sustained_elapsed (>60%)
+- launch__grid_size
+
+Rules:
+- 1D: (cdiv(N, BLOCK))
+- 2D: (cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))
+- 3D: (batch, cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))
+- >3D: flatten ONLY independent dims
+- Prefer batch / head / expert parallelism before shrinking BLOCK
+- Change grid only if SM utilization is clearly low
+
+Safety:
+- Max 3 grid dims, static rank
+- grid=(G0,G1,G2) must match tl.program_id(0/1/2)
+- If unsure about correctness, do NOT change grid
+
+Autotune:
+- Autotune either BLOCK_* OR (num_warps, num_stages)
+- If autotuning BLOCK_*, use grid=lambda META: (...)
+- Never redefine BLOCK_* in both kernel and launch
+
+
+
+[CURRENT CODE]
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+import math
+
+@triton.jit
+def conv2d_kernel(
+    x_ptr,
+    w_ptr,
+    b_ptr,
+    y_ptr,
+    B,
+    IC,
+    IH,
+    IW,
+    OC,
+    KH,
+    KW,
+    stride_h,
+    stride_w,
+    pad_h,
+    pad_w,
+    dil_h,
+    dil_w,
+    OH,
+    OW,
+    total_elements,
+    has_bias: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK
+    offsets = block_start + tl.arange(0, BLOCK)
+    mask = offsets < total_elements
+
+    ow = offsets % OW
+    tmp = offsets // OW
+    oh = tmp % OH
+    tmp = tmp // OH
+    oc = tmp % OC
+    b = tmp // OC
+
+    ih_base = oh * stride_h - pad_h
+    iw_base = ow * stride_w - pad_w
+
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+
+    for ic in range(0, IC):
+        for kh in range(0, KH):
+            ih = ih_base + kh * dil_h
+            valid_h = (ih >= 0) & (ih < IH)
+            ih = tl.where(valid_h, ih, 0)
+            for kw in range(0, KW):
+                iw = iw_base + kw * dil_w
+                valid_w = (iw >= 0) & (iw < IW)
+                valid = mask & valid_h & valid_w
+                iw = tl.where(valid_w, iw, 0)
+
+                x_offset = ((b * IC + ic) * IH + ih) * IW + iw
+                w_offset = ((oc * IC + ic) * KH + kh) * KW + kw
+
+                x_val = tl.load(x_ptr + x_offset, mask=valid, other=0.0)
+                w_val = tl.load(w_ptr + w_offset, mask=mask, other=0.0)
+                acc += x_val * w_val
+
+    if has_bias:
+        bias = tl.load(b_ptr + oc, mask=mask, other=0.0)
+        acc += bias
+
+    tl.store(y_ptr + offsets, acc, mask=mask)
+
+
+def triton_conv2d(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, stride: tuple, padding: tuple, dilation: tuple) -> torch.Tensor:
+    assert x.is_contiguous()
+    assert weight.is_contiguous()
+
+    stride_h, stride_w = stride
+    pad_h, pad_w = padding
+    dil_h, dil_w = dilation
+
+    B, IC, IH, IW = x.shape
+    OC, _, KH, KW = weight.shape
+
+    OH = (IH + 2 * pad_h - dil_h * (KH - 1) - 1) // stride_h + 1
+    OW = (IW + 2 * pad_w - dil_w * (KW - 1) - 1) // stride_w + 1
+
+    y = torch.empty((B, OC, OH, OW), device=x.device, dtype=x.dtype)
+    total_elements = y.numel()
+
+    BLOCK = 128
+    grid = lambda meta: (triton.cdiv(total_elements, meta["BLOCK"]),)
+
+    has_bias = bias is not None
+    bias_ptr = bias if has_bias else x.new_empty(1)
+
+    conv2d_kernel[grid](
+        x,
+        weight,
+        bias_ptr,
+        y,
+        B,
+        IC,
+        IH,
+        IW,
+        OC,
+        KH,
+        KW,
+        stride_h,
+        stride_w,
+        pad_h,
+        pad_w,
+        dil_h,
+        dil_w,
+        OH,
+        OW,
+        total_elements,
+        has_bias=has_bias,
+        BLOCK=BLOCK,
+    )
+
+    return y
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: tuple, stride: int = 1, padding: tuple = (0, 0), dilation: tuple = (1, 1), bias: bool = False):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = (stride, stride) if isinstance(stride, int) else stride
+        self.padding = padding
+        self.dilation = dilation
+        self.weight = nn.Parameter(torch.empty(out_channels, in_channels, *kernel_size))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_channels))
+        else:
+            self.bias = None
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in = self.in_channels * self.kernel_size[0] * self.kernel_size[1]
+            bound = 1 / math.sqrt(fan_in)
+            nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_conv2d(x, self.weight, self.bias, self.stride, self.padding, self.dilation)
+```
+
+[NCU PROFILING METRICS]
+{
+  "conv2d_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 71.98,
+    "launch__grid_size": 1007872,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 98.73,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 0.58,
+    "lts__t_sector_hit_rate.pct": 99.76
+  }
+}
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

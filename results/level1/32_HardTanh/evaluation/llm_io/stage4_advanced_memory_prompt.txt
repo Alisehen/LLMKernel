@@ -1,0 +1,145 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU
+GPU Name: 4090
+Architecture: Ada Lovelace
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+[OPTIMIZATION STAGE]
+
+## Current Optimization Stage
+
+**Focus**: Final micro-optimizations (small adjustments only).
+
+**Parameters to Tune**:
+• `num_warps`: {2, 4, 8, 16}
+• `num_stages`: {2, 3, 4}
+
+**Guidelines**:
+- Adjust num_warps only if occupancy suggests it; otherwise keep the original.
+- Change num_stages only by ±1 from current.
+- Do not modify BLOCK sizes or grid mapping here.
+
+**Autotune Tip (safe)**:
+Use 3–6 configs around the current settings; always include the original kernel config, and autotune must wrap the JIT kernel.
+
+
+
+[CURRENT CODE]
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 1024}, num_stages=1, num_warps=32),
+        triton.Config({'BLOCK_SIZE': 1024}, num_stages=2, num_warps=32),
+        triton.Config({'BLOCK_SIZE': 1024}, num_stages=3, num_warps=32),
+        triton.Config({'BLOCK_SIZE': 512}, num_stages=2, num_warps=16),
+        triton.Config({'BLOCK_SIZE': 256}, num_stages=3, num_warps=8),
+    ],
+    key=['n_elements'],
+)
+@triton.jit
+def hardtanh_kernel(
+    x_ptr,
+    out_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Optimized HardTanh kernel with power-of-two block sizes for memory access."""
+    pid = tl.program_id(axis=0)
+    
+    # Start position of the block
+    start_idx = pid * BLOCK_SIZE
+    offsets = start_idx + tl.arange(0, BLOCK_SIZE)
+    
+    # Create mask to avoid out-of-bounds memory access
+    mask = offsets < n_elements
+    
+    # Load input data
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    
+    # HardTanh: clamp to [-1, 1] using efficient min/max operations
+    # Use fused max/min for better instruction pipelining
+    out = tl.minimum(tl.maximum(x, -1.0), 1.0)
+    
+    # Store result
+    tl.store(out_ptr + offsets, out, mask=mask)
+
+def triton_hardtanh(x: torch.Tensor) -> torch.Tensor:
+    """Triton-accelerated HardTanh activation function."""
+    output = torch.empty_like(x)
+    n_elements = output.numel()
+    
+    # Ensure input is contiguous for optimal memory access
+    if not x.is_contiguous():
+        x = x.contiguous()
+    
+    # Calculate grid size - use BLOCK_SIZE as the base (power of 2)
+    grid = (triton.cdiv(n_elements, 1024),)  # Use largest BLOCK_SIZE for grid calculation
+    
+    # Launch kernel with autotuned parameters
+    hardtanh_kernel[grid](
+        x, output, n_elements,
+    )
+    
+    return output
+
+class ModelNew(nn.Module):
+    """Optimized model using Triton kernels for HardTanh activation."""
+    def __init__(self):
+        super(ModelNew, self).__init__()
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies HardTanh activation using optimized Triton kernel.
+        
+        Args:
+            x (torch.Tensor): Input tensor of any shape.
+            
+        Returns:
+            torch.Tensor: Output tensor with HardTanh applied.
+        """
+        return triton_hardtanh(x)
+```
+
+[NCU PROFILING METRICS]
+{
+  "hardtanh_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 7.82,
+    "launch__grid_size": 1572864,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 80.63,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 93.69,
+    "lts__t_sector_hit_rate.pct": 50.0
+  }
+}
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

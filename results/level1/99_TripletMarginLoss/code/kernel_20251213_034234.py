@@ -1,0 +1,174 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def triplet_margin_loss_kernel_2d(
+    anchor_ptr,
+    positive_ptr,
+    negative_ptr,
+    loss_ptr,
+    margin,
+    batch_size,
+    feature_size,
+    stride_batch,
+    stride_feat,
+    BLOCK_BATCH: tl.constexpr,
+    BLOCK_FEAT: tl.constexpr,
+):
+    """
+    Optimized 2D kernel for Triplet Margin Loss.
+    Each thread block processes a tile of [BLOCK_BATCH x BLOCK_FEAT] elements.
+    """
+    pid_batch = tl.program_id(axis=0)
+    pid_feat = tl.program_id(axis=1)
+    
+    # Create offsets for the batch dimension
+    batch_offsets = pid_batch * BLOCK_BATCH + tl.arange(0, BLOCK_BATCH)
+    batch_mask = batch_offsets < batch_size
+    
+    # Create offsets for the feature dimension
+    feat_offsets = pid_feat * BLOCK_FEAT + tl.arange(0, BLOCK_FEAT)
+    feat_mask = feat_offsets < feature_size
+    
+    # Combine masks for 2D tiling
+    mask = batch_mask[:, None] & feat_mask[None, :]
+    
+    # Calculate base pointers for the current tile
+    anchor_ptrs = anchor_ptr + batch_offsets[:, None] * stride_batch + feat_offsets[None, :]
+    positive_ptrs = positive_ptr + batch_offsets[:, None] * stride_batch + feat_offsets[None, :]
+    negative_ptrs = negative_ptr + batch_offsets[:, None] * stride_batch + feat_offsets[None, :]
+    
+    # Load data in 2D tiles
+    anchor = tl.load(anchor_ptrs, mask=mask, other=0.0)
+    positive = tl.load(positive_ptrs, mask=mask, other=0.0)
+    negative = tl.load(negative_ptrs, mask=mask, other=0.0)
+    
+    # Compute squared differences
+    pos_diff = anchor - positive
+    neg_diff = anchor - negative
+    pos_sq = tl.where(mask, pos_diff * pos_diff, 0.0)
+    neg_sq = tl.where(mask, neg_diff * neg_diff, 0.0)
+    
+    # Reduce across feature dimension within the thread block
+    # Each thread reduces its column of the block
+    pos_reduced = tl.sum(pos_sq, axis=1)
+    neg_reduced = tl.sum(neg_sq, axis=1)
+    
+    # Atomic add to global memory for final reduction
+    for i in range(BLOCK_BATCH):
+        if batch_offsets[i] < batch_size:
+            pos_ptr = loss_ptr + batch_offsets[i] * 2
+            neg_ptr = loss_ptr + batch_offsets[i] * 2 + 1
+            tl.atomic_add(pos_ptr, pos_reduced[i])
+            tl.atomic_add(neg_ptr, neg_reduced[i])
+
+@triton.jit
+def triplet_finalize_kernel(
+    sums_ptr,
+    loss_ptr,
+    margin,
+    batch_size,
+    epsilon: tl.constexpr,
+):
+    """
+    Finalize kernel to compute distances and loss from accumulated sums.
+    """
+    pid = tl.program_id(axis=0)
+    
+    if pid >= batch_size:
+        return
+    
+    # Load accumulated sums
+    pos_sum = tl.load(sums_ptr + pid * 2)
+    neg_sum = tl.load(sums_ptr + pid * 2 + 1)
+    
+    # Compute L2 distances with epsilon for numerical stability
+    pos_dist = tl.sqrt(pos_sum + epsilon)
+    neg_dist = tl.sqrt(neg_sum + epsilon)
+    
+    # Compute final triplet loss
+    loss_val = tl.maximum(pos_dist - neg_dist + margin, 0.0)
+    tl.store(loss_ptr + pid, loss_val)
+
+def triton_triplet_margin_loss(
+    anchor: torch.Tensor,
+    positive: torch.Tensor,
+    negative: torch.Tensor,
+    margin: float = 1.0
+) -> torch.Tensor:
+    """
+    Compute Triplet Margin Loss using optimized Triton kernels.
+    """
+    assert anchor.shape == positive.shape == negative.shape
+    assert anchor.is_cuda and positive.is_cuda and negative.is_cuda
+    
+    batch_size, feature_size = anchor.shape
+    
+    # Temporary buffer for accumulated sums (pos and neg for each sample)
+    sums = torch.zeros(batch_size * 2, device=anchor.device, dtype=torch.float32)
+    
+    # Allocate output for per-sample losses
+    sample_losses = torch.zeros(batch_size, device=anchor.device, dtype=anchor.dtype)
+    
+    # Define autotune configurations
+    configs = [
+        triton.Config({'BLOCK_BATCH': 64, 'BLOCK_FEAT': 256}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_BATCH': 32, 'BLOCK_FEAT': 512}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_BATCH': 16, 'BLOCK_FEAT': 1024}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_BATCH': 128, 'BLOCK_FEAT': 128}, num_warps=8, num_stages=3),
+    ]
+    
+    # Autotuned kernel launch function
+    def grid(meta):
+        return (
+            triton.cdiv(batch_size, meta['BLOCK_BATCH']),
+            triton.cdiv(feature_size, meta['BLOCK_FEAT'])
+        )
+    
+    # Create the autotuned kernel
+    autotuned_kernel = triton.autotune(
+        configs=configs,
+        key=['batch_size', 'feature_size']
+    )(triplet_margin_loss_kernel_2d)
+    
+    # Launch the autotuned kernel to compute sums
+    autotuned_kernel[grid](
+        anchor,
+        positive,
+        negative,
+        sums,
+        margin,
+        batch_size,
+        feature_size,
+        anchor.stride(0),
+        anchor.stride(1),
+    )
+    
+    # Launch finalization kernel
+    grid_final = (triton.cdiv(batch_size, 256),)
+    triplet_finalize_kernel[grid_final](
+        sums,
+        sample_losses,
+        margin,
+        batch_size,
+        epsilon=1e-8,
+    )
+    
+    # Average across batch
+    return sample_losses.mean()
+
+class ModelNew(nn.Module):
+    """
+    A model that computes Triplet Margin Loss using optimized Triton kernels.
+    
+    Parameters:
+        margin (float): The margin between the positive and negative samples.
+    """
+    def __init__(self, margin: float = 1.0):
+        super(ModelNew, self).__init__()
+        self.margin = margin
+
+    def forward(self, anchor: torch.Tensor, positive: torch.Tensor, negative: torch.Tensor) -> torch.Tensor:
+        return triton_triplet_margin_loss(anchor, positive, negative, self.margin)

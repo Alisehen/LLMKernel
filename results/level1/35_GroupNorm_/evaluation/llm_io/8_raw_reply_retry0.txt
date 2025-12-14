@@ -1,0 +1,394 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        # Original configs with adjusted num_stages
+        triton.Config({'BLOCK_SIZE': 256, 'NUM_WARPS': 4}, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 512, 'NUM_WARPS': 4}, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 1024, 'NUM_WARPS': 8}, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 2048, 'NUM_WARPS': 8}, num_stages=2),
+        # Higher warp configurations for better occupancy
+        triton.Config({'BLOCK_SIZE': 256, 'NUM_WARPS': 8}, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 512, 'NUM_WARPS': 8}, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 1024, 'NUM_WARPS': 16}, num_stages=2),
+        # Balanced config with more warps and stages
+        triton.Config({'BLOCK_SIZE': 1024, 'NUM_WARPS': 8}, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 2048, 'NUM_WARPS': 8}, num_stages=3),
+    ],
+    key=['group_size']
+)
+@triton.jit
+def group_norm_forward_kernel(
+    x_ptr,
+    out_ptr,
+    mean_ptr,
+    rstd_ptr,
+    weight_ptr,
+    bias_ptr,
+    N,
+    C,
+    H,
+    W,
+    G,
+    eps,
+    channels_per_group: tl.constexpr,
+    group_size: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    NUM_WARPS: tl.constexpr,
+):
+    # Process one group per program
+    batch_group = tl.program_id(0)
+    batch_idx = batch_group // G
+    group_idx = batch_group % G
+    
+    channel_start = group_idx * channels_per_group
+    
+    # Initialize accumulators
+    sum_val = 0.0
+    sum_sq = 0.0
+    
+    # Compute statistics for this group
+    # We'll process elements in chunks of BLOCK_SIZE
+    for offset in range(0, group_size, BLOCK_SIZE):
+        elem_idx = offset + tl.arange(0, BLOCK_SIZE)
+        mask = elem_idx < group_size
+        
+        # Calculate indices
+        channel_in_group = elem_idx // (H * W)
+        spatial_idx = elem_idx % (H * W)
+        h_idx = spatial_idx // W
+        w_idx = spatial_idx % W
+        
+        channel_idx = channel_start + channel_in_group
+        batch_offset = batch_idx * C * H * W
+        channel_offset = channel_idx * H * W
+        spatial_offset = h_idx * W + w_idx
+        
+        x_offset = batch_offset + channel_offset + spatial_offset
+        x_val = tl.load(x_ptr + x_offset, mask=mask, other=0.0)
+        
+        # Accumulate sum and sum of squares
+        sum_val += tl.sum(x_val, axis=0)
+        sum_sq += tl.sum(x_val * x_val, axis=0)
+    
+    # Compute mean and variance for this group
+    mean = sum_val / group_size
+    var = (sum_sq / group_size) - (mean * mean)
+    rstd = 1.0 / tl.sqrt(var + eps)
+    
+    # Store statistics
+    stats_idx = batch_idx * G + group_idx
+    tl.store(mean_ptr + stats_idx, mean)
+    tl.store(rstd_ptr + stats_idx, rstd)
+    
+    # Normalize and apply weight/bias
+    # Process normalization in parallel across threads
+    for offset in range(0, group_size, BLOCK_SIZE):
+        elem_idx = offset + tl.arange(0, BLOCK_SIZE)
+        mask = elem_idx < group_size
+        
+        # Calculate indices
+        channel_in_group = elem_idx // (H * W)
+        spatial_idx = elem_idx % (H * W)
+        h_idx = spatial_idx // W
+        w_idx = spatial_idx % W
+        
+        channel_idx = channel_start + channel_in_group
+        batch_offset = batch_idx * C * H * W
+        channel_offset = channel_idx * H * W
+        spatial_offset = h_idx * W + w_idx
+        
+        x_offset = batch_offset + channel_offset + spatial_offset
+        out_offset = x_offset
+        
+        # Load and normalize
+        x_val = tl.load(x_ptr + x_offset, mask=mask, other=0.0)
+        normalized = (x_val - mean) * rstd
+        
+        # Apply weight and bias if provided
+        if weight_ptr is not None and bias_ptr is not None:
+            weight = tl.load(weight_ptr + channel_idx, mask=mask, other=1.0)
+            bias = tl.load(bias_ptr + channel_idx, mask=mask, other=0.0)
+            out_val = normalized * weight + bias
+        elif weight_ptr is not None:
+            weight = tl.load(weight_ptr + channel_idx, mask=mask, other=1.0)
+            out_val = normalized * weight
+        elif bias_ptr is not None:
+            bias = tl.load(bias_ptr + channel_idx, mask=mask, other=0.0)
+            out_val = normalized + bias
+        else:
+            out_val = normalized
+        
+        tl.store(out_ptr + out_offset, out_val, mask=mask)
+
+
+@triton.autotune(
+    configs=[
+        # Original configs with adjusted num_stages
+        triton.Config({'BLOCK_SIZE': 256, 'NUM_WARPS': 4}, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 512, 'NUM_WARPS': 4}, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 1024, 'NUM_WARPS': 8}, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 2048, 'NUM_WARPS': 8}, num_stages=2),
+        # Higher warp configurations for better occupancy
+        triton.Config({'BLOCK_SIZE': 256, 'NUM_WARPS': 8}, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 512, 'NUM_WARPS': 8}, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 1024, 'NUM_WARPS': 16}, num_stages=2),
+        # Balanced config with more warps and stages
+        triton.Config({'BLOCK_SIZE': 1024, 'NUM_WARPS': 8}, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 2048, 'NUM_WARPS': 8}, num_stages=3),
+    ],
+    key=['group_size']
+)
+@triton.jit
+def group_norm_backward_kernel(
+    dout_ptr,
+    x_ptr,
+    dx_ptr,
+    dweight_ptr,
+    dbias_ptr,
+    mean_ptr,
+    rstd_ptr,
+    weight_ptr,
+    N,
+    C,
+    H,
+    W,
+    G,
+    channels_per_group: tl.constexpr,
+    group_size: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    NUM_WARPS: tl.constexpr,
+):
+    # Process one group per program
+    batch_group = tl.program_id(0)
+    batch_idx = batch_group // G
+    group_idx = batch_group % G
+    
+    channel_start = group_idx * channels_per_group
+    
+    # Load statistics
+    stats_idx = batch_idx * G + group_idx
+    mean = tl.load(mean_ptr + stats_idx)
+    rstd = tl.load(rstd_ptr + stats_idx)
+    
+    # Initialize accumulators for gradient reduction
+    sum_dout = 0.0
+    sum_dout_xhat = 0.0
+    sum_dweight = tl.zeros([channels_per_group], dtype=tl.float32)
+    sum_dbias = tl.zeros([channels_per_group], dtype=tl.float32)
+    
+    # First pass: compute sums
+    for offset in range(0, group_size, BLOCK_SIZE):
+        elem_idx = offset + tl.arange(0, BLOCK_SIZE)
+        mask = elem_idx < group_size
+        
+        # Calculate indices
+        channel_in_group = elem_idx // (H * W)
+        spatial_idx = elem_idx % (H * W)
+        h_idx = spatial_idx // W
+        w_idx = spatial_idx % W
+        
+        channel_idx = channel_start + channel_in_group
+        batch_offset = batch_idx * C * H * W
+        channel_offset = channel_idx * H * W
+        spatial_offset = h_idx * W + w_idx
+        
+        offset_idx = batch_offset + channel_offset + spatial_offset
+        
+        # Load data
+        x_val = tl.load(x_ptr + offset_idx, mask=mask, other=0.0)
+        dout_val = tl.load(dout_ptr + offset_idx, mask=mask, other=0.0)
+        
+        # Compute normalized value
+        x_hat = (x_val - mean) * rstd
+        
+        # Accumulate gradients
+        sum_dout += tl.sum(dout_val, axis=0)
+        sum_dout_xhat += tl.sum(dout_val * x_hat, axis=0)
+        
+        # Accumulate weight/bias gradients per channel
+        if dweight_ptr is not None:
+            channel_mask = channel_in_group < channels_per_group
+            channel_idx_local = tl.where(channel_mask, channel_in_group, 0)
+            dweight_acc = tl.where(mask & channel_mask, dout_val * x_hat, 0.0)
+            dbias_acc = tl.where(mask & channel_mask, dout_val, 0.0)
+            
+            # Reduce across spatial dimensions
+            for i in range(BLOCK_SIZE):
+                if i < tl.num_programs(0) and mask[i] and channel_mask[i]:
+                    idx = tl.min(channel_idx_local[i], channels_per_group - 1)
+                    sum_dweight = tl.sum(sum_dweight.at[idx].add(dweight_acc[i]), axis=0)
+                    sum_dbias = tl.sum(sum_dbias.at[idx].add(dbias_acc[i]), axis=0)
+    
+    # Compute scaling factors
+    scale = rstd / group_size
+    c1 = sum_dout_xhat * scale
+    c2 = sum_dout * scale
+    
+    # Second pass: compute gradients
+    for offset in range(0, group_size, BLOCK_SIZE):
+        elem_idx = offset + tl.arange(0, BLOCK_SIZE)
+        mask = elem_idx < group_size
+        
+        # Calculate indices
+        channel_in_group = elem_idx // (H * W)
+        spatial_idx = elem_idx % (H * W)
+        h_idx = spatial_idx // W
+        w_idx = spatial_idx % W
+        
+        channel_idx = channel_start + channel_in_group
+        batch_offset = batch_idx * C * H * W
+        channel_offset = channel_idx * H * W
+        spatial_offset = h_idx * W + w_idx
+        
+        offset_idx = batch_offset + channel_offset + spatial_offset
+        
+        # Load data
+        x_val = tl.load(x_ptr + offset_idx, mask=mask, other=0.0)
+        dout_val = tl.load(dout_ptr + offset_idx, mask=mask, other=0.0)
+        
+        # Compute normalized value
+        x_hat = (x_val - mean) * rstd
+        
+        # Compute gradient
+        if weight_ptr is not None:
+            weight = tl.load(weight_ptr + channel_idx, mask=mask, other=1.0)
+            dx_val = weight * rstd * (dout_val - x_hat * c1 - c2)
+        else:
+            dx_val = rstd * (dout_val - x_hat * c1 - c2)
+        
+        tl.store(dx_ptr + offset_idx, dx_val, mask=mask)
+    
+    # Store weight/bias gradients
+    if dweight_ptr is not None:
+        for c in range(channels_per_group):
+            channel_idx = channel_start + c
+            if channel_idx < C:
+                tl.atomic_add(dweight_ptr + channel_idx, sum_dweight[c])
+                tl.atomic_add(dbias_ptr + channel_idx, sum_dbias[c])
+
+
+def triton_group_norm_forward(x, weight, bias, num_groups, eps=1e-5):
+    N, C, *spatial_dims = x.shape
+    if len(spatial_dims) == 1:
+        H, W = spatial_dims[0], 1
+    elif len(spatial_dims) == 2:
+        H, W = spatial_dims
+    else:
+        # Handle higher dimensions by flattening
+        H, W = 1, 1
+        for dim in spatial_dims:
+            H *= dim
+    
+    G = num_groups
+    channels_per_group = C // G
+    group_size = channels_per_group * H * W
+    
+    out = torch.empty_like(x)
+    mean = torch.empty(N, G, dtype=torch.float32, device=x.device)
+    rstd = torch.empty(N, G, dtype=torch.float32, device=x.device)
+    
+    # Grid: one program per batch*group combination
+    grid = (N * G,)
+    
+    # Launch kernel
+    group_norm_forward_kernel[grid](
+        x, out, mean, rstd,
+        weight if weight is not None else None,
+        bias if bias is not None else None,
+        N, C, H, W, G, eps,
+        channels_per_group, group_size
+    )
+    
+    return out, mean, rstd
+
+
+def triton_group_norm_backward(dout, x, mean, rstd, weight, num_groups):
+    N, C, *spatial_dims = x.shape
+    if len(spatial_dims) == 1:
+        H, W = spatial_dims[0], 1
+    elif len(spatial_dims) == 2:
+        H, W = spatial_dims
+    else:
+        # Handle higher dimensions by flattening
+        H, W = 1, 1
+        for dim in spatial_dims:
+            H *= dim
+    
+    G = num_groups
+    channels_per_group = C // G
+    group_size = channels_per_group * H * W
+    
+    dx = torch.empty_like(x)
+    dweight = torch.zeros_like(weight) if weight is not None else None
+    dbias = torch.zeros_like(weight) if weight is not None else None
+    
+    # Grid: one program per batch*group combination
+    grid = (N * G,)
+    
+    # Launch kernel
+    group_norm_backward_kernel[grid](
+        dout, x, dx,
+        dweight if dweight is not None else None,
+        dbias if dbias is not None else None,
+        mean, rstd,
+        weight if weight is not None else None,
+        N, C, H, W, G,
+        channels_per_group, group_size
+    )
+    
+    return dx, dweight, dbias
+
+
+class ModelNew(nn.Module):
+    def __init__(self, num_features: int, num_groups: int, eps: float = 1e-5):
+        super().__init__()
+        self.num_features = num_features
+        self.num_groups = num_groups
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(num_features))
+        self.bias = nn.Parameter(torch.zeros(num_features))
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out, _, _ = triton_group_norm_forward(
+            x, self.weight, self.bias, self.num_groups, self.eps
+        )
+        return out
+    
+    def backward(self, dout: torch.Tensor, x: torch.Tensor) -> tuple:
+        # Compute mean and rstd for backward pass
+        N, C, *spatial_dims = x.shape
+        if len(spatial_dims) == 1:
+            H, W = spatial_dims[0], 1
+        elif len(spatial_dims) == 2:
+            H, W = spatial_dims
+        else:
+            H, W = 1, 1
+            for dim in spatial_dims:
+                H *= dim
+        
+        G = self.num_groups
+        channels_per_group = C // G
+        group_size = channels_per_group * H * W
+        
+        # Compute statistics for backward pass
+        mean = torch.empty(N, G, dtype=torch.float32, device=x.device)
+        rstd = torch.empty(N, G, dtype=torch.float32, device=x.device)
+        
+        # Compute statistics using a simple kernel or PyTorch ops
+        x_flat = x.reshape(N, G, channels_per_group, H, W)
+        x_flat = x_flat.reshape(N, G, -1)
+        mean = x_flat.mean(dim=-1)
+        var = x_flat.var(dim=-1, unbiased=False)
+        rstd = 1.0 / torch.sqrt(var + self.eps)
+        
+        dx, dweight, dbias = triton_group_norm_backward(
+            dout, x, mean, rstd, self.weight, self.num_groups
+        )
+        return dx, dweight, dbias
+```

@@ -1,0 +1,238 @@
+Fix the Triton kernel errors. Generate correct, high-performance code.
+
+Current Error Log:
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 535, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251213_080709_batch_range1to40_deepseek_deepseek/7_Conv3d_ReLU_LeakyReLU_GELU_Sigmoid_BiasAdd/code/kernel_20251213_114646.py", line 153, in forward
+    x = fused_activation_bias(x, self.bias)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251213_080709_batch_range1to40_deepseek_deepseek/7_Conv3d_ReLU_LeakyReLU_GELU_Sigmoid_BiasAdd/code/kernel_20251213_114646.py", line 118, in fused_activation_bias
+    @triton.autotune(configs=configs, key=['spatial_size'])
+     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 378, in decorator
+    return Autotuner(fn, fn.arg_names, configs, key, reset_to_zero, restore_value, pre_hook=pre_hook,
+                         ^^^^^^^^^^^^
+AttributeError: 'function' object has no attribute 'arg_names'
+
+History Error:
+None
+
+
+PyTorch Reference:
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs a 3D convolution, applies ReLU, LeakyReLU, GELU, Sigmoid activations, and bias in sequence.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, bias_shape):
+        super(Model, self).__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size)
+        self.bias = nn.Parameter(torch.randn(bias_shape)) 
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = torch.relu(x)
+        x = torch.nn.functional.leaky_relu(x, negative_slope=0.01)
+        x = torch.nn.functional.gelu(x)
+        x = torch.sigmoid(x)
+        x = x + self.bias
+        return x
+
+batch_size = 64
+in_channels = 8
+out_channels = 32
+depth, height, width = 32, 64, 64
+kernel_size = 3
+bias_shape = (out_channels, 1, 1, 1)
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, depth, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, bias_shape]
+```
+
+Broken Code:
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def fused_activation_bias_kernel(
+    x_ptr,
+    bias_ptr,
+    output_ptr,
+    batch_size,
+    channels,
+    spatial_size,
+    batch_stride,
+    channel_stride,
+    spatial_stride,
+    BLOCK_SIZE_SPATIAL: tl.constexpr,
+):
+    # Optimized 2D grid: (batch*channels, spatial_blocks)
+    # Flatten batch and channel dimensions for better parallelism
+    pid_batch_channel = tl.program_id(axis=0)
+    pid_spatial = tl.program_id(axis=1)
+    
+    # Reconstruct batch and channel indices
+    batch_idx = pid_batch_channel // channels
+    channel_idx = pid_batch_channel % channels
+    
+    # Check bounds
+    if batch_idx >= batch_size:
+        return
+    
+    # Spatial block offsets
+    spatial_start = pid_spatial * BLOCK_SIZE_SPATIAL
+    spatial_offsets = spatial_start + tl.arange(0, BLOCK_SIZE_SPATIAL)
+    spatial_mask = spatial_offsets < spatial_size
+    
+    # Base pointer calculation
+    batch_offset = batch_idx * batch_stride
+    channel_offset = channel_idx * channel_stride
+    base_offset = batch_offset + channel_offset
+    
+    # Load input block with better memory coalescing
+    x_block = tl.load(
+        x_ptr + base_offset + spatial_offsets,
+        mask=spatial_mask,
+        other=0.0
+    )
+    
+    # Load bias (scalar per channel)
+    bias_scalar = tl.load(bias_ptr + channel_idx)
+    
+    # Fused operations
+    # ReLU
+    x_act = tl.maximum(x_block, 0.0)
+    
+    # Optimized GELU approximation - use more accurate polynomial
+    # gelu(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    # Precomputed constants for performance
+    GELU_CONST = 0.7978845608028654  # sqrt(2/pi)
+    GELU_COEF = 0.044715
+    
+    x_cubed = x_act * x_act * x_act
+    gelu_inner = GELU_CONST * (x_act + GELU_COEF * x_cubed)
+    
+    # Optimized tanh approximation: tanh(x) = x * (1 - x^2/3) for small x (more accurate)
+    gelu_inner_sq = gelu_inner * gelu_inner
+    tanh_approx = gelu_inner * (1.0 - gelu_inner_sq * 0.3333333333333333)
+    gelu_result = 0.5 * x_act * (1.0 + tanh_approx)
+    
+    # Optimized Sigmoid: sigmoid(x) = 1/(1 + exp(-x))
+    # Use piecewise approximation for better performance
+    sigmoid_result = tl.where(gelu_result >= 0,
+                             1.0 / (1.0 + tl.exp(-gelu_result)),
+                             tl.exp(gelu_result) / (1.0 + tl.exp(gelu_result)))
+    
+    # Add bias
+    result = sigmoid_result + bias_scalar
+    
+    # Store result
+    tl.store(
+        output_ptr + base_offset + spatial_offsets,
+        result,
+        mask=spatial_mask
+    )
+
+def fused_activation_bias(x: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    Fused activation and bias addition for 5D tensors.
+    x shape: [batch, channels, depth, height, width]
+    bias shape: [channels, 1, 1, 1] or [channels]
+    """
+    output = torch.empty_like(x)
+    
+    batch_size, channels, depth, height, width = x.shape
+    spatial_size = depth * height * width
+    
+    # Flatten spatial dimensions
+    x_reshaped = x.reshape(batch_size, channels, spatial_size)
+    output_reshaped = output.reshape(batch_size, channels, spatial_size)
+    
+    # Compute strides for flattened tensor
+    batch_stride = channels * spatial_size
+    channel_stride = spatial_size
+    
+    # Ensure bias is correctly shaped
+    if bias.dim() == 4:
+        bias = bias.squeeze(-1).squeeze(-1).squeeze(-1)
+    
+    # Optimized kernel configuration with autotuning
+    # Use 2D grid for better SM utilization
+    configs = [
+        triton.Config({'BLOCK_SIZE_SPATIAL': 256}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_SIZE_SPATIAL': 512}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_SIZE_SPATIAL': 1024}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_SIZE_SPATIAL': 2048}, num_warps=16, num_stages=1),
+    ]
+    
+    @triton.autotune(configs=configs, key=['spatial_size'])
+    def kernel_launcher(x_reshaped, bias, output_reshaped, batch_size, channels, spatial_size, batch_stride, channel_stride):
+        grid = lambda META: (
+            batch_size * channels,  # Combine batch and channel for better parallelism
+            triton.cdiv(spatial_size, META['BLOCK_SIZE_SPATIAL']),
+        )
+        
+        fused_activation_bias_kernel[grid](
+            x_reshaped,
+            bias,
+            output_reshaped,
+            batch_size,
+            channels,
+            spatial_size,
+            batch_stride,
+            channel_stride,
+            1,  # spatial_stride is 1 for contiguous flattened tensor
+            META['BLOCK_SIZE_SPATIAL'],
+        )
+    
+    kernel_launcher(x_reshaped, bias, output_reshaped, batch_size, channels, spatial_size, batch_stride, channel_stride)
+    
+    return output
+
+class ModelNew(nn.Module):
+    """
+    Model that performs a 3D convolution, applies fused activations and bias.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, bias_shape):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size)
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = fused_activation_bias(x, self.bias)
+        return x
+```
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+3. Learn from previous repair attempts to avoid repeating the same mistakes
+
+```python
+# <corrected code>
+```

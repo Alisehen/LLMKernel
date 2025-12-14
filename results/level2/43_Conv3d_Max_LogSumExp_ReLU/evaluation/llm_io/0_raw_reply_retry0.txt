@@ -1,0 +1,157 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def logsumexp_relu_kernel(
+    input_ptr,
+    output_ptr,
+    n_batch,
+    n_channel,
+    n_depth,
+    n_height,
+    n_width,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Kernel for logsumexp over channel dimension followed by ReLU.
+    """
+    # Compute flattened spatial position
+    pid = tl.program_id(axis=0)
+    num_spatial_positions = n_depth * n_height * n_width
+    num_elements = n_batch * num_spatial_positions
+    
+    if pid >= num_elements:
+        return
+    
+    # Extract batch and spatial indices
+    batch_idx = pid // num_spatial_positions
+    spatial_idx = pid % num_spatial_positions
+    
+    # Compute spatial dimensions
+    width_idx = spatial_idx % n_width
+    height_idx = (spatial_idx // n_width) % n_height
+    depth_idx = spatial_idx // (n_height * n_width)
+    
+    # Initialize reduction
+    max_val = -float('inf')
+    sum_exp = 0.0
+    
+    # Block-based reduction over channels
+    for channel_block_start in range(0, n_channel, BLOCK_SIZE):
+        channel_offsets = tl.arange(0, BLOCK_SIZE)
+        channel_idx = channel_block_start + channel_offsets
+        
+        # Create mask for valid channels
+        channel_mask = channel_idx < n_channel
+        
+        # Compute pointer offset for this block
+        offset = (batch_idx * n_channel * num_spatial_positions +
+                  channel_idx * num_spatial_positions +
+                  depth_idx * n_height * n_width +
+                  height_idx * n_width +
+                  width_idx)
+        
+        # Load input values
+        values = tl.load(input_ptr + offset, mask=channel_mask, other=-float('inf'))
+        
+        # Update max value
+        block_max = tl.max(values, axis=0)
+        max_val = tl.maximum(max_val, block_max)
+        
+        # Compute exponentials (with numerical stability)
+        # We'll accumulate sum_exp after computing all max values
+        
+    # Second pass: compute sum of exponentials
+    for channel_block_start in range(0, n_channel, BLOCK_SIZE):
+        channel_offsets = tl.arange(0, BLOCK_SIZE)
+        channel_idx = channel_block_start + channel_offsets
+        channel_mask = channel_idx < n_channel
+        
+        offset = (batch_idx * n_channel * num_spatial_positions +
+                  channel_idx * num_spatial_positions +
+                  depth_idx * n_height * n_width +
+                  height_idx * n_width +
+                  width_idx)
+        
+        values = tl.load(input_ptr + offset, mask=channel_mask, other=-float('inf'))
+        
+        # Compute exp(values - max_val) with numerical stability
+        exp_values = tl.exp(values - max_val)
+        block_sum = tl.sum(exp_values, axis=0)
+        sum_exp += block_sum
+    
+    # Compute logsumexp
+    log_sum_exp = tl.log(sum_exp) + max_val
+    
+    # Apply ReLU
+    result = tl.maximum(log_sum_exp, 0.0)
+    
+    # Compute output offset (keepdim=True)
+    output_offset = (batch_idx * num_spatial_positions +
+                     depth_idx * n_height * n_width +
+                     height_idx * n_width +
+                     width_idx)
+    
+    # Store result
+    tl.store(output_ptr + output_offset, result)
+
+
+def triton_logsumexp_relu(x: torch.Tensor) -> torch.Tensor:
+    """
+    Wrapper function for logsumexp over channel dimension followed by ReLU.
+    """
+    n_batch, n_channel, n_depth, n_height, n_width = x.shape
+    
+    # Output shape: (batch, 1, depth, height, width)
+    output = torch.empty(n_batch, 1, n_depth, n_height, n_width, 
+                        device=x.device, dtype=x.dtype)
+    
+    # Flatten spatial dimensions for grid calculation
+    num_spatial_positions = n_depth * n_height * n_width
+    grid_size = n_batch * num_spatial_positions
+    
+    # Choose block size - power of 2 that fits within channel dimension
+    BLOCK_SIZE = 64 if n_channel >= 64 else triton.next_power_of_2(n_channel)
+    BLOCK_SIZE = min(BLOCK_SIZE, 1024)  # Ensure it's within hardware limits
+    
+    # Launch kernel
+    logsumexp_relu_kernel[grid_size](
+        x,
+        output,
+        n_batch,
+        n_channel,
+        n_depth,
+        n_height,
+        n_width,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
+    
+    return output
+
+
+class ModelNew(nn.Module):
+    """
+    Model that performs a 3D convolution, max pooling, log sum exp, and ReLU activation.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size, 
+                             stride=stride, padding=padding)
+        self.max_pool = nn.MaxPool3d(kernel_size=2, stride=2)
+
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor of shape (batch_size, in_channels, depth, height, width)
+        Returns:
+            Output tensor of shape (batch_size, out_channels, depth', height', width')
+        """
+        x = self.conv(x)
+        x = self.max_pool(x)
+        x = triton_logsumexp_relu(x)  # Replace PyTorch logsumexp + ReLU with Triton kernel
+        return x
+```

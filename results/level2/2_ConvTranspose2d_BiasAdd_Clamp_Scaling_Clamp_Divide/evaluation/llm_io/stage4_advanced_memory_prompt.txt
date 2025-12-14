@@ -1,0 +1,168 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU
+GPU Name: 4090
+Architecture: Ada Lovelace
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+[OPTIMIZATION STAGE]
+
+## Current Optimization Stage
+
+Focus: Final micro-tuning.
+
+Params:
+- num_warps ∈ {2,4,8,16}
+- num_stages ∈ {2,3,4}
+
+Rules:
+- Change num_warps only if occupancy suggests it
+- Change num_stages by ±1 only
+- Do NOT modify grid or BLOCK sizes
+
+Autotune:
+- 3–6 nearby configs
+- Always include original config
+- Revert if gain <1–2% or unstable
+
+
+
+[CURRENT CODE]
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 128, 'VEC_SIZE': 8}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 256, 'VEC_SIZE': 4}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 512, 'VEC_SIZE': 2}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 1024, 'VEC_SIZE': 1}, num_warps=8, num_stages=1),
+    ],
+    key=['spatial_size']
+)
+@triton.jit
+def post_process_kernel(
+    x_ptr,
+    bias_ptr,
+    output_ptr,
+    scaling_factor,
+    B, C, H, W,
+    BLOCK_SIZE: tl.constexpr,
+    VEC_SIZE: tl.constexpr,
+):
+    # 2D grid: (spatial_blocks, batch*channel)
+    pid = tl.program_id(0)
+    bc_id = tl.program_id(1)
+    
+    spatial_size = H * W
+    batch_id = bc_id // C
+    channel_id = bc_id % C
+    base_offset = batch_id * C * spatial_size + channel_id * spatial_size
+    
+    # Process VEC_SIZE elements per thread, BLOCK_SIZE threads per block
+    spatial_start = pid * BLOCK_SIZE * VEC_SIZE
+    offsets = base_offset + spatial_start + tl.arange(0, BLOCK_SIZE)[:, None] * VEC_SIZE + tl.arange(0, VEC_SIZE)[None, :]
+    
+    # Compute mask for boundary handling
+    spatial_idx = tl.arange(0, BLOCK_SIZE)[:, None] * VEC_SIZE + tl.arange(0, VEC_SIZE)[None, :] + spatial_start
+    mask = spatial_idx < spatial_size
+    
+    # Vectorized load
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    
+    # Load bias and broadcast
+    bias = tl.load(bias_ptr + channel_id)
+    x = x + bias
+    
+    # Fused operations
+    scale_inv = 1.0 / scaling_factor
+    x = tl.minimum(tl.maximum(x, 0.0), 1.0)
+    x_scaled = x * scaling_factor
+    x = tl.minimum(tl.maximum(x_scaled, 0.0), 1.0) * scale_inv
+    
+    # Vectorized store
+    tl.store(output_ptr + offsets, x, mask=mask)
+
+def triton_post_process(
+    x: torch.Tensor,
+    bias: torch.Tensor,
+    scaling_factor: float
+) -> torch.Tensor:
+    assert x.is_contiguous(), "Input tensor must be contiguous"
+    assert bias.is_contiguous(), "Bias tensor must be contiguous"
+    
+    B, C, H, W = x.shape
+    spatial_size = H * W
+    output = torch.empty_like(x)
+    
+    # Calculate grid size
+    BLOCK_SIZE = 1024  # Max BLOCK_SIZE for autotuning
+    VEC_SIZE = 1       # Max VEC_SIZE for autotuning
+    spatial_blocks = (spatial_size + BLOCK_SIZE * VEC_SIZE - 1) // (BLOCK_SIZE * VEC_SIZE)
+    grid = (spatial_blocks, B * C)
+    
+    bias_reshaped = bias.view(-1)
+    
+    post_process_kernel[grid](
+        x, bias_reshaped, output,
+        scaling_factor,
+        B, C, H, W,
+    )
+    
+    return output
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, bias_shape, scaling_factor):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose2d(
+            in_channels, out_channels, kernel_size, 
+            stride=stride, padding=padding, output_padding=output_padding
+        )
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.scaling_factor = scaling_factor
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        return triton_post_process(x, self.bias, self.scaling_factor)
+```
+
+[NCU PROFILING METRICS]
+{
+  "post_process_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 3.7,
+    "launch__grid_size": 524288,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 81.33,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 92.94,
+    "lts__t_sector_hit_rate.pct": 50.01
+  }
+}
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

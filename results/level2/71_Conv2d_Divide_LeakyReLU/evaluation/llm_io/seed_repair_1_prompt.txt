@@ -1,0 +1,346 @@
+Fix the Triton kernel errors. Generate correct, high-performance code.
+
+Current Error Log:
+Traceback (most recent call last):
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 34, in wrapper
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 1427, in program_id
+    return semantic.program_id(axis, _builder)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/semantic.py", line 29, in program_id
+    raise ValueError(f"program_id axis must be 0, 1, or 2 but got {axis}")
+ValueError: program_id axis must be 0, 1, or 2 but got 3
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 535, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251213_080749_batch_range71to100_deepseek_deepseek/71_Conv2d_Divide_LeakyReLU/code/kernel_20251213_081019.py", line 222, in forward
+    return triton_conv_div_leaky_relu(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251213_080749_batch_range71to100_deepseek_deepseek/71_Conv2d_Divide_LeakyReLU/code/kernel_20251213_081019.py", line 188, in triton_conv_div_leaky_relu
+    conv_div_leaky_relu_kernel[grid_batch, grid_channel, grid_height, grid_width](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 347, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 569, in run
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 278, in compile
+    module = src.make_ir(options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 81, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 28:12:
+    weight_output_channel_stride, weight_input_channel_stride, weight_height_stride, weight_width_stride,
+    output_batch_stride, output_channel_stride, output_height_stride, output_width_stride,
+    BLOCK_SIZE_BATCH: tl.constexpr,
+    BLOCK_SIZE_CHANNEL: tl.constexpr,
+    BLOCK_SIZE_HEIGHT: tl.constexpr,
+    BLOCK_SIZE_WIDTH: tl.constexpr,
+):
+    # Parallelize over output spatial dimensions and output channels
+    pid_batch = tl.program_id(axis=0)
+    pid_channel = tl.program_id(axis=1)
+    pid_h = tl.program_id(axis=2)
+    pid_w = tl.program_id(axis=3)
+            ^
+
+History Error:
+None
+
+
+PyTorch Reference:
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs a convolution, divides by a constant, and applies LeakyReLU.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, divisor):
+        super(Model, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.divisor = divisor
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = x / self.divisor
+        x = torch.nn.functional.leaky_relu(x, negative_slope=0.01)
+        return x
+
+batch_size = 128
+in_channels = 8
+out_channels = 64
+height, width = 128, 128
+kernel_size = 3
+divisor = 2
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, divisor]
+```
+
+Broken Code:
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def conv_div_leaky_relu_kernel(
+    input_ptr,
+    weight_ptr,
+    bias_ptr,
+    output_ptr,
+    divisor,
+    negative_slope,
+    stride_h, stride_w,
+    padding_h, padding_w,
+    dilation_h, dilation_w,
+    groups,
+    batch_size, in_channels, out_channels,
+    height, width,
+    kernel_h, kernel_w,
+    output_h, output_w,
+    input_batch_stride, input_channel_stride, input_height_stride, input_width_stride,
+    weight_output_channel_stride, weight_input_channel_stride, weight_height_stride, weight_width_stride,
+    output_batch_stride, output_channel_stride, output_height_stride, output_width_stride,
+    BLOCK_SIZE_BATCH: tl.constexpr,
+    BLOCK_SIZE_CHANNEL: tl.constexpr,
+    BLOCK_SIZE_HEIGHT: tl.constexpr,
+    BLOCK_SIZE_WIDTH: tl.constexpr,
+):
+    # Parallelize over output spatial dimensions and output channels
+    pid_batch = tl.program_id(axis=0)
+    pid_channel = tl.program_id(axis=1)
+    pid_h = tl.program_id(axis=2)
+    pid_w = tl.program_id(axis=3)
+    
+    # Create ranges for the block
+    batch_range = pid_batch * BLOCK_SIZE_BATCH + tl.arange(0, BLOCK_SIZE_BATCH)
+    channel_range = pid_channel * BLOCK_SIZE_CHANNEL + tl.arange(0, BLOCK_SIZE_CHANNEL)
+    height_range = pid_h * BLOCK_SIZE_HEIGHT + tl.arange(0, BLOCK_SIZE_HEIGHT)
+    width_range = pid_w * BLOCK_SIZE_WIDTH + tl.arange(0, BLOCK_SIZE_WIDTH)
+    
+    # Create masks for boundary checks
+    batch_mask = batch_range < batch_size
+    channel_mask = channel_range < out_channels
+    height_mask = height_range < output_h
+    width_mask = width_range < output_w
+    
+    # Initialize accumulator
+    acc = tl.zeros((BLOCK_SIZE_BATCH, BLOCK_SIZE_CHANNEL, BLOCK_SIZE_HEIGHT, BLOCK_SIZE_WIDTH), dtype=tl.float32)
+    
+    # Compute convolution
+    for kh in range(kernel_h):
+        for kw in range(kernel_w):
+            # Calculate input positions
+            input_h = height_range * stride_h + kh * dilation_h - padding_h
+            input_w = width_range * stride_w + kw * dilation_w - padding_w
+            
+            # Check input bounds
+            input_h_mask = (input_h >= 0) & (input_h < height)
+            input_w_mask = (input_w >= 0) & (input_w < width)
+            input_spatial_mask = input_h_mask & input_w_mask
+            
+            # Loop over input channels
+            input_channel_start = (pid_channel * BLOCK_SIZE_CHANNEL) // (out_channels // groups) * (in_channels // groups)
+            for ic in range(in_channels // groups):
+                # Load input block
+                input_idx = (
+                    batch_range[:, None, None, None] * input_batch_stride +
+                    (input_channel_start + ic) * input_channel_stride +
+                    input_h[None, None, :, None] * input_height_stride +
+                    input_w[None, None, None, :] * input_width_stride
+                )
+                
+                # Load input with proper masking
+                input_mask = batch_mask[:, None, None, None] & input_spatial_mask[None, None, :, :]
+                input_val = tl.load(
+                    input_ptr + input_idx,
+                    mask=input_mask,
+                    other=0.0
+                )
+                
+                # Load weight block
+                weight_idx = (
+                    channel_range[None, :, None, None] * weight_output_channel_stride +
+                    ic * weight_input_channel_stride +
+                    kh * weight_height_stride +
+                    kw * weight_width_stride
+                )
+                weight_val = tl.load(
+                    weight_ptr + weight_idx,
+                    mask=channel_mask[None, :, None, None],
+                    other=0.0
+                )
+                
+                # Accumulate
+                acc += input_val * weight_val[None, :, None, None]
+    
+    # Add bias
+    if bias_ptr is not None:
+        bias_idx = channel_range[None, :, None, None]
+        bias_val = tl.load(
+            bias_ptr + bias_idx,
+            mask=channel_mask[None, :, None, None],
+            other=0.0
+        )
+        acc += bias_val[None, :, None, None]
+    
+    # Apply division and leaky ReLU
+    acc = acc / divisor
+    acc = tl.where(acc >= 0, acc, acc * negative_slope)
+    
+    # Store output
+    output_idx = (
+        batch_range[:, None, None, None] * output_batch_stride +
+        channel_range[None, :, None, None] * output_channel_stride +
+        height_range[None, None, :, None] * output_height_stride +
+        width_range[None, None, None, :] * output_width_stride
+    )
+    
+    output_mask = (
+        batch_mask[:, None, None, None] &
+        channel_mask[None, :, None, None] &
+        height_mask[None, None, :, None] &
+        width_mask[None, None, None, :]
+    )
+    
+    tl.store(
+        output_ptr + output_idx,
+        acc,
+        mask=output_mask
+    )
+
+
+def triton_conv_div_leaky_relu(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    divisor: float,
+    stride: int = 1,
+    padding: int = 0,
+    dilation: int = 1,
+    groups: int = 1,
+) -> torch.Tensor:
+    # Get input dimensions
+    batch_size, in_channels, height, width = x.shape
+    out_channels, _, kernel_h, kernel_w = weight.shape
+    
+    # Calculate output dimensions
+    output_h = (height + 2 * padding - dilation * (kernel_h - 1) - 1) // stride + 1
+    output_w = (width + 2 * padding - dilation * (kernel_w - 1) - 1) // stride + 1
+    
+    # Create output tensor
+    output = torch.empty(
+        batch_size, out_channels, output_h, output_w,
+        device=x.device, dtype=x.dtype
+    )
+    
+    # Define block sizes (powers of 2)
+    BLOCK_SIZE_BATCH = 1
+    BLOCK_SIZE_CHANNEL = 16
+    BLOCK_SIZE_HEIGHT = 4
+    BLOCK_SIZE_WIDTH = 4
+    
+    # Compute grid
+    grid_batch = triton.cdiv(batch_size, BLOCK_SIZE_BATCH)
+    grid_channel = triton.cdiv(out_channels, BLOCK_SIZE_CHANNEL)
+    grid_height = triton.cdiv(output_h, BLOCK_SIZE_HEIGHT)
+    grid_width = triton.cdiv(output_w, BLOCK_SIZE_WIDTH)
+    
+    # Compute strides
+    input_batch_stride = x.stride(0)
+    input_channel_stride = x.stride(1)
+    input_height_stride = x.stride(2)
+    input_width_stride = x.stride(3)
+    
+    weight_output_channel_stride = weight.stride(0)
+    weight_input_channel_stride = weight.stride(1)
+    weight_height_stride = weight.stride(2)
+    weight_width_stride = weight.stride(3)
+    
+    output_batch_stride = output.stride(0)
+    output_channel_stride = output.stride(1)
+    output_height_stride = output.stride(2)
+    output_width_stride = output.stride(3)
+    
+    # Launch kernel
+    conv_div_leaky_relu_kernel[grid_batch, grid_channel, grid_height, grid_width](
+        x,
+        weight,
+        bias,
+        output,
+        divisor,
+        0.01,  # negative_slope
+        stride, stride,
+        padding, padding,
+        dilation, dilation,
+        groups,
+        batch_size, in_channels, out_channels,
+        height, width,
+        kernel_h, kernel_w,
+        output_h, output_w,
+        input_batch_stride, input_channel_stride, input_height_stride, input_width_stride,
+        weight_output_channel_stride, weight_input_channel_stride, weight_height_stride, weight_width_stride,
+        output_batch_stride, output_channel_stride, output_height_stride, output_width_stride,
+        BLOCK_SIZE_BATCH=BLOCK_SIZE_BATCH,
+        BLOCK_SIZE_CHANNEL=BLOCK_SIZE_CHANNEL,
+        BLOCK_SIZE_HEIGHT=BLOCK_SIZE_HEIGHT,
+        BLOCK_SIZE_WIDTH=BLOCK_SIZE_WIDTH,
+    )
+    
+    return output
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, divisor):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.divisor = divisor
+
+    def forward(self, x):
+        return triton_conv_div_leaky_relu(
+            x,
+            self.conv.weight,
+            self.conv.bias,
+            self.divisor,
+            stride=self.conv.stride[0],
+            padding=self.conv.padding[0],
+            dilation=self.conv.dilation[0],
+            groups=self.conv.groups,
+        )
+```
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+3. Learn from previous repair attempts to avoid repeating the same mistakes
+
+```python
+# <corrected code>
+```

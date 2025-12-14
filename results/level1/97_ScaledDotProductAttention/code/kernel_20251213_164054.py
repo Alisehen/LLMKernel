@@ -1,0 +1,249 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=4, num_stages=2),
+        triton.Config({}, num_warps=8, num_stages=2),
+        triton.Config({}, num_warps=8, num_stages=3),
+        triton.Config({}, num_warps=16, num_stages=3),
+    ],
+    key=["M", "N", "K"],
+)
+@triton.jit
+def batched_matmul_kernel(
+    A_ptr, B_ptr, C_ptr,
+    BATCH, M, N, K,
+    stride_ab, stride_am, stride_ak,
+    stride_bb, stride_bk, stride_bn,
+    stride_cb, stride_cm, stride_cn,
+    scale,
+    ADD_SCALE: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """
+    Compute batched matrix multiplication:
+        for b in [0, BATCH):
+            C[b, :, :] = (A[b, :, :] @ B[b, :, :]) * scale (if ADD_SCALE)
+
+    Shapes:
+        A: [BATCH, M, K]
+        B: [BATCH, K, N]
+        C: [BATCH, M, N]
+
+    Grid (3D):
+        pid_b in [0, BATCH)
+        pid_m in [0, ceil(M / BLOCK_M))
+        pid_n in [0, ceil(N / BLOCK_N))
+    """
+    pid_b = tl.program_id(axis=0)
+    pid_m = tl.program_id(axis=1)
+    pid_n = tl.program_id(axis=2)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Base pointers for this batch
+    A_batch_ptr = A_ptr + pid_b * stride_ab
+    B_batch_ptr = B_ptr + pid_b * stride_bb
+    C_batch_ptr = C_ptr + pid_b * stride_cb
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    k = 0
+    while k < K:
+        k_offsets = k + offs_k
+        k_mask = k_offsets < K
+
+        a_ptrs = A_batch_ptr + (
+            offs_m[:, None] * stride_am + k_offsets[None, :] * stride_ak
+        )
+        b_ptrs = B_batch_ptr + (
+            k_offsets[:, None] * stride_bk + offs_n[None, :] * stride_bn
+        )
+
+        a = tl.load(
+            a_ptrs,
+            mask=(offs_m[:, None] < M) & (k_mask[None, :]),
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptrs,
+            mask=(k_mask[:, None]) & (offs_n[None, :] < N),
+            other=0.0,
+        )
+
+        acc += tl.dot(a, b)
+        k += BLOCK_K
+
+    if ADD_SCALE:
+        acc *= scale
+
+    c = acc.to(tl.float16)
+    c_ptrs = C_batch_ptr + (
+        offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    )
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, c, mask=c_mask)
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=2, num_stages=1),
+        triton.Config({}, num_warps=4, num_stages=1),
+        triton.Config({}, num_warps=8, num_stages=1),
+    ],
+    key=["N"],
+)
+@triton.jit
+def softmax_kernel(
+    input_ptr, output_ptr,
+    stride_ib, stride_im, stride_in,
+    stride_ob, stride_om, stride_on,
+    BATCH, M, N,
+    BLOCK_N: tl.constexpr,
+):
+    """
+    Row-wise softmax over the last dimension N for a [BATCH, M, N] tensor.
+    Each program instance handles one row.
+
+    Grid (2D):
+        pid_m in [0, M)
+        pid_b in [0, BATCH)
+    """
+    pid_m = tl.program_id(axis=0)
+    pid_b = tl.program_id(axis=1)
+
+    row_in_ptr = input_ptr + pid_b * stride_ib + pid_m * stride_im
+    row_out_ptr = output_ptr + pid_b * stride_ob + pid_m * stride_om
+
+    offs_n = tl.arange(0, BLOCK_N)
+    mask = offs_n < N
+
+    row = tl.load(
+        row_in_ptr + offs_n * stride_in,
+        mask=mask,
+        other=-float("inf"),
+    ).to(tl.float32)
+
+    row_max = tl.max(row, axis=0)
+    row = row - row_max
+    exp_row = tl.exp(row)
+    denom = tl.sum(exp_row, axis=0)
+    softmax = (exp_row / denom).to(tl.float16)
+
+    tl.store(
+        row_out_ptr + offs_n * stride_on,
+        softmax,
+        mask=mask,
+    )
+
+
+def triton_scaled_dot_product_attention(Q: torch.Tensor,
+                                        K: torch.Tensor,
+                                        V: torch.Tensor) -> torch.Tensor:
+    """
+    Triton implementation of scaled dot-product attention:
+
+        attn = softmax(Q @ K^T / sqrt(d_k))
+        out  = attn @ V
+
+    Inputs:
+        Q, K, V: [B, H, S, D], dtype=float16, CUDA tensors
+    Output:
+        out: [B, H, S, D], dtype=float16
+    """
+    assert Q.is_cuda and K.is_cuda and V.is_cuda
+    assert Q.dtype == torch.float16 and K.dtype == torch.float16 and V.dtype == torch.float16
+    assert Q.shape == K.shape == V.shape
+
+    B, H, S, D = Q.shape
+    BH = B * H
+
+    Q_flat = Q.contiguous().view(BH, S, D)
+    K_flat = K.contiguous().view(BH, S, D)
+    V_flat = V.contiguous().view(BH, S, D)
+
+    device = Q.device
+
+    # 1) scores = Q @ K^T / sqrt(D)
+    scores = torch.empty((BH, S, S), device=device, dtype=torch.float16)
+
+    BLOCK_M = 64
+    BLOCK_N = 64
+    BLOCK_K = 32
+
+    # Grid: (batch, m_tiles, n_tiles)
+    grid_scores = lambda meta: (
+        BH,
+        triton.cdiv(S, meta["BLOCK_M"]),
+        triton.cdiv(S, meta["BLOCK_N"]),
+    )
+
+    scale = 1.0 / float(D**0.5)
+
+    batched_matmul_kernel[grid_scores](
+        Q_flat, K_flat, scores,
+        BH, S, S, D,
+        # A: [BH, M=S, K=D]
+        Q_flat.stride(0), Q_flat.stride(1), Q_flat.stride(2),
+        # B: treat as [BH, K=D, N=S] via transpose of last two dims
+        K_flat.stride(0), K_flat.stride(2), K_flat.stride(1),
+        # C: [BH, M=S, N=S]
+        scores.stride(0), scores.stride(1), scores.stride(2),
+        scale,
+        ADD_SCALE=True,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+    )
+
+    # 2) probs = softmax(scores) along last dimension
+    probs = torch.empty_like(scores)
+
+    BLOCK_SOFTMAX = 512  # tuned for S=512
+
+    grid_softmax = (S, BH)
+    softmax_kernel[grid_softmax](
+        scores, probs,
+        scores.stride(0), scores.stride(1), scores.stride(2),
+        probs.stride(0), probs.stride(1), probs.stride(2),
+        BH, S, S,
+        BLOCK_N=BLOCK_SOFTMAX,
+    )
+
+    # 3) out = probs @ V
+    out_flat = torch.empty((BH, S, D), device=device, dtype=torch.float16)
+
+    grid_out = lambda meta: (
+        BH,
+        triton.cdiv(S, meta["BLOCK_M"]),
+        triton.cdiv(D, meta["BLOCK_N"]),
+    )
+
+    batched_matmul_kernel[grid_out](
+        probs, V_flat, out_flat,
+        BH, S, D, S,
+        # A: [BH, M=S, K=S]
+        probs.stride(0), probs.stride(1), probs.stride(2),
+        # B: [BH, K=S, N=D]
+        V_flat.stride(0), V_flat.stride(1), V_flat.stride(2),
+        # C: [BH, M=S, N=D]
+        out_flat.stride(0), out_flat.stride(1), out_flat.stride(2),
+        1.0,
+        ADD_SCALE=False,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+    )
+
+    out = out_flat.view(B, H, S, D)
+    return out
+
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
+        return triton_scaled_dot_product_attention(Q, K, V)

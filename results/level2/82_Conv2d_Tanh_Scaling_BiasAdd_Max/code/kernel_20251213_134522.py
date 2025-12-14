@@ -1,0 +1,224 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 256, 'num_warps': 4}),
+        triton.Config({'BLOCK_SIZE': 512, 'num_warps': 4}),
+        triton.Config({'BLOCK_SIZE': 1024, 'num_warps': 8}),
+        triton.Config({'BLOCK_SIZE': 2048, 'num_warps': 8}),
+        triton.Config({'BLOCK_SIZE': 4096, 'num_warps': 8}),
+    ],
+    key=['n_elements'],
+)
+@triton.jit
+def fused_activation_kernel(
+    x_ptr,
+    bias_ptr,
+    output_ptr,
+    scaling_factor,
+    n_elements,
+    C: tl.constexpr,
+    H: tl.constexpr,
+    W: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    
+    x = tl.load(x_ptr + offsets, mask=mask)
+    
+    # Optimized tanh with better numerical stability
+    x2 = x * 2.0
+    # Clamp to prevent overflow in exp
+    x2 = tl.minimum(tl.maximum(x2, -88.0), 88.0)
+    exp_2x = tl.exp(x2)
+    tanh_x = (exp_2x - 1.0) / (exp_2x + 1.0)
+    
+    # Compute bias offset - correct 2D bias indexing
+    if C > 1:
+        # For 2D bias shape (C, 1, 1)
+        channel_idx = (offsets // (H * W)) % C
+        bias = tl.load(bias_ptr + channel_idx)
+    else:
+        # Scalar bias
+        bias = tl.load(bias_ptr)
+    
+    activated = tanh_x * scaling_factor + bias
+    tl.store(output_ptr + offsets, activated, mask=mask)
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_C': 1, 'BLOCK_H': 2, 'BLOCK_W': 64, 'num_warps': 4}),
+        triton.Config({'BLOCK_C': 1, 'BLOCK_H': 4, 'BLOCK_W': 32, 'num_warps': 4}),
+        triton.Config({'BLOCK_C': 2, 'BLOCK_H': 2, 'BLOCK_W': 32, 'num_warps': 8}),
+        triton.Config({'BLOCK_C': 2, 'BLOCK_H': 4, 'BLOCK_W': 32, 'num_warps': 8}),
+        triton.Config({'BLOCK_C': 4, 'BLOCK_H': 2, 'BLOCK_W': 16, 'num_warps': 8}),
+    ],
+    key=['B', 'C', 'H', 'W', 'output_h', 'output_w', 'pool_h', 'pool_w'],
+)
+@triton.jit
+def max_pool_2d_kernel(
+    input_ptr,
+    output_ptr,
+    B, C, H, W,
+    pool_h, pool_w,
+    stride_h, stride_w,
+    output_h, output_w,
+    BLOCK_C: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+):
+    # 3D grid: batch, channel blocks, height blocks
+    batch_idx = tl.program_id(axis=0)
+    channel_block_idx = tl.program_id(axis=1)
+    height_block_idx = tl.program_id(axis=2)
+    
+    # Compute base indices
+    c_start = channel_block_idx * BLOCK_C
+    h_start = height_block_idx * BLOCK_H
+    channel_ids = c_start + tl.arange(0, BLOCK_C)
+    height_ids = h_start + tl.arange(0, BLOCK_H)
+    
+    # Initialize accumulator with negative infinity
+    acc = tl.full((BLOCK_C, BLOCK_H, BLOCK_W), float('-inf'), dtype=tl.float32)
+    
+    # Iterate over width dimension
+    for w_idx in range(BLOCK_W):
+        w_base = w_idx * stride_w
+        w_offsets = tl.arange(0, pool_w)
+        
+        # Compute input positions
+        h_positions = height_ids[:, None, None] * stride_h + tl.arange(0, pool_h)[None, :, None]
+        w_positions = w_base + w_offsets[None, None, :]
+        
+        # Create masks for valid positions
+        h_mask = h_positions < H
+        w_mask = w_positions < W
+        c_mask = channel_ids[:, None, None] < C
+        b_mask = batch_idx < B
+        
+        # Load input values
+        for ph in range(pool_h):
+            for pw in range(pool_w):
+                # Compute indices for this pooling window element
+                input_h = height_ids[:, None] * stride_h + ph
+                input_w = w_base + pw
+                
+                # Compute linear indices
+                input_offsets = (
+                    (batch_idx * C * H * W)[:, None, None] +
+                    (channel_ids * H * W)[:, None, None] +
+                    (input_h * W)[:, None] +
+                    input_w
+                )
+                
+                # Load with bounds checking
+                load_mask = (
+                    (batch_idx < B)[:, None, None] &
+                    (channel_ids < C)[:, None, None] &
+                    (input_h < H)[:, None] &
+                    (input_w < W)[:, None]
+                )
+                
+                values = tl.load(input_ptr + input_offsets, mask=load_mask, other=float('-inf'))
+                
+                # Update max
+                acc = tl.maximum(acc, values[:, :, None])
+    
+    # Compute output indices and store
+    channel_mask = channel_ids[:, None, None] < C
+    height_mask = height_ids[:, None] < output_h
+    width_mask = tl.arange(0, BLOCK_W)[None, None, :] < output_w
+    
+    for w_idx in range(BLOCK_W):
+        if w_idx < output_w:
+            output_offsets = (
+                (batch_idx * C * output_h * output_w) +
+                (channel_ids[:, None, None] * output_h * output_w) +
+                (height_ids[:, None] * output_w) +
+                w_idx
+            )
+            
+            store_mask = (
+                (batch_idx < B) &
+                (channel_ids < C)[:, None, None] &
+                (height_ids < output_h)[:, None] &
+                (w_idx < output_w)
+            )
+            
+            tl.store(output_ptr + output_offsets, acc[:, :, w_idx], mask=store_mask)
+
+
+def triton_fused_activation(x: torch.Tensor, scaling_factor: float, bias: torch.Tensor) -> torch.Tensor:
+    output = torch.empty_like(x)
+    n_elements = output.numel()
+    B, C, H, W = x.shape
+    
+    # Flatten bias if needed
+    if bias.dim() == 3:
+        bias = bias.view(-1)
+    
+    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
+    
+    fused_activation_kernel[grid](
+        x, bias, output, scaling_factor, n_elements,
+        C, H, W
+    )
+    return output
+
+
+def triton_max_pool2d(x: torch.Tensor, kernel_size: int) -> torch.Tensor:
+    B, C, H, W = x.shape
+    stride = kernel_size
+    pool_h = pool_w = kernel_size
+    
+    output_h = H // stride
+    output_w = W // stride
+    
+    if output_h <= 0 or output_w <= 0:
+        raise ValueError(f"Invalid output dimensions: {output_h}x{output_w}")
+    
+    output = torch.empty((B, C, output_h, output_w), device=x.device, dtype=x.dtype)
+    
+    # Calculate grid size
+    grid_b = B
+    grid_c = triton.cdiv(C, 2)  # Use BLOCK_C=2 as base
+    grid_h = triton.cdiv(output_h, 2)  # Use BLOCK_H=2 as base
+    
+    grid = (grid_b, grid_c, grid_h)
+    
+    max_pool_2d_kernel[grid](
+        x, output,
+        B, C, H, W,
+        pool_h, pool_w,
+        stride, stride,
+        output_h, output_w
+    )
+    return output
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, scaling_factor, bias_shape, pool_kernel_size):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.scaling_factor = scaling_factor
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.pool_kernel_size = pool_kernel_size
+        
+    def forward(self, x):
+        # PyTorch convolution
+        x = self.conv(x)
+        
+        # Fused activation
+        x = triton_fused_activation(x, self.scaling_factor, self.bias)
+        
+        # Max pooling
+        x = triton_max_pool2d(x, self.pool_kernel_size)
+        
+        return x

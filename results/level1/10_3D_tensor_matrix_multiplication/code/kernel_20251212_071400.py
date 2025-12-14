@@ -1,0 +1,132 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 32}, num_stages=4, num_warps=8),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=4, num_warps=8),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=5, num_warps=4),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=5, num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_stages=5, num_warps=4),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=5, num_warps=2),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_stages=5, num_warps=2),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 64}, num_stages=6, num_warps=2),
+    ],
+    key=['M', 'N', 'K', 'L']
+)
+@triton.jit
+def batched_matmul_kernel(
+    A_ptr,
+    B_ptr,
+    C_ptr,
+    N, M, K, L,
+    stride_An, stride_Am, stride_Ak,
+    stride_Bk, stride_Bl,
+    stride_Cn, stride_Cm, stride_Cl,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    USE_TENSOR_CORES: tl.constexpr,
+    ACC_TYPE: tl.constexpr,
+):
+    """Optimized batched matmul kernel with improved memory access patterns"""
+    pid_batch = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    pid_n = tl.program_id(2)
+    
+    # Create block pointers for better coalescing
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    
+    # Initialize accumulator
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
+    
+    # Batch pointers
+    A_batch_ptr = A_ptr + pid_batch * stride_An
+    C_batch_ptr = C_ptr + pid_batch * stride_Cn
+    
+    # Pre-compute base pointers for A and B
+    # A: [BLOCK_M, BLOCK_K] accessed column-major for better L1 cache hit
+    a_ptrs = A_batch_ptr + (offs_m[:, None] * stride_Am + offs_k[None, :] * stride_Ak)
+    # B: [BLOCK_K, BLOCK_N] accessed row-major for coalescing
+    b_ptrs = B_ptr + (offs_k[:, None] * stride_Bk + offs_n[None, :] * stride_Bl)
+    
+    # Loop over K with software pipelining
+    for k in range(0, tl.cdiv(K, BLOCK_K)):
+        k_offset = k * BLOCK_K
+        
+        # Load A and B with masking - minimize control divergence
+        a_mask = (offs_m[:, None] < M) & ((k_offset + offs_k[None, :]) < K)
+        b_mask = ((k_offset + offs_k[:, None]) < K) & (offs_n[None, :] < L)
+        
+        # Load with explicit cache hints
+        a = tl.load(a_ptrs + k_offset * stride_Ak, mask=a_mask, other=0.0, cache_modifier=".cg")
+        b = tl.load(b_ptrs + k_offset * stride_Bk, mask=b_mask, other=0.0, cache_modifier=".cg")
+        
+        # Matrix multiplication with tensor cores when available
+        if USE_TENSOR_CORES and ACC_TYPE == tl.float32:
+            acc += tl.dot(a, b, allow_tf32=True)
+        else:
+            acc += tl.dot(a, b)
+    
+    # Store result with coalesced writes
+    c_offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    c_offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    
+    c_ptrs = C_batch_ptr + (c_offs_m[:, None] * stride_Cm + c_offs_n[None, :] * stride_Cl)
+    c_mask = (c_offs_m[:, None] < M) & (c_offs_n[None, :] < L)
+    tl.store(c_ptrs, acc, mask=c_mask)
+
+
+def triton_batched_matmul(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    """Optimized wrapper with automatic dtype handling"""
+    assert A.dim() == 3 and B.dim() == 2
+    N, M, K = A.shape
+    L = B.shape[1]
+    
+    C = torch.empty((N, M, L), device=A.device, dtype=A.dtype)
+    
+    # Determine accumulator type and tensor core usage
+    if A.dtype == torch.float16:
+        acc_dtype = tl.float32
+        use_tensor_cores = True
+    elif A.dtype == torch.bfloat16:
+        acc_dtype = tl.float32
+        use_tensor_cores = True
+    elif A.dtype == torch.float32:
+        acc_dtype = tl.float32
+        use_tensor_cores = True
+    else:
+        acc_dtype = tl.float32
+        use_tensor_cores = False
+    
+    # Calculate grid dimensions
+    grid = lambda META: (N, triton.cdiv(M, META['BLOCK_M']), triton.cdiv(L, META['BLOCK_N']))
+    
+    # Launch kernel with automatic grid calculation
+    batched_matmul_kernel[grid](
+        A, B, C,
+        N, M, K, L,
+        A.stride(0), A.stride(1), A.stride(2),
+        B.stride(0), B.stride(1),
+        C.stride(0), C.stride(1), C.stride(2),
+        USE_TENSOR_CORES=use_tensor_cores,
+        ACC_TYPE=acc_dtype,
+    )
+    
+    return C
+
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super(ModelNew, self).__init__()
+    
+    def forward(self, A, B):
+        return triton_batched_matmul(A, B)

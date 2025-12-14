@@ -1,0 +1,312 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def conv_div_leaky_relu_kernel(
+    input_ptr,
+    weight_ptr,
+    bias_ptr,
+    output_ptr,
+    divisor,
+    negative_slope,
+    stride_h, stride_w,
+    padding_h, padding_w,
+    dilation_h, dilation_w,
+    groups,
+    batch_size, in_channels, out_channels,
+    height, width,
+    kernel_h, kernel_w,
+    output_h, output_w,
+    input_batch_stride, input_channel_stride, input_height_stride, input_width_stride,
+    weight_output_channel_stride, weight_input_channel_stride, weight_height_stride, weight_width_stride,
+    output_batch_stride, output_channel_stride, output_height_stride, output_width_stride,
+    BLOCK_SIZE_BATCH: tl.constexpr,
+    BLOCK_SIZE_CHANNEL: tl.constexpr,
+    BLOCK_SIZE_HEIGHT: tl.constexpr,
+    BLOCK_SIZE_WIDTH: tl.constexpr,
+    USE_BIAS: tl.constexpr,
+):
+    """Optimized convolution with division and leaky ReLU activation."""
+    # 3D grid: (batch, channel, height*width)
+    pid_batch = tl.program_id(axis=0)
+    pid_channel = tl.program_id(axis=1)
+    pid_spatial = tl.program_id(axis=2)
+    
+    # Calculate spatial block - use integer arithmetic for better performance
+    blocks_per_row = tl.cdiv(output_w, BLOCK_SIZE_WIDTH)
+    pid_h = pid_spatial // blocks_per_row
+    pid_w = pid_spatial % blocks_per_row
+    
+    # Create block ranges with immediate offsets for better ILP
+    batch_offset = pid_batch * BLOCK_SIZE_BATCH
+    channel_offset = pid_channel * BLOCK_SIZE_CHANNEL
+    height_offset = pid_h * BLOCK_SIZE_HEIGHT
+    width_offset = pid_w * BLOCK_SIZE_WIDTH
+    
+    batch_range = batch_offset + tl.arange(0, BLOCK_SIZE_BATCH)
+    channel_range = channel_offset + tl.arange(0, BLOCK_SIZE_CHANNEL)
+    height_range = height_offset + tl.arange(0, BLOCK_SIZE_HEIGHT)
+    width_range = width_offset + tl.arange(0, BLOCK_SIZE_WIDTH)
+    
+    # Boundary masks - precompute for reuse
+    batch_mask = batch_range < batch_size
+    channel_mask = channel_range < out_channels
+    height_mask = height_range < output_h
+    width_mask = width_range < output_w
+    
+    # Combine spatial masks for efficient reuse
+    full_spatial_mask = height_mask[:, None] & width_mask[None, :]
+    
+    # Group configuration - optimized for minimal computation
+    input_channels_per_group = in_channels // groups
+    output_channels_per_group = out_channels // groups
+    channel_blocks_per_group = tl.cdiv(output_channels_per_group, BLOCK_SIZE_CHANNEL)
+    group_id = pid_channel // channel_blocks_per_group
+    group_channel_offset = group_id * output_channels_per_group
+    input_channel_start = group_id * input_channels_per_group
+    
+    # Initialize accumulator - use float32 for accumulation
+    acc = tl.zeros((BLOCK_SIZE_BATCH, BLOCK_SIZE_CHANNEL, BLOCK_SIZE_HEIGHT, BLOCK_SIZE_WIDTH), dtype=tl.float32)
+    
+    # Process each input channel in the group with better loop ordering
+    for ic in range(input_channels_per_group):
+        input_channel_idx = input_channel_start + ic
+        
+        # Process kernel spatial dimensions
+        for kh_idx in range(kernel_h):
+            kh = kh_idx * dilation_h
+            for kw_idx in range(kernel_w):
+                kw = kw_idx * dilation_w
+                
+                # Input positions with vectorized computation
+                input_h = height_range * stride_h + kh - padding_h
+                input_w = width_range * stride_w + kw - padding_w
+                
+                # Vectorized boundary checks
+                input_h_mask = (input_h >= 0) & (input_h < height)
+                input_w_mask = (input_w >= 0) & (input_w < width)
+                spatial_mask = input_h_mask[:, None] & input_w_mask[None, :]
+                
+                # Load input values with coalesced access pattern
+                base_input_offset = input_channel_idx * input_channel_stride
+                
+                # Compute input offsets with better memory pattern
+                input_h_offsets = input_h[None, None, :, None] * input_height_stride
+                input_w_offsets = input_w[None, None, None, :] * input_width_stride
+                
+                input_offsets = (
+                    batch_range[:, None, None, None] * input_batch_stride +
+                    base_input_offset +
+                    input_h_offsets +
+                    input_w_offsets
+                )
+                
+                input_val = tl.load(
+                    input_ptr + input_offsets,
+                    mask=batch_mask[:, None, None, None] & spatial_mask[None, None, :, :],
+                    other=0.0
+                )
+                
+                # Load weight values with better cache locality
+                weight_channel_range = channel_range + group_channel_offset
+                
+                # Optimize weight offset computation
+                base_weight_offset = (
+                    ic * weight_input_channel_stride +
+                    kh_idx * weight_height_stride +
+                    kw_idx * weight_width_stride
+                )
+                
+                weight_offsets = (
+                    weight_channel_range[None, :, None, None] * weight_output_channel_stride +
+                    base_weight_offset
+                )
+                
+                weight_val = tl.load(
+                    weight_ptr + weight_offsets,
+                    mask=channel_mask[None, :, None, None],
+                    other=0.0
+                )
+                
+                # FMA accumulation with proper broadcasting
+                acc = tl.math.fma(input_val, weight_val, acc)
+    
+    # Add bias if present with vectorized load
+    if USE_BIAS:
+        bias_val = tl.load(
+            bias_ptr + channel_range + group_channel_offset,
+            mask=channel_mask,
+            other=0.0
+        )
+        acc = acc + bias_val[None, :, None, None]
+    
+    # Apply division and leaky ReLU with optimized conditional
+    acc = acc / divisor
+    acc = tl.where(acc >= 0, acc, acc * negative_slope)
+    
+    # Compute output offsets with optimized computation
+    output_channel_offsets = (channel_range + group_channel_offset)[None, :, None, None] * output_channel_stride
+    output_height_offsets = height_range[None, None, :, None] * output_height_stride
+    output_width_offsets = width_range[None, None, None, :] * output_width_stride
+    
+    output_offsets = (
+        batch_range[:, None, None, None] * output_batch_stride +
+        output_channel_offsets +
+        output_height_offsets +
+        output_width_offsets
+    )
+    
+    # Store result with coalesced writes
+    tl.store(
+        output_ptr + output_offsets,
+        acc,
+        mask=(
+            batch_mask[:, None, None, None] &
+            channel_mask[None, :, None, None] &
+            full_spatial_mask[None, None, :, :]
+        )
+    )
+
+
+def triton_conv_div_leaky_relu(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    divisor: float,
+    stride: int = 1,
+    padding: int = 0,
+    dilation: int = 1,
+    groups: int = 1,
+) -> torch.Tensor:
+    """Optimized wrapper for convolution with division and leaky ReLU."""
+    # Get dimensions
+    batch_size, in_channels, height, width = x.shape
+    out_channels, weight_in_channels, kernel_h, kernel_w = weight.shape
+    
+    # Output dimensions
+    output_h = (height + 2 * padding - dilation * (kernel_h - 1) - 1) // stride + 1
+    output_w = (width + 2 * padding - dilation * (kernel_w - 1) - 1) // stride + 1
+    
+    # Output tensor
+    output = torch.empty(
+        batch_size, out_channels, output_h, output_w,
+        device=x.device, dtype=x.dtype
+    )
+    
+    # Optimized block sizes for Ada Lovelace (RTX 4090)
+    BLOCK_SIZE_BATCH = min(batch_size, 4)
+    BLOCK_SIZE_CHANNEL = min(32, out_channels // groups)
+    BLOCK_SIZE_HEIGHT = min(output_h, 8)
+    BLOCK_SIZE_WIDTH = min(output_w, 8)
+    
+    # Ensure block sizes are positive and properly aligned
+    BLOCK_SIZE_BATCH = max(1, BLOCK_SIZE_BATCH)
+    BLOCK_SIZE_CHANNEL = max(1, BLOCK_SIZE_CHANNEL)
+    BLOCK_SIZE_HEIGHT = max(1, BLOCK_SIZE_HEIGHT)
+    BLOCK_SIZE_WIDTH = max(1, BLOCK_SIZE_WIDTH)
+    
+    # Grid dimensions - maintain 3D for SM utilization
+    grid_batch = triton.cdiv(batch_size, BLOCK_SIZE_BATCH)
+    grid_channel = triton.cdiv(out_channels, BLOCK_SIZE_CHANNEL)
+    grid_spatial = triton.cdiv(output_h, BLOCK_SIZE_HEIGHT) * triton.cdiv(output_w, BLOCK_SIZE_WIDTH)
+    
+    # Ensure we have enough parallelism for 128 SMs
+    total_blocks = grid_batch * grid_channel * grid_spatial
+    if total_blocks < 512:
+        # Reduce block sizes to increase parallelism while maintaining performance
+        if grid_batch * grid_channel < 128:
+            BLOCK_SIZE_HEIGHT = max(1, BLOCK_SIZE_HEIGHT // 2)
+            BLOCK_SIZE_WIDTH = max(1, BLOCK_SIZE_WIDTH // 2)
+        grid_batch = triton.cdiv(batch_size, BLOCK_SIZE_BATCH)
+        grid_channel = triton.cdiv(out_channels, BLOCK_SIZE_CHANNEL)
+        grid_spatial = triton.cdiv(output_h, BLOCK_SIZE_HEIGHT) * triton.cdiv(output_w, BLOCK_SIZE_WIDTH)
+    
+    # Strides
+    input_batch_stride = x.stride(0)
+    input_channel_stride = x.stride(1)
+    input_height_stride = x.stride(2)
+    input_width_stride = x.stride(3)
+    
+    weight_output_channel_stride = weight.stride(0)
+    weight_input_channel_stride = weight.stride(1)
+    weight_height_stride = weight.stride(2)
+    weight_width_stride = weight.stride(3)
+    
+    output_batch_stride = output.stride(0)
+    output_channel_stride = output.stride(1)
+    output_height_stride = output.stride(2)
+    output_width_stride = output.stride(3)
+    
+    # Create autotune configurations
+    configs = [
+        triton.Config({}, num_warps=16, num_stages=3),
+        triton.Config({}, num_warps=8, num_stages=3),
+        triton.Config({}, num_warps=8, num_stages=2),
+        triton.Config({}, num_warps=8, num_stages=4),
+        triton.Config({}, num_warps=4, num_stages=3),
+        triton.Config({}, num_warps=16, num_stages=2),
+    ]
+    
+    @triton.autotune(
+        configs=configs,
+        key=['batch_size', 'out_channels', 'output_h', 'output_w', 'in_channels', 'kernel_h', 'kernel_w']
+    )
+    @triton.jit
+    def autotuned_kernel(
+        input_ptr, weight_ptr, bias_ptr, output_ptr, divisor, negative_slope,
+        stride_h, stride_w, padding_h, padding_w, dilation_h, dilation_w, groups,
+        batch_size, in_channels, out_channels, height, width, kernel_h, kernel_w,
+        output_h, output_w, input_batch_stride, input_channel_stride, input_height_stride,
+        input_width_stride, weight_output_channel_stride, weight_input_channel_stride,
+        weight_height_stride, weight_width_stride, output_batch_stride, output_channel_stride,
+        output_height_stride, output_width_stride, BLOCK_SIZE_BATCH: tl.constexpr,
+        BLOCK_SIZE_CHANNEL: tl.constexpr, BLOCK_SIZE_HEIGHT: tl.constexpr,
+        BLOCK_SIZE_WIDTH: tl.constexpr, USE_BIAS: tl.constexpr
+    ):
+        conv_div_leaky_relu_kernel(
+            input_ptr, weight_ptr, bias_ptr, output_ptr, divisor, negative_slope,
+            stride_h, stride_w, padding_h, padding_w, dilation_h, dilation_w, groups,
+            batch_size, in_channels, out_channels, height, width, kernel_h, kernel_w,
+            output_h, output_w, input_batch_stride, input_channel_stride, input_height_stride,
+            input_width_stride, weight_output_channel_stride, weight_input_channel_stride,
+            weight_height_stride, weight_width_stride, output_batch_stride, output_channel_stride,
+            output_height_stride, output_width_stride, BLOCK_SIZE_BATCH,
+            BLOCK_SIZE_CHANNEL, BLOCK_SIZE_HEIGHT, BLOCK_SIZE_WIDTH, USE_BIAS
+        )
+    
+    # Launch autotuned kernel
+    autotuned_kernel[(grid_batch, grid_channel, grid_spatial)](
+        x, weight, bias, output, divisor, 0.01,
+        stride, stride, padding, padding, dilation, dilation, groups,
+        batch_size, in_channels, out_channels, height, width, kernel_h, kernel_w,
+        output_h, output_w, input_batch_stride, input_channel_stride, input_height_stride,
+        input_width_stride, weight_output_channel_stride, weight_input_channel_stride,
+        weight_height_stride, weight_width_stride, output_batch_stride, output_channel_stride,
+        output_height_stride, output_width_stride, BLOCK_SIZE_BATCH=BLOCK_SIZE_BATCH,
+        BLOCK_SIZE_CHANNEL=BLOCK_SIZE_CHANNEL, BLOCK_SIZE_HEIGHT=BLOCK_SIZE_HEIGHT,
+        BLOCK_SIZE_WIDTH=BLOCK_SIZE_WIDTH, USE_BIAS=bias is not None
+    )
+    
+    return output
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, divisor):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.divisor = divisor
+
+    def forward(self, x):
+        return triton_conv_div_leaky_relu(
+            x,
+            self.conv.weight,
+            self.conv.bias,
+            self.divisor,
+            stride=self.conv.stride[0],
+            padding=self.conv.padding[0],
+            dilation=self.conv.dilation[0],
+            groups=self.conv.groups,
+        )

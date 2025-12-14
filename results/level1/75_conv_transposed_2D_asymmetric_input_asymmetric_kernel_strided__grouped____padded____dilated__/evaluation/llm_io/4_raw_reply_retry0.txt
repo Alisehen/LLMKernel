@@ -1,0 +1,224 @@
+```python
+# <complete ModelNew code with optimized Triton kernels>
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+import math
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_W": 64}, num_warps=2, num_stages=1),
+        triton.Config({"BLOCK_W": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_W": 256}, num_warps=8, num_stages=2),
+    ],
+    key=["W_OUT"],
+)
+@triton.jit
+def conv_transpose2d_kernel(
+    x_ptr,
+    weight_ptr,
+    bias_ptr,
+    out_ptr,
+    N,
+    C_IN,
+    H_IN,
+    W_IN,
+    C_OUT,
+    H_OUT,
+    W_OUT,
+    GROUPS,
+    OC_PER_GROUP: tl.constexpr,
+    IC_PER_GROUP: tl.constexpr,
+    K_H: tl.constexpr,
+    K_W: tl.constexpr,
+    STRIDE_H: tl.constexpr,
+    STRIDE_W: tl.constexpr,
+    PAD_H: tl.constexpr,
+    PAD_W: tl.constexpr,
+    DIL_H: tl.constexpr,
+    DIL_W: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    OUT_DTYPE: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+):
+    pid_oc_h = tl.program_id(axis=0)
+    pid_w = tl.program_id(axis=1)
+
+    ow = pid_w * BLOCK_W + tl.arange(0, BLOCK_W)
+    mask = ow < W_OUT
+
+    oc_h_dim = C_OUT * H_OUT
+    n = pid_oc_h // oc_h_dim
+    rem = pid_oc_h % oc_h_dim
+    oc = rem // H_OUT
+    oh = rem % H_OUT
+
+    oc_group = oc // OC_PER_GROUP
+    oc_in_group = oc % OC_PER_GROUP
+    ic_group_start = oc_group * IC_PER_GROUP
+
+    acc = tl.zeros([BLOCK_W], dtype=tl.float32)
+    if HAS_BIAS:
+        bias_val = tl.load(bias_ptr + oc, mask=True, other=0.0).to(tl.float32)
+        acc += bias_val
+
+    for kh in tl.static_range(K_H):
+        h_tmp = oh + PAD_H - kh * DIL_H
+        mask_h = (h_tmp >= 0) & ((h_tmp % STRIDE_H) == 0)
+        h_in = tl.where(mask_h, h_tmp // STRIDE_H, 0)
+        mask_h = mask_h & (h_in < H_IN)
+        mask_hw = mask & mask_h
+
+        for kw in tl.static_range(K_W):
+            w_tmp = ow + PAD_W - kw * DIL_W
+            mask_w = mask_hw & (w_tmp >= 0)
+            w_mod = tl.where(mask_w, w_tmp % STRIDE_W, 0)
+            mask_w = mask_w & (w_mod == 0)
+            w_in = tl.where(mask_w, w_tmp // STRIDE_W, 0)
+            mask_w = mask_w & (w_in < W_IN)
+
+            if not tl.any(mask_w):
+                continue
+
+            for ic_inner in tl.static_range(IC_PER_GROUP):
+                ic = ic_group_start + ic_inner
+                inp_base = ((n * C_IN + ic) * H_IN + h_in) * W_IN
+                inp_ptrs = x_ptr + inp_base + w_in
+                val_in = tl.load(inp_ptrs, mask=mask_w, other=0.0).to(tl.float32)
+
+                w_offset = ((((ic) * OC_PER_GROUP) + oc_in_group) * K_H + kh) * K_W + kw
+                val_w = tl.load(weight_ptr + w_offset, mask=True, other=0.0).to(tl.float32)
+
+                acc += val_w * val_in
+
+    out_offset = (((n * C_OUT + oc) * H_OUT + oh) * W_OUT) + ow
+    if OUT_DTYPE == tl.float32:
+        out_val = acc
+    elif OUT_DTYPE == tl.float16:
+        out_val = acc.to(tl.float16)
+    elif OUT_DTYPE == tl.bfloat16:
+        out_val = acc.to(tl.bfloat16)
+    else:
+        out_val = acc
+    tl.store(out_ptr + out_offset, out_val, mask=mask)
+
+
+def conv_transpose2d_triton(x, weight, bias, stride, padding, dilation, groups):
+    assert x.is_contiguous()
+    assert weight.is_contiguous()
+    if bias is not None:
+        assert bias.is_contiguous()
+
+    stride_h, stride_w = stride
+    pad_h, pad_w = padding
+    dil_h, dil_w = dilation
+
+    N, C_in, H_in, W_in = x.shape
+    oc_per_group = weight.shape[1]
+    C_out = oc_per_group * groups
+    K_h, K_w = weight.shape[2], weight.shape[3]
+    H_out = (H_in - 1) * stride_h - 2 * pad_h + dil_h * (K_h - 1) + 1
+    W_out = (W_in - 1) * stride_w - 2 * pad_w + dil_w * (K_w - 1) + 1
+
+    out = torch.empty((N, C_out, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    dtype_map = {
+        torch.float32: tl.float32,
+        torch.float16: tl.float16,
+        torch.bfloat16: tl.bfloat16,
+    }
+    out_dtype = dtype_map[out.dtype]
+
+    grid = lambda meta: (
+        N * C_out * H_out,
+        triton.cdiv(W_out, meta["BLOCK_W"]),
+    )
+
+    conv_transpose2d_kernel[grid](
+        x,
+        weight,
+        bias if bias is not None else x,
+        out,
+        N,
+        C_in,
+        H_in,
+        W_in,
+        C_out,
+        H_out,
+        W_out,
+        groups,
+        oc_per_group,
+        C_in // groups,
+        K_h,
+        K_w,
+        stride_h,
+        stride_w,
+        pad_h,
+        pad_w,
+        dil_h,
+        dil_w,
+        bias is not None,
+        out_dtype,
+    )
+
+    return out
+
+
+class ModelNew(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: tuple,
+        stride: tuple = (1, 1),
+        padding: tuple = (0, 0),
+        dilation: tuple = (1, 1),
+        groups: int = 1,
+        bias: bool = False,
+    ):
+        super().__init__()
+        if isinstance(kernel_size, int):
+            kernel_size = (kernel_size, kernel_size)
+        if isinstance(stride, int):
+            stride = (stride, stride)
+        if isinstance(padding, int):
+            padding = (padding, padding)
+        if isinstance(dilation, int):
+            dilation = (dilation, dilation)
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+        self.groups = groups
+
+        weight_shape = (in_channels, out_channels // groups, kernel_size[0], kernel_size[1])
+        self.weight = nn.Parameter(torch.empty(weight_shape))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_channels))
+        else:
+            self.bias = None
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in = self.in_channels * self.kernel_size[0] * self.kernel_size[1]
+            bound = 1 / math.sqrt(fan_in)
+            nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return conv_transpose2d_triton(
+            x,
+            self.weight,
+            self.bias,
+            self.stride,
+            self.padding,
+            self.dilation,
+            self.groups,
+        )
+```

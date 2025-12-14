@@ -1,0 +1,246 @@
+Fix the Triton kernel errors. Generate correct, high-performance code.
+
+Current Error Log:
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 535, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251213_080631_batch_range40to70_deepseek_deepseek/43_Conv3d_Max_LogSumExp_ReLU/code/kernel_20251213_092723.py", line 154, in forward
+    x = triton_logsumexp_relu(x)  # Replace PyTorch logsumexp + ReLU with Triton kernel
+        ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251213_080631_batch_range40to70_deepseek_deepseek/43_Conv3d_Max_LogSumExp_ReLU/code/kernel_20251213_092723.py", line 121, in triton_logsumexp_relu
+    logsumexp_relu_kernel[grid_size](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 347, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 585, in run
+    grid_size = len(grid)
+                ^^^^^^^^^
+TypeError: object of type 'int' has no len()
+
+History Error:
+None
+
+
+PyTorch Reference:
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs a 3D convolution, max pooling, log sum exp, and ReLU activation.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding):
+        super(Model, self).__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding)
+        self.max_pool = nn.MaxPool3d(kernel_size=2, stride=2)
+
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor of shape (batch_size, in_channels, depth, height, width)
+        Returns:
+            Output tensor of shape (batch_size, out_channels, depth', height', width')
+        """
+        x = self.conv(x)
+        x = self.max_pool(x)
+        x = torch.logsumexp(x, dim=1, keepdim=True)
+        x = torch.relu(x)
+        return x
+
+batch_size = 4
+in_channels = 32
+out_channels = 64
+depth, height, width = 32, 128, 128
+kernel_size = 3
+stride = 1
+padding = 1
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, depth, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, stride, padding]
+```
+
+Broken Code:
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def logsumexp_relu_kernel(
+    input_ptr,
+    output_ptr,
+    n_batch,
+    n_channel,
+    n_depth,
+    n_height,
+    n_width,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Kernel for logsumexp over channel dimension followed by ReLU.
+    """
+    # Compute flattened spatial position
+    pid = tl.program_id(axis=0)
+    num_spatial_positions = n_depth * n_height * n_width
+    num_elements = n_batch * num_spatial_positions
+    
+    if pid >= num_elements:
+        return
+    
+    # Extract batch and spatial indices
+    batch_idx = pid // num_spatial_positions
+    spatial_idx = pid % num_spatial_positions
+    
+    # Compute spatial dimensions
+    width_idx = spatial_idx % n_width
+    height_idx = (spatial_idx // n_width) % n_height
+    depth_idx = spatial_idx // (n_height * n_width)
+    
+    # Initialize reduction
+    max_val = -float('inf')
+    sum_exp = 0.0
+    
+    # Block-based reduction over channels
+    for channel_block_start in range(0, n_channel, BLOCK_SIZE):
+        channel_offsets = tl.arange(0, BLOCK_SIZE)
+        channel_idx = channel_block_start + channel_offsets
+        
+        # Create mask for valid channels
+        channel_mask = channel_idx < n_channel
+        
+        # Compute pointer offset for this block
+        offset = (batch_idx * n_channel * num_spatial_positions +
+                  channel_idx * num_spatial_positions +
+                  depth_idx * n_height * n_width +
+                  height_idx * n_width +
+                  width_idx)
+        
+        # Load input values
+        values = tl.load(input_ptr + offset, mask=channel_mask, other=-float('inf'))
+        
+        # Update max value
+        block_max = tl.max(values, axis=0)
+        max_val = tl.maximum(max_val, block_max)
+        
+        # Compute exponentials (with numerical stability)
+        # We'll accumulate sum_exp after computing all max values
+        
+    # Second pass: compute sum of exponentials
+    for channel_block_start in range(0, n_channel, BLOCK_SIZE):
+        channel_offsets = tl.arange(0, BLOCK_SIZE)
+        channel_idx = channel_block_start + channel_offsets
+        channel_mask = channel_idx < n_channel
+        
+        offset = (batch_idx * n_channel * num_spatial_positions +
+                  channel_idx * num_spatial_positions +
+                  depth_idx * n_height * n_width +
+                  height_idx * n_width +
+                  width_idx)
+        
+        values = tl.load(input_ptr + offset, mask=channel_mask, other=-float('inf'))
+        
+        # Compute exp(values - max_val) with numerical stability
+        exp_values = tl.exp(values - max_val)
+        block_sum = tl.sum(exp_values, axis=0)
+        sum_exp += block_sum
+    
+    # Compute logsumexp
+    log_sum_exp = tl.log(sum_exp) + max_val
+    
+    # Apply ReLU
+    result = tl.maximum(log_sum_exp, 0.0)
+    
+    # Compute output offset (keepdim=True)
+    output_offset = (batch_idx * num_spatial_positions +
+                     depth_idx * n_height * n_width +
+                     height_idx * n_width +
+                     width_idx)
+    
+    # Store result
+    tl.store(output_ptr + output_offset, result)
+
+
+def triton_logsumexp_relu(x: torch.Tensor) -> torch.Tensor:
+    """
+    Wrapper function for logsumexp over channel dimension followed by ReLU.
+    """
+    n_batch, n_channel, n_depth, n_height, n_width = x.shape
+    
+    # Output shape: (batch, 1, depth, height, width)
+    output = torch.empty(n_batch, 1, n_depth, n_height, n_width, 
+                        device=x.device, dtype=x.dtype)
+    
+    # Flatten spatial dimensions for grid calculation
+    num_spatial_positions = n_depth * n_height * n_width
+    grid_size = n_batch * num_spatial_positions
+    
+    # Choose block size - power of 2 that fits within channel dimension
+    BLOCK_SIZE = 64 if n_channel >= 64 else triton.next_power_of_2(n_channel)
+    BLOCK_SIZE = min(BLOCK_SIZE, 1024)  # Ensure it's within hardware limits
+    
+    # Launch kernel
+    logsumexp_relu_kernel[grid_size](
+        x,
+        output,
+        n_batch,
+        n_channel,
+        n_depth,
+        n_height,
+        n_width,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
+    
+    return output
+
+
+class ModelNew(nn.Module):
+    """
+    Model that performs a 3D convolution, max pooling, log sum exp, and ReLU activation.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size, 
+                             stride=stride, padding=padding)
+        self.max_pool = nn.MaxPool3d(kernel_size=2, stride=2)
+
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor of shape (batch_size, in_channels, depth, height, width)
+        Returns:
+            Output tensor of shape (batch_size, out_channels, depth', height', width')
+        """
+        x = self.conv(x)
+        x = self.max_pool(x)
+        x = triton_logsumexp_relu(x)  # Replace PyTorch logsumexp + ReLU with Triton kernel
+        return x
+```
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+3. Learn from previous repair attempts to avoid repeating the same mistakes
+
+```python
+# <corrected code>
+```

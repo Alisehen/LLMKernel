@@ -1,0 +1,395 @@
+Fix the Triton kernel errors. Generate correct, high-performance code.
+
+Current Error Log:
+Traceback (most recent call last):
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 34, in wrapper
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 2579, in multiple_of
+    return semantic.multiple_of(input, values)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/semantic.py", line 1795, in multiple_of
+    if max(1, len(x.shape)) != len(values):
+                  ^^^^^^^
+AttributeError: 'constexpr' object has no attribute 'shape'
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 536, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251214_030720_batch_range50to68_openai_deepseek/50_conv_standard_2D__square_input__square_kernel/code/kernel_20251214_031336.py", line 267, in forward
+    return triton_conv2d_nchw(
+           ^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251214_030720_batch_range50to68_openai_deepseek/50_conv_standard_2D__square_input__square_kernel/code/kernel_20251214_031336.py", line 236, in triton_conv2d_nchw
+    conv2d_fwd_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 347, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 192, in run
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 192, in <dictcomp>
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 170, in _bench
+    return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/testing.py", line 145, in do_bench
+    fn()
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 156, in kernel_call
+    self.fn.run(
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 569, in run
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 278, in compile
+    module = src.make_ir(options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 81, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 38:4:
+    # -----------------------------------------------------------------------
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # [BM]
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # [BN]
+
+    OH_OW = OH * OW
+    M_total = N * OH_OW
+    mask_m = offs_m < M_total          # [BM]
+    mask_n = offs_n < C_out            # [BN]
+
+    tl.multiple_of(offs_m, BLOCK_M)
+    tl.multiple_of(offs_n, BLOCK_N)
+    tl.multiple_of(K_TOTAL, BLOCK_K)
+    ^
+
+History Error:
+None
+
+
+PyTorch Reference:
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class Model(nn.Module):
+    def __init__(self, num_classes=1000):
+        super(Model, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels=3, out_channels=96, kernel_size=11, stride=4, padding=2)
+    
+    def forward(self, x):
+        x = self.conv1(x)
+        return x
+
+# Test code
+batch_size = 256
+num_classes = 1000
+
+def get_inputs():
+    return [torch.rand(batch_size, 3, 224, 224)]
+
+def get_init_inputs():
+    return [num_classes]
+```
+
+Broken Code:
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        # Original config (baseline)
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+        # Fewer warps per block → more CTAs per SM, potentially higher occupancy
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_warps=2,
+            num_stages=2,
+        ),
+        # More warps per block → better latency hiding if registers allow
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_warps=8,
+            num_stages=2,
+        ),
+        # Deeper pipelining with moderate warps
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=3,
+        ),
+        # Deeper pipelining + more warps
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_warps=8,
+            num_stages=3,
+        ),
+    ],
+    key=['N', 'C_in', 'H', 'W', 'C_out', 'OH', 'OW'],
+)
+@triton.jit
+def conv2d_fwd_kernel(
+    x_ptr,         # float*  [N, C_in, H, W]   (contiguous, NCHW)
+    w_ptr,         # float*  [C_out, C_in, KH, KW] (contiguous)
+    b_ptr,         # float*  [C_out] or nullptr if bias is None
+    out_ptr,       # float*  [N, C_out, OH, OW]
+
+    N, C_in, H, W,
+    C_out, KH, KW,
+    OH, OW,
+    stride_h, stride_w,
+    pad_h, pad_w,
+
+    K_TOTAL: tl.constexpr,   # = C_in * KH * KW
+    HAS_BIAS: tl.constexpr,  # bool: whether b_ptr is valid
+    BLOCK_M: tl.constexpr,   # tile over output positions (N * OH * OW)
+    BLOCK_N: tl.constexpr,   # tile over output channels
+    BLOCK_K: tl.constexpr,   # tile over K
+):
+    # -----------------------------------------------------------------------
+    # Program ids
+    # -----------------------------------------------------------------------
+    pid_m = tl.program_id(0)  # tile over output positions
+    pid_n = tl.program_id(1)  # tile over output channels
+
+    # -----------------------------------------------------------------------
+    # Offsets for M (output positions) and N (output channels)
+    # -----------------------------------------------------------------------
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # [BM]
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # [BN]
+
+    OH_OW = OH * OW
+    M_total = N * OH_OW
+    mask_m = offs_m < M_total          # [BM]
+    mask_n = offs_n < C_out            # [BN]
+
+    tl.multiple_of(offs_m, BLOCK_M)
+    tl.multiple_of(offs_n, BLOCK_N)
+    tl.multiple_of(K_TOTAL, BLOCK_K)
+
+    # -----------------------------------------------------------------------
+    # Decode linear output index m -> (n, oh, ow)
+    # m in [0, N*OH*OW)
+    # -----------------------------------------------------------------------
+    tmp = offs_m
+    n_idx = tmp // OH_OW
+    rem = tmp % OH_OW
+    oh = rem // OW
+    ow = rem % OW
+
+    # Broadcasted versions
+    n_b = n_idx[:, None]        # [BM,1]
+    oh_b = oh[:, None]          # [BM,1]
+    ow_b = ow[:, None]          # [BM,1]
+    mask_m_b = mask_m[:, None]  # [BM,1]
+
+    # Precompute base spatial coordinates per output position
+    base_ih = oh_b * stride_h - pad_h   # [BM,1]
+    base_iw = ow_b * stride_w - pad_w   # [BM,1]
+
+    # -----------------------------------------------------------------------
+    # Initialize accumulator for [BM, BN] tile
+    # -----------------------------------------------------------------------
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # -----------------------------------------------------------------------
+    # Constants for K mapping
+    # -----------------------------------------------------------------------
+    KHW = KH * KW
+
+    # -----------------------------------------------------------------------
+    # Stream over K dimension in tiles of BLOCK_K
+    # Use static_range for software pipelining with num_stages
+    # -----------------------------------------------------------------------
+    for k_base in tl.static_range(0, K_TOTAL, BLOCK_K):
+        offs_k = k_base + tl.arange(0, BLOCK_K)        # [BK]
+        k_mask = offs_k < K_TOTAL                      # [BK]
+
+        # Map linear k -> (ic, kh, kw)
+        ic = offs_k // KHW                             # [BK]
+        rem_k = offs_k % KHW                           # [BK]
+        kh = rem_k // KW                               # [BK]
+        kw = rem_k % KW                                # [BK]
+
+        ic_b = ic[None, :]                             # [1,BK]
+        kh_b = kh[None, :]                             # [1,BK]
+        kw_b = kw[None, :]                             # [1,BK]
+
+        # Input spatial coordinates for each (m, k)
+        ih = base_ih + kh_b                            # [BM,BK]
+        iw = base_iw + kw_b                            # [BM,BK]
+
+        # Valid input mask for each (m, k)
+        mask_in = (
+            mask_m_b &
+            (ih >= 0) & (ih < H) &
+            (iw >= 0) & (iw < W) &
+            k_mask[None, :]
+        )
+
+        # Linear offsets into input tensor: ((n * C_in + ic) * H + ih) * W + iw
+        x_offsets = ((n_b * C_in + ic_b) * H + ih) * W + iw  # [BM,BK]
+        x_ptrs = x_ptr + x_offsets
+        a = tl.load(x_ptrs, mask=mask_in, other=0.0).to(tl.float32)
+
+        # -------------------------------------------------------------------
+        # Load weights as [BK, BN] tile:
+        # weight[oc, ic, kh, kw] contiguous
+        # flatten (ic, kh, kw) -> k in [0, K_TOTAL)
+        # linear index = oc * K_TOTAL + k
+        # -------------------------------------------------------------------
+        offs_k_b = offs_k[:, None]                     # [BK,1]
+        offs_n_b = offs_n[None, :]                     # [1,BN]
+
+        mask_w = (offs_k_b < K_TOTAL) & (offs_n_b < C_out)
+
+        w_offsets = offs_n_b * K_TOTAL + offs_k_b      # [BK,BN]
+        w_ptrs = w_ptr + w_offsets
+        b = tl.load(w_ptrs, mask=mask_w, other=0.0).to(tl.float32)
+
+        # -------------------------------------------------------------------
+        # Matrix multiply accumulate: [BM,BK] x [BK,BN] -> [BM,BN]
+        # -------------------------------------------------------------------
+        acc += tl.dot(a, b)
+
+    # -----------------------------------------------------------------------
+    # Add bias: bias[oc]
+    # -----------------------------------------------------------------------
+    if HAS_BIAS:
+        bias = tl.load(b_ptr + offs_n, mask=mask_n, other=0.0)  # [BN]
+        acc += bias[None, :]  # broadcast over BM
+
+    # -----------------------------------------------------------------------
+    # Write back to output: out[n, oc, oh, ow]
+    # index = ((n * C_out + oc) * OH + oh) * OW + ow
+    # -----------------------------------------------------------------------
+    n_out = n_idx[:, None]       # [BM,1]
+    oh_out = oh[:, None]         # [BM,1]
+    ow_out = ow[:, None]         # [BM,1]
+    oc_out = offs_n[None, :]     # [1,BN]
+
+    out_offsets = ((n_out * C_out + oc_out) * OH + oh_out) * OW + ow_out  # [BM,BN]
+    mask_out = mask_m_b & (oc_out < C_out)
+
+    tl.store(out_ptr + out_offsets, acc, mask=mask_out)
+
+
+def triton_conv2d_nchw(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    stride: int,
+    padding: int,
+) -> torch.Tensor:
+    """
+    x:      [N, C_in, H, W],  contiguous, CUDA
+    weight: [C_out, C_in, KH, KW], contiguous, CUDA
+    bias:   [C_out] or None, CUDA
+    stride, padding: int (assumed symmetric for H/W)
+    """
+    assert x.is_cuda and weight.is_cuda, "Inputs must be CUDA tensors"
+    assert x.dtype == torch.float32 and weight.dtype == torch.float32, "Only float32 supported"
+    if bias is not None:
+        assert bias.is_cuda and bias.dtype == torch.float32
+
+    x = x.contiguous()
+    weight = weight.contiguous()
+    if bias is not None:
+        bias = bias.contiguous()
+
+    N, C_in, H, W = x.shape
+    C_out, C_in_w, KH, KW = weight.shape
+    assert C_in_w == C_in, "Incompatible in_channels"
+
+    stride_h = stride_w = stride
+    pad_h = pad_w = padding
+
+    OH = (H + 2 * pad_h - KH) // stride_h + 1
+    OW = (W + 2 * pad_w - KW) // stride_w + 1
+
+    out = torch.empty((N, C_out, OH, OW), device=x.device, dtype=x.dtype)
+
+    # Precompute K_TOTAL as compile-time meta-parameter for the kernel.
+    K_TOTAL = C_in * KH * KW
+
+    # Grid: 2D over (output positions, output channels)
+    M_total = N * OH * OW
+
+    def grid(meta):
+        return (
+            triton.cdiv(M_total, meta['BLOCK_M']),
+            triton.cdiv(C_out, meta['BLOCK_N']),
+        )
+
+    conv2d_fwd_kernel[grid](
+        x, weight, bias if bias is not None else x,  # dummy ptr if no bias
+        out,
+        N, C_in, H, W,
+        C_out, KH, KW,
+        OH, OW,
+        stride_h, stride_w,
+        pad_h, pad_w,
+        K_TOTAL=K_TOTAL,
+        HAS_BIAS=bias is not None,
+    )
+
+    return out
+
+
+class ModelNew(nn.Module):
+    def __init__(self, num_classes=1000) -> None:
+        super().__init__()
+        self.conv1 = nn.Conv2d(
+            in_channels=3,
+            out_channels=96,
+            kernel_size=11,
+            stride=4,
+            padding=2,
+            bias=True,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not x.is_cuda:
+            return self.conv1(x)
+
+        return triton_conv2d_nchw(
+            x,
+            self.conv1.weight,
+            self.conv1.bias,
+            stride=self.conv1.stride[0],
+            padding=self.conv1.padding[0],
+        )
+```
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl, AND any other modules used (e.g., import math if using math.sqrt)
+   2. @triton.jit decorated kernel function(s) — NO continue/break/return inside loops (use masking)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels — THIS CLASS IS REQUIRED
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+3. Learn from previous repair attempts to avoid repeating the same mistakes
+4. Ensure ALL imports are included at the top (common mistake: forgetting `import math`)
+
+```python
+# <corrected code>
+```

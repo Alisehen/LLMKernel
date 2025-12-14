@@ -1,0 +1,307 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+def _to_triton_dtype(torch_dtype: torch.dtype):
+    if torch_dtype == torch.float32:
+        return tl.float32
+    if torch_dtype == torch.float16:
+        return tl.float16
+    if torch_dtype == torch.bfloat16:
+        return tl.bfloat16
+    raise TypeError(f"Unsupported dtype for Triton conv_transpose3d: {torch_dtype}")
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=8, num_stages=4),
+        triton.Config({}, num_warps=4, num_stages=3),
+    ],
+    key=["N", "OC", "OD", "OH", "OW"],
+)
+@triton.jit
+def conv_transpose3d_kernel(
+    x_ptr,
+    w_ptr,
+    out_ptr,
+    N,
+    IC,
+    ID,
+    IH,
+    IW,
+    OC,
+    KD,
+    KH,
+    KW,
+    stride_d,
+    stride_h,
+    stride_w,
+    pad_d,
+    pad_h,
+    pad_w,
+    dil_d,
+    dil_h,
+    dil_w,
+    OD,
+    OH,
+    OW,
+    K_elems,
+    stride_xn,
+    stride_xc,
+    stride_xd,
+    stride_xh,
+    stride_xw,
+    stride_outn,
+    stride_outc,
+    stride_outd,
+    stride_outh,
+    stride_outw,
+    stride_wic,
+    stride_woc,
+    stride_wd,
+    stride_wh,
+    stride_ww,
+    NUM_K_TILES: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    OUT_DTYPE: tl.constexpr,
+):
+    pid_batch = tl.program_id(axis=0)
+    pid_spatial = tl.program_id(axis=1)
+    pid_outch = tl.program_id(axis=2)
+
+    spatial = OD * OH * OW
+    hw = OH * OW
+
+    m_offsets = pid_spatial * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = m_offsets < spatial
+
+    n_offsets = pid_outch * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = n_offsets < OC
+
+    od_idx = m_offsets // hw
+    rem = m_offsets % hw
+    oh_idx = rem // OW
+    ow_idx = rem % OW
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    k_idx = tl.arange(0, BLOCK_K)
+
+    x_batch_ptr = x_ptr + pid_batch * stride_xn
+    out_batch_ptr = out_ptr + pid_batch * stride_outn
+
+    for k_tile in range(NUM_K_TILES):
+        k_offsets = k_tile * BLOCK_K + k_idx
+        k_mask = k_offsets < K_elems
+
+        kw_idx = k_offsets % KW
+        tmp = k_offsets // KW
+        kh_idx = tmp % KH
+        tmp = tmp // KH
+        kd_idx = tmp % KD
+        ic_idx = tmp // KD
+
+        od_bc = od_idx[:, None]
+        oh_bc = oh_idx[:, None]
+        ow_bc = ow_idx[:, None]
+
+        kd_bc = kd_idx[None, :]
+        kh_bc = kh_idx[None, :]
+        kw_bc = kw_idx[None, :]
+        ic_bc = ic_idx[None, :]
+
+        num_d = od_bc + pad_d - kd_bc * dil_d
+        num_h = oh_bc + pad_h - kh_bc * dil_h
+        num_w = ow_bc + pad_w - kw_bc * dil_w
+
+        mask_d = (num_d >= 0) & (tl.math.fmod(num_d, stride_d) == 0)
+        mask_h = (num_h >= 0) & (tl.math.fmod(num_h, stride_h) == 0)
+        mask_w = (num_w >= 0) & (tl.math.fmod(num_w, stride_w) == 0)
+
+        id_idx = num_d // stride_d
+        ih_idx = num_h // stride_h
+        iw_idx = num_w // stride_w
+
+        mask_d = mask_d & (id_idx >= 0) & (id_idx < ID)
+        mask_h = mask_h & (ih_idx >= 0) & (ih_idx < IH)
+        mask_w = mask_w & (iw_idx >= 0) & (iw_idx < IW)
+
+        valid_in = mask_m[:, None] & k_mask[None, :] & mask_d & mask_h & mask_w
+
+        id_bc = id_idx
+        ih_bc = ih_idx
+        iw_bc = iw_idx
+
+        inp_offset = (
+            ic_bc.to(tl.int64) * stride_xc
+            + id_bc.to(tl.int64) * stride_xd
+            + ih_bc.to(tl.int64) * stride_xh
+            + iw_bc.to(tl.int64) * stride_xw
+        )
+        x_vals = tl.load(x_batch_ptr + inp_offset, mask=valid_in, other=0.0)
+
+        w_offset = (
+            ic_idx[:, None].to(tl.int64) * stride_wic
+            + n_offsets[None, :].to(tl.int64) * stride_woc
+            + kd_idx[:, None].to(tl.int64) * stride_wd
+            + kh_idx[:, None].to(tl.int64) * stride_wh
+            + kw_idx[:, None].to(tl.int64) * stride_ww
+        )
+        w_mask = k_mask[:, None] & mask_n[None, :]
+        w_vals = tl.load(w_ptr + w_offset, mask=w_mask, other=0.0)
+
+        acc += tl.dot(x_vals, w_vals)
+
+    out_mask = mask_m[:, None] & mask_n[None, :]
+    out_offset = (
+        n_offsets[None, :].to(tl.int64) * stride_outc
+        + od_idx[:, None].to(tl.int64) * stride_outd
+        + oh_idx[:, None].to(tl.int64) * stride_outh
+        + ow_idx[:, None].to(tl.int64) * stride_outw
+    )
+    out_vals = acc.to(OUT_DTYPE)
+    tl.store(out_batch_ptr + out_offset, out_vals, mask=out_mask)
+
+
+def triton_conv_transpose3d(x, weight, bias, stride, padding, dilation):
+    assert x.is_cuda and weight.is_cuda, "Inputs must be CUDA tensors."
+    assert x.dtype == weight.dtype, "Input and weight dtypes must match."
+
+    stride_d, stride_h, stride_w = stride if isinstance(stride, (tuple, list)) else (stride,) * 3
+    pad_d, pad_h, pad_w = padding if isinstance(padding, (tuple, list)) else (padding,) * 3
+    dil_d, dil_h, dil_w = dilation if isinstance(dilation, (tuple, list)) else (dilation,) * 3
+
+    x = x.contiguous()
+    weight = weight.contiguous()
+
+    N, IC, ID, IH, IW = x.shape
+    _, OC, KD, KH, KW = weight.shape
+
+    OD = (ID - 1) * stride_d - 2 * pad_d + dil_d * (KD - 1) + 1
+    OH = (IH - 1) * stride_h - 2 * pad_h + dil_h * (KH - 1) + 1
+    OW = (IW - 1) * stride_w - 2 * pad_w + dil_w * (KW - 1) + 1
+
+    out = torch.empty((N, OC, OD, OH, OW), device=x.device, dtype=x.dtype)
+
+    stride_xn = IC * ID * IH * IW
+    stride_xc = ID * IH * IW
+    stride_xd = IH * IW
+    stride_xh = IW
+    stride_xw = 1
+
+    stride_outn = OC * OD * OH * OW
+    stride_outc = OD * OH * OW
+    stride_outd = OH * OW
+    stride_outh = OW
+    stride_outw = 1
+
+    stride_wic = OC * KD * KH * KW
+    stride_woc = KD * KH * KW
+    stride_wd = KH * KW
+    stride_wh = KW
+    stride_ww = 1
+
+    BLOCK_M = 128
+    BLOCK_N = 64
+    BLOCK_K = 64
+
+    K_elems = IC * KD * KH * KW
+    NUM_K_TILES = triton.cdiv(K_elems, BLOCK_K)
+
+    grid = (
+        N,
+        triton.cdiv(OD * OH * OW, BLOCK_M),
+        triton.cdiv(OC, BLOCK_N),
+    )
+
+    out_dtype = _to_triton_dtype(x.dtype)
+
+    conv_transpose3d_kernel[grid](
+        x,
+        weight,
+        out,
+        N,
+        IC,
+        ID,
+        IH,
+        IW,
+        OC,
+        KD,
+        KH,
+        KW,
+        stride_d,
+        stride_h,
+        stride_w,
+        pad_d,
+        pad_h,
+        pad_w,
+        dil_d,
+        dil_h,
+        dil_w,
+        OD,
+        OH,
+        OW,
+        K_elems,
+        stride_xn,
+        stride_xc,
+        stride_xd,
+        stride_xh,
+        stride_xw,
+        stride_outn,
+        stride_outc,
+        stride_outd,
+        stride_outh,
+        stride_outw,
+        stride_wic,
+        stride_woc,
+        stride_wd,
+        stride_wh,
+        stride_ww,
+        NUM_K_TILES=NUM_K_TILES,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        OUT_DTYPE=out_dtype,
+    )
+
+    if bias is not None:
+        out += bias.view(1, -1, 1, 1, 1)
+
+    return out
+
+
+class ModelNew(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        stride: int = 1,
+        padding: int = 0,
+        dilation: int = 1,
+        bias: bool = False,
+    ) -> None:
+        super().__init__()
+        self.conv = nn.ConvTranspose3d(
+            in_channels,
+            out_channels,
+            kernel_size=(kernel_size, kernel_size, kernel_size),
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            bias=bias,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_conv_transpose3d(
+            x,
+            self.conv.weight,
+            self.conv.bias,
+            self.conv.stride,
+            self.conv.padding,
+            self.conv.dilation,
+        )

@@ -1,0 +1,70 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 128, 'VEC_SIZE': 2}, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 256, 'VEC_SIZE': 2}, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 512, 'VEC_SIZE': 2}, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 1024, 'VEC_SIZE': 2}, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 128, 'VEC_SIZE': 4}, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 256, 'VEC_SIZE': 4}, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 512, 'VEC_SIZE': 4}, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 1024, 'VEC_SIZE': 4}, num_warps=8),
+    ],
+    key=['n_elements'],
+)
+@triton.jit
+def tanh_kernel_optimized(
+    x_ptr,
+    output_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+    VEC_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    
+    # Calculate base offset for this block
+    block_start = pid * BLOCK_SIZE * VEC_SIZE
+    
+    # Create 1D offsets for vectorized access
+    offsets = block_start + tl.arange(0, BLOCK_SIZE * VEC_SIZE)
+    mask = offsets < n_elements
+    
+    # Vectorized load
+    x_vec = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    
+    # Use Triton's built-in tanh for correctness
+    tanh_result = tl.tanh(x_vec)
+    
+    # Vectorized store
+    tl.store(output_ptr + offsets, tanh_result, mask=mask)
+
+
+def triton_tanh_optimized(x: torch.Tensor) -> torch.Tensor:
+    output = torch.empty_like(x)
+    output_flat = output.view(-1)
+    x_flat = x.view(-1)
+    
+    n_elements = x_flat.numel()
+    
+    # Calculate optimal grid size with vectorization
+    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE'] * meta['VEC_SIZE']),)
+    
+    # Launch optimized kernel
+    tanh_kernel_optimized[grid](
+        x_flat, output_flat, n_elements
+    )
+    
+    return output
+
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super(ModelNew, self).__init__()
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_tanh_optimized(x)

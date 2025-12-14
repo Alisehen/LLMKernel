@@ -1,0 +1,204 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_IN": 64, "BLOCK_OC": 2}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_IN": 64, "BLOCK_OC": 4}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_IN": 128, "BLOCK_OC": 2}, num_warps=8, num_stages=4),
+        triton.Config({"BLOCK_IN": 128, "BLOCK_OC": 4}, num_warps=8, num_stages=4),
+    ],
+    key=["total_in_elems", "cout_per_group"],
+)
+@triton.jit
+def conv_transpose3d_kernel(
+    x_ptr,
+    w_ptr,
+    out_ptr,
+    total_in_elems,
+    N,
+    Cin,
+    Cout,
+    D,
+    H,
+    W,
+    KD,
+    KH,
+    KW,
+    stride_d,
+    stride_h,
+    stride_w,
+    pad_d,
+    pad_h,
+    pad_w,
+    out_pad_d,
+    out_pad_h,
+    out_pad_w,
+    out_D,
+    out_H,
+    out_W,
+    cin_per_group,
+    cout_per_group,
+    BLOCK_IN: tl.constexpr,
+    BLOCK_OC: tl.constexpr,
+):
+    pid_in = tl.program_id(0)
+    pid_oc = tl.program_id(1)
+
+    in_offsets = pid_in * BLOCK_IN + tl.arange(0, BLOCK_IN)
+    in_mask = in_offsets < total_in_elems
+    in_offsets64 = in_offsets.to(tl.int64)
+
+    oc_block = pid_oc * BLOCK_OC + tl.arange(0, BLOCK_OC)
+    oc_mask = oc_block < cout_per_group
+    oc_block64 = oc_block.to(tl.int64)
+
+    w_idx = in_offsets64 % W
+    tmp = in_offsets64 // W
+    h_idx = tmp % H
+    tmp = tmp // H
+    d_idx = tmp % D
+    tmp = tmp // D
+    c_idx = tmp % Cin
+    n_idx = tmp // Cin
+
+    x_vals = tl.load(x_ptr + in_offsets64, mask=in_mask, other=0.0)
+
+    group_idx = c_idx // cin_per_group
+    oc_base = group_idx * cout_per_group
+
+    for kd in range(KD):
+        out_d = d_idx * stride_d - pad_d + kd
+        valid_d = (out_d >= 0) & (out_d < out_D)
+
+        for kh in range(KH):
+            out_h = h_idx * stride_h - pad_h + kh
+            valid_h = (out_h >= 0) & (out_h < out_H)
+
+            for kw in range(KW):
+                out_w = w_idx * stride_w - pad_w + kw
+                valid_w = (out_w >= 0) & (out_w < out_W)
+
+                base_mask = in_mask & valid_d & valid_h & valid_w
+
+                w_core = (((c_idx * cout_per_group) + 0) * KD + kd)
+                w_core = (w_core * KH + kh) * KW + kw
+
+                out_core = ((((n_idx * Cout) + oc_base) * out_D + out_d) * out_H + out_h) * out_W + out_w
+
+                for lane in range(BLOCK_OC):
+                    lane_valid = oc_mask[lane]
+                    lane_mask = base_mask & lane_valid
+                    oc_sub = oc_block64[lane]
+                    w_offsets = w_core + oc_sub
+                    oc_full = oc_base + oc_sub
+                    out_offsets = out_core + oc_sub * (out_D * out_H * out_W)
+                    w_vals = tl.load(w_ptr + w_offsets, mask=lane_mask, other=0.0)
+                    contrib = x_vals * w_vals
+                    tl.atomic_add(out_ptr + out_offsets, contrib, mask=lane_mask)
+
+
+def triton_conv_transpose3d(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    stride: tuple,
+    padding: tuple,
+    output_padding: tuple,
+    groups: int,
+) -> torch.Tensor:
+    N, Cin, D, H, W = x.shape
+    KD, KH, KW = weight.shape[2:]
+    stride_d, stride_h, stride_w = stride
+    pad_d, pad_h, pad_w = padding
+    out_pad_d, out_pad_h, out_pad_w = output_padding
+    Cout = weight.shape[1] * groups
+
+    out_D = (D - 1) * stride_d - 2 * pad_d + KD + out_pad_d
+    out_H = (H - 1) * stride_h - 2 * pad_h + KH + out_pad_h
+    out_W = (W - 1) * stride_w - 2 * pad_w + KW + out_pad_w
+
+    output = torch.zeros((N, Cout, out_D, out_H, out_W), device=x.device, dtype=x.dtype)
+
+    total_in_elems = x.numel()
+    cin_per_group = Cin // groups
+    cout_per_group = Cout // groups
+
+    grid = lambda meta: (
+        triton.cdiv(total_in_elems, meta["BLOCK_IN"]),
+        triton.cdiv(cout_per_group, meta["BLOCK_OC"]),
+    )
+
+    conv_transpose3d_kernel[grid](
+        x,
+        weight,
+        output,
+        total_in_elems,
+        N,
+        Cin,
+        Cout,
+        D,
+        H,
+        W,
+        KD,
+        KH,
+        KW,
+        stride_d,
+        stride_h,
+        stride_w,
+        pad_d,
+        pad_h,
+        pad_w,
+        out_pad_d,
+        out_pad_h,
+        out_pad_w,
+        out_D,
+        out_H,
+        out_W,
+        cin_per_group,
+        cout_per_group,
+    )
+
+    if bias is not None:
+        output += bias.view(1, Cout, 1, 1, 1)
+
+    return output
+
+
+class ModelNew(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: tuple,
+        stride: tuple = (1, 1, 1),
+        padding: tuple = (0, 0, 0),
+        output_padding: tuple = (0, 0, 0),
+        groups: int = 1,
+        bias: bool = False,
+    ):
+        super().__init__()
+        self.conv_transpose3d = nn.ConvTranspose3d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            output_padding=output_padding,
+            groups=groups,
+            bias=bias,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_conv_transpose3d(
+            x,
+            self.conv_transpose3d.weight,
+            self.conv_transpose3d.bias,
+            self.conv_transpose3d.stride,
+            self.conv_transpose3d.padding,
+            self.conv_transpose3d.output_padding,
+            self.conv_transpose3d.groups,
+        )

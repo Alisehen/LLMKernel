@@ -1,0 +1,110 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 64, 'BLOCK_K': 256}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_K': 128}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_K': 64}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_K': 256}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_K': 128}, num_warps=8, num_stages=3),
+    ],
+    key=['M', 'K'],
+)
+@triton.jit
+def matvec_kernel(
+    A_ptr,
+    B_ptr,
+    C_ptr,
+    M,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_cm,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # 1D grid over rows - each program processes BLOCK_M rows
+    pid = tl.program_id(0)
+    
+    # Offsets for this block
+    offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    m_mask = offs_m < M
+    
+    # Initialize accumulator
+    acc = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    
+    # Loop over K dimension in blocks
+    for k in range(0, tl.cdiv(K, BLOCK_K)):
+        offs_k = k * BLOCK_K + tl.arange(0, BLOCK_K)
+        k_mask = offs_k < K
+        
+        # Load A block: (BLOCK_M, BLOCK_K)
+        A_ptrs = A_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+        a = tl.load(A_ptrs, mask=m_mask[:, None] & k_mask[None, :])
+        
+        # Load B block: (BLOCK_K,)
+        B_ptrs = B_ptr + offs_k * stride_bk
+        b = tl.load(B_ptrs, mask=k_mask)
+        
+        # Accumulate dot product
+        acc += tl.sum(a * b[None, :], axis=1)
+    
+    # Store result
+    C_ptrs = C_ptr + offs_m * stride_cm
+    tl.store(C_ptrs, acc, mask=m_mask)
+
+
+def triton_matvec(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    M, K = A.shape
+    assert B.shape == (K, 1), f"B must be shape ({K}, 1), got {B.shape}"
+    
+    # Allocate output tensor
+    C = torch.empty((M, 1), device=A.device, dtype=A.dtype)
+    
+    # Convert to float32 for accumulation if needed
+    A_acc = A if A.dtype == torch.float32 else A.to(torch.float32)
+    B_acc = B if B.dtype == torch.float32 else B.to(torch.float32)
+    
+    # Grid configuration - 1D over rows
+    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']),)
+    
+    # Launch kernel
+    matvec_kernel[grid](
+        A_acc,
+        B_acc,
+        C if C.dtype == torch.float32 else C.to(torch.float32),
+        M,
+        K,
+        A_acc.stride(0),
+        A_acc.stride(1),
+        B_acc.stride(0),
+        C.stride(0),
+    )
+    
+    return C
+
+
+class ModelNew(nn.Module):
+    """
+    Simple model that performs matrix-vector multiplication (C = A * B).
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+    
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        """
+        Performs matrix-vector multiplication using optimized Triton kernels.
+
+        Args:
+            A: Input matrix of shape (M, K).
+            B: Input vector of shape (K, 1).
+
+        Returns:
+            Output vector of shape (M, 1).
+        """
+        return triton_matvec(A, B)

@@ -1,0 +1,144 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def avgpool2d_kernel(
+    x_ptr,  # *f32, shape [N, C, H, W]
+    y_ptr,  # *f32, shape [N, C, OH, OW]
+    N, C, H, W,
+    OH, OW,
+    STRIDE_H, STRIDE_W,
+    PAD_H, PAD_W,
+    BLOCK_W: tl.constexpr,
+    KERNEL_H: tl.constexpr,
+    KERNEL_W: tl.constexpr,
+):
+    # program ids
+    pid_row = tl.program_id(axis=0)       # over N*C*OH
+    pid_w_blk = tl.program_id(axis=1)     # over OW blocks
+
+    # decode pid_row -> (n, c, oh)
+    OH_i = OH
+    C_i = C
+
+    nco = pid_row // OH_i
+    oh = pid_row % OH_i
+    n = nco // C_i
+    c = nco % C_i
+
+    # compute output w indices for this block
+    offs_w = pid_w_blk * BLOCK_W + tl.arange(0, BLOCK_W)
+    mask_ow = offs_w < OW
+
+    # accumulator
+    acc = tl.zeros([BLOCK_W], dtype=tl.float32)
+
+    # precompute some scalars
+    stride_h = STRIDE_H
+    stride_w = STRIDE_W
+    pad_h = PAD_H
+    pad_w = PAD_W
+
+    # cast dimensions to int64 for safe indexing
+    n64 = tl.cast(n, tl.int64)
+    c64 = tl.cast(c, tl.int64)
+    C64 = tl.cast(C, tl.int64)
+    H64 = tl.cast(H, tl.int64)
+    W64 = tl.cast(W, tl.int64)
+
+    base_nc = (n64 * C64 + c64) * H64  # (n*C + c) * H
+
+    # loop over kernel window
+    for kh in range(KERNEL_H):
+        ih = oh * stride_h + kh - pad_h   # scalar
+        valid_h = (ih >= 0) & (ih < H)
+
+        ih64 = tl.cast(ih, tl.int64)
+        base_nch = (base_nc + ih64) * W64  # ((n*C + c)*H + ih) * W
+
+        for kw in range(KERNEL_W):
+            iw = offs_w * stride_w + kw - pad_w          # [BLOCK_W]
+            mask_w = (iw >= 0) & (iw < W)
+            mask = mask_ow & mask_w & valid_h
+
+            iw64 = tl.cast(iw, tl.int64)
+            ptr = x_ptr + base_nch + iw64
+            vals = tl.load(ptr, mask=mask, other=0.0)
+            acc += vals
+
+    # divide by kernel area (count_include_pad=True behavior)
+    denom = float(KERNEL_H * KERNEL_W)
+    acc = acc / denom
+
+    # write output
+    # out index: (((n*C + c) * OH + oh) * OW + ow)
+    OH64 = tl.cast(OH, tl.int64)
+    OW64 = tl.cast(OW, tl.int64)
+    base_out_nc = (n64 * C64 + c64) * OH64
+    base_out_row = (base_out_nc + tl.cast(oh, tl.int64)) * OW64
+
+    out_ptrs = y_ptr + base_out_row + tl.cast(offs_w, tl.int64)
+    tl.store(out_ptrs, acc, mask=mask_ow)
+
+
+def triton_avg_pool2d(x: torch.Tensor, kernel_size: int, stride: int = None, padding: int = 0) -> torch.Tensor:
+    """
+    Average Pooling 2D using Triton (NCHW, count_include_pad=True, ceil_mode=False).
+    """
+    assert x.is_cuda, "Input must be on CUDA device"
+    assert x.dtype == torch.float32, "This implementation currently supports float32 only"
+    assert x.dim() == 4, "Input must be 4D NCHW"
+
+    if stride is None:
+        stride = kernel_size
+
+    N, C, H, W = x.shape
+    kh = kw = int(kernel_size)
+    sh = sw = int(stride)
+    ph = pw = int(padding)
+
+    # PyTorch AvgPool2d output size formula with ceil_mode=False
+    OH = (H + 2 * ph - kh) // sh + 1
+    OW = (W + 2 * pw - kw) // sw + 1
+
+    y = torch.empty((N, C, OH, OW), device=x.device, dtype=x.dtype)
+
+    BLOCK_W = 128  # power-of-two as required
+
+    grid = lambda meta: (
+        N * C * OH,                      # pid_row
+        triton.cdiv(OW, meta["BLOCK_W"]),  # pid_w_blk
+    )
+
+    avgpool2d_kernel[grid](
+        x,
+        y,
+        N, C, H, W,
+        OH, OW,
+        sh, sw,
+        ph, pw,
+        BLOCK_W=BLOCK_W,
+        KERNEL_H=kh,
+        KERNEL_W=kw,
+    )
+
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-backed 2D Average Pooling (NCHW) matching nn.AvgPool2d
+    for kernel_size, stride, padding, count_include_pad=True, ceil_mode=False.
+    """
+
+    def __init__(self, kernel_size: int, stride: int = None, padding: int = 0) -> None:
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_avg_pool2d(x, self.kernel_size, self.stride, self.padding)

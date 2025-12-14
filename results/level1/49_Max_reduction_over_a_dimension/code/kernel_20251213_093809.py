@@ -1,0 +1,95 @@
+# import torch, torch.nn, triton, triton.language as tl
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=4, num_stages=2),  # original
+        triton.Config({}, num_warps=4, num_stages=3),
+        triton.Config({}, num_warps=8, num_stages=2),
+    ],
+    key=["reduce_size"],
+)
+@triton.jit
+def max_reduce_lastdim_kernel(
+    x_ptr,
+    out_ptr,
+    n_rows,
+    reduce_size,
+    stride_row,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    row_mask = pid < n_rows
+    row_start = pid * stride_row
+    offsets = tl.arange(0, BLOCK_SIZE)
+    ptrs = x_ptr + row_start + offsets
+    mask = row_mask & (offsets < reduce_size)
+    values = tl.load(ptrs, mask=mask, other=-float("inf"))
+    row_max = tl.max(values, axis=0)
+    tl.store(out_ptr + pid, row_max, mask=row_mask)
+
+
+def triton_max_reduce(x: torch.Tensor, dim: int) -> torch.Tensor:
+    ndim = x.ndim
+    if dim < 0:
+        dim += ndim
+    assert 0 <= dim < ndim, "Invalid reduction dimension"
+
+    if dim == ndim - 1:
+        x_perm = x.contiguous()
+        perm = list(range(ndim))
+    else:
+        perm = list(range(ndim))
+        perm.pop(dim)
+        perm.append(dim)
+        x_perm = x.permute(perm).contiguous()
+
+    shape_perm = x_perm.shape
+    reduce_size = shape_perm[-1]
+    outer = x_perm.numel() // reduce_size
+
+    block_size = 1
+    while block_size < reduce_size:
+        block_size <<= 1
+    block_size = max(1, block_size)
+
+    out = torch.empty(outer, device=x.device, dtype=x.dtype)
+
+    grid = lambda meta: (triton.cdiv(outer, 1),)
+    max_reduce_lastdim_kernel[grid](
+        x_perm,
+        out,
+        outer,
+        reduce_size,
+        reduce_size,
+        BLOCK_SIZE=block_size,
+    )
+
+    out = out.view(shape_perm[:-1])
+    if ndim == 1:
+        return out
+
+    if dim == ndim - 1:
+        return out
+
+    perm_wo_last = perm[:-1]
+    inverse = sorted(range(len(perm_wo_last)), key=lambda i: perm_wo_last[i])
+    if out.ndim <= 1:
+        return out if out.ndim == 0 else out.contiguous()
+    return out.permute(inverse).contiguous()
+
+
+class ModelNew(nn.Module):
+    """
+    Simple model that performs Max reduction over a specific dimension using a Triton kernel.
+    """
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_max_reduce(x, self.dim)

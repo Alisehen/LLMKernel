@@ -1,0 +1,210 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU
+GPU Name: 4090
+Architecture: Ada Lovelace
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+[OPTIMIZATION STAGE]
+
+## Current Optimization Stage
+
+**Focus**: Optimize grid layout and parallel work distribution.
+
+**NCU Metrics**:
+• `sm__throughput.avg.pct_of_peak_sustained_elapsed` (target >60%)
+• `launch__grid_size` (primarily determined by grid mapping)
+
+**Guidelines**:
+- 1D → `(cdiv(N, BLOCK))`
+- 2D → `(cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))`
+- 3D (batch×M×N) → `(batch, cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))`
+- 4D+ → flatten **independent parallel dims** to 3D
+- Prefer batch / head / expert parallelism when available, before shrinking BLOCK sizes
+- Change grid only if SM utilization is clearly low
+- Ensure `grid = (...)` matches `tl.program_id(axis)` logic
+
+**Safety Rules**:
+- Max 3 grid dimensions; grid rank must be static
+- If unsure about correctness, do not modify grid
+
+**Autotune (safe)**:
+- Autotune **either** BLOCK_* **or** (`num_warps`, `num_stages`)
+- If BLOCK_* are autotuned, use `grid = lambda META: (...)` with `META["BLOCK_*"]`
+- Never redefine BLOCK_* in both configs and launch
+
+
+
+[CURRENT CODE]
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def matmul_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # Simplified kernel for small K dimensions
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    
+    # Offsets for the current block
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    
+    # Pointers to A and B blocks
+    a_ptrs = a_ptr + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
+    
+    # Initialize accumulator
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    # For small K, we can load everything in one iteration
+    if tl.cdiv(K, BLOCK_K) == 1:
+        # Load A and B once
+        a = tl.load(a_ptrs, mask=(offs_m[:, None] < M) & (offs_k[None, :] < K), other=0.0)
+        b = tl.load(b_ptrs, mask=(offs_k[:, None] < K) & (offs_n[None, :] < N), other=0.0)
+        accumulator = tl.dot(a, b, accumulator)
+    else:
+        # Loop over K dimension
+        for k in range(0, K, BLOCK_K):
+            a = tl.load(a_ptrs, mask=(offs_m[:, None] < M) & ((offs_k[None, :] + k) < K), other=0.0)
+            b = tl.load(b_ptrs, mask=((offs_k[:, None] + k) < K) & (offs_n[None, :] < N), other=0.0)
+            accumulator = tl.dot(a, b, accumulator)
+            a_ptrs += BLOCK_K * stride_ak
+            b_ptrs += BLOCK_K * stride_bk
+    
+    # Write back result
+    offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    c_ptrs = c_ptr + (offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn)
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, accumulator, mask=c_mask)
+
+
+def triton_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    M, K = a.shape
+    K, N = b.shape
+    
+    assert a.is_cuda and b.is_cuda, "Inputs must be on GPU"
+    assert a.dtype == b.dtype == torch.float32, "Only float32 supported"
+    
+    # Ensure contiguous memory layout
+    a = a.contiguous()
+    b = b.contiguous()
+    c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+    
+    # Choose block sizes based on problem dimensions
+    if K <= 64:
+        # For small K, use larger blocks for M and N
+        BLOCK_M = 128 if M >= 128 else 64
+        BLOCK_N = 128 if N >= 128 else 64
+        BLOCK_K = K
+    else:
+        # For larger K, use smaller blocks to fit in shared memory
+        BLOCK_M = 64
+        BLOCK_N = 64
+        BLOCK_K = 32
+    
+    # Adjust block sizes for better GPU utilization
+    if BLOCK_M * BLOCK_K > 8192:  # Limit shared memory usage
+        BLOCK_M = 64
+    if BLOCK_N * BLOCK_K > 8192:
+        BLOCK_N = 64
+    
+    # Calculate grid
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+    
+    # Launch kernel with optimized parameters
+    matmul_kernel[grid](
+        a, b, c,
+        M, N, K,
+        a.stride(0), a.stride(1),
+        b.stride(0), b.stride(1),
+        c.stride(0), c.stride(1),
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        num_warps=4 if K <= 32 else 8,
+        num_stages=2,  # Reduced to avoid shared memory overflow
+    )
+    
+    return c
+
+
+class ModelNew(nn.Module):
+    """
+    Simple model that performs a single matrix multiplication (C = A * B) with a small K dimension
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+    
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        """
+        Performs matrix multiplication.
+
+        Args:
+            A: Input tensor of shape (M, K).
+            B: Input tensor of shape (K, N).
+
+        Returns:
+            Output tensor of shape (M, N).
+        """
+        return triton_matmul(A, B)
+```
+
+[NCU PROFILING METRICS]
+{
+  "matmul_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 18.87,
+    "launch__grid_size": 65536,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 16.54,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 87.43,
+    "lts__t_sector_hit_rate.pct": 99.8
+  }
+}
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

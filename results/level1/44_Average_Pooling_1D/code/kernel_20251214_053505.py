@@ -1,0 +1,131 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def avg_pool1d_kernel(
+    x_ptr, y_ptr,
+    N, C,
+    L_in, L_out,
+    stride_xn, stride_xc, stride_xl,
+    stride_yn, stride_yc, stride_yl,
+    kernel_size, stride, padding,
+    BLOCK_OUT: tl.constexpr,
+):
+    # program ids
+    pid_nc = tl.program_id(axis=0)  # over N * C
+    pid_oh = tl.program_id(axis=1)  # over output-length tiles
+
+    # decode (n, c) from flattened nc index
+    nc = pid_nc
+    n = nc // C
+    c = nc % C
+
+    # base pointers for this (n, c) row
+    x_row_ptr = x_ptr + n * stride_xn + c * stride_xc
+    y_row_ptr = y_ptr + n * stride_yn + c * stride_yc
+
+    # tile of output positions along length dimension
+    block_start = pid_oh * BLOCK_OUT
+    oh_offsets = block_start + tl.arange(0, BLOCK_OUT)
+    mask_out = oh_offsets < L_out
+
+    # base input index for each output position before adding kernel offset
+    base_ih = oh_offsets * stride - padding
+
+    # accumulate in fp32 for numerical stability
+    acc = tl.zeros([BLOCK_OUT], dtype=tl.float32)
+
+    # iterate over kernel window
+    for k in range(0, kernel_size):
+        ih = base_ih + k  # vector of input indices for this k
+
+        in_bounds = (ih >= 0) & (ih < L_in) & mask_out
+        ih_safe = tl.where(in_bounds, ih, 0)
+
+        vals = tl.load(
+            x_row_ptr + ih_safe * stride_xl,
+            mask=in_bounds,
+            other=0.0,
+        )
+        vals = vals.to(tl.float32)
+        acc += vals
+
+    # AvgPool1d with padding uses count_include_pad=True by default
+    denom = kernel_size
+    out_vals = acc / denom
+
+    # store results
+    tl.store(
+        y_row_ptr + oh_offsets * stride_yl,
+        out_vals,
+        mask=mask_out,
+    )
+
+
+def triton_avg_pool1d(x: torch.Tensor, kernel_size: int, stride: int, padding: int) -> torch.Tensor:
+    """
+    Triton implementation of 1D average pooling with semantics matching:
+    nn.AvgPool1d(kernel_size, stride=stride, padding=padding, count_include_pad=True).
+    """
+    assert x.is_cuda, "Input must be a CUDA tensor for Triton kernel"
+    assert x.dim() == 3, "Input must have shape (N, C, L)"
+
+    N, C, L_in = x.shape
+    # PyTorch AvgPool1d formula (ceil_mode=False)
+    L_out = (L_in + 2 * padding - kernel_size) // stride + 1
+    assert L_out > 0, "Invalid output length computed for AvgPool1d"
+
+    y = torch.empty((N, C, L_out), device=x.device, dtype=x.dtype)
+
+    stride_xn, stride_xc, stride_xl = x.stride()
+    stride_yn, stride_yc, stride_yl = y.stride()
+
+    BLOCK_OUT = 128  # power-of-2 as required
+
+    grid = lambda meta: (
+        N * C,
+        triton.cdiv(L_out, meta["BLOCK_OUT"]),
+    )
+
+    avg_pool1d_kernel[grid](
+        x,
+        y,
+        N,
+        C,
+        L_in,
+        L_out,
+        stride_xn,
+        stride_xc,
+        stride_xl,
+        stride_yn,
+        stride_yc,
+        stride_yl,
+        kernel_size,
+        stride,
+        padding,
+        BLOCK_OUT=BLOCK_OUT,
+        num_warps=4,
+    )
+
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Simple model that performs 1D Average Pooling using a Triton kernel.
+    Semantics match torch.nn.AvgPool1d with count_include_pad=True.
+    """
+
+    def __init__(self, kernel_size: int, stride: int = 1, padding: int = 0):
+        super().__init__()
+        self.kernel_size = int(kernel_size)
+        self.stride = int(stride)
+        self.padding = int(padding)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_avg_pool1d(
+            x, self.kernel_size, self.stride, self.padding
+        )

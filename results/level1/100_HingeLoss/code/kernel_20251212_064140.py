@@ -1,0 +1,183 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def hinge_loss_stage1_kernel(
+    predictions_ptr,
+    targets_ptr,
+    partial_sums_ptr,
+    partial_counts_ptr,
+    n_elements,
+    n_rows,
+    n_cols,
+    BLOCK_SIZE: tl.constexpr,
+    MAX_ROWS_PER_BLOCK: tl.constexpr,
+    num_stages: tl.constexpr,
+):
+    """
+    Optimized Stage 1: Uses shared memory to cache target values and reduces
+    global memory traffic. Each block processes a contiguous chunk and caches
+    the target values for all rows in that chunk.
+    """
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    
+    # Compute row indices for the entire block
+    row_indices = offsets // n_cols
+    
+    # Determine unique row range in this block
+    start_row = tl.minimum(block_start // n_cols, n_rows - 1)
+    end_row = tl.minimum((block_start + BLOCK_SIZE - 1) // n_cols, n_rows - 1)
+    rows_in_block = end_row - start_row + 1
+    
+    # Allocate shared memory for target caching
+    target_cache = tl.zeros((MAX_ROWS_PER_BLOCK,), dtype=tl.float32)
+    
+    # Cache target values in shared memory
+    # Each thread handles one row if within bounds
+    cache_idx = tl.arange(0, MAX_ROWS_PER_BLOCK)
+    cache_mask = cache_idx < rows_in_block
+    row_idx = start_row + cache_idx
+    cached_target = tl.load(targets_ptr + row_idx, mask=cache_mask, other=0.0)
+    
+    # Store to shared memory - fix: use proper indexing
+    for i in tl.range(MAX_ROWS_PER_BLOCK):
+        if i < rows_in_block:
+            target_cache[i] = tl.load(targets_ptr + start_row + i)
+    
+    # Synchronize to ensure all targets are cached
+    tl.barrier()
+    
+    # Load predictions and compute relative row indices for shared memory access
+    preds = tl.load(predictions_ptr + offsets, mask=mask)
+    rel_row_indices = row_indices - start_row
+    
+    # Load targets from shared memory using computed indices
+    targets = tl.where(
+        (rel_row_indices >= 0) & (rel_row_indices < rows_in_block) & mask,
+        target_cache[rel_row_indices],
+        0.0
+    )
+    
+    # Compute hinge loss
+    product = preds * targets
+    loss = 1.0 - product
+    clamped_loss = tl.where(loss > 0.0, loss, 0.0)
+    
+    # Masked reduction within the block
+    clamped_loss_masked = tl.where(mask, clamped_loss, 0.0)
+    block_sum = tl.sum(clamped_loss_masked)
+    mask_float = tl.where(mask, 1.0, 0.0)
+    block_count = tl.sum(mask_float)
+    
+    # Store partial results
+    tl.store(partial_sums_ptr + pid, block_sum)
+    tl.store(partial_counts_ptr + pid, block_count)
+
+
+@triton.jit
+def reduce_partials_kernel(
+    partial_sums_ptr,
+    partial_counts_ptr,
+    output_sums_ptr,
+    output_counts_ptr,
+    n_partials,
+    BLOCK_SIZE: tl.constexpr,
+    num_stages: tl.constexpr,
+):
+    """
+    Optimized reduction kernel with increased num_stages for better latency hiding.
+    """
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_partials
+    
+    # Load with higher num_stages for better pipelining
+    partial_sums = tl.load(partial_sums_ptr + offsets, mask=mask, other=0.0)
+    partial_counts = tl.load(partial_counts_ptr + offsets, mask=mask, other=0.0)
+    
+    # Tree reduction within the block
+    sum_val = tl.sum(partial_sums)
+    count_val = tl.sum(partial_counts)
+    
+    # Store reduced results
+    tl.store(output_sums_ptr + pid, sum_val)
+    tl.store(output_counts_ptr + pid, count_val)
+
+
+def triton_hinge_loss(predictions: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    """
+    Optimized Triton implementation with shared memory caching and tuned num_stages.
+    """
+    predictions = predictions.contiguous()
+    targets = targets.contiguous()
+    
+    n_rows, n_cols = predictions.shape
+    n_elements = predictions.numel()
+    
+    output = torch.zeros(1, device=predictions.device, dtype=predictions.dtype)
+    
+    # Stage 1: Compute partial sums with optimized block size and shared memory
+    BLOCK_SIZE = 1024
+    MAX_ROWS_PER_BLOCK = 32
+    num_blocks = triton.cdiv(n_elements, BLOCK_SIZE)
+    
+    partial_sums = torch.zeros(num_blocks, device=predictions.device, dtype=predictions.dtype)
+    partial_counts = torch.zeros(num_blocks, device=predictions.device, dtype=predictions.dtype)
+    
+    grid1 = (num_blocks,)
+    hinge_loss_stage1_kernel[grid1](
+        predictions, targets, partial_sums, partial_counts,
+        n_elements, n_rows, n_cols,
+        BLOCK_SIZE=BLOCK_SIZE,
+        MAX_ROWS_PER_BLOCK=MAX_ROWS_PER_BLOCK,
+        num_stages=3,  # Increased to hide memory latency
+    )
+    
+    # Recursive reduction with optimized block size
+    current_sums = partial_sums
+    current_counts = partial_counts
+    current_n = num_blocks
+    
+    REDUCE_BLOCK_SIZE = 1024
+    while current_n > 1:
+        next_n = triton.cdiv(current_n, REDUCE_BLOCK_SIZE)
+        next_sums = torch.zeros(next_n, device=predictions.device, dtype=predictions.dtype)
+        next_counts = torch.zeros(next_n, device=predictions.device, dtype=predictions.dtype)
+        
+        grid_reduce = (next_n,)
+        reduce_partials_kernel[grid_reduce](
+            current_sums, current_counts, next_sums, next_counts,
+            current_n,
+            BLOCK_SIZE=REDUCE_BLOCK_SIZE,
+            num_stages=3,  # Increased for better pipelining
+        )
+        
+        current_sums = next_sums
+        current_counts = next_counts
+        current_n = next_n
+    
+    if current_n > 0:
+        final_sum = current_sums[0]
+        final_count = current_counts[0]
+        output[0] = final_sum / final_count if final_count > 0 else 0.0
+    
+    return output
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized Triton implementation of Hinge Loss model with shared memory caching
+    and tuned pipeline stages.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+
+    def forward(self, predictions, targets):
+        return triton_hinge_loss(predictions, targets)

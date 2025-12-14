@@ -1,0 +1,328 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        # Smaller tiles – lower register pressure, higher occupancy
+        triton.Config(
+            {'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 16},
+            num_warps=4,
+            num_stages=1,
+        ),
+        triton.Config(
+            {'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+        triton.Config(
+            {'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+        # Medium tiles – better compute intensity
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 16},
+            num_warps=8,
+            num_stages=2,
+        ),
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_warps=8,
+            num_stages=2,
+        ),
+        # Slightly deeper pipeline – for cases with higher memory stall
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_warps=8,
+            num_stages=3,
+        ),
+    ],
+    key=['M', 'C_out_per_group'],
+)
+@triton.jit
+def conv3d_implicit_gemm_kernel(
+    x_ptr, w_ptr, b_ptr, y_ptr,
+    N, C_in, D_in, H_in, W_in,
+    C_out, D_out, H_out, W_out,
+    KD, KH, KW,
+    stride_d, stride_h, stride_w,
+    pad_d, pad_h, pad_w,
+    dil_d, dil_h, dil_w,
+    M, K_total,
+    C_in_per_group, C_out_per_group,
+    groups,
+    x_stride_n, x_stride_c, x_stride_d, x_stride_h, x_stride_w,
+    w_stride_oc, w_stride_ic, w_stride_kd, w_stride_kh, w_stride_kw,
+    y_stride_n, y_stride_c, y_stride_d, y_stride_h, y_stride_w,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+):
+    # Program ids over (M, C_out_per_group, groups)
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+    pid_g = tl.program_id(axis=2)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n_local = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    mask_m = offs_m < M
+    mask_n = offs_n_local < C_out_per_group
+
+    # Global output channel indices (with grouping)
+    oc = pid_g * C_out_per_group + offs_n_local
+
+    # Decompose M -> (n, od, oh, ow)
+    tmp = offs_m
+    ow = tmp % W_out
+    tmp = tmp // W_out
+    oh = tmp % H_out
+    tmp = tmp // H_out
+    od = tmp % D_out
+    tmp = tmp // D_out
+    n_idx = tmp
+
+    # Broadcasted indices
+    n_b = n_idx[:, None]
+    od_b = od[:, None]
+    oh_b = oh[:, None]
+    ow_b = ow[:, None]
+    mask_m_b = mask_m[:, None]
+
+    oc_b = oc[None, :]
+    mask_n_b = mask_n[None, :]
+
+    # Per-group input channel base
+    ic_group_offset = pid_g * C_in_per_group
+
+    # Precompute base spatial coordinates for this output position
+    base_d = od_b * stride_d - pad_d
+    base_h = oh_b * stride_h - pad_h
+    base_w = ow_b * stride_w - pad_w
+
+    # Accumulator in FP32
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Optional hints for compiler (improve memory coalescing/TC usage)
+    tl.multiple_of(offs_n_local, 8)
+    tl.multiple_of(offs_m, 8)
+    tl.multiple_of(K_total, BLOCK_K)
+
+    # Reduction loop over K dimension in tiles
+    k_start = 0
+    while k_start < K_total:
+        offs_k = k_start + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < K_total
+
+        # Decompose K -> (ic_in_group, kd, kh, kw)
+        ic_in_group = offs_k // (KD * KH * KW)
+        rem = offs_k % (KD * KH * KW)
+        kd = rem // (KH * KW)
+        rem = rem % (KH * KW)
+        kh = rem // KW
+        kw = rem % KW
+
+        ic_abs = ic_in_group + ic_group_offset
+
+        # Broadcast K-dim indices
+        kd_b = kd[None, :]
+        kh_b = kh[None, :]
+        kw_b = kw[None, :]
+        ic_b = ic_abs[None, :]
+
+        # Compute input coordinates
+        in_d = base_d + kd_b * dil_d
+        in_h = base_h + kh_b * dil_h
+        in_w = base_w + kw_b * dil_w
+
+        # Bounds check only on spatial dims + valid M/K lanes
+        in_bounds = (
+            (in_d >= 0) & (in_d < D_in) &
+            (in_h >= 0) & (in_h < H_in) &
+            (in_w >= 0) & (in_w < W_in)
+        )
+        in_bounds = in_bounds & (mask_m_b & mask_k[None, :])
+
+        # Input pointers [BM, BK]
+        x_ptrs = (
+            x_ptr
+            + n_b * x_stride_n
+            + ic_b * x_stride_c
+            + in_d * x_stride_d
+            + in_h * x_stride_h
+            + in_w * x_stride_w
+        )
+
+        x_vals = tl.load(x_ptrs, mask=in_bounds, other=0.0)
+
+        # Weight pointers [BK, BN]
+        icg_b = ic_in_group[:, None]
+        kd_wb = kd[:, None]
+        kh_wb = kh[:, None]
+        kw_wb = kw[:, None]
+
+        w_ptrs = (
+            w_ptr
+            + oc_b * w_stride_oc
+            + icg_b * w_stride_ic
+            + kd_wb * w_stride_kd
+            + kh_wb * w_stride_kh
+            + kw_wb * w_stride_kw
+        )
+
+        w_mask = mask_k[:, None] & mask_n_b
+        w_vals = tl.load(w_ptrs, mask=w_mask, other=0.0)
+
+        # Tensor-core-friendly dot: [BM, BK] x [BK, BN] -> [BM, BN]
+        acc += tl.dot(x_vals, w_vals)
+
+        k_start += BLOCK_K
+
+    # Add bias if requested
+    if HAS_BIAS:
+        b_vals = tl.load(b_ptr + oc, mask=mask_n, other=0.0)
+        acc = acc + b_vals[None, :]
+
+    # Store results
+    y_ptrs = (
+        y_ptr
+        + n_b * y_stride_n
+        + oc_b * y_stride_c
+        + od_b * y_stride_d
+        + oh_b * y_stride_h
+        + ow_b * y_stride_w
+    )
+    out_mask = mask_m_b & mask_n_b
+    tl.store(y_ptrs, acc, mask=out_mask)
+
+
+def _triple(v):
+    if isinstance(v, int):
+        return (v, v, v)
+    return v
+
+
+def conv3d_triton(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    b: torch.Tensor,
+    stride,
+    padding,
+    dilation,
+    groups: int,
+) -> torch.Tensor:
+    # Ensure contiguous tensors for predictable strides
+    x = x.contiguous()
+    w = w.contiguous()
+    if b is not None:
+        b = b.contiguous()
+
+    N, C_in, D_in, H_in, W_in = x.shape
+    C_out, C_in_per_group, KD, KH, KW = w.shape
+
+    stride_d, stride_h, stride_w = _triple(stride)
+    pad_d, pad_h, pad_w = _triple(padding)
+    dil_d, dil_h, dil_w = _triple(dilation)
+
+    C_out_per_group = C_out // groups
+    assert C_in == C_in_per_group * groups
+
+    # Output dimensions (PyTorch Conv3d semantics)
+    D_out = (D_in + 2 * pad_d - dil_d * (KD - 1) - 1) // stride_d + 1
+    H_out = (H_in + 2 * pad_h - dil_h * (KH - 1) - 1) // stride_h + 1
+    W_out = (W_in + 2 * pad_w - dil_w * (KW - 1) - 1) // stride_w + 1
+
+    y = torch.empty((N, C_out, D_out, H_out, W_out),
+                    device=x.device, dtype=x.dtype)
+
+    # Strides
+    x_stride_n, x_stride_c, x_stride_d, x_stride_h, x_stride_w = x.stride()
+    w_stride_oc, w_stride_ic, w_stride_kd, w_stride_kh, w_stride_kw = w.stride()
+    y_stride_n, y_stride_c, y_stride_d, y_stride_h, y_stride_w = y.stride()
+
+    # GEMM sizes
+    M = N * D_out * H_out * W_out
+    K_total = C_in_per_group * KD * KH * KW
+
+    HAS_BIAS = b is not None
+    if b is None:
+        # Dummy pointer, never read when HAS_BIAS is False
+        b = w
+
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta['BLOCK_M']),
+            triton.cdiv(C_out_per_group, meta['BLOCK_N']),
+            groups,
+        )
+
+    conv3d_implicit_gemm_kernel[grid](
+        x, w, b, y,
+        N, C_in, D_in, H_in, W_in,
+        C_out, D_out, H_out, W_out,
+        KD, KH, KW,
+        stride_d, stride_h, stride_w,
+        pad_d, pad_h, pad_w,
+        dil_d, dil_h, dil_w,
+        M, K_total,
+        C_in_per_group, C_out_per_group,
+        groups,
+        x_stride_n, x_stride_c, x_stride_d, x_stride_h, x_stride_w,
+        w_stride_oc, w_stride_ic, w_stride_kd, w_stride_kh, w_stride_kw,
+        y_stride_n, y_stride_c, y_stride_d, y_stride_h, y_stride_w,
+        HAS_BIAS=HAS_BIAS,
+    )
+
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-accelerated 3D convolution model using an implicit-GEMM kernel
+    aggressively optimized for Ada Lovelace (SM 8.9).
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: tuple,
+        stride: int = 1,
+        padding: int = 0,
+        dilation: int = 1,
+        groups: int = 1,
+        bias: bool = False,
+    ) -> None:
+        super().__init__()
+        self.conv3d = nn.Conv3d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            groups=groups,
+            bias=bias,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        w = self.conv3d.weight
+        b = self.conv3d.bias
+        return conv3d_triton(
+            x,
+            w,
+            b,
+            stride=self.conv3d.stride,
+            padding=self.conv3d.padding,
+            dilation=self.conv3d.dilation,
+            groups=self.conv3d.groups,
+        )

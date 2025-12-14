@@ -1,0 +1,291 @@
+Fix the Triton kernel errors. Generate correct, high-performance code.
+
+Current Error Log:
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 533, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 131, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/hyc/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/hyc/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251212_073248_batch_first10_deepseek_deepseek/12_Matmul_with_diagonal_matrices_/code/kernel_20251212_082502.py", line 181, in forward
+    return triton_diag_matmul(A, B)
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251212_073248_batch_first10_deepseek_deepseek/12_Matmul_with_diagonal_matrices_/code/kernel_20251212_082502.py", line 149, in triton_diag_matmul
+    diag_matmul_optimized_kernel[grid](
+  File "/home/hyc/miniconda3/envs/hyc/lib/python3.11/site-packages/triton/runtime/jit.py", line 419, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/hyc/lib/python3.11/site-packages/triton/runtime/jit.py", line 733, in run
+    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/hyc/lib/python3.11/site-packages/triton/runtime/jit.py", line 861, in _do_compile
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/hyc/lib/python3.11/site-packages/triton/compiler/compiler.py", line 300, in compile
+    module = src.make_ir(target, options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/hyc/lib/python3.11/site-packages/triton/compiler/compiler.py", line 80, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 43:13:
+    # Create 2D indices with vectorization
+    row_idx = tl.reshape(row_offsets, (BLOCK_SIZE_N, 1))
+    col_idx_vec = tl.reshape(col_offsets_base, (1, BLOCK_SIZE_M, 1))
+    col_offsets_full = col_idx_vec + tl.arange(0, VEC_SIZE)
+
+    # Load B with vectorized access
+    b_ptrs_base = b_ptr + row_idx * stride_b0
+    b_mask_rows = tl.reshape(row_mask, (BLOCK_SIZE_N, 1, 1))
+    b_mask_cols = col_offsets_full < m
+    b_mask = b_mask_rows & b_mask_cols
+
+    b_ptrs = b_ptrs_base + col_offsets_full * stride_b1
+             ^
+ValueError('Cannot make_shape_compatible: incompatible dimensions at index 1: 128 and 32')
+
+History Error:
+None
+
+
+PyTorch Reference:
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs a matrix multiplication of a diagonal matrix with another matrix.
+    C = diag(A) * B
+    """
+    def __init__(self):
+        super(Model, self).__init__()
+    
+    def forward(self, A, B):
+        """
+        Performs the matrix multiplication.
+
+        Args:
+            A (torch.Tensor): A 1D tensor representing the diagonal of the diagonal matrix. Shape: (N,).
+            B (torch.Tensor): A 2D tensor representing the second matrix. Shape: (N, M).
+
+        Returns:
+            torch.Tensor: The result of the matrix multiplication. Shape: (N, M).
+        """
+        return torch.diag(A) @ B
+
+M = 4096
+N = 4096
+
+def get_inputs():
+    A = torch.rand(N)
+    B = torch.rand(N, M)
+    return [A, B]
+
+def get_init_inputs():
+    return []  # No special initialization inputs needed
+```
+
+Broken Code:
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def diag_matmul_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    n, m,
+    stride_a,
+    stride_b0, stride_b1,
+    stride_c0, stride_c1,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+):
+    """
+    Computes C = diag(A) @ B using diagonal broadcasting.
+    Each program processes a 2D tile of size (BLOCK_SIZE_N, BLOCK_SIZE_M).
+    """
+    pid_n = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    
+    # Row offsets for the tile
+    row_start = pid_n * BLOCK_SIZE_N
+    row_offsets = row_start + tl.arange(0, BLOCK_SIZE_N)
+    row_mask = row_offsets < n
+    
+    # Load diagonal elements for this tile's rows
+    a = tl.load(a_ptr + row_offsets * stride_a, mask=row_mask)
+    
+    # Column offsets for the tile
+    col_start = pid_m * BLOCK_SIZE_M
+    col_offsets = col_start + tl.arange(0, BLOCK_SIZE_M)
+    col_mask = col_offsets < m
+    
+    # Create 2D masks and indices
+    row_idx = tl.reshape(row_offsets, (BLOCK_SIZE_N, 1))
+    col_idx = tl.reshape(col_offsets, (1, BLOCK_SIZE_M))
+    
+    # Load B tile with 2D mask
+    b_ptrs = b_ptr + row_idx * stride_b0 + col_idx * stride_b1
+    b_mask = tl.reshape(row_mask, (BLOCK_SIZE_N, 1)) & tl.reshape(col_mask, (1, BLOCK_SIZE_M))
+    b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+    
+    # Compute C = diag(A) * B
+    a_expanded = tl.reshape(a, (BLOCK_SIZE_N, 1))
+    c = a_expanded * b
+    
+    # Store C tile
+    c_ptrs = c_ptr + row_idx * stride_c0 + col_idx * stride_c1
+    tl.store(c_ptrs, c, mask=b_mask)
+
+@triton.jit
+def diag_matmul_optimized_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    n, m,
+    stride_a,
+    stride_b0, stride_b1,
+    stride_c0, stride_c1,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    VEC_SIZE: tl.constexpr,
+):
+    """
+    Optimized version with vectorized loads/stores for better memory throughput.
+    Each thread processes VEC_SIZE consecutive elements in the column dimension.
+    """
+    pid_n = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    
+    # Row offsets
+    row_start = pid_n * BLOCK_SIZE_N
+    row_offsets = row_start + tl.arange(0, BLOCK_SIZE_N)
+    row_mask = row_offsets < n
+    
+    # Load diagonal elements
+    a = tl.load(a_ptr + row_offsets * stride_a, mask=row_mask)
+    
+    # Column offsets with vectorization
+    col_start = pid_m * BLOCK_SIZE_M * VEC_SIZE
+    col_offsets_base = col_start + tl.arange(0, BLOCK_SIZE_M) * VEC_SIZE
+    
+    # Create 2D indices with vectorization
+    row_idx = tl.reshape(row_offsets, (BLOCK_SIZE_N, 1))
+    col_idx_vec = tl.reshape(col_offsets_base, (1, BLOCK_SIZE_M, 1))
+    col_offsets_full = col_idx_vec + tl.arange(0, VEC_SIZE)
+    
+    # Load B with vectorized access
+    b_ptrs_base = b_ptr + row_idx * stride_b0
+    b_mask_rows = tl.reshape(row_mask, (BLOCK_SIZE_N, 1, 1))
+    b_mask_cols = col_offsets_full < m
+    b_mask = b_mask_rows & b_mask_cols
+    
+    b_ptrs = b_ptrs_base + col_offsets_full * stride_b1
+    b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+    
+    # Compute C = diag(A) * B
+    a_expanded = tl.reshape(a, (BLOCK_SIZE_N, 1, 1))
+    c = a_expanded * b
+    
+    # Store C with vectorized access
+    c_ptrs_base = c_ptr + row_idx * stride_c0
+    c_ptrs = c_ptrs_base + col_offsets_full * stride_c1
+    tl.store(c_ptrs, c, mask=b_mask)
+
+def triton_diag_matmul(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    """
+    Computes C = diag(A) @ B using Triton kernels.
+    
+    Args:
+        A: 1D tensor of shape (N,)
+        B: 2D tensor of shape (N, M)
+        
+    Returns:
+        C: 2D tensor of shape (N, M)
+    """
+    assert A.dim() == 1 and B.dim() == 2, "A must be 1D and B must be 2D"
+    N, M = B.shape
+    assert A.shape[0] == N, "A must have same length as B's rows"
+    
+    C = torch.empty_like(B)
+    
+    # Choose kernel based on tensor size for optimal performance
+    if N * M <= 16384:  # Small tensors
+        BLOCK_SIZE_N = min(64, triton.next_power_of_2(N))
+        BLOCK_SIZE_M = min(64, triton.next_power_of_2(M))
+        grid = (triton.cdiv(N, BLOCK_SIZE_N), triton.cdiv(M, BLOCK_SIZE_M))
+        
+        diag_matmul_kernel[grid](
+            A, B, C,
+            N, M,
+            A.stride(0),
+            B.stride(0), B.stride(1),
+            C.stride(0), C.stride(1),
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+        )
+    else:  # Large tensors - use optimized kernel
+        BLOCK_SIZE_N = 128
+        BLOCK_SIZE_M = 32
+        VEC_SIZE = 4
+        
+        grid = (triton.cdiv(N, BLOCK_SIZE_N), triton.cdiv(M, BLOCK_SIZE_M * VEC_SIZE))
+        
+        diag_matmul_optimized_kernel[grid](
+            A, B, C,
+            N, M,
+            A.stride(0),
+            B.stride(0), B.stride(1),
+            C.stride(0), C.stride(1),
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            VEC_SIZE=VEC_SIZE,
+        )
+    
+    return C
+
+class ModelNew(nn.Module):
+    """
+    Simple model that performs a matrix multiplication of a diagonal matrix with another matrix.
+    C = diag(A) * B
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+    
+    def forward(self, A, B):
+        """
+        Performs the matrix multiplication.
+
+        Args:
+            A (torch.Tensor): A 1D tensor representing the diagonal of the diagonal matrix. Shape: (N,).
+            B (torch.Tensor): A 2D tensor representing the second matrix. Shape: (N, M).
+
+        Returns:
+            torch.Tensor: The result of the matrix multiplication. Shape: (N, M).
+        """
+        return triton_diag_matmul(A, B)
+```
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+3. Learn from previous repair attempts to avoid repeating the same mistakes
+
+```python
+# <corrected code>
+```

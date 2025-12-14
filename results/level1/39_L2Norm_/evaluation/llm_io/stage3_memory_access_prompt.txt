@@ -1,0 +1,267 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU
+GPU Name: 4090
+Architecture: Ada Lovelace
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+[OPTIMIZATION STAGE]
+
+## Current Optimization Stage
+
+**Focus**: Optimize memory access patterns and latency hiding.
+
+**NCU Metrics to Check**:
+• `dram__throughput.avg.pct_of_peak_sustained_elapsed`
+• `lts__t_sector_hit_rate.pct`
+• `smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct` (target: <20%)
+
+**Guidelines**:
+- Increase `num_stages` only if memory stalls are high; otherwise keep it small.
+- Improve locality or coalescing only when metrics show issues; avoid unnecessary rewrites.
+- Larger BLOCK_K increases reuse but can raise register pressure; adjust only when metrics justify it.
+
+**Autotune Tip (safe)**:
+If unsure, try a tiny set varying `num_stages` (e.g., {1, 2, 3}) via autotune on the **kernel**.
+
+
+
+[CURRENT CODE]
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def l2_norm_kernel(
+    x_ptr,
+    output_ptr,
+    batch_size,
+    dim,
+    stride_x_batch,
+    stride_x_dim,
+    stride_out_batch,
+    stride_out_dim,
+    BLOCK_SIZE_BATCH: tl.constexpr,
+    BLOCK_SIZE_DIM: tl.constexpr,
+):
+    # 2D block structure for better cache utilization
+    pid_batch = tl.program_id(0)
+    pid_dim = tl.program_id(1)
+    
+    # Calculate offsets for this block
+    batch_offsets = pid_batch * BLOCK_SIZE_BATCH + tl.arange(0, BLOCK_SIZE_BATCH)
+    dim_offsets = pid_dim * BLOCK_SIZE_DIM + tl.arange(0, BLOCK_SIZE_DIM)
+    
+    # Create masks for boundary checks
+    batch_mask = batch_offsets < batch_size
+    dim_mask = dim_offsets < dim
+    
+    # Load block of data with proper striding
+    x_ptrs = x_ptr + (
+        batch_offsets[:, None] * stride_x_batch +
+        dim_offsets[None, :] * stride_x_dim
+    )
+    x_block = tl.load(x_ptrs, mask=batch_mask[:, None] & dim_mask[None, :])
+    
+    # Compute local sum of squares with higher precision
+    local_squares = x_block * x_block
+    local_sum = tl.sum(local_squares, axis=1)
+    
+    # Use atomic add to accumulate sums across dimension blocks
+    sum_ptr = output_ptr + batch_offsets * stride_out_batch
+    tl.atomic_add(sum_ptr, local_sum, mask=batch_mask)
+
+@triton.jit
+def normalize_kernel(
+    x_ptr,
+    norm_ptr,
+    output_ptr,
+    batch_size,
+    dim,
+    epsilon,
+    stride_x_batch,
+    stride_x_dim,
+    stride_norm_batch,
+    stride_out_batch,
+    stride_out_dim,
+    BLOCK_SIZE_BATCH: tl.constexpr,
+    BLOCK_SIZE_DIM: tl.constexpr,
+):
+    # 2D block structure
+    pid_batch = tl.program_id(0)
+    pid_dim = tl.program_id(1)
+    
+    # Calculate offsets
+    batch_offsets = pid_batch * BLOCK_SIZE_BATCH + tl.arange(0, BLOCK_SIZE_BATCH)
+    dim_offsets = pid_dim * BLOCK_SIZE_DIM + tl.arange(0, BLOCK_SIZE_DIM)
+    
+    # Create masks
+    batch_mask = batch_offsets < batch_size
+    dim_mask = dim_offsets < dim
+    
+    # Load norm values for this batch
+    norm_ptrs = norm_ptr + batch_offsets * stride_norm_batch
+    norm_values = tl.load(norm_ptrs, mask=batch_mask)
+    
+    # Add epsilon and compute inverse norm
+    norm_values = tl.sqrt(norm_values) + epsilon
+    inv_norm = 1.0 / norm_values
+    
+    # Load input data
+    x_ptrs = x_ptr + (
+        batch_offsets[:, None] * stride_x_batch +
+        dim_offsets[None, :] * stride_x_dim
+    )
+    x_block = tl.load(x_ptrs, mask=batch_mask[:, None] & dim_mask[None, :])
+    
+    # Normalize and store
+    normalized = x_block * inv_norm[:, None]
+    
+    # Store results
+    out_ptrs = output_ptr + (
+        batch_offsets[:, None] * stride_out_batch +
+        dim_offsets[None, :] * stride_out_dim
+    )
+    tl.store(out_ptrs, normalized, mask=batch_mask[:, None] & dim_mask[None, :])
+
+def triton_l2_norm(x: torch.Tensor, epsilon: float = 1e-8) -> torch.Tensor:
+    assert x.is_cuda, "Input must be on CUDA device"
+    assert x.dim() >= 2, "Input must have at least 2 dimensions"
+    
+    # Get input shape and strides
+    batch_size, dim = x.shape[0], x.shape[1]
+    output = torch.empty_like(x)
+    
+    # Ensure input is contiguous for optimal memory access
+    x = x.contiguous()
+    output = output.contiguous()
+    
+    # Get strides
+    stride_x_batch = x.stride(0) if x.dim() > 1 else 0
+    stride_x_dim = x.stride(1) if x.dim() > 1 else x.stride(0)
+    
+    # Allocate tensor for norm sums
+    norm_sums = torch.zeros(batch_size, device=x.device, dtype=torch.float32)
+    
+    # Configure block sizes (tuned for A100)
+    BLOCK_SIZE_BATCH = 64  # Warp-aligned for better memory coalescing
+    BLOCK_SIZE_DIM = 256   # Good for cache line utilization
+    
+    # Calculate grid dimensions
+    grid_batch = triton.cdiv(batch_size, BLOCK_SIZE_BATCH)
+    grid_dim = triton.cdiv(dim, BLOCK_SIZE_DIM)
+    
+    # Launch first kernel to compute sums
+    l2_norm_kernel[(
+        grid_batch,
+        grid_dim,
+        1  # 3D grid for better occupancy
+    )](
+        x,
+        norm_sums,
+        batch_size,
+        dim,
+        stride_x_batch,
+        stride_x_dim,
+        1,  # norm_sums is 1D
+        0,
+        BLOCK_SIZE_BATCH=BLOCK_SIZE_BATCH,
+        BLOCK_SIZE_DIM=BLOCK_SIZE_DIM,
+    )
+    
+    # Launch second kernel for normalization
+    normalize_kernel[(
+        grid_batch,
+        grid_dim,
+        1
+    )](
+        x,
+        norm_sums,
+        output,
+        batch_size,
+        dim,
+        epsilon,
+        stride_x_batch,
+        stride_x_dim,
+        1,  # norm_sums stride
+        output.stride(0) if output.dim() > 1 else 0,
+        output.stride(1) if output.dim() > 1 else output.stride(0),
+        BLOCK_SIZE_BATCH=BLOCK_SIZE_BATCH,
+        BLOCK_SIZE_DIM=BLOCK_SIZE_DIM,
+    )
+    
+    return output
+
+class ModelNew(nn.Module):
+    """
+    L2 normalization layer with optimized Triton kernels.
+    """
+    def __init__(self, epsilon: float = 1e-8):
+        """
+        Initializes the L2Norm layer.
+
+        Args:
+            epsilon (float): Small value to avoid division by zero.
+        """
+        super(ModelNew, self).__init__()
+        self.epsilon = epsilon
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies L2 normalization to the input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (*, dim, *).
+
+        Returns:
+            torch.Tensor: Output tensor with L2 normalization applied, same shape as input.
+        """
+        return triton_l2_norm(x, self.epsilon)
+```
+
+[NCU PROFILING METRICS]
+{
+  "l2_norm_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 25.22,
+    "launch__grid_size": 131072,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 21.21,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 97.11,
+    "lts__t_sector_hit_rate.pct": 5.17
+  },
+  "normalize_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 4.33,
+    "launch__grid_size": 131072,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 16.02,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 74.88,
+    "lts__t_sector_hit_rate.pct": 54.28
+  }
+}
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

@@ -1,0 +1,259 @@
+Fix the Triton kernel errors. Generate correct, high-performance code.
+
+Current Error Log:
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 533, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 131, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/hyc/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/hyc/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251212_131222_batch_range1to20_deepseek_deepseek/4_Matrix_vector_multiplication_/code/kernel_20251212_135413.py", line 135, in forward
+    return triton_matvec(A, B)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251212_131222_batch_range1to20_deepseek_deepseek/4_Matrix_vector_multiplication_/code/kernel_20251212_135413.py", line 98, in triton_matvec
+    matvec_kernel[grid](
+  File "/home/hyc/miniconda3/envs/hyc/lib/python3.11/site-packages/triton/runtime/jit.py", line 419, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/hyc/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 238, in run
+    benchmark()
+  File "/home/hyc/miniconda3/envs/hyc/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 227, in benchmark
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/hyc/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 227, in <dictcomp>
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/hyc/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 162, in _bench
+    return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/hyc/lib/python3.11/site-packages/triton/testing.py", line 149, in do_bench
+    fn()
+  File "/home/hyc/miniconda3/envs/hyc/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 148, in kernel_call
+    self.fn.run(
+  File "/home/hyc/miniconda3/envs/hyc/lib/python3.11/site-packages/triton/runtime/jit.py", line 733, in run
+    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/hyc/lib/python3.11/site-packages/triton/runtime/jit.py", line 861, in _do_compile
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/hyc/lib/python3.11/site-packages/triton/compiler/compiler.py", line 300, in compile
+    module = src.make_ir(target, options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/hyc/lib/python3.11/site-packages/triton/compiler/compiler.py", line 80, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 52:38:
+            next_k_mask = next_offs_k < K
+            next_B_ptrs = B_ptr + next_offs_k * stride_bk
+            b_next = tl.load(next_B_ptrs, mask=next_k_mask)
+        else:
+            b_next = tl.zeros((BLOCK_K,), dtype=tl.float32)
+
+        # Load A block: (BLOCK_M, BLOCK_K)
+        A_ptrs = A_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+        a = tl.load(A_ptrs, mask=m_mask[:, None] & k_mask[None, :])
+
+        # Use pre-fetched B
+        b = tl.where(k == 0, b_start, b_prev)
+                                      ^
+NameError('b_prev is not defined')
+
+History Error:
+None
+
+
+PyTorch Reference:
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs matrix-vector multiplication (C = A * B).
+    """
+    def __init__(self):
+        super(Model, self).__init__()
+    
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        """
+        Performs matrix-vector multiplication.
+
+        Args:
+            A: Input matrix of shape (M, K).
+            B: Input vector of shape (K, 1).
+
+        Returns:
+            Output vector of shape (M, 1).
+        """
+        return torch.matmul(A, B)
+
+M = 256 * 8 # 2048
+K = 131072 * 8 # 1048576
+
+def get_inputs():
+    A = torch.rand(M, K)
+    B = torch.rand(K, 1)
+    return [A, B]
+
+def get_init_inputs():
+    return []  # No special initialization inputs needed
+```
+
+Broken Code:
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 128, 'BLOCK_K': 256}, num_warps=4, num_stages=4),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_K': 128}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_K': 256}, num_warps=4, num_stages=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_K': 128}, num_warps=4, num_stages=3),
+    ],
+    key=['M', 'K'],
+)
+@triton.jit
+def matvec_kernel(
+    A_ptr,
+    B_ptr,
+    C_ptr,
+    M,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_cm,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # 1D grid over rows - each program processes BLOCK_M rows
+    pid = tl.program_id(0)
+    
+    # Offsets for this block
+    offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    m_mask = offs_m < M
+    
+    # Initialize accumulator
+    acc = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    
+    # Pre-fetch first B block to hide latency
+    k_start = 0
+    offs_k_start = tl.arange(0, BLOCK_K)
+    k_mask_start = offs_k_start < K
+    B_ptrs_start = B_ptr + offs_k_start * stride_bk
+    b_start = tl.load(B_ptrs_start, mask=k_mask_start)
+    
+    # Loop over K dimension in blocks
+    for k in range(0, tl.cdiv(K, BLOCK_K)):
+        # Compute current K offset
+        offs_k = k * BLOCK_K + tl.arange(0, BLOCK_K)
+        k_mask = offs_k < K
+        
+        # Load next B block (pre-fetch for next iteration)
+        next_k = k + 1
+        if next_k * BLOCK_K < K:
+            next_offs_k = next_k * BLOCK_K + tl.arange(0, BLOCK_K)
+            next_k_mask = next_offs_k < K
+            next_B_ptrs = B_ptr + next_offs_k * stride_bk
+            b_next = tl.load(next_B_ptrs, mask=next_k_mask)
+        else:
+            b_next = tl.zeros((BLOCK_K,), dtype=tl.float32)
+        
+        # Load A block: (BLOCK_M, BLOCK_K)
+        A_ptrs = A_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+        a = tl.load(A_ptrs, mask=m_mask[:, None] & k_mask[None, :])
+        
+        # Use pre-fetched B
+        b = tl.where(k == 0, b_start, b_prev)
+        
+        # Accumulate dot product with manual unrolling hint
+        # Using manual reduction for better control
+        acc += tl.sum(a * b[None, :], axis=1)
+        
+        # Prepare for next iteration
+        b_prev = b_next
+    
+    # Store result
+    C_ptrs = C_ptr + offs_m * stride_cm
+    tl.store(C_ptrs, acc, mask=m_mask)
+
+
+def triton_matvec(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    M, K = A.shape
+    assert B.shape == (K, 1), f"B must be shape ({K}, 1), got {B.shape}"
+    
+    # Allocate output tensor
+    C = torch.empty((M, 1), device=A.device, dtype=A.dtype)
+    
+    # Convert to float32 for accumulation
+    A_acc = A if A.dtype == torch.float32 else A.to(torch.float32)
+    B_acc = B if B.dtype == torch.float32 else B.to(torch.float32)
+    C_acc = C if C.dtype == torch.float32 else C.to(torch.float32)
+    
+    # Grid configuration - 1D over rows
+    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']),)
+    
+    # Launch kernel
+    matvec_kernel[grid](
+        A_acc,
+        B_acc,
+        C_acc,
+        M,
+        K,
+        A_acc.stride(0),
+        A_acc.stride(1),
+        B_acc.stride(0),
+        C_acc.stride(0),
+    )
+    
+    # Convert back if needed
+    if C.dtype != torch.float32:
+        C.copy_(C_acc.to(C.dtype))
+    
+    return C
+
+
+class ModelNew(nn.Module):
+    """
+    Simple model that performs matrix-vector multiplication (C = A * B).
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+    
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        """
+        Performs matrix-vector multiplication using optimized Triton kernels.
+
+        Args:
+            A: Input matrix of shape (M, K).
+            B: Input vector of shape (K, 1).
+
+        Returns:
+            Output vector of shape (M, 1).
+        """
+        return triton_matvec(A, B)
+```
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+3. Learn from previous repair attempts to avoid repeating the same mistakes
+
+```python
+# <corrected code>
+```

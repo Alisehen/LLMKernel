@@ -1,0 +1,229 @@
+Fix the Triton kernel errors. Generate correct, high-performance code.
+
+Current Error Log:
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 535, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251213_080631_batch_range40to70_deepseek_deepseek/52_Conv2d_Activation_BatchNorm/code/kernel_20251213_152636.py", line 95, in forward
+    x = triton_fused_activation(x)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251213_080631_batch_range40to70_deepseek_deepseek/52_Conv2d_Activation_BatchNorm/code/kernel_20251213_152636.py", line 73, in triton_fused_activation
+    fused_activation_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 347, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 569, in run
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 230, in compile
+    key = f"{triton_key()}-{src.hash()}-{backend.hash()}-{options.hash()}-{str(sorted(env_vars.items()))}"
+                            ^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 77, in hash
+    key = f"{self.fn.cache_key}-{str(self.attrs)}-{sorted_sig}-{constants_key}"
+             ^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 665, in cache_key
+    dependencies_finder.visit(self.parse())
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 418, in visit
+    return visitor(node)
+           ^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 426, in generic_visit
+    self.visit(item)
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 418, in visit
+    return visitor(node)
+           ^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 149, in visit_FunctionDef
+    self.generic_visit(node)
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 426, in generic_visit
+    self.visit(item)
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 418, in visit
+    return visitor(node)
+           ^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 203, in visit_Assign
+    self.generic_visit(node)
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 428, in generic_visit
+    self.visit(value)
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 418, in visit
+    return visitor(node)
+           ^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 426, in generic_visit
+    self.visit(item)
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 418, in visit
+    return visitor(node)
+           ^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 428, in generic_visit
+    self.visit(value)
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 418, in visit
+    return visitor(node)
+           ^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 428, in generic_visit
+    self.visit(value)
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 418, in visit
+    return visitor(node)
+           ^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 142, in visit_Attribute
+    ret = getattr(lhs, node.attr)
+          ^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: module 'triton.language' has no attribute 'log1p'
+
+History Error:
+None
+
+
+PyTorch Reference:
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs a convolution, applies activation, and then applies Batch Normalization.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, eps=1e-5, momentum=0.1):
+        super(Model, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.bn = nn.BatchNorm2d(out_channels, eps=eps, momentum=momentum)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = torch.multiply(torch.tanh(torch.nn.functional.softplus(x)), x)
+        x = self.bn(x)
+        return x
+
+batch_size = 64
+in_channels = 64
+out_channels = 128
+height, width = 128, 128
+kernel_size = 3
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size]
+```
+
+Broken Code:
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def fused_activation_kernel(
+    x_ptr,
+    output_ptr,
+    M,  # Batch * Channels
+    N,  # Height * Width
+    stride_m,
+    stride_n,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Optimized 2D kernel with better grid layout for 4D tensors"""
+    # 2D grid: (batch*channels, height*width)
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    
+    # Create offsets for 2D block
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    
+    # Create masks for boundaries
+    mask_m = rm < M
+    mask_n = rn < N
+    
+    # Load input with 2D indexing
+    x_ptrs = x_ptr + rm[:, None] * stride_m + rn[None, :] * stride_n
+    mask = mask_m[:, None] & mask_n[None, :]
+    x = tl.load(x_ptrs, mask=mask, other=0.0)
+    
+    # Compute fused activation
+    # Optimized: Use tl.where and tl.log1p for better numerical stability
+    is_positive = x > 0
+    exp_neg_x = tl.exp(-tl.where(is_positive, x, 0.0))
+    exp_x = tl.exp(tl.where(~is_positive, x, 0.0))
+    
+    log1p_exp_x = tl.where(
+        is_positive,
+        x + tl.log1p(exp_neg_x),  # log1p is more accurate for small values
+        tl.log1p(exp_x)
+    )
+    
+    # Use built-in tanh for better performance
+    tanh_val = tl.tanh(log1p_exp_x)
+    
+    # Multiply with original x
+    output = x * tanh_val
+    
+    # Store result
+    tl.store(x_ptrs, output, mask=mask)
+
+def triton_fused_activation(x: torch.Tensor) -> torch.Tensor:
+    """Wrapper with 2D grid for 4D tensors"""
+    # Reshape 4D tensor to (batch*channels, height*width)
+    B, C, H, W = x.shape
+    M = B * C
+    N = H * W
+    
+    # Create output tensor
+    output = torch.empty_like(x)
+    
+    # Use optimized 2D grid layout
+    grid = lambda META: (
+        triton.cdiv(M, META['BLOCK_M']),
+        triton.cdiv(N, META['BLOCK_N']),
+    )
+    
+    # Launch kernel with optimized block sizes
+    fused_activation_kernel[grid](
+        x, output, M, N,
+        x.stride(0) * C,  # stride for batch*channels dimension
+        x.stride(2),      # stride for spatial dimensions
+        BLOCK_M=32,       # Optimized for spatial locality
+        BLOCK_N=64        # Good balance for Ada Lovelace
+    )
+    
+    return output
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, eps=1e-5, momentum=0.1):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.bn = nn.BatchNorm2d(out_channels, eps=eps, momentum=momentum)
+
+    def forward(self, x):
+        # Apply convolution
+        x = self.conv(x)
+        
+        # Apply fused activation using optimized Triton kernel
+        x = triton_fused_activation(x)
+        
+        # Apply batch normalization
+        x = self.bn(x)
+        return x
+```
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+3. Learn from previous repair attempts to avoid repeating the same mistakes
+
+```python
+# <corrected code>
+```

@@ -1,0 +1,528 @@
+Fix the Triton kernel errors. Generate correct, high-performance code.
+
+Current Error Log:
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 535, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251212_170112_batch_range40to70_deepseek_deepseek/42_Max_Pooling_2D/code/kernel_20251212_181726.py", line 423, in forward
+    return triton_max_pool2d(
+           ^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251212_170112_batch_range40to70_deepseek_deepseek/42_Max_Pooling_2D/code/kernel_20251212_181726.py", line 314, in triton_max_pool2d
+    @triton.autotune(
+     ^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 378, in decorator
+    return Autotuner(fn, fn.arg_names, configs, key, reset_to_zero, restore_value, pre_hook=pre_hook,
+                         ^^^^^^^^^^^^
+AttributeError: 'function' object has no attribute 'arg_names'
+
+History Error:
+None
+
+
+PyTorch Reference:
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs Max Pooling 2D.
+    """
+    def __init__(self, kernel_size: int, stride: int, padding: int, dilation: int):
+        """
+        Initializes the Max Pooling 2D layer.
+
+        Args:
+            kernel_size (int): Size of the pooling window.
+            stride (int): Stride of the pooling window.
+            padding (int): Padding to be applied before pooling.
+            dilation (int): Spacing between kernel elements.
+        """
+        super(Model, self).__init__()
+        self.maxpool = nn.MaxPool2d(kernel_size=kernel_size, stride=stride, padding=padding, dilation=dilation)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies Max Pooling 2D to the input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, channels, height, width).
+
+        Returns:
+            torch.Tensor: Output tensor after Max Pooling 2D, shape (batch_size, channels, pooled_height, pooled_width).
+        """
+        return self.maxpool(x)
+
+batch_size = 32
+channels = 64
+height = 512
+width = 512
+kernel_size = 4
+stride = 1
+padding = 1
+dilation = 1
+
+def get_inputs():
+    x = torch.rand(batch_size, channels, height, width)
+    return [x]
+
+def get_init_inputs():
+    return [kernel_size, stride, padding, dilation]
+```
+
+Broken Code:
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def max_pool2d_kernel_optimized(
+    x_ptr,
+    output_ptr,
+    # Tensor dimensions
+    batch_stride_x, channel_stride_x, height_stride_x, width_stride_x,
+    batch_stride_out, channel_stride_out, height_stride_out, width_stride_out,
+    batch_size, channels, height, width,
+    pooled_height, pooled_width,
+    # Pooling parameters
+    kernel_h, kernel_w,
+    stride_h, stride_w,
+    pad_h, pad_w,
+    dilation_h, dilation_w,
+    # Grid dimensions for re-mapping
+    grid_batch: tl.constexpr,
+    grid_channel: tl.constexpr,
+    # Block parameters
+    BLOCK_SIZE_H: tl.constexpr,
+    BLOCK_SIZE_W: tl.constexpr,
+    BLOCK_SIZE_C: tl.constexpr,
+    # Optimization parameters
+    NUM_STAGES: tl.constexpr,
+    BLOCK_K_H: tl.constexpr,
+    BLOCK_K_W: tl.constexpr,
+):
+    # Parallelize across batch, channels, and output spatial dimensions using 3D grid
+    pid_ph = tl.program_id(0)
+    pid_pw = tl.program_id(1)
+    pid_combined = tl.program_id(2)
+    
+    # Split combined dimension into batch and channel blocks
+    pid_batch = pid_combined // grid_channel
+    pid_channel = pid_combined % grid_channel
+    
+    # Check boundaries
+    if pid_batch >= batch_size:
+        return
+    
+    # Create block of output positions in H and W dimensions
+    ph_block_start = pid_ph * BLOCK_SIZE_H
+    ph_offsets = ph_block_start + tl.arange(0, BLOCK_SIZE_H)
+    ph_mask = ph_offsets < pooled_height
+    
+    pw_block_start = pid_pw * BLOCK_SIZE_W
+    pw_offsets = pw_block_start + tl.arange(0, BLOCK_SIZE_W)
+    pw_mask = pw_offsets < pooled_width
+    
+    # Process multiple channels per block
+    channel_block_start = pid_channel * BLOCK_SIZE_C
+    channel_offsets = channel_block_start + tl.arange(0, BLOCK_SIZE_C)
+    channel_mask = channel_offsets < channels
+    
+    # Initialize output with -inf using float32
+    output_block = tl.full((BLOCK_SIZE_H, BLOCK_SIZE_W, BLOCK_SIZE_C), 
+                          float('-inf'), dtype=tl.float32)
+    
+    # Compute loop bounds for kernel window with blocking
+    kh_start = 0
+    kh_end = kernel_h
+    kw_start = 0
+    kw_end = kernel_w
+    
+    # Tile the kernel window to increase data reuse and hide memory latency
+    for kh_tile in range(kh_start, kh_end, BLOCK_K_H):
+        kh_tile_end = min(kh_tile + BLOCK_K_H, kh_end)
+        for kw_tile in range(kw_start, kw_end, BLOCK_K_W):
+            kw_tile_end = min(kw_tile + BLOCK_K_W, kw_end)
+            
+            # Pre-compute and reuse indices within the tile
+            for kh in range(kh_tile, kh_tile_end):
+                kh_offset = kh * dilation_h
+                for kw in range(kw_tile, kw_tile_end):
+                    kw_offset = kw * dilation_w
+                    
+                    # Compute input positions with dilation - vectorized
+                    h_idx = ph_offsets[:, None, None] * stride_h - pad_h + kh_offset
+                    w_idx = pw_offsets[None, :, None] * stride_w - pad_w + kw_offset
+                    
+                    # Create mask for valid input positions
+                    h_valid = (h_idx >= 0) & (h_idx < height)
+                    w_valid = (w_idx >= 0) & (w_idx < width)
+                    valid_mask = h_valid & w_valid  # [BLOCK_SIZE_H, BLOCK_SIZE_W, 1]
+                    
+                    # Compute input pointers with coalesced memory access
+                    x_ptrs = (
+                        x_ptr +
+                        pid_batch * batch_stride_x +
+                        channel_offsets[None, None, :] * channel_stride_x +
+                        h_idx * height_stride_x +
+                        w_idx * width_stride_x
+                    )
+                    
+                    # Load input values with boundary checking
+                    # Use proper mask shape [BLOCK_SIZE_H, BLOCK_SIZE_W, BLOCK_SIZE_C]
+                    expanded_valid_mask = tl.broadcast_to(valid_mask, (BLOCK_SIZE_H, BLOCK_SIZE_W, BLOCK_SIZE_C))
+                    expanded_channel_mask = tl.broadcast_to(channel_mask[None, None, :], (BLOCK_SIZE_H, BLOCK_SIZE_W, BLOCK_SIZE_C))
+                    load_mask = expanded_valid_mask & expanded_channel_mask
+                    
+                    # Use caching modifier for better L1 cache utilization
+                    x_vals = tl.load(x_ptrs, mask=load_mask, other=float('-inf'), 
+                                    cache_modifier=".cg")  # Cache global
+                    
+                    # Update max (invalid positions are -inf, so they don't affect the max)
+                    output_block = tl.maximum(output_block, x_vals)
+    
+    # Store results with coalesced writes
+    # Create output pointer offsets
+    ph_expanded = tl.broadcast_to(ph_offsets[:, None, None], (BLOCK_SIZE_H, BLOCK_SIZE_W, BLOCK_SIZE_C))
+    pw_expanded = tl.broadcast_to(pw_offsets[None, :, None], (BLOCK_SIZE_H, BLOCK_SIZE_W, BLOCK_SIZE_C))
+    ch_expanded = tl.broadcast_to(channel_offsets[None, None, :], (BLOCK_SIZE_H, BLOCK_SIZE_W, BLOCK_SIZE_C))
+    
+    output_ptrs = (
+        output_ptr +
+        pid_batch * batch_stride_out +
+        ch_expanded * channel_stride_out +
+        ph_expanded * height_stride_out +
+        pw_expanded * width_stride_out
+    )
+    
+    # Create output mask with proper broadcasting
+    output_mask = (
+        tl.broadcast_to(ph_mask[:, None, None], (BLOCK_SIZE_H, BLOCK_SIZE_W, BLOCK_SIZE_C)) &
+        tl.broadcast_to(pw_mask[None, :, None], (BLOCK_SIZE_H, BLOCK_SIZE_W, BLOCK_SIZE_C)) &
+        tl.broadcast_to(channel_mask[None, None, :], (BLOCK_SIZE_H, BLOCK_SIZE_W, BLOCK_SIZE_C))
+    )
+    
+    # Store with write-back cache policy
+    tl.store(output_ptrs, output_block, mask=output_mask, cache_modifier=".wb")
+
+
+@triton.jit(do_not_specialize=["stride_h", "stride_w", "pad_h", "pad_w", "dilation_h", "dilation_w"])
+def max_pool2d_kernel_autotune(
+    x_ptr,
+    output_ptr,
+    # Tensor dimensions
+    batch_stride_x, channel_stride_x, height_stride_x, width_stride_x,
+    batch_stride_out, channel_stride_out, height_stride_out, width_stride_out,
+    batch_size, channels, height, width,
+    pooled_height, pooled_width,
+    # Pooling parameters
+    kernel_h, kernel_w,
+    stride_h, stride_w,
+    pad_h, pad_w,
+    dilation_h, dilation_w,
+    # Grid dimensions for re-mapping
+    grid_batch: tl.constexpr,
+    grid_channel: tl.constexpr,
+    # Block parameters
+    BLOCK_SIZE_H: tl.constexpr,
+    BLOCK_SIZE_W: tl.constexpr,
+    BLOCK_SIZE_C: tl.constexpr,
+    # Optimization parameters
+    NUM_STAGES: tl.constexpr,
+):
+    # Same implementation as optimized kernel but with autotune-friendly parameters
+    pid_ph = tl.program_id(0)
+    pid_pw = tl.program_id(1)
+    pid_combined = tl.program_id(2)
+    
+    pid_batch = pid_combined // grid_channel
+    pid_channel = pid_combined % grid_channel
+    
+    if pid_batch >= batch_size:
+        return
+    
+    # Create block of output positions
+    ph_block_start = pid_ph * BLOCK_SIZE_H
+    ph_offsets = ph_block_start + tl.arange(0, BLOCK_SIZE_H)
+    ph_mask = ph_offsets < pooled_height
+    
+    pw_block_start = pid_pw * BLOCK_SIZE_W
+    pw_offsets = pw_block_start + tl.arange(0, BLOCK_SIZE_W)
+    pw_mask = pw_offsets < pooled_width
+    
+    channel_block_start = pid_channel * BLOCK_SIZE_C
+    channel_offsets = channel_block_start + tl.arange(0, BLOCK_SIZE_C)
+    channel_mask = channel_offsets < channels
+    
+    # Initialize output
+    output_block = tl.full((BLOCK_SIZE_H, BLOCK_SIZE_W, BLOCK_SIZE_C), 
+                          float('-inf'), dtype=tl.float32)
+    
+    # Optimized loop with prefetching for better memory latency hiding
+    for kh in range(kernel_h):
+        kh_offset = kh * dilation_h
+        # Precompute h_idx for better ILP
+        h_idx_base = ph_offsets[:, None, None] * stride_h - pad_h + kh_offset
+        h_valid_base = (h_idx_base >= 0) & (h_idx_base < height)
+        
+        for kw in range(kernel_w):
+            kw_offset = kw * dilation_w
+            # Compute w_idx
+            w_idx = pw_offsets[None, :, None] * stride_w - pad_w + kw_offset
+            w_valid = (w_idx >= 0) & (w_idx < width)
+            
+            # Combine masks efficiently
+            valid_mask = h_valid_base & w_valid
+            
+            # Compute input pointers with optimized addressing
+            x_ptrs = (
+                x_ptr +
+                pid_batch * batch_stride_x +
+                channel_offsets[None, None, :] * channel_stride_x +
+                h_idx_base * height_stride_x +
+                w_idx * width_stride_x
+            )
+            
+            # Load with optimized mask
+            load_mask = tl.broadcast_to(valid_mask & channel_mask[None, None, :], 
+                                       (BLOCK_SIZE_H, BLOCK_SIZE_W, BLOCK_SIZE_C))
+            
+            x_vals = tl.load(x_ptrs, mask=load_mask, other=float('-inf'))
+            output_block = tl.maximum(output_block, x_vals)
+    
+    # Store results
+    output_ptrs = (
+        output_ptr +
+        pid_batch * batch_stride_out +
+        tl.broadcast_to(channel_offsets[None, None, :], (BLOCK_SIZE_H, BLOCK_SIZE_W, BLOCK_SIZE_C)) * channel_stride_out +
+        tl.broadcast_to(ph_offsets[:, None, None], (BLOCK_SIZE_H, BLOCK_SIZE_W, BLOCK_SIZE_C)) * height_stride_out +
+        tl.broadcast_to(pw_offsets[None, :, None], (BLOCK_SIZE_H, BLOCK_SIZE_W, BLOCK_SIZE_C)) * width_stride_out
+    )
+    
+    output_mask = (
+        tl.broadcast_to(ph_mask[:, None, None], (BLOCK_SIZE_H, BLOCK_SIZE_W, BLOCK_SIZE_C)) &
+        tl.broadcast_to(pw_mask[None, :, None], (BLOCK_SIZE_H, BLOCK_SIZE_W, BLOCK_SIZE_C)) &
+        tl.broadcast_to(channel_mask[None, None, :], (BLOCK_SIZE_H, BLOCK_SIZE_W, BLOCK_SIZE_C))
+    )
+    
+    tl.store(output_ptrs, output_block, mask=output_mask)
+
+
+def triton_max_pool2d(
+    x: torch.Tensor,
+    kernel_size: int,
+    stride: int = None,
+    padding: int = 0,
+    dilation: int = 1,
+    use_autotune: bool = True,
+) -> torch.Tensor:
+    """Triton implementation of 2D max pooling with optimizations."""
+    if stride is None:
+        stride = kernel_size
+    
+    # Parameter handling
+    if isinstance(kernel_size, int):
+        kernel_h = kernel_w = kernel_size
+    else:
+        kernel_h, kernel_w = kernel_size
+    
+    if isinstance(stride, int):
+        stride_h = stride_w = stride
+    else:
+        stride_h, stride_w = stride
+    
+    if isinstance(padding, int):
+        pad_h = pad_w = padding
+    else:
+        pad_h, pad_w = padding
+    
+    if isinstance(dilation, int):
+        dilation_h = dilation_w = dilation
+    else:
+        dilation_h, dilation_w = dilation
+    
+    # Compute output dimensions
+    batch_size, channels, height, width = x.shape
+    pooled_height = (height + 2 * pad_h - dilation_h * (kernel_h - 1) - 1) // stride_h + 1
+    pooled_width = (width + 2 * pad_w - dilation_w * (kernel_w - 1) - 1) // stride_w + 1
+    
+    # Allocate output tensor
+    output = torch.empty(
+        (batch_size, channels, pooled_height, pooled_width),
+        device=x.device,
+        dtype=x.dtype
+    )
+    
+    # Strides for tensor access
+    batch_stride_x = x.stride(0)
+    channel_stride_x = x.stride(1)
+    height_stride_x = x.stride(2)
+    width_stride_x = x.stride(3)
+    
+    batch_stride_out = output.stride(0)
+    channel_stride_out = output.stride(1)
+    height_stride_out = output.stride(2)
+    width_stride_out = output.stride(3)
+    
+    if use_autotune:
+        # Autotune configuration based on NCU metrics
+        configs = []
+        
+        # Try different block sizes and stages
+        for BLOCK_SIZE_H in [16, 32]:
+            for BLOCK_SIZE_W in [16, 32]:
+                for BLOCK_SIZE_C in [1, 2, 4]:
+                    # Ensure total threads per block <= 1024
+                    if BLOCK_SIZE_H * BLOCK_SIZE_W * BLOCK_SIZE_C <= 1024:
+                        for NUM_STAGES in [1, 2, 3]:
+                            configs.append(triton.Config({
+                                'BLOCK_SIZE_H': BLOCK_SIZE_H,
+                                'BLOCK_SIZE_W': BLOCK_SIZE_W,
+                                'BLOCK_SIZE_C': BLOCK_SIZE_C,
+                                'NUM_STAGES': NUM_STAGES,
+                            }, num_stages=NUM_STAGES))
+        
+        # Use autotune to find best configuration
+        @triton.autotune(
+            configs=configs,
+            key=['batch_size', 'channels', 'height', 'width', 'kernel_h', 'kernel_w']
+        )
+        def tuned_kernel(*args, **kwargs):
+            return max_pool2d_kernel_autotune(*args, **kwargs)
+        
+        # Grid calculation
+        def grid(META):
+            BLOCK_SIZE_H = META['BLOCK_SIZE_H']
+            BLOCK_SIZE_W = META['BLOCK_SIZE_W']
+            BLOCK_SIZE_C = META['BLOCK_SIZE_C']
+            
+            grid_ph = triton.cdiv(pooled_height, BLOCK_SIZE_H)
+            grid_pw = triton.cdiv(pooled_width, BLOCK_SIZE_W)
+            grid_channel = triton.cdiv(channels, BLOCK_SIZE_C)
+            grid_batch_channel = batch_size * grid_channel
+            
+            return (grid_ph, grid_pw, grid_batch_channel)
+        
+        # Launch autotuned kernel
+        tuned_kernel[grid](
+            x,
+            output,
+            batch_stride_x, channel_stride_x, height_stride_x, width_stride_x,
+            batch_stride_out, channel_stride_out, height_stride_out, width_stride_out,
+            batch_size, channels, height, width,
+            pooled_height, pooled_width,
+            kernel_h, kernel_w,
+            stride_h, stride_w,
+            pad_h, pad_w,
+            dilation_h, dilation_w,
+            grid_batch=batch_size,
+            grid_channel=triton.cdiv(channels, 4),  # Will be overridden by autotune
+        )
+    else:
+        # Use optimized configuration based on NCU metrics analysis
+        # Optimized for Ada Lovelace with high DRAM throughput
+        BLOCK_SIZE_H = 32
+        BLOCK_SIZE_W = 32
+        BLOCK_SIZE_C = 2
+        NUM_STAGES = 3  # Increased to hide memory latency based on high DRAM usage
+        BLOCK_K_H = 1  # Tile kernel height for better reuse
+        BLOCK_K_W = 2  # Tile kernel width for better reuse
+        
+        grid_ph = triton.cdiv(pooled_height, BLOCK_SIZE_H)
+        grid_pw = triton.cdiv(pooled_width, BLOCK_SIZE_W)
+        grid_channel = triton.cdiv(channels, BLOCK_SIZE_C)
+        grid_batch_channel = batch_size * grid_channel
+        
+        grid = (grid_ph, grid_pw, grid_batch_channel)
+        
+        # Launch optimized kernel
+        max_pool2d_kernel_optimized[grid](
+            x,
+            output,
+            batch_stride_x, channel_stride_x, height_stride_x, width_stride_x,
+            batch_stride_out, channel_stride_out, height_stride_out, width_stride_out,
+            batch_size, channels, height, width,
+            pooled_height, pooled_width,
+            kernel_h, kernel_w,
+            stride_h, stride_w,
+            pad_h, pad_w,
+            dilation_h, dilation_w,
+            grid_batch=batch_size,
+            grid_channel=grid_channel,
+            BLOCK_SIZE_H=BLOCK_SIZE_H,
+            BLOCK_SIZE_W=BLOCK_SIZE_W,
+            BLOCK_SIZE_C=BLOCK_SIZE_C,
+            NUM_STAGES=NUM_STAGES,
+            BLOCK_K_H=BLOCK_K_H,
+            BLOCK_K_W=BLOCK_K_W,
+        )
+    
+    return output
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs Max Pooling 2D using Triton kernels.
+    """
+    def __init__(self, kernel_size: int, stride: int, padding: int, dilation: int, use_autotune: bool = True):
+        """
+        Initializes the Max Pooling 2D layer.
+
+        Args:
+            kernel_size (int): Size of the pooling window.
+            stride (int): Stride of the pooling window.
+            padding (int): Padding to be applied before pooling.
+            dilation (int): Spacing between kernel elements.
+            use_autotune (bool): Whether to use autotune for kernel optimization.
+        """
+        super(ModelNew, self).__init__()
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+        self.use_autotune = use_autotune
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies optimized Max Pooling 2D to the input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, channels, height, width).
+
+        Returns:
+            torch.Tensor: Output tensor after Max Pooling 2D.
+        """
+        return triton_max_pool2d(
+            x,
+            kernel_size=self.kernel_size,
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation,
+            use_autotune=self.use_autotune
+        )
+```
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+3. Learn from previous repair attempts to avoid repeating the same mistakes
+
+```python
+# <corrected code>
+```

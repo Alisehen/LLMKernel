@@ -1,0 +1,137 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 128, 'VECTOR_SIZE': 4}, num_stages=1, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 128, 'VECTOR_SIZE': 8}, num_stages=1, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 256, 'VECTOR_SIZE': 4}, num_stages=2, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 256, 'VECTOR_SIZE': 8}, num_stages=2, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 512, 'VECTOR_SIZE': 4}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 512, 'VECTOR_SIZE': 8}, num_stages=3, num_warps=8),
+    ],
+    key=['n_elements'],
+)
+@triton.jit
+def swish_kernel_optimized(
+    x_ptr,
+    output_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+    VECTOR_SIZE: tl.constexpr,
+):
+    """Optimized Swish activation with vectorized memory operations."""
+    pid = tl.program_id(axis=0)
+    elements_per_block = BLOCK_SIZE * VECTOR_SIZE
+    block_start = pid * elements_per_block
+    
+    # Create offsets using vectorized pattern
+    base_offsets = block_start + tl.arange(0, BLOCK_SIZE)[:, None] * VECTOR_SIZE + tl.arange(0, VECTOR_SIZE)[None, :]
+    offsets = tl.ravel(base_offsets)
+    mask = offsets < n_elements
+    
+    # Vectorized load
+    x_vec = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    
+    # Compute sigmoid using stable formulation
+    # sigmoid(x) = 1 / (1 + exp(-x))
+    neg_x = -x_vec
+    exp_neg_x = tl.exp(neg_x)
+    denom = 1.0 + exp_neg_x
+    sigmoid_x = 1.0 / denom
+    
+    # Swish: x * sigmoid(x)
+    output_vec = x_vec * sigmoid_x
+    
+    # Vectorized store
+    tl.store(output_ptr + offsets, output_vec, mask=mask)
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 256, 'VECTOR_SIZE': 4}, num_stages=2, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 256, 'VECTOR_SIZE': 8}, num_stages=2, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 512, 'VECTOR_SIZE': 4}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 512, 'VECTOR_SIZE': 8}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 1024, 'VECTOR_SIZE': 4}, num_stages=4, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 1024, 'VECTOR_SIZE': 8}, num_stages=4, num_warps=8),
+    ],
+    key=['n_elements'],
+)
+@triton.jit
+def swish_fast_kernel_optimized(
+    x_ptr,
+    output_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+    VECTOR_SIZE: tl.constexpr,
+):
+    """Fast approximation of Swish with vectorized operations."""
+    pid = tl.program_id(axis=0)
+    elements_per_block = BLOCK_SIZE * VECTOR_SIZE
+    block_start = pid * elements_per_block
+    
+    # Create offsets using vectorized pattern
+    base_offsets = block_start + tl.arange(0, BLOCK_SIZE)[:, None] * VECTOR_SIZE + tl.arange(0, VECTOR_SIZE)[None, :]
+    offsets = tl.ravel(base_offsets)
+    mask = offsets < n_elements
+    
+    # Vectorized load
+    x_vec = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    
+    # Fast approximation: x * sigmoid(x) ≈ x * (tanh(x/2) + 1) / 2
+    half_x = x_vec * 0.5
+    tanh_half_x = tl.tanh(half_x)  # Using built-in tanh for better performance
+    sigmoid_approx = (tanh_half_x + 1.0) * 0.5
+    output_vec = x_vec * sigmoid_approx
+    
+    # Vectorized store
+    tl.store(output_ptr + offsets, output_vec, mask=mask)
+
+def triton_swish_optimized(x: torch.Tensor, fast_math: bool = False) -> torch.Tensor:
+    """Optimized Triton Swish with autotuned configurations."""
+    output = torch.empty_like(x)
+    n_elements = output.numel()
+    
+    if n_elements == 0:
+        return output
+    
+    # Define grid function that uses tunable parameters
+    def grid_fn(meta):
+        return (triton.cdiv(n_elements, meta['BLOCK_SIZE'] * meta['VECTOR_SIZE']),)
+    
+    if fast_math:
+        swish_fast_kernel_optimized[grid_fn](
+            x, output, n_elements,
+        )
+    else:
+        swish_kernel_optimized[grid_fn](
+            x, output, n_elements,
+        )
+    
+    return output
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs Swish activation using advanced Triton kernels.
+    """
+    def __init__(self, use_fast_math: bool = False):
+        super(ModelNew, self).__init__()
+        self.use_fast_math = use_fast_math
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies Swish activation using optimized Triton kernel.
+        
+        Args:
+            x (torch.Tensor): Input tensor of any shape.
+            
+        Returns:
+            torch.Tensor: Output tensor with Swish applied, same shape as input.
+        """
+        # Ensure contiguous memory layout
+        if not x.is_contiguous():
+            x = x.contiguous()
+        
+        return triton_swish_optimized(x, self.use_fast_math)

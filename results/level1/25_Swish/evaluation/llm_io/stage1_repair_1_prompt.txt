@@ -1,0 +1,266 @@
+Fix the Triton kernel errors. Generate correct, high-performance code.
+
+Current Error Log:
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 535, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251212_170043_batch_range5to40_deepseek_deepseek/25_Swish/code/kernel_20251212_231057.py", line 162, in forward
+    return triton_swish(x, self.use_fast_math)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251212_170043_batch_range5to40_deepseek_deepseek/25_Swish/code/kernel_20251212_231057.py", line 131, in triton_swish
+    swish_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 347, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 569, in run
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 278, in compile
+    module = src.make_ir(options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 81, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.UnsupportedLanguageConstruct: at 26:4:
+    mask2 = (offsets + 2 * BLOCK_SIZE) < n_elements
+    mask3 = (offsets + 3 * BLOCK_SIZE) < n_elements
+
+    # Load input values
+    x0 = tl.load(x_ptr + offsets, mask=mask0, other=0.0)
+    x1 = tl.load(x_ptr + offsets + BLOCK_SIZE, mask=mask1, other=0.0)
+    x2 = tl.load(x_ptr + offsets + 2 * BLOCK_SIZE, mask=mask2, other=0.0)
+    x3 = tl.load(x_ptr + offsets + 3 * BLOCK_SIZE, mask=mask3, other=0.0)
+
+    # Process 4 elements using vectorized operations
+    # Stable sigmoid implementation
+    def compute_swish(x):
+    ^
+nested function definition is not supported.
+
+History Error:
+None
+
+
+PyTorch Reference:
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs a Swish activation.
+    """
+    def __init__(self):
+        super(Model, self).__init__()
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies Swish activation to the input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor of any shape.
+
+        Returns:
+            torch.Tensor: Output tensor with Swish applied, same shape as input.
+        """
+        return x * torch.sigmoid(x)
+
+batch_size = 4096
+dim = 393216
+
+def get_inputs():
+    x = torch.rand(batch_size, dim)
+    return [x]
+
+def get_init_inputs():
+    return []  # No special initialization inputs needed
+```
+
+Broken Code:
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def swish_kernel(
+    x_ptr,
+    output_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Swish activation optimized with thread coarsening."""
+    pid = tl.program_id(axis=0)
+    block_start = pid * (BLOCK_SIZE * 4)  # Process 4 elements per thread
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    
+    # Load 4 elements per thread with contiguous access
+    mask0 = offsets < n_elements
+    mask1 = (offsets + BLOCK_SIZE) < n_elements
+    mask2 = (offsets + 2 * BLOCK_SIZE) < n_elements
+    mask3 = (offsets + 3 * BLOCK_SIZE) < n_elements
+    
+    # Load input values
+    x0 = tl.load(x_ptr + offsets, mask=mask0, other=0.0)
+    x1 = tl.load(x_ptr + offsets + BLOCK_SIZE, mask=mask1, other=0.0)
+    x2 = tl.load(x_ptr + offsets + 2 * BLOCK_SIZE, mask=mask2, other=0.0)
+    x3 = tl.load(x_ptr + offsets + 3 * BLOCK_SIZE, mask=mask3, other=0.0)
+    
+    # Process 4 elements using vectorized operations
+    # Stable sigmoid implementation
+    def compute_swish(x):
+        abs_x = tl.abs(x)
+        exp_neg_abs_x = tl.exp(-abs_x)
+        denom = 1.0 + exp_neg_abs_x
+        numerator = tl.where(x >= 0, 1.0, exp_neg_abs_x)
+        sigmoid_x = numerator / denom
+        return x * sigmoid_x
+    
+    out0 = compute_swish(x0)
+    out1 = compute_swish(x1)
+    out2 = compute_swish(x2)
+    out3 = compute_swish(x3)
+    
+    # Store results
+    tl.store(output_ptr + offsets, out0, mask=mask0)
+    tl.store(output_ptr + offsets + BLOCK_SIZE, out1, mask=mask1)
+    tl.store(output_ptr + offsets + 2 * BLOCK_SIZE, out2, mask=mask2)
+    tl.store(output_ptr + offsets + 3 * BLOCK_SIZE, out3, mask=mask3)
+
+@triton.jit
+def swish_fast_kernel(
+    x_ptr,
+    output_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+    USE_FAST_MATH: tl.constexpr,
+):
+    """Fast math Swish with thread coarsening."""
+    pid = tl.program_id(axis=0)
+    block_start = pid * (BLOCK_SIZE * 4)
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    
+    # Masks for 4 elements per thread
+    mask0 = offsets < n_elements
+    mask1 = (offsets + BLOCK_SIZE) < n_elements
+    mask2 = (offsets + 2 * BLOCK_SIZE) < n_elements
+    mask3 = (offsets + 3 * BLOCK_SIZE) < n_elements
+    
+    # Load input values
+    x0 = tl.load(x_ptr + offsets, mask=mask0, other=0.0)
+    x1 = tl.load(x_ptr + offsets + BLOCK_SIZE, mask=mask1, other=0.0)
+    x2 = tl.load(x_ptr + offsets + 2 * BLOCK_SIZE, mask=mask2, other=0.0)
+    x3 = tl.load(x_ptr + offsets + 3 * BLOCK_SIZE, mask=mask3, other=0.0)
+    
+    if USE_FAST_MATH:
+        # Fast approximation for all 4 elements
+        def fast_swish(x):
+            half_x = x * 0.5
+            exp_x = tl.exp(tl.where(half_x > 10.0, 10.0, tl.where(half_x < -10.0, -10.0, half_x)))
+            tanh_half_x = (exp_x - 1.0) / (exp_x + 1.0)
+            sigmoid_approx = 0.5 + 0.5 * tanh_half_x
+            return x * sigmoid_approx
+        
+        out0 = fast_swish(x0)
+        out1 = fast_swish(x1)
+        out2 = fast_swish(x2)
+        out3 = fast_swish(x3)
+    else:
+        # Standard stable implementation
+        def stable_swish(x):
+            abs_x = tl.abs(x)
+            exp_neg_abs_x = tl.exp(-abs_x)
+            denom = 1.0 + exp_neg_abs_x
+            numerator = tl.where(x >= 0, 1.0, exp_neg_abs_x)
+            sigmoid_x = numerator / denom
+            return x * sigmoid_x
+        
+        out0 = stable_swish(x0)
+        out1 = stable_swish(x1)
+        out2 = stable_swish(x2)
+        out3 = stable_swish(x3)
+    
+    # Store results
+    tl.store(output_ptr + offsets, out0, mask=mask0)
+    tl.store(output_ptr + offsets + BLOCK_SIZE, out1, mask=mask1)
+    tl.store(output_ptr + offsets + 2 * BLOCK_SIZE, out2, mask=mask2)
+    tl.store(output_ptr + offsets + 3 * BLOCK_SIZE, out3, mask=mask3)
+
+def triton_swish(x: torch.Tensor, fast_math: bool = False) -> torch.Tensor:
+    """Triton-optimized Swish activation with optimized grid layout."""
+    output = torch.empty_like(x)
+    n_elements = output.numel()
+    
+    # Fixed optimal configuration for Ada Lovelace (4090)
+    # 256 threads per block × 4 elements per thread = 1024 elements per block
+    BLOCK_SIZE = 256
+    
+    # Reduced grid size: process 4× more elements per block
+    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE'] * 4),)
+    
+    if fast_math:
+        swish_fast_kernel[grid](
+            x, output, n_elements,
+            BLOCK_SIZE=BLOCK_SIZE,
+            USE_FAST_MATH=True,
+            num_warps=8,  # 256 threads / 32 = 8 warps
+            num_stages=4
+        )
+    else:
+        swish_kernel[grid](
+            x, output, n_elements,
+            BLOCK_SIZE=BLOCK_SIZE,
+            num_warps=8,
+            num_stages=4
+        )
+    
+    return output
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs Swish activation using optimized Triton kernels.
+    """
+    def __init__(self, use_fast_math: bool = False):
+        super(ModelNew, self).__init__()
+        self.use_fast_math = use_fast_math
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies Swish activation using optimized Triton kernel.
+        
+        Args:
+            x (torch.Tensor): Input tensor of any shape.
+            
+        Returns:
+            torch.Tensor: Output tensor with Swish applied, same shape as input.
+        """
+        # Ensure contiguous memory layout
+        if not x.is_contiguous():
+            x = x.contiguous()
+        
+        return triton_swish(x, self.use_fast_math)
+```
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+3. Learn from previous repair attempts to avoid repeating the same mistakes
+
+```python
+# <corrected code>
+```

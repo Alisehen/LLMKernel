@@ -1,0 +1,296 @@
+Fix the Triton kernel errors. Generate correct, high-performance code.
+
+Current Error Log:
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 535, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251213_091928_batch_range68to99_openai_deepseek/83_conv_depthwise_2D_square_input_asymmetric_kernel/code/kernel_20251213_110847.py", line 162, in forward
+    return depthwise_conv_heightwise_triton(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251213_091928_batch_range68to99_openai_deepseek/83_conv_depthwise_2D_square_input_asymmetric_kernel/code/kernel_20251213_110847.py", line 110, in depthwise_conv_heightwise_triton
+    depthwise_heightwise_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 347, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 569, in run
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 278, in compile
+    module = src.make_ir(options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 81, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.UnsupportedLanguageConstruct: at 65:12:
+        bias_val = tl.load(b_ptr + c)
+        acc = tl.full((BLOCK_W,), bias_val, tl.float32)
+    else:
+        acc = tl.zeros((BLOCK_W,), dtype=tl.float32)
+
+    base_h = pid_oh * STRIDE_H - PAD_H
+    w_base_ptr = w_ptr + c * stride_w_c
+
+    for kh in range(K_H):
+        in_h = base_h + kh * DIL_H
+        if (in_h < 0) | (in_h >= H):
+            continue
+            ^
+unsupported AST node type: Continue
+
+History Error:
+Previous Repair Attempts (avoid repeating these errors):
+Attempt 1:
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251213_091928_batch_range68to99_openai_deepseek/83_conv_depthwise_2D_square_input_asymmetric_kernel/code/kernel_20251213_110828.py", line 153, in __init__
+    nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+                                            ^^^^
+NameError: name 'math' is not defined
+
+
+
+PyTorch Reference:
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Performs a depthwise 2D convolution with a square input and an asymmetric kernel.
+
+    Args:
+        in_channels (int): Number of channels in the input tensor.
+        kernel_size (int): Size of the convolution kernel.
+        stride (int, optional): Stride of the convolution. Defaults to 1.
+        padding (int, optional): Padding applied to the input. Defaults to 0.
+        dilation (int, optional): Spacing between kernel elements. Defaults to 1.
+        bias (bool, optional): If `True`, adds a learnable bias to the output. Defaults to `False`.
+    """
+    def __init__(self, in_channels: int, kernel_size: int, stride: int = 1, padding: int = 0, dilation: int = 1, bias: bool = False):
+        super(Model, self).__init__()
+        self.conv2d = nn.Conv2d(in_channels, in_channels, kernel_size=(kernel_size, 1), stride=stride, padding=padding, dilation=dilation, groups=in_channels, bias=bias)
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Performs the depthwise 2D convolution.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_channels, height, width).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, in_channels, height_out, width_out).
+        """
+        return self.conv2d(x)
+
+# Test code
+batch_size = 64
+in_channels = 8
+kernel_size = 3
+width = 512
+height = 512
+stride = 1
+padding = 0
+dilation = 1
+
+def get_inputs():
+    x = torch.rand(batch_size, in_channels, height, width)
+    return [x]
+
+def get_init_inputs():
+    return [in_channels, kernel_size, stride, padding, dilation]
+```
+
+Broken Code:
+```python
+import math
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def depthwise_heightwise_kernel(
+    x_ptr,
+    w_ptr,
+    b_ptr,
+    y_ptr,
+    N,
+    C,
+    H,
+    W,
+    K_H,
+    STRIDE_H,
+    STRIDE_W,
+    PAD_H,
+    PAD_W,
+    DIL_H,
+    DIL_W,
+    H_OUT,
+    W_OUT,
+    stride_in_n,
+    stride_in_c,
+    stride_in_h,
+    stride_in_w,
+    stride_w_c,
+    stride_w_kh,
+    stride_out_n,
+    stride_out_c,
+    stride_out_h,
+    stride_out_w,
+    HAS_BIAS: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+):
+    pid_nc = tl.program_id(axis=0)
+    pid_oh = tl.program_id(axis=1)
+    pid_ow = tl.program_id(axis=2)
+
+    NC = N * C
+    if pid_nc >= NC or pid_oh >= H_OUT:
+        return
+
+    n = pid_nc // C
+    c = pid_nc % C
+
+    ow_start = pid_ow * BLOCK_W
+    ow_offsets = ow_start + tl.arange(0, BLOCK_W)
+    mask_ow = ow_offsets < W_OUT
+
+    base_in_ptr = x_ptr + n * stride_in_n + c * stride_in_c
+    base_out_ptr = y_ptr + n * stride_out_n + c * stride_out_c
+
+    in_w = ow_offsets * STRIDE_W - PAD_W
+    valid_w = (in_w >= 0) & (in_w < W)
+
+    if HAS_BIAS:
+        bias_val = tl.load(b_ptr + c)
+        acc = tl.full((BLOCK_W,), bias_val, tl.float32)
+    else:
+        acc = tl.zeros((BLOCK_W,), dtype=tl.float32)
+
+    base_h = pid_oh * STRIDE_H - PAD_H
+    w_base_ptr = w_ptr + c * stride_w_c
+
+    for kh in range(K_H):
+        in_h = base_h + kh * DIL_H
+        if (in_h < 0) | (in_h >= H):
+            continue
+
+        mask_k = mask_ow & valid_w
+        ptrs = base_in_ptr + in_h * stride_in_h + in_w * stride_in_w
+        vals = tl.load(ptrs, mask=mask_k, other=0.0)
+        w_val = tl.load(w_base_ptr + kh * stride_w_kh)
+        acc += vals * w_val
+
+    out_ptrs = base_out_ptr + pid_oh * stride_out_h + ow_offsets * stride_out_w
+    tl.store(out_ptrs, acc, mask=mask_ow)
+
+
+def depthwise_conv_heightwise_triton(x, weight, bias, stride, padding, dilation):
+    if not x.is_contiguous():
+        x = x.contiguous()
+    if not weight.is_contiguous():
+        weight = weight.contiguous()
+    if bias is not None and not bias.is_contiguous():
+        bias = bias.contiguous()
+
+    stride_h, stride_w = stride
+    pad_h, pad_w = padding
+    dil_h, dil_w = dilation
+
+    N, C, H, W = x.shape
+    K_H = weight.shape[2]
+    K_W = weight.shape[3]
+    assert K_W == 1, "Kernel width must be 1 for this specialized kernel."
+
+    H_OUT = (H + 2 * pad_h - dil_h * (K_H - 1) - 1) // stride_h + 1
+    W_OUT = (W + 2 * pad_w - dil_w * (K_W - 1) - 1) // stride_w + 1
+
+    y = torch.empty((N, C, H_OUT, W_OUT), device=x.device, dtype=x.dtype)
+
+    BLOCK_W = 128
+    grid = (N * C, H_OUT, triton.cdiv(W_OUT, BLOCK_W))
+
+    depthwise_heightwise_kernel[grid](
+        x,
+        weight,
+        bias if bias is not None else weight,  # placeholder, unused when HAS_BIAS=False
+        y,
+        N,
+        C,
+        H,
+        W,
+        K_H,
+        stride_h,
+        stride_w,
+        pad_h,
+        pad_w,
+        dil_h,
+        dil_w,
+        H_OUT,
+        W_OUT,
+        x.stride(0),
+        x.stride(1),
+        x.stride(2),
+        x.stride(3),
+        weight.stride(0),
+        weight.stride(2),
+        y.stride(0),
+        y.stride(1),
+        y.stride(2),
+        y.stride(3),
+        HAS_BIAS=bias is not None,
+        BLOCK_W=BLOCK_W,
+    )
+
+    return y
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels: int, kernel_size: int, stride: int = 1, padding: int = 0, dilation: int = 1, bias: bool = False):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(in_channels, 1, kernel_size, 1))
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(in_channels))
+            fan_in = kernel_size
+            bound = 1 / math.sqrt(fan_in)
+            nn.init.uniform_(self.bias, -bound, bound)
+        else:
+            self.bias = None
+        self.stride = (stride, stride)
+        self.padding = (padding, padding)
+        self.dilation = (dilation, dilation)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return depthwise_conv_heightwise_triton(
+            x,
+            self.weight,
+            self.bias,
+            self.stride,
+            self.padding,
+            self.dilation,
+        )
+```
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+3. Learn from previous repair attempts to avoid repeating the same mistakes
+
+```python
+# <corrected code>
+```

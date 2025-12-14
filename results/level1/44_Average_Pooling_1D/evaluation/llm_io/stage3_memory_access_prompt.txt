@@ -1,0 +1,214 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU
+GPU Name: 4090
+Architecture: Ada Lovelace
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+
+
+[OPTIMIZATION STAGE]
+
+## Current Optimization Stage
+
+Focus: Memory efficiency & latency hiding.
+
+Metrics:
+- dram__throughput.avg.pct_of_peak_sustained_elapsed
+- lts__t_sector_hit_rate.pct
+- smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct (<20%)
+
+Rules:
+- Increase num_stages only if memory stalls are high
+- Do not rewrite access patterns without metric evidence
+- Larger BLOCK_K improves reuse but increases register pressure
+
+Autotune:
+- If unsure, try num_stages ∈ {1,2,3} on kernel
+
+
+
+[CURRENT CODE]
+```python
+# <corrected code>
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_OUT': 64}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_OUT': 128}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_OUT': 256}, num_warps=4, num_stages=2),
+    ],
+    key=['L_out'],
+)
+@triton.jit
+def avg_pool1d_kernel(
+    x_ptr, y_ptr,
+    N, C,
+    L_in, L_out,
+    stride_xn, stride_xc, stride_xl,
+    stride_yn, stride_yc, stride_yl,
+    kernel_size: tl.constexpr,
+    stride: tl.constexpr,
+    padding,
+    inv_kernel_size,  # precomputed 1.0 / kernel_size (fp32)
+    BLOCK_OUT: tl.constexpr,
+):
+    # Program ids:
+    #  - pid_nc over batch/channel rows
+    #  - pid_oh over tiles of output-length
+    pid_nc = tl.program_id(axis=0)
+    pid_oh = tl.program_id(axis=1)
+
+    # Decode (n, c) from flattened index
+    n = pid_nc // C
+    c = pid_nc % C
+
+    # Base pointers for this (n, c) row
+    x_row_ptr = x_ptr + n * stride_xn + c * stride_xc
+    y_row_ptr = y_ptr + n * stride_yn + c * stride_yc
+
+    # Tile of output positions along length dimension
+    block_start = pid_oh * BLOCK_OUT
+    oh_offsets = block_start + tl.arange(0, BLOCK_OUT)
+    mask_out = oh_offsets < L_out
+
+    # Base input index for each output position
+    base_ih = oh_offsets * stride - padding
+
+    # Accumulate in fp32
+    acc = tl.zeros([BLOCK_OUT], dtype=tl.float32)
+
+    # Unrolled kernel window loop
+    for k in tl.static_range(0, kernel_size):
+        ih = base_ih + k  # input indices for this k
+
+        in_bounds = (ih >= 0) & (ih < L_in) & mask_out
+        ih_safe = tl.where(in_bounds, ih, 0)
+
+        ptrs = x_row_ptr + ih_safe * stride_xl
+        vals = tl.load(ptrs, mask=in_bounds, other=0.0)
+        vals = vals.to(tl.float32)
+        acc += vals
+
+    # Multiply by precomputed reciprocal instead of divide
+    out_vals = acc * inv_kernel_size
+
+    # Store results
+    tl.store(
+        y_row_ptr + oh_offsets * stride_yl,
+        out_vals,
+        mask=mask_out,
+    )
+
+
+def triton_avg_pool1d(x: torch.Tensor, kernel_size: int, stride: int, padding: int) -> torch.Tensor:
+    """
+    Triton implementation of 1D average pooling with semantics matching:
+    nn.AvgPool1d(kernel_size, stride=stride, padding=padding, count_include_pad=True).
+    """
+    assert x.is_cuda, "Input must be a CUDA tensor for Triton kernel"
+    assert x.dim() == 3, "Input must have shape (N, C, L)"
+
+    N, C, L_in = x.shape
+
+    # PyTorch AvgPool1d formula (ceil_mode=False)
+    L_out = (L_in + 2 * padding - kernel_size) // stride + 1
+    assert L_out > 0, "Invalid output length computed for AvgPool1d"
+
+    y = torch.empty((N, C, L_out), device=x.device, dtype=x.dtype)
+
+    stride_xn, stride_xc, stride_xl = x.stride()
+    stride_yn, stride_yc, stride_yl = y.stride()
+
+    # Precompute reciprocal of kernel_size in fp32 for faster multiply
+    inv_kernel_size = float(1.0 / kernel_size)
+
+    # Grid over (N * C) rows and tiles along output length
+    grid = lambda meta: (
+        N * C,
+        triton.cdiv(L_out, meta['BLOCK_OUT']),
+    )
+
+    avg_pool1d_kernel[grid](
+        x,
+        y,
+        N,
+        C,
+        L_in,
+        L_out,
+        stride_xn,
+        stride_xc,
+        stride_xl,
+        stride_yn,
+        stride_yc,
+        stride_yl,
+        kernel_size=kernel_size,
+        stride=stride,
+        padding=padding,
+        inv_kernel_size=inv_kernel_size,
+    )
+
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    1D Average Pooling using an optimized Triton kernel.
+    Semantics match torch.nn.AvgPool1d with count_include_pad=True.
+    """
+
+    def __init__(self, kernel_size: int, stride: int = 1, padding: int = 0):
+        super().__init__()
+        self.kernel_size = int(kernel_size)
+        self.stride = int(stride)
+        self.padding = int(padding)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_avg_pool1d(
+            x, self.kernel_size, self.stride, self.padding
+        )
+```
+
+[NCU PROFILING METRICS]
+{
+  "avg_pool1d_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 40.67,
+    "launch__grid_size": 2105344,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 89.93,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 82.87,
+    "lts__t_sector_hit_rate.pct": 54.74
+  }
+}
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

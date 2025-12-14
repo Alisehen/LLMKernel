@@ -1,0 +1,169 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def maxpool1d_forward_kernel(
+    x_ptr,
+    output_ptr,
+    B,
+    C,
+    L_in,
+    L_out,
+    kernel_size: tl.constexpr,
+    stride: tl.constexpr,
+    padding: tl.constexpr,
+    dilation: tl.constexpr,
+    BLOCK_SIZE_IN: tl.constexpr,
+    BLOCK_SIZE_C: tl.constexpr,
+):
+    # 2D grid: (C * triton.cdiv(L_out, BLOCK_SIZE_IN), B)
+    pid_c_out = tl.program_id(0)
+    pid_b = tl.program_id(1)
+    
+    # Decompose first dimension
+    grid_c = (C + BLOCK_SIZE_C - 1) // BLOCK_SIZE_C
+    grid_out = (L_out + BLOCK_SIZE_IN - 1) // BLOCK_SIZE_IN
+    pid_c_block = pid_c_out // grid_out
+    pid_out_block = pid_c_out % grid_out
+    
+    # Channel offsets
+    c_start = pid_c_block * BLOCK_SIZE_C
+    c_offsets = c_start + tl.arange(0, BLOCK_SIZE_C)
+    c_mask = c_offsets < C
+    
+    # Output position offsets
+    out_start = pid_out_block * BLOCK_SIZE_IN
+    out_offsets = out_start + tl.arange(0, BLOCK_SIZE_IN)
+    out_mask = out_offsets < L_out
+    
+    # Initialize max values
+    max_vals = tl.full((BLOCK_SIZE_C, BLOCK_SIZE_IN), float('-inf'), dtype=tl.float32)
+    
+    # Process kernel positions sequentially (unrolled at compile time)
+    # Use static for loop with constexpr kernel_size
+    for k_idx in tl.static_range(kernel_size):
+        # Calculate input positions for all output positions in block
+        input_positions = out_offsets * stride - padding + k_idx * dilation
+        
+        # Check input bounds
+        input_valid = (input_positions >= 0) & (input_positions < L_in)
+        
+        # Create 2D mask for loading: (BLOCK_SIZE_C, BLOCK_SIZE_IN)
+        load_mask_2d = out_mask[None, :] & input_valid[None, :] & c_mask[:, None]
+        
+        # Compute offsets for all channels and positions
+        channel_offsets = c_offsets[:, None] * L_in  # (BLOCK_SIZE_C, 1)
+        batch_offset = pid_b * C * L_in
+        input_positions_2d = input_positions[None, :]  # (1, BLOCK_SIZE_IN)
+        offsets_2d = batch_offset + channel_offsets + input_positions_2d
+        
+        # Load values for all channels and positions
+        values = tl.load(
+            x_ptr + offsets_2d,
+            mask=load_mask_2d,
+            other=float('-inf')
+        )
+        
+        # Update max values
+        max_vals = tl.maximum(max_vals, values)
+    
+    # Store results
+    store_mask = out_mask[None, :] & c_mask[:, None]
+    output_offset_base = pid_b * C * L_out + c_offsets[:, None] * L_out + out_offsets[None, :]
+    tl.store(output_ptr + output_offset_base, max_vals, mask=store_mask)
+
+
+def triton_maxpool1d(
+    x: torch.Tensor,
+    kernel_size: int,
+    stride: int = None,
+    padding: int = 0,
+    dilation: int = 1,
+    return_indices: bool = False
+) -> torch.Tensor:
+    """
+    Max Pooling 1D implemented with Triton kernels.
+    
+    Args:
+        x: Input tensor of shape (B, C, L_in)
+        kernel_size: Size of the window to take max over
+        stride: Stride of the window (defaults to kernel_size)
+        padding: Zero padding added to both sides
+        dilation: Spacing between kernel elements
+        return_indices: Whether to return indices (not implemented)
+    
+    Returns:
+        Output tensor of shape (B, C, L_out)
+    """
+    if stride is None:
+        stride = kernel_size
+    
+    B, C, L_in = x.shape
+    
+    # Calculate output length
+    L_out = (L_in + 2 * padding - dilation * (kernel_size - 1) - 1) // stride + 1
+    
+    # Create output tensor
+    output = torch.empty(B, C, L_out, device=x.device, dtype=x.dtype)
+    
+    # Choose optimal block sizes
+    BLOCK_SIZE_IN = 64 if L_out >= 64 else 32
+    BLOCK_SIZE_C = 32 if C >= 32 else 16
+    
+    # Launch kernel
+    grid_c = (C + BLOCK_SIZE_C - 1) // BLOCK_SIZE_C
+    grid_out = (L_out + BLOCK_SIZE_IN - 1) // BLOCK_SIZE_IN
+    
+    grid = (grid_c * grid_out, B)
+    
+    maxpool1d_forward_kernel[grid](
+        x,
+        output,
+        B,
+        C,
+        L_in,
+        L_out,
+        kernel_size=kernel_size,
+        stride=stride,
+        padding=padding,
+        dilation=dilation,
+        BLOCK_SIZE_IN=BLOCK_SIZE_IN,
+        BLOCK_SIZE_C=BLOCK_SIZE_C,
+    )
+    
+    return output
+
+
+class ModelNew(nn.Module):
+    """
+    Simple model that performs Max Pooling 1D with optimized Triton kernels.
+    """
+    def __init__(self, kernel_size: int, stride: int = None, padding: int = 0, dilation: int = 1, return_indices: bool = False):
+        super(ModelNew, self).__init__()
+        self.kernel_size = kernel_size
+        self.stride = stride if stride is not None else kernel_size
+        self.padding = padding
+        self.dilation = dilation
+        self.return_indices = return_indices
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies Max Pooling 1D to the input tensor using Triton kernels.
+        
+        Args:
+            x: Input tensor of shape (batch_size, num_features, sequence_length).
+        
+        Returns:
+            Output tensor with Max Pooling 1D applied.
+        """
+        return triton_maxpool1d(
+            x,
+            kernel_size=self.kernel_size,
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation,
+            return_indices=self.return_indices
+        )

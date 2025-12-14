@@ -1,0 +1,167 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 256}, num_warps=8, num_stages=1),
+        triton.Config({'BLOCK_SIZE': 256}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 256}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 512}, num_warps=16, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 512}, num_warps=16, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 512}, num_warps=16, num_stages=4),
+    ],
+    key=['n_elements'],
+)
+@triton.jit
+def leaky_relu_kernel_optimized(
+    x_ptr,
+    output_ptr,
+    negative_slope,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Optimized LeakyReLU kernel with fine-tuned warp/stage configs."""
+    pid = tl.program_id(axis=0)
+    
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    output = tl.where(x >= 0, x, x * negative_slope)
+    
+    tl.store(output_ptr + offsets, output, mask=mask)
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32}, num_warps=32, num_stages=2),
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32}, num_warps=32, num_stages=3),
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32}, num_warps=32, num_stages=4),
+        triton.Config({'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_N': 64}, num_warps=32, num_stages=2),
+        triton.Config({'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_N': 64}, num_warps=32, num_stages=3),
+        triton.Config({'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_N': 64}, num_warps=32, num_stages=4),
+    ],
+    key=['M', 'N'],
+)
+@triton.jit
+def leaky_relu_kernel_2d_optimized(
+    x_ptr,
+    output_ptr,
+    negative_slope,
+    M, N,
+    stride_m, stride_n,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+):
+    """Optimized 2D LeakyReLU kernel with tuned warp/stage configs."""
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+    
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+    
+    x_ptrs = x_ptr + offs_m[:, None] * stride_m + offs_n[None, :] * stride_n
+    mask = mask_m[:, None] & mask_n[None, :]
+    
+    x = tl.load(x_ptrs, mask=mask, other=0.0)
+    output = tl.where(x >= 0, x, x * negative_slope)
+    
+    tl.store(x_ptrs, output, mask=mask)
+
+def triton_leaky_relu_optimized(x: torch.Tensor, negative_slope: float = 0.01) -> torch.Tensor:
+    """High-performance LeakyReLU implementation with optimized grid layout."""
+    output = torch.empty_like(x)
+    
+    if x.ndim > 2:
+        original_shape = x.shape
+        if x.ndim == 3:
+            x_2d = x.view(-1, x.shape[-1])
+            output_2d = output.view(-1, x.shape[-1])
+            M, N = x_2d.shape
+            
+            grid = lambda META: (
+                triton.cdiv(M, META['BLOCK_SIZE_M']),
+                triton.cdiv(N, META['BLOCK_SIZE_N']),
+            )
+            
+            leaky_relu_kernel_2d_optimized[grid](
+                x_2d, output_2d, negative_slope,
+                M, N,
+                x_2d.stride(0), x_2d.stride(1)
+            )
+            return output
+        elif x.ndim == 4:
+            x_3d = x.view(-1, x.shape[-2], x.shape[-1])
+            output_3d = output.view(-1, x.shape[-2], x.shape[-1])
+            
+            batch_size = x_3d.shape[0]
+            M, N = x_3d.shape[1], x_3d.shape[2]
+            
+            grid = lambda META: (
+                batch_size,
+                triton.cdiv(M, META['BLOCK_SIZE_M']),
+                triton.cdiv(N, META['BLOCK_SIZE_N']),
+            )
+            
+            leaky_relu_kernel_2d_optimized[grid](
+                x_3d, output_3d, negative_slope,
+                M, N,
+                x_3d.stride(1), x_3d.stride(2)
+            )
+            return output
+    
+    if x.ndim == 1 or (x.ndim == 2 and x.is_contiguous()):
+        n_elements = x.numel()
+        
+        grid = lambda META: (triton.cdiv(n_elements, META['BLOCK_SIZE']),)
+        
+        leaky_relu_kernel_optimized[grid](
+            x, output, negative_slope, n_elements
+        )
+    else:
+        M, N = x.shape[-2], x.shape[-1]
+        
+        grid = lambda META: (
+            triton.cdiv(M, META['BLOCK_SIZE_M']),
+            triton.cdiv(N, META['BLOCK_SIZE_N']),
+        )
+        
+        leaky_relu_kernel_2d_optimized[grid](
+            x, output, negative_slope,
+            M, N,
+            x.stride(-2) if x.ndim > 1 else 1,
+            x.stride(-1)
+        )
+    
+    return output
+
+class ModelNew(nn.Module):
+    """
+    High-performance LeakyReLU model using optimized Triton kernels.
+    """
+    def __init__(self, negative_slope: float = 0.01):
+        """
+        Initializes the LeakyReLU module.
+
+        Args:
+            negative_slope (float, optional): The negative slope of the activation function. Defaults to 0.01.
+        """
+        super(ModelNew, self).__init__()
+        self.negative_slope = negative_slope
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies LeakyReLU activation to the input tensor using optimized Triton kernel.
+
+        Args:
+            x (torch.Tensor): Input tensor of any shape.
+
+        Returns:
+            torch.Tensor: Output tensor with LeakyReLU applied, same shape as input.
+        """
+        return triton_leaky_relu_optimized(x, negative_slope=self.negative_slope)

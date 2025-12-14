@@ -1,0 +1,249 @@
+Fix the Triton kernel errors. Generate correct, high-performance code.
+
+Current Error Log:
+Traceback (most recent call last):
+  File "/home/hyc/miniconda3/envs/hyc/lib/python3.11/site-packages/triton/language/core.py", line 43, in wrapper
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/hyc/lib/python3.11/site-packages/triton/language/core.py", line 1638, in arange
+    return _semantic.arange(start, end)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/hyc/lib/python3.11/site-packages/triton/language/semantic.py", line 574, in arange
+    raise ValueError("arange's arguments must be of type tl.constexpr")
+ValueError: arange's arguments must be of type tl.constexpr
+
+The above exception was the direct cause of the following exception:
+
+triton.compiler.errors.CompilationError: at 14:28:
+    targets_ptr,
+    output_ptr,
+    n_elements,
+    beta: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    USE_TENSOR_CORES: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+
+    # Each block processes multiple elements for better utilization
+    block_start = pid * BLOCK_SIZE * 4  # Process 4x more elements per block
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+                            ^
+arange's arguments must be of type tl.constexpr
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 533, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 131, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/hyc/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/hyc/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251212_130526_batch_range90to100_deepseek_deepseek/96_HuberLoss/code/kernel_20251212_134014.py", line 112, in forward
+    return triton_smooth_l1_loss(predictions, targets)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251212_130526_batch_range90to100_deepseek_deepseek/96_HuberLoss/code/kernel_20251212_134014.py", line 94, in triton_smooth_l1_loss
+    kernel_wrapper[grid](
+  File "/home/hyc/miniconda3/envs/hyc/lib/python3.11/site-packages/triton/runtime/jit.py", line 419, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/hyc/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 238, in run
+    benchmark()
+  File "/home/hyc/miniconda3/envs/hyc/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 227, in benchmark
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/hyc/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 227, in <dictcomp>
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/hyc/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 162, in _bench
+    return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/hyc/lib/python3.11/site-packages/triton/testing.py", line 149, in do_bench
+    fn()
+  File "/home/hyc/miniconda3/envs/hyc/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 148, in kernel_call
+    self.fn.run(
+  File "/home/hyc/miniconda3/envs/hyc/lib/python3.11/site-packages/triton/runtime/jit.py", line 733, in run
+    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/hyc/lib/python3.11/site-packages/triton/runtime/jit.py", line 861, in _do_compile
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/hyc/lib/python3.11/site-packages/triton/compiler/compiler.py", line 300, in compile
+    module = src.make_ir(target, options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/hyc/lib/python3.11/site-packages/triton/compiler/compiler.py", line 80, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 2:4:
+def kernel_wrapper(predictions_ptr, targets_ptr, output_ptr, n_elements, beta, BLOCK_SIZE, USE_TENSOR_CORES):
+    smooth_l1_loss_kernel(predictions_ptr, targets_ptr, output_ptr, n_elements, beta, BLOCK_SIZE, USE_TENSOR_CORES)
+    ^
+
+History Error:
+None
+
+
+PyTorch Reference:
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    A model that computes Smooth L1 (Huber) Loss for regression tasks.
+
+    Parameters:
+        None
+    """
+    def __init__(self):
+        super(Model, self).__init__()
+
+    def forward(self, predictions, targets):
+        return torch.nn.functional.smooth_l1_loss(predictions, targets)
+
+batch_size = 32768
+input_shape = (32768,)
+dim = 1
+
+def get_inputs():
+    scale = torch.rand(())
+    return [torch.rand(batch_size, *input_shape)*scale, torch.rand(batch_size, *input_shape)]
+
+def get_init_inputs():
+    return []
+```
+
+Broken Code:
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def smooth_l1_loss_kernel(
+    predictions_ptr,
+    targets_ptr,
+    output_ptr,
+    n_elements,
+    beta: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    USE_TENSOR_CORES: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    
+    # Each block processes multiple elements for better utilization
+    block_start = pid * BLOCK_SIZE * 4  # Process 4x more elements per block
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    
+    # Use tensor cores for FP16/BF16 if available
+    if USE_TENSOR_CORES:
+        # Load in FP16/BF16 for tensor cores
+        preds = tl.load(predictions_ptr + offsets, mask=offsets < n_elements, other=0.0).to(tl.float32)
+        targets = tl.load(targets_ptr + offsets, mask=offsets < n_elements, other=0.0).to(tl.float32)
+    else:
+        preds = tl.load(predictions_ptr + offsets, mask=offsets < n_elements, other=0.0)
+        targets = tl.load(targets_ptr + offsets, mask=offsets < n_elements, other=0.0)
+    
+    diff = preds - targets
+    abs_diff = tl.abs(diff)
+    
+    # Smooth L1 Loss: 0.5 * x^2 / beta if |x| < beta else |x| - 0.5 * beta
+    is_small = abs_diff < beta
+    smooth_loss = 0.5 * diff * diff / beta
+    linear_loss = abs_diff - 0.5 * beta
+    
+    loss = tl.where(is_small, smooth_loss, linear_loss)
+    
+    # Efficient reduction within warp first, then across warps
+    warp_sum = tl.sum(loss, axis=0)
+    block_sum = tl.sum(warp_sum)
+    
+    # Store block sum to global memory for final reduction
+    if pid == 0:
+        tl.store(output_ptr, block_sum / n_elements)
+    else:
+        # Use atomic add for other blocks
+        tl.atomic_add(output_ptr, block_sum / n_elements)
+
+def triton_smooth_l1_loss(predictions: torch.Tensor, targets: torch.Tensor, beta: float = 1.0) -> torch.Tensor:
+    assert predictions.shape == targets.shape, "Predictions and targets must have same shape"
+    
+    # Ensure tensors are contiguous
+    predictions = predictions.contiguous()
+    targets = targets.contiguous()
+    
+    n_elements = predictions.numel()
+    
+    # Choose optimal configuration based on tensor size and dtype
+    dtype = predictions.dtype
+    
+    # Autotune configurations
+    configs = [
+        triton.Config({'BLOCK_SIZE': 256, 'USE_TENSOR_CORES': False}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 512, 'USE_TENSOR_CORES': False}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 1024, 'USE_TENSOR_CORES': False}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 2048, 'USE_TENSOR_CORES': False}, num_warps=8, num_stages=3),
+    ]
+    
+    # Add tensor core configurations for supported dtypes
+    if dtype in [torch.float16, torch.bfloat16]:
+        configs.extend([
+            triton.Config({'BLOCK_SIZE': 512, 'USE_TENSOR_CORES': True}, num_warps=4, num_stages=3),
+            triton.Config({'BLOCK_SIZE': 1024, 'USE_TENSOR_CORES': True}, num_warps=8, num_stages=3),
+        ])
+    
+    # Calculate optimal grid size - significantly reduce number of blocks
+    # Process 4x more elements per block to reduce grid size
+    @triton.autotune(configs=configs, key=['n_elements', 'dtype'])
+    @triton.jit
+    def kernel_wrapper(predictions_ptr, targets_ptr, output_ptr, n_elements, beta, BLOCK_SIZE, USE_TENSOR_CORES):
+        smooth_l1_loss_kernel(predictions_ptr, targets_ptr, output_ptr, n_elements, beta, BLOCK_SIZE, USE_TENSOR_CORES)
+    
+    # Allocate output tensor
+    device = predictions.device
+    output = torch.zeros(1, device=device, dtype=torch.float32)
+    
+    # Launch kernel with optimized grid size
+    # Reduce grid size by processing more elements per block
+    grid = lambda META: (triton.cdiv(n_elements, META['BLOCK_SIZE'] * 4),)
+    
+    kernel_wrapper[grid](
+        predictions,
+        targets,
+        output,
+        n_elements,
+        beta=beta,
+    )
+    
+    return output
+
+class ModelNew(nn.Module):
+    """
+    A model that computes Smooth L1 (Huber) Loss for regression tasks.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+
+    def forward(self, predictions, targets):
+        return triton_smooth_l1_loss(predictions, targets)
+```
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+3. Learn from previous repair attempts to avoid repeating the same mistakes
+
+```python
+# <corrected code>
+```

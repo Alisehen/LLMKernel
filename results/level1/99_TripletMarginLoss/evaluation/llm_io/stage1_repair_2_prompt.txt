@@ -1,0 +1,294 @@
+Fix the Triton kernel errors. Generate correct, high-performance code.
+
+Current Error Log:
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 535, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251212_170115_batch_range70to100_deepseek_deepseek/99_TripletMarginLoss/code/kernel_20251213_034234.py", line 174, in forward
+    return triton_triplet_margin_loss(anchor, positive, negative, self.margin)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251212_170115_batch_range70to100_deepseek_deepseek/99_TripletMarginLoss/code/kernel_20251213_034234.py", line 137, in triton_triplet_margin_loss
+    autotuned_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 347, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 192, in run
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 192, in <dictcomp>
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 170, in _bench
+    return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/testing.py", line 145, in do_bench
+    fn()
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 156, in kernel_call
+    self.fn.run(
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 569, in run
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 278, in compile
+    module = src.make_ir(options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 81, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 55:11:
+    neg_diff = anchor - negative
+    pos_sq = tl.where(mask, pos_diff * pos_diff, 0.0)
+    neg_sq = tl.where(mask, neg_diff * neg_diff, 0.0)
+
+    # Reduce across feature dimension within the thread block
+    # Each thread reduces its column of the block
+    pos_reduced = tl.sum(pos_sq, axis=1)
+    neg_reduced = tl.sum(neg_sq, axis=1)
+
+    # Atomic add to global memory for final reduction
+    for i in range(BLOCK_BATCH):
+        if batch_offsets[i] < batch_size:
+           ^
+ValueError('Did you forget to add @triton.jit ? (`_builder` argument must be provided outside of JIT functions.)')
+
+History Error:
+Previous Repair Attempts (avoid repeating these errors):
+Attempt 1:
+     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 378, in decorator
+    return Autotuner(fn, fn.arg_names, configs, key, reset_to_zero, restore_value, pre_hook=pre_hook,
+                         ^^^^^^^^^^^^
+AttributeError: 'function' object has no attribute 'arg_names'
+
+
+
+PyTorch Reference:
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    A model that computes Triplet Margin Loss for metric learning tasks.
+
+    Parameters:
+        margin (float): The margin between the positive and negative samples.
+    """
+    def __init__(self, margin=1.0):
+        super(Model, self).__init__()
+        self.loss_fn = torch.nn.TripletMarginLoss(margin=margin)
+
+    def forward(self, anchor, positive, negative):
+        return self.loss_fn(anchor, positive, negative)
+
+batch_size = 32768
+input_shape = (8192,)
+dim = 1
+
+def get_inputs():
+    scale = torch.rand(())
+    return [torch.rand(batch_size, *input_shape)*scale, torch.rand(batch_size, *input_shape), torch.rand(batch_size, *input_shape)]
+    
+def get_init_inputs():
+    return [1.0]  # Default margin
+```
+
+Broken Code:
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def triplet_margin_loss_kernel_2d(
+    anchor_ptr,
+    positive_ptr,
+    negative_ptr,
+    loss_ptr,
+    margin,
+    batch_size,
+    feature_size,
+    stride_batch,
+    stride_feat,
+    BLOCK_BATCH: tl.constexpr,
+    BLOCK_FEAT: tl.constexpr,
+):
+    """
+    Optimized 2D kernel for Triplet Margin Loss.
+    Each thread block processes a tile of [BLOCK_BATCH x BLOCK_FEAT] elements.
+    """
+    pid_batch = tl.program_id(axis=0)
+    pid_feat = tl.program_id(axis=1)
+    
+    # Create offsets for the batch dimension
+    batch_offsets = pid_batch * BLOCK_BATCH + tl.arange(0, BLOCK_BATCH)
+    batch_mask = batch_offsets < batch_size
+    
+    # Create offsets for the feature dimension
+    feat_offsets = pid_feat * BLOCK_FEAT + tl.arange(0, BLOCK_FEAT)
+    feat_mask = feat_offsets < feature_size
+    
+    # Combine masks for 2D tiling
+    mask = batch_mask[:, None] & feat_mask[None, :]
+    
+    # Calculate base pointers for the current tile
+    anchor_ptrs = anchor_ptr + batch_offsets[:, None] * stride_batch + feat_offsets[None, :]
+    positive_ptrs = positive_ptr + batch_offsets[:, None] * stride_batch + feat_offsets[None, :]
+    negative_ptrs = negative_ptr + batch_offsets[:, None] * stride_batch + feat_offsets[None, :]
+    
+    # Load data in 2D tiles
+    anchor = tl.load(anchor_ptrs, mask=mask, other=0.0)
+    positive = tl.load(positive_ptrs, mask=mask, other=0.0)
+    negative = tl.load(negative_ptrs, mask=mask, other=0.0)
+    
+    # Compute squared differences
+    pos_diff = anchor - positive
+    neg_diff = anchor - negative
+    pos_sq = tl.where(mask, pos_diff * pos_diff, 0.0)
+    neg_sq = tl.where(mask, neg_diff * neg_diff, 0.0)
+    
+    # Reduce across feature dimension within the thread block
+    # Each thread reduces its column of the block
+    pos_reduced = tl.sum(pos_sq, axis=1)
+    neg_reduced = tl.sum(neg_sq, axis=1)
+    
+    # Atomic add to global memory for final reduction
+    for i in range(BLOCK_BATCH):
+        if batch_offsets[i] < batch_size:
+            pos_ptr = loss_ptr + batch_offsets[i] * 2
+            neg_ptr = loss_ptr + batch_offsets[i] * 2 + 1
+            tl.atomic_add(pos_ptr, pos_reduced[i])
+            tl.atomic_add(neg_ptr, neg_reduced[i])
+
+@triton.jit
+def triplet_finalize_kernel(
+    sums_ptr,
+    loss_ptr,
+    margin,
+    batch_size,
+    epsilon: tl.constexpr,
+):
+    """
+    Finalize kernel to compute distances and loss from accumulated sums.
+    """
+    pid = tl.program_id(axis=0)
+    
+    if pid >= batch_size:
+        return
+    
+    # Load accumulated sums
+    pos_sum = tl.load(sums_ptr + pid * 2)
+    neg_sum = tl.load(sums_ptr + pid * 2 + 1)
+    
+    # Compute L2 distances with epsilon for numerical stability
+    pos_dist = tl.sqrt(pos_sum + epsilon)
+    neg_dist = tl.sqrt(neg_sum + epsilon)
+    
+    # Compute final triplet loss
+    loss_val = tl.maximum(pos_dist - neg_dist + margin, 0.0)
+    tl.store(loss_ptr + pid, loss_val)
+
+def triton_triplet_margin_loss(
+    anchor: torch.Tensor,
+    positive: torch.Tensor,
+    negative: torch.Tensor,
+    margin: float = 1.0
+) -> torch.Tensor:
+    """
+    Compute Triplet Margin Loss using optimized Triton kernels.
+    """
+    assert anchor.shape == positive.shape == negative.shape
+    assert anchor.is_cuda and positive.is_cuda and negative.is_cuda
+    
+    batch_size, feature_size = anchor.shape
+    
+    # Temporary buffer for accumulated sums (pos and neg for each sample)
+    sums = torch.zeros(batch_size * 2, device=anchor.device, dtype=torch.float32)
+    
+    # Allocate output for per-sample losses
+    sample_losses = torch.zeros(batch_size, device=anchor.device, dtype=anchor.dtype)
+    
+    # Define autotune configurations
+    configs = [
+        triton.Config({'BLOCK_BATCH': 64, 'BLOCK_FEAT': 256}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_BATCH': 32, 'BLOCK_FEAT': 512}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_BATCH': 16, 'BLOCK_FEAT': 1024}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_BATCH': 128, 'BLOCK_FEAT': 128}, num_warps=8, num_stages=3),
+    ]
+    
+    # Autotuned kernel launch function
+    def grid(meta):
+        return (
+            triton.cdiv(batch_size, meta['BLOCK_BATCH']),
+            triton.cdiv(feature_size, meta['BLOCK_FEAT'])
+        )
+    
+    # Create the autotuned kernel
+    autotuned_kernel = triton.autotune(
+        configs=configs,
+        key=['batch_size', 'feature_size']
+    )(triplet_margin_loss_kernel_2d)
+    
+    # Launch the autotuned kernel to compute sums
+    autotuned_kernel[grid](
+        anchor,
+        positive,
+        negative,
+        sums,
+        margin,
+        batch_size,
+        feature_size,
+        anchor.stride(0),
+        anchor.stride(1),
+    )
+    
+    # Launch finalization kernel
+    grid_final = (triton.cdiv(batch_size, 256),)
+    triplet_finalize_kernel[grid_final](
+        sums,
+        sample_losses,
+        margin,
+        batch_size,
+        epsilon=1e-8,
+    )
+    
+    # Average across batch
+    return sample_losses.mean()
+
+class ModelNew(nn.Module):
+    """
+    A model that computes Triplet Margin Loss using optimized Triton kernels.
+    
+    Parameters:
+        margin (float): The margin between the positive and negative samples.
+    """
+    def __init__(self, margin: float = 1.0):
+        super(ModelNew, self).__init__()
+        self.margin = margin
+
+    def forward(self, anchor: torch.Tensor, positive: torch.Tensor, negative: torch.Tensor) -> torch.Tensor:
+        return triton_triplet_margin_loss(anchor, positive, negative, self.margin)
+```
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+3. Learn from previous repair attempts to avoid repeating the same mistakes
+
+```python
+# <corrected code>
+```

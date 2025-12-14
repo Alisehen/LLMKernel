@@ -1,0 +1,78 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def softsign_kernel(
+    x_ptr,
+    output_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Optimized Softsign activation kernel.
+    Uses direct computation: x / (1 + |x|) for maximum performance.
+    """
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    
+    # Load input with mask
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    
+    # Direct computation: x / (1 + |x|)
+    # This allows the compiler to optimize the operation pattern
+    output = tl.math.fdiv(x, 1.0 + tl.abs(x))
+    
+    # Store result
+    tl.store(output_ptr + offsets, output, mask=mask)
+
+
+def triton_softsign(x: torch.Tensor) -> torch.Tensor:
+    """
+    Triton wrapper for Softsign activation with optimized launch configuration.
+    """
+    output = torch.empty_like(x)
+    n_elements = output.numel()
+    
+    # Use a fixed block size for simplicity and good performance
+    # For large tensors, 1024 is typically optimal
+    BLOCK_SIZE = 1024
+    
+    # Calculate grid size
+    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
+    
+    # Launch optimized kernel with appropriate config
+    softsign_kernel[grid](
+        x, output, n_elements,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=BLOCK_SIZE // 32
+    )
+    
+    return output
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs Softsign activation using autotuned Triton kernels.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies optimized Softsign activation to the input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor of any shape.
+
+        Returns:
+            torch.Tensor: Output tensor with Softsign applied, same shape as input.
+        """
+        # Use optimized Triton kernel
+        return triton_softsign(x)
+```

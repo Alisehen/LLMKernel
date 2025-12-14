@@ -1,0 +1,247 @@
+Fix the Triton kernel errors. Generate correct, high-performance code.
+
+Current Error Log:
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 535, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251212_170115_batch_range70to100_deepseek_deepseek/94_MSELoss/code/kernel_20251213_014707.py", line 142, in forward
+    return triton_mse_fast(predictions, targets)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251212_170115_batch_range70to100_deepseek_deepseek/94_MSELoss/code/kernel_20251213_014707.py", line 106, in triton_mse_fast
+    mse_kernel_fast[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 347, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 569, in run
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 278, in compile
+    module = src.make_ir(options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 81, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 21:4:
+    Optimized MSE kernel with:
+    - Correct warp-level reduction
+    - Vectorized memory access patterns
+    - Proper masking for boundary conditions
+    """
+    pid = tl.program_id(axis=0)
+    tid = tl.arange(0, BLOCK_SIZE)
+
+    # Each thread processes multiple elements
+    thread_sum = tl.zeros((1,), tl.float32)
+
+    for i in range(ELEMENTS_PER_THREAD):
+    ^
+AssertionError("Loop-carried variable thread_sum has initial type <['1'], fp32> but is re-assigned to <['512'], fp32> in loop! Please make sure that the type stays consistent.")
+
+History Error:
+Previous Repair Attempts (avoid repeating these errors):
+Attempt 1:
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 619, in compare_and_bench
+    raise ValueError(
+ValueError: Outputs are not close (atol=0.001, rtol=0.001). max_abs_err=2.806e-01, mean_abs_err=2.806e-01
+
+
+
+PyTorch Reference:
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    A model that computes the Mean Squared Error loss for regression tasks.
+
+    Parameters:
+        None
+    """
+    def __init__(self):
+        super(Model, self).__init__()
+
+    def forward(self, predictions, targets):
+        return torch.mean((predictions - targets) ** 2)
+
+batch_size = 32768
+input_shape = (32768,)
+dim = 1
+
+def get_inputs():
+    scale = torch.rand(())
+    return [torch.rand(batch_size, *input_shape)*scale, torch.rand(batch_size, *input_shape)]
+
+def get_init_inputs():
+    return []
+```
+
+Broken Code:
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def mse_kernel_fast(
+    pred_ptr,
+    target_ptr,
+    output_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+    ELEMENTS_PER_THREAD: tl.constexpr,
+):
+    """
+    Optimized MSE kernel with:
+    - Correct warp-level reduction
+    - Vectorized memory access patterns
+    - Proper masking for boundary conditions
+    """
+    pid = tl.program_id(axis=0)
+    tid = tl.arange(0, BLOCK_SIZE)
+    
+    # Each thread processes multiple elements
+    thread_sum = tl.zeros((1,), tl.float32)
+    
+    for i in range(ELEMENTS_PER_THREAD):
+        # Calculate global offset for this element
+        element_offset = pid * BLOCK_SIZE * ELEMENTS_PER_THREAD + i * BLOCK_SIZE + tid
+        mask = element_offset < n_elements
+        
+        # Load with efficient memory access patterns
+        preds = tl.load(pred_ptr + element_offset, mask=mask, other=0.0)
+        targets = tl.load(target_ptr + element_offset, mask=mask, other=0.0)
+        
+        # Compute squared differences
+        diff = preds - targets
+        squared = diff * diff
+        thread_sum += tl.where(mask, squared, 0.0)
+    
+    # Reduce within warp using proper warp-level reduction
+    warp_sum = tl.sum(thread_sum, axis=0)
+    
+    # Warp leaders store partial sums
+    if tl.program_id(axis=0) % 32 == 0:
+        warp_id = tl.program_id(axis=0) // 32
+        tl.store(output_ptr + warp_id, warp_sum)
+
+@triton.jit
+def reduce_kernel(
+    partial_ptr,
+    output_ptr,
+    n_partials,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Efficient reduction kernel for partial sums using tree reduction.
+    """
+    pid = tl.program_id(axis=0)
+    tid = tl.arange(0, BLOCK_SIZE)
+    
+    offsets = pid * BLOCK_SIZE + tid
+    mask = offsets < n_partials
+    
+    # Load partial sums
+    partials = tl.load(partial_ptr + offsets, mask=mask, other=0.0)
+    
+    # Tree reduction within block
+    block_sum = tl.sum(partials, axis=0)
+    
+    # Store final result
+    if pid == 0:
+        tl.store(output_ptr, block_sum)
+
+def triton_mse_fast(predictions: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    """
+    Optimized MSE computation with correct reduction patterns.
+    """
+    # Ensure tensors are contiguous
+    predictions = predictions.contiguous()
+    targets = targets.contiguous()
+    
+    # Flatten tensors for 1D processing
+    predictions = predictions.view(-1)
+    targets = targets.view(-1)
+    
+    n_elements = predictions.numel()
+    device = predictions.device
+    dtype = predictions.dtype
+    
+    # Configuration optimized for modern GPUs
+    BLOCK_SIZE = 512  # Optimal for better occupancy
+    ELEMENTS_PER_THREAD = 8  # Increase ILP and hide latency
+    
+    # Calculate grid size
+    elements_per_block = BLOCK_SIZE * ELEMENTS_PER_THREAD
+    num_blocks = triton.cdiv(n_elements, elements_per_block)
+    
+    # Allocate partial sums (one per warp)
+    warps_per_block = BLOCK_SIZE // 32
+    total_warps = num_blocks * warps_per_block
+    partials = torch.zeros(total_warps, device=device, dtype=dtype)
+    
+    # Launch main MSE kernel
+    grid = (num_blocks,)
+    mse_kernel_fast[grid](
+        predictions, targets, partials,
+        n_elements,
+        BLOCK_SIZE=BLOCK_SIZE,
+        ELEMENTS_PER_THREAD=ELEMENTS_PER_THREAD,
+        num_warps=warps_per_block,
+    )
+    
+    # Final reduction if needed
+    if total_warps > 1:
+        result = torch.zeros(1, device=device, dtype=dtype)
+        reduce_block_size = 512
+        reduce_grid = (triton.cdiv(total_warps, reduce_block_size),)
+        
+        reduce_kernel[reduce_grid](
+            partials, result,
+            total_warps,
+            BLOCK_SIZE=reduce_block_size,
+            num_warps=reduce_block_size // 32,
+        )
+        total_sum = result.item()
+    else:
+        total_sum = partials.item()
+    
+    # Compute final MSE
+    output = total_sum / n_elements
+    return torch.tensor([output], device=device, dtype=dtype)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that computes Mean Squared Error loss using fast Triton kernels.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+    
+    def forward(self, predictions, targets):
+        return triton_mse_fast(predictions, targets)
+```
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+3. Learn from previous repair attempts to avoid repeating the same mistakes
+
+```python
+# <corrected code>
+```

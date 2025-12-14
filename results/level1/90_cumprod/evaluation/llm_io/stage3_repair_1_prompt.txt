@@ -1,0 +1,221 @@
+Fix the Triton kernel errors. Generate correct, high-performance code.
+
+Current Error Log:
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 535, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251213_091928_batch_range68to99_openai_deepseek/90_cumprod/code/kernel_20251213_114237.py", line 92, in forward
+    return triton_cumprod(x, self.dim)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251213_091928_batch_range68to99_openai_deepseek/90_cumprod/code/kernel_20251213_114237.py", line 76, in triton_cumprod
+    cumprod_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 347, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 192, in run
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 192, in <dictcomp>
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 170, in _bench
+    return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/testing.py", line 145, in do_bench
+    fn()
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 156, in kernel_call
+    self.fn.run(
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 569, in run
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 278, in compile
+    module = src.make_ir(options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 81, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 36:16:
+    running = first
+
+    start = 1
+    while start < axis_len_val:
+        idx = start + tl.arange(0, BLOCK)
+        mask = idx < axis_len_val
+        offs = base_offset + idx * inner_val
+        vals = tl.load(x_ptr + offs, mask=mask, other=1)
+        out_vals = tl.zeros((BLOCK,), dtype=vals.dtype)
+        acc = running
+        for i in range(BLOCK):
+            m = mask[i]
+                ^
+ValueError('Did you forget to add @triton.jit ? (`_builder` argument must be provided outside of JIT functions.)')
+
+History Error:
+None
+
+
+PyTorch Reference:
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    A model that performs a cumulative product operation along a specified dimension.
+
+    Parameters:
+        dim (int): The dimension along which to perform the cumulative product operation.
+    """
+
+    def __init__(self, dim):
+        """
+        Initialize the CumulativeProductModel.
+
+        Args:
+            dim (int): The dimension along which to perform the cumulative product.
+        """
+        super(Model, self).__init__()
+        self.dim = dim
+
+    def forward(self, x):
+        """
+        Forward pass, computing the cumulative product along the specified dimension.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, *input_shape).
+
+        Returns:
+            torch.Tensor: Tensor of the same shape as `x` after applying cumulative product along `dim`.
+        """
+        return torch.cumprod(x, dim=self.dim)
+
+# Define input dimensions and parameters
+batch_size = 32768
+input_shape = (32768,)
+dim = 1
+
+def get_inputs():
+    return [torch.rand(batch_size, *input_shape)]
+
+def get_init_inputs():
+    return [dim]
+```
+
+Broken Code:
+```python
+# import order (torch, torch.nn, triton, triton.language as tl)
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK": 32}, num_warps=2, num_stages=1),
+        triton.Config({"BLOCK": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK": 128}, num_warps=4, num_stages=2),
+    ],
+    key=["axis_len"],
+)
+@triton.jit
+def cumprod_kernel(
+    x_ptr,
+    y_ptr,
+    axis_len,
+    inner,
+    seq_count,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    if pid >= seq_count:
+        return
+
+    inner_val = inner
+    axis_len_val = axis_len
+    if axis_len_val <= 0:
+        return
+
+    seq_stride = axis_len_val * inner_val
+    outer_idx = pid // inner_val
+    inner_idx = pid % inner_val
+    base_offset = outer_idx * seq_stride + inner_idx
+
+    first = tl.load(x_ptr + base_offset)
+    tl.store(y_ptr + base_offset, first)
+    running = first
+
+    start = 1
+    while start < axis_len_val:
+        idx = start + tl.arange(0, BLOCK)
+        mask = idx < axis_len_val
+        offs = base_offset + idx * inner_val
+        vals = tl.load(x_ptr + offs, mask=mask, other=1)
+        out_vals = tl.zeros((BLOCK,), dtype=vals.dtype)
+        acc = running
+        for i in range(BLOCK):
+            m = mask[i]
+            val = vals[i]
+            acc = tl.where(m, acc * val, acc)
+            out_vals[i] = acc
+        tl.store(y_ptr + offs, out_vals, mask=mask)
+        running = acc
+        start += BLOCK
+
+
+def triton_cumprod(x: torch.Tensor, dim: int) -> torch.Tensor:
+    if not x.is_cuda:
+        raise RuntimeError("Input must be a CUDA tensor.")
+    x_contig = x.contiguous()
+    out = torch.empty_like(x_contig)
+
+    dim = dim if dim >= 0 else dim + x_contig.ndim
+    axis_len = x_contig.shape[dim]
+    if axis_len == 0:
+        return out
+
+    inner = x_contig.stride(dim)
+    seq_count = x_contig.numel() // axis_len
+
+    grid = (seq_count,)
+    cumprod_kernel[grid](
+        x_contig,
+        out,
+        axis_len,
+        inner,
+        seq_count,
+    )
+    return out
+
+
+class ModelNew(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x):
+        return triton_cumprod(x, self.dim)
+```
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+3. Learn from previous repair attempts to avoid repeating the same mistakes
+
+```python
+# <corrected code>
+```

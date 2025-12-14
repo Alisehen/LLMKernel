@@ -1,0 +1,367 @@
+Fix the Triton kernel errors. Generate correct, high-performance code.
+
+Current Error Log:
+Traceback (most recent call last):
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 34, in wrapper
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 1490, in full
+    shape = _shape_check_impl(shape)
+            ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 1474, in _shape_check_impl
+    validate_block_shape(shape)
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/_utils.py", line 14, in validate_block_shape
+    raise TypeError(f"Shape element {i} must have type `constexpr[int]`, got `constexpr[{type(d)}]")
+TypeError: Shape element 0 must have type `constexpr[int]`, got `constexpr[<class 'triton.language.core.tensor'>]
+
+The above exception was the direct cause of the following exception:
+
+triton.compiler.errors.CompilationError: at 10:11:
+def zeros(shape, dtype):
+    """
+    Returns a tensor filled with the scalar value 0 for the given :code:`shape` and :code:`dtype`.
+
+    :param shape: Shape of the new array, e.g., (8, 16) or (8, )
+    :type shape: tuple of ints
+    :param dtype: Data-type of the new array, e.g., :code:`tl.float16`
+    :type dtype: DType
+    """
+    return core.full(shape, 0, dtype)
+           ^
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 535, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251212_170115_batch_range70to100_deepseek_deepseek/99_TripletMarginLoss/code/kernel_20251213_033051.py", line 238, in forward
+    return triton_triplet_margin_loss(anchor, positive, negative, self.margin)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251212_170115_batch_range70to100_deepseek_deepseek/99_TripletMarginLoss/code/kernel_20251213_033051.py", line 211, in triton_triplet_margin_loss
+    triplet_margin_loss_kernel_optimized[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 347, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 569, in run
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 278, in compile
+    module = src.make_ir(options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 81, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 50:12:
+    neg_diff = anchor - negative
+    pos_sq = pos_diff * pos_diff
+    neg_sq = neg_diff * neg_diff
+
+    # Reduce within block
+    pos_sum = tl.sum(pos_sq)
+    neg_sum = tl.sum(neg_sq)
+
+    # Use shared memory for per-sample accumulation
+    # Each sample gets 2 slots: pos_sum, neg_sum
+    shmem_size = BLOCK_SIZE_BATCH * 2
+    shmem = tl.zeros((shmem_size,), tl.float32)
+            ^
+
+History Error:
+None
+
+
+PyTorch Reference:
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    A model that computes Triplet Margin Loss for metric learning tasks.
+
+    Parameters:
+        margin (float): The margin between the positive and negative samples.
+    """
+    def __init__(self, margin=1.0):
+        super(Model, self).__init__()
+        self.loss_fn = torch.nn.TripletMarginLoss(margin=margin)
+
+    def forward(self, anchor, positive, negative):
+        return self.loss_fn(anchor, positive, negative)
+
+batch_size = 32768
+input_shape = (8192,)
+dim = 1
+
+def get_inputs():
+    scale = torch.rand(())
+    return [torch.rand(batch_size, *input_shape)*scale, torch.rand(batch_size, *input_shape), torch.rand(batch_size, *input_shape)]
+    
+def get_init_inputs():
+    return [1.0]  # Default margin
+```
+
+Broken Code:
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def triplet_margin_loss_kernel(
+    anchor_ptr,
+    positive_ptr,
+    negative_ptr,
+    loss_ptr,
+    margin,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Compute Triplet Margin Loss directly in a single fused kernel.
+    Loss = max(∥anchor - positive∥² - ∥anchor - negative∥² + margin, 0)
+    """
+    pid = tl.program_id(axis=0)
+    
+    # Start index for this block
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    
+    # Load data for this block
+    anchor = tl.load(anchor_ptr + offsets, mask=mask)
+    positive = tl.load(positive_ptr + offsets, mask=mask)
+    negative = tl.load(negative_ptr + offsets, mask=mask)
+    
+    # Compute squared differences
+    pos_diff = anchor - positive
+    neg_diff = anchor - negative
+    pos_sq = pos_diff * pos_diff
+    neg_sq = neg_diff * neg_diff
+    
+    # Sum within block using efficient horizontal reduction
+    # Reduce within warp first (32 threads)
+    pos_sum = tl.sum(pos_sq, axis=0)
+    neg_sum = tl.sum(neg_sq, axis=0)
+    
+    # Allocate shared memory for block-level reduction
+    # Using static indexing with compile-time constants
+    SHARED_MEM_SIZE = 1024  # Power of 2, less than 99KB
+    shmem_ptr = tl.zeros((SHARED_MEM_SIZE,), tl.float32)
+    
+    # Store block sums in shared memory at fixed positions
+    # Use unique indices to avoid conflicts
+    pos_idx = pid * 2
+    neg_idx = pid * 2 + 1
+    tl.atomic_add(shmem_ptr + pos_idx, pos_sum)
+    tl.atomic_add(shmem_ptr + neg_idx, neg_sum)
+    
+    # Synchronize (implicit in Triton when using atomics across warps)
+    
+    # Only first thread in each block computes final loss
+    if pid == 0:
+        # Load all block sums and compute final distances
+        total_pos = 0.0
+        total_neg = 0.0
+        num_blocks = tl.cdiv(n_elements, BLOCK_SIZE)
+        
+        # Unrolled loop for better performance
+        for i in range(0, num_blocks * 2, 8):  # Process 4 blocks at a time (8 values)
+            idx = i + tl.arange(0, 8)
+            mask = idx < (num_blocks * 2)
+            vals = tl.load(shmem_ptr + idx, mask=mask)
+            
+            # Separate positive and negative sums
+            for j in range(0, 8, 2):
+                if i + j < num_blocks * 2:
+                    total_pos += vals[j]
+                if i + j + 1 < num_blocks * 2:
+                    total_neg += vals[j + 1]
+        
+        # Compute final loss
+        loss = tl.maximum(total_pos - total_neg + margin, 0.0)
+        
+        # Normalize by batch size (inverse already handled in grid)
+        loss = loss / float(num_blocks)
+        tl.store(loss_ptr, loss)
+
+@triton.jit
+def triplet_margin_loss_kernel_optimized(
+    anchor_ptr,
+    positive_ptr,
+    negative_ptr,
+    loss_ptr,
+    margin,
+    batch_size,
+    feature_size,
+    BLOCK_SIZE_FEAT: tl.constexpr,
+    BLOCK_SIZE_BATCH: tl.constexpr,
+):
+    """
+    Optimized kernel using 2D grid for batch and feature dimensions.
+    Each thread block handles multiple samples for better GPU utilization.
+    """
+    pid_batch = tl.program_id(axis=0)
+    pid_feat = tl.program_id(axis=1)
+    
+    if pid_batch >= batch_size:
+        return
+    
+    # Compute feature offsets
+    feat_start = pid_feat * BLOCK_SIZE_FEAT
+    feat_offsets = feat_start + tl.arange(0, BLOCK_SIZE_FEAT)
+    feat_mask = feat_offsets < feature_size
+    
+    # Base pointers for current batch
+    base_anchor = anchor_ptr + pid_batch * feature_size
+    base_positive = positive_ptr + pid_batch * feature_size
+    base_negative = negative_ptr + pid_batch * feature_size
+    
+    # Load data for this feature block
+    anchor = tl.load(base_anchor + feat_offsets, mask=feat_mask)
+    positive = tl.load(base_positive + feat_offsets, mask=feat_mask)
+    negative = tl.load(base_negative + feat_offsets, mask=feat_mask)
+    
+    # Compute squared differences
+    pos_diff = anchor - positive
+    neg_diff = anchor - negative
+    pos_sq = pos_diff * pos_diff
+    neg_sq = neg_diff * neg_diff
+    
+    # Reduce within block
+    pos_sum = tl.sum(pos_sq)
+    neg_sum = tl.sum(neg_sq)
+    
+    # Use shared memory for per-sample accumulation
+    # Each sample gets 2 slots: pos_sum, neg_sum
+    shmem_size = BLOCK_SIZE_BATCH * 2
+    shmem = tl.zeros((shmem_size,), tl.float32)
+    
+    # Store with atomic add to handle concurrent writes
+    tl.atomic_add(shmem + pid_batch * 2, pos_sum)
+    tl.atomic_add(shmem + pid_batch * 2 + 1, neg_sum)
+    
+    # Only first feature block computes final loss for each sample
+    if pid_feat == 0:
+        # Wait for all feature blocks to contribute
+        # (implicit barrier through shared memory)
+        
+        # Load accumulated sums for this sample
+        sample_pos = tl.load(shmem + pid_batch * 2)
+        sample_neg = tl.load(shmem + pid_batch * 2 + 1)
+        
+        # Compute loss for this sample
+        loss_val = tl.maximum(sample_pos - sample_neg + margin, 0.0)
+        
+        # Store individual sample loss
+        tl.store(loss_ptr + pid_batch, loss_val)
+
+def triton_triplet_margin_loss(
+    anchor: torch.Tensor,
+    positive: torch.Tensor,
+    negative: torch.Tensor,
+    margin: float = 1.0
+) -> torch.Tensor:
+    """
+    Compute Triplet Margin Loss using Triton kernels.
+    
+    Args:
+        anchor: Tensor of shape (batch_size, feature_dim)
+        positive: Tensor of shape (batch_size, feature_dim)
+        negative: Tensor of shape (batch_size, feature_dim)
+        margin: Margin for the triplet loss
+        
+    Returns:
+        Scalar loss value
+    """
+    assert anchor.shape == positive.shape == negative.shape
+    assert anchor.is_cuda and positive.is_cuda and negative.is_cuda
+    
+    batch_size, feature_size = anchor.shape
+    
+    # Method 1: Simple 1D kernel for smaller batches
+    if batch_size <= 1024:
+        n_elements = anchor.numel()
+        loss = torch.zeros(1, device=anchor.device, dtype=anchor.dtype)
+        
+        BLOCK_SIZE = 1024
+        grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
+        
+        triplet_margin_loss_kernel[grid](
+            anchor,
+            positive,
+            negative,
+            loss,
+            margin,
+            n_elements,
+            BLOCK_SIZE=BLOCK_SIZE
+        )
+        
+        return loss
+    
+    # Method 2: Optimized 2D kernel for larger batches
+    else:
+        # Store per-sample losses
+        sample_losses = torch.zeros(batch_size, device=anchor.device, dtype=anchor.dtype)
+        
+        BLOCK_SIZE_FEAT = 256
+        BLOCK_SIZE_BATCH = min(batch_size, 1024)
+        
+        grid_feat = triton.cdiv(feature_size, BLOCK_SIZE_FEAT)
+        grid_batch = triton.cdiv(batch_size, BLOCK_SIZE_BATCH)
+        
+        grid = (grid_batch, grid_feat)
+        
+        triplet_margin_loss_kernel_optimized[grid](
+            anchor,
+            positive,
+            negative,
+            sample_losses,
+            margin,
+            batch_size,
+            feature_size,
+            BLOCK_SIZE_FEAT=BLOCK_SIZE_FEAT,
+            BLOCK_SIZE_BATCH=BLOCK_SIZE_BATCH
+        )
+        
+        # Average across batch
+        return sample_losses.mean()
+
+class ModelNew(nn.Module):
+    """
+    A model that computes Triplet Margin Loss using optimized Triton kernels.
+    
+    Parameters:
+        margin (float): The margin between the positive and negative samples.
+    """
+    def __init__(self, margin: float = 1.0):
+        super(ModelNew, self).__init__()
+        self.margin = margin
+
+    def forward(self, anchor: torch.Tensor, positive: torch.Tensor, negative: torch.Tensor) -> torch.Tensor:
+        return triton_triplet_margin_loss(anchor, positive, negative, self.margin)
+```
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+3. Learn from previous repair attempts to avoid repeating the same mistakes
+
+```python
+# <corrected code>
+```

@@ -1,0 +1,197 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def fused_activation_kernel_2d(
+    input_ptr,
+    output_ptr,
+    M, N,
+    stride_m, stride_n,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    
+    # Create offsets for 2D block
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    
+    # Create masks for boundary checking
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+    
+    # Load input tile (BLOCK_M x BLOCK_N)
+    # Using 2D broadcasting to avoid unnecessary loads
+    x_ptrs = input_ptr + offs_m[:, None] * stride_m + offs_n[None, :] * stride_n
+    mask = mask_m[:, None] & mask_n[None, :]
+    x = tl.load(x_ptrs, mask=mask, other=0.0)
+    
+    # Fused activation pipeline
+    # Swish: x * sigmoid(x)
+    sigmoid_x = 1.0 / (1.0 + tl.exp(-x))
+    x = x * sigmoid_x
+    
+    # Divide by 2.0
+    x = x * 0.5
+    
+    # Clamp between -1 and 1
+    x = tl.minimum(tl.maximum(x, -1.0), 1.0)
+    
+    # Tanh activation
+    exp_2x = tl.exp(2.0 * x)
+    x = (exp_2x - 1.0) / (exp_2x + 1.0)
+    
+    # Clamp between -1 and 1
+    x = tl.minimum(tl.maximum(x, -1.0), 1.0)
+    
+    # Store result
+    tl.store(x_ptrs, x, mask=mask)
+
+
+@triton.jit
+def fused_activation_kernel_3d(
+    input_ptr,
+    output_ptr,
+    B, M, N,
+    stride_b, stride_m, stride_n,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid_b = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    pid_n = tl.program_id(2)
+    
+    # Create offsets
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    
+    # Masks for boundary checking
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+    mask_b = pid_b < B
+    
+    # Only process if batch dimension is valid
+    if mask_b:
+        # Load input tile
+        base_ptr = input_ptr + pid_b * stride_b
+        x_ptrs = base_ptr + offs_m[:, None] * stride_m + offs_n[None, :] * stride_n
+        mask = mask_m[:, None] & mask_n[None, :]
+        x = tl.load(x_ptrs, mask=mask, other=0.0)
+        
+        # Fused activation pipeline
+        sigmoid_x = 1.0 / (1.0 + tl.exp(-x))
+        x = x * sigmoid_x
+        x = x * 0.5
+        x = tl.minimum(tl.maximum(x, -1.0), 1.0)
+        exp_2x = tl.exp(2.0 * x)
+        x = (exp_2x - 1.0) / (exp_2x + 1.0)
+        x = tl.minimum(tl.maximum(x, -1.0), 1.0)
+        
+        # Store result
+        tl.store(x_ptrs, x, mask=mask)
+
+
+def triton_fused_activation_2d(x: torch.Tensor) -> torch.Tensor:
+    output = torch.empty_like(x)
+    M, N = x.shape
+    
+    # Optimized 2D grid with tuned block sizes
+    BLOCK_M = 64
+    BLOCK_N = 64
+    
+    grid = lambda meta: (triton.cdiv(M, meta['BLOCK_M']), 
+                        triton.cdiv(N, meta['BLOCK_N']))
+    
+    fused_activation_kernel_2d[grid](
+        x, output, M, N,
+        x.stride(0), x.stride(1),
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+        num_warps=4, num_stages=3
+    )
+    
+    return output
+
+
+def triton_fused_activation_3d(x: torch.Tensor) -> torch.Tensor:
+    output = torch.empty_like(x)
+    B, M, N = x.shape
+    
+    # Optimized 3D grid for batch parallelism
+    BLOCK_M = 64
+    BLOCK_N = 32
+    
+    grid = lambda meta: (B,
+                        triton.cdiv(M, meta['BLOCK_M']),
+                        triton.cdiv(N, meta['BLOCK_N']))
+    
+    fused_activation_kernel_3d[grid](
+        x, output, B, M, N,
+        x.stride(0), x.stride(1), x.stride(2),
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+        num_warps=4, num_stages=3
+    )
+    
+    return output
+
+
+def triton_fused_activation(x: torch.Tensor) -> torch.Tensor:
+    """Wrapper that selects optimal kernel based on input dimensions."""
+    if x.dim() == 2:
+        return triton_fused_activation_2d(x)
+    elif x.dim() == 3:
+        return triton_fused_activation_3d(x)
+    else:
+        # Flatten to 2D for higher-dimensional tensors
+        original_shape = x.shape
+        x_2d = x.view(-1, x.shape[-1])
+        output = triton_fused_activation_2d(x_2d)
+        return output.view(original_shape)
+
+
+class ModelNew(nn.Module):
+    """
+    Simple model that performs a gemm, swish, divide, clamp, tanh, and clamp operations.
+    """
+    def __init__(self, in_features, out_features, bias=True):
+        super().__init__()
+        self.gemm = nn.Linear(in_features, out_features, bias=bias)
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_features).
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_features).
+        """
+        x = self.gemm(x)
+        # Fused activation using optimized Triton kernel
+        x = triton_fused_activation(x)
+        return x
+```
+
+## Optimization Rationale
+
+1. **2D Grid Layout**: Changed from 1D to 2D grid for better SM utilization. The original 1D grid with 8192 blocks was underutilizing SMs (19.83% throughput). The 2D grid provides better parallelism and work distribution across SMs.
+
+2. **Tuned Block Sizes**: Using BLOCK_M=64 and BLOCK_N=64 for 2D case:
+   - Total threads per block: 4096 (but Triton will handle this efficiently)
+   - Better SM occupancy and warp utilization
+   - Aligned with tensor core sizes for potential future optimization
+
+3. **3D Grid for Batch Parallelism**: Added a 3D kernel variant that parallelizes across batch dimension first, maximizing grid size without reducing block size.
+
+4. **Memory Access Pattern**: Using 2D block loading with proper striding for coalesced memory access.
+
+5. **Warp Configuration**: Using 4 warps (128 threads) per block for better occupancy on Ada Lovelace:
+   - Maximum warps per SM: 48
+   - With 4 warps per block, can have up to 12 blocks per SM
+   - Better hides memory latency
+
+6. **Automatic Dimension Handling**: Wrapper function automatically selects optimal kernel based on input dimensions and flattens higher-dimensional tensors when needed.
+
+The new grid layout should significantly improve SM utilization from 19.83% to closer to the target >60% by providing better parallelism and work distribution across the GPU's 128 SMs.

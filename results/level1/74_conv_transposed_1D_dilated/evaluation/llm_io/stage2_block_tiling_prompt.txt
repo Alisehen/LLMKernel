@@ -1,0 +1,234 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU
+GPU Name: 4090
+Architecture: Ada Lovelace
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+[OPTIMIZATION STAGE]
+
+## Current Optimization Stage
+
+**Focus**: Tune BLOCK_M/N/K sizes for balanced data reuse and resource usage.
+
+**NCU Metrics to Check**:
+• `sm__warps_active.avg.pct_of_peak_sustained_active`: Warp occupancy (target: >50%)
+
+**Guidelines**:
+- Tensor Cores: BLOCK_M/N multiple of 16; BLOCK_K multiple of 8.
+- FP32: BLOCK_M/N in [32, 64, 128, 256], BLOCK_K in [16, 32, 64].
+- **All BLOCK_SIZE/BLOCK_* must be powers of 2** (16, 32, 64, 128, 256, 512, 1024).
+- Avoid oversized tiles (wasted masking); change BLOCK_* only when occupancy or reuse metrics indicate issues.
+- If BLOCK sizes are unclear, keep the baseline tile as a valid candidate.
+
+**Autotune Tip (safe)**:
+Use a small autotune list (2–4 configs), all being powers of two, and **decorating the @triton.jit kernel**, never the wrapper.
+
+
+
+[CURRENT CODE]
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+from typing import Optional
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_C_IN': 16, 'BLOCK_C_OUT': 64, 'BLOCK_L': 64, 'GROUP_C_IN': 16}, num_warps=4),
+        triton.Config({'BLOCK_C_IN': 16, 'BLOCK_C_OUT': 64, 'BLOCK_L': 128, 'GROUP_C_IN': 16}, num_warps=8),
+        triton.Config({'BLOCK_C_IN': 16, 'BLOCK_C_OUT': 64, 'BLOCK_L': 256, 'GROUP_C_IN': 16}, num_warps=8),
+        triton.Config({'BLOCK_C_IN': 16, 'BLOCK_C_OUT': 128, 'BLOCK_L': 64, 'GROUP_C_IN': 16}, num_warps=8),
+        triton.Config({'BLOCK_C_IN': 32, 'BLOCK_C_OUT': 64, 'BLOCK_L': 64, 'GROUP_C_IN': 32}, num_warps=8),
+        triton.Config({'BLOCK_C_IN': 32, 'BLOCK_C_OUT': 64, 'BLOCK_L': 128, 'GROUP_C_IN': 32}, num_warps=8),
+        triton.Config({'BLOCK_C_IN': 32, 'BLOCK_C_OUT': 128, 'BLOCK_L': 64, 'GROUP_C_IN': 32}, num_warps=8),
+    ],
+    key=['C_in', 'C_out', 'L_out'],
+)
+@triton.jit
+def conv_transpose1d_kernel(
+    x_ptr,
+    w_ptr,
+    b_ptr,
+    out_ptr,
+    B,
+    C_in,
+    C_out,
+    L_in,
+    L_out,
+    K,
+    stride,
+    padding,
+    dilation,
+    has_bias: tl.constexpr,
+    BLOCK_C_IN: tl.constexpr,
+    BLOCK_C_OUT: tl.constexpr,
+    BLOCK_L: tl.constexpr,
+    GROUP_C_IN: tl.constexpr,
+):
+    pid_b = tl.program_id(0)
+    pid_c = tl.program_id(1)
+    pid_l = tl.program_id(2)
+    
+    c_out_offset = pid_c * BLOCK_C_OUT + tl.arange(0, BLOCK_C_OUT)
+    l_out_offset = pid_l * BLOCK_L + tl.arange(0, BLOCK_L)
+    
+    c_out_mask = c_out_offset < C_out
+    l_out_mask = l_out_offset < L_out
+    
+    acc = tl.zeros((BLOCK_C_OUT, BLOCK_L), dtype=tl.float32)
+    
+    for c_in_block in range(0, C_in, GROUP_C_IN):
+        c_in_base = c_in_block + tl.arange(0, GROUP_C_IN)
+        c_in_mask = c_in_base < C_in
+        
+        for k in range(K):
+            w_ptrs = w_ptr + (
+                c_in_base[:, None] * (C_out * K) +
+                c_out_offset[None, :] * K +
+                k
+            )
+            w_slice = tl.load(w_ptrs, 
+                           mask=c_in_mask[:, None] & c_out_mask[None, :], 
+                           other=0.0)
+            
+            l_in_pos = (l_out_offset - dilation * k + padding) // stride
+            
+            valid_l_in = (l_in_pos >= 0) & (l_in_pos < L_in)
+            valid_stride = ((l_out_offset - dilation * k + padding) % stride == 0)
+            in_bounds = valid_l_in & valid_stride
+            
+            x_ptrs = x_ptr + (
+                pid_b * (C_in * L_in) +
+                c_in_base[:, None] * L_in +
+                l_in_pos[None, :]
+            )
+            
+            mask = c_in_mask[:, None] & in_bounds[None, :]
+            x_tile = tl.load(x_ptrs, mask=mask, other=0.0)
+            
+            acc += tl.dot(w_slice.T, x_tile, allow_tf32=True)
+    
+    if has_bias:
+        b_ptrs = b_ptr + c_out_offset
+        bias = tl.load(b_ptrs, mask=c_out_mask, other=0.0)
+        acc += bias[:, None]
+    
+    out_ptrs = out_ptr + (
+        pid_b * (C_out * L_out) +
+        c_out_offset[:, None] * L_out +
+        l_out_offset[None, :]
+    )
+    tl.store(out_ptrs, acc, mask=c_out_mask[:, None] & l_out_mask[None, :])
+
+
+def triton_conv_transpose1d(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    stride: int = 1,
+    padding: int = 0,
+    dilation: int = 1,
+) -> torch.Tensor:
+    B, C_in, L_in = x.shape
+    C_out = weight.shape[1]
+    K = weight.shape[2]
+    
+    L_out = (L_in - 1) * stride - 2 * padding + dilation * (K - 1) + 1
+    output = torch.empty((B, C_out, L_out), device=x.device, dtype=x.dtype)
+    
+    grid = lambda META: (
+        B,
+        triton.cdiv(C_out, META['BLOCK_C_OUT']),
+        triton.cdiv(L_out, META['BLOCK_L'])
+    )
+    
+    conv_transpose1d_kernel[grid](
+        x, weight,
+        bias if bias is not None else torch.empty(0, device=x.device),
+        output,
+        B, C_in, C_out, L_in, L_out, K,
+        stride, padding, dilation,
+        has_bias=bias is not None,
+    )
+    
+    return output
+
+
+class ModelNew(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        stride: int = 1,
+        padding: int = 0,
+        dilation: int = 1,
+        bias: bool = False,
+    ):
+        super(ModelNew, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+        
+        self.weight = nn.Parameter(
+            torch.empty(in_channels, out_channels, kernel_size)
+        )
+        nn.init.kaiming_uniform_(self.weight, a=5**0.5)
+        
+        self.bias = None
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_channels))
+            fan_in = in_channels * kernel_size
+            bound = 1 / (fan_in ** 0.5)
+            nn.init.uniform_(self.bias, -bound, bound)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_conv_transpose1d(
+            x, self.weight, self.bias,
+            self.stride, self.padding, self.dilation
+        )
+```
+
+[NCU PROFILING METRICS]
+{
+  "conv_transpose1d_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 45.41,
+    "launch__grid_size": 32800,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 33.05,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 60.38,
+    "lts__t_sector_hit_rate.pct": 87.85
+  }
+}
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

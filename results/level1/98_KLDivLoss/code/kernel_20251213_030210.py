@@ -1,0 +1,142 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def kl_div_kernel(
+    predictions_ptr,
+    targets_ptr,
+    output_ptr,
+    batch_size,
+    inner_dim,
+    BLOCK_INNER: tl.constexpr,
+    BLOCK_BATCH: tl.constexpr,
+):
+    # 2D grid: pid_batch for batch dimension, pid_inner for inner dimension blocks
+    pid_batch = tl.program_id(axis=0)
+    pid_inner = tl.program_id(axis=1)
+    
+    # Process multiple batch elements per thread block for better SM occupancy
+    batch_start = pid_batch * BLOCK_BATCH
+    batch_offsets = batch_start + tl.arange(0, BLOCK_BATCH)
+    batch_mask = batch_offsets < batch_size
+    
+    # Process multiple inner dimension elements per thread
+    inner_start = pid_inner * BLOCK_INNER
+    inner_offsets = inner_start + tl.arange(0, BLOCK_INNER)
+    inner_mask = inner_offsets < inner_dim
+    
+    # Initialize local accumulator
+    acc = tl.zeros((BLOCK_BATCH,), dtype=tl.float32)
+    
+    # Load predictions and targets for current block
+    batch_idx = tl.max_contiguous(tl.arange(0, BLOCK_BATCH), BLOCK_BATCH)
+    inner_idx = tl.max_contiguous(tl.arange(0, BLOCK_INNER), BLOCK_INNER)
+    
+    # Use 2D block loading for better memory coalescing
+    pred_ptrs = predictions_ptr + batch_idx[:, None] * inner_dim + inner_idx[None, :]
+    target_ptrs = targets_ptr + batch_idx[:, None] * inner_dim + inner_idx[None, :]
+    
+    pred_block = tl.load(pred_ptrs, mask=batch_mask[:, None] & inner_mask[None, :], other=0.0)
+    target_block = tl.load(target_ptrs, mask=batch_mask[:, None] & inner_mask[None, :], other=0.0)
+    
+    # Avoid log(0) by adding epsilon
+    epsilon = 1e-12
+    safe_pred = tl.maximum(pred_block, epsilon)
+    safe_target = tl.maximum(target_block, epsilon)
+    
+    # Compute KL divergence: target * (log(target) - log(prediction))
+    kl_div = target_block * (tl.log(safe_target) - tl.log(safe_pred))
+    
+    # Reduce within the block across inner dimension
+    acc += tl.sum(kl_div, axis=1)
+    
+    # Final reduction across inner dimension blocks using atomic add
+    if pid_inner == 0:
+        # Initialize output for these batch elements
+        output_ptrs = output_ptr + batch_offsets
+        tl.store(output_ptrs, tl.zeros((BLOCK_BATCH,), dtype=tl.float32), mask=batch_mask)
+    
+    # Atomic add to accumulate partial sums
+    output_ptrs = output_ptr + batch_offsets
+    tl.atomic_add(output_ptrs, acc, mask=batch_mask)
+
+@triton.jit
+def final_mean_kernel(
+    row_sums_ptr,
+    output_ptr,
+    batch_size,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    
+    # Parallel reduction for final mean calculation
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < batch_size
+    
+    # Load row sums
+    row_sums = tl.load(row_sums_ptr + offsets, mask=mask, other=0.0)
+    
+    # Fast parallel reduction
+    sum_val = tl.sum(row_sums, axis=0)
+    
+    # Atomic add to accumulate total sum
+    tl.atomic_add(output_ptr, sum_val)
+    
+    # Final division handled in wrapper
+
+def triton_kl_div(predictions: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    # Ensure tensors are contiguous
+    predictions = predictions.contiguous()
+    targets = targets.contiguous()
+    
+    batch_size = predictions.shape[0]
+    inner_dim = predictions.numel() // batch_size
+    
+    # Allocate output tensor for row sums
+    row_sums = torch.zeros(batch_size, dtype=torch.float32, device=predictions.device)
+    
+    # Optimized 2D grid layout for better SM utilization
+    # BLOCK_BATCH: Number of batch elements processed per thread block
+    # BLOCK_INNER: Number of inner dimension elements processed per thread block
+    BLOCK_BATCH = 32
+    BLOCK_INNER = 256
+    
+    # 2D grid: batch dimension × inner dimension blocks
+    grid_batch = triton.cdiv(batch_size, BLOCK_BATCH)
+    grid_inner = triton.cdiv(inner_dim, BLOCK_INNER)
+    
+    # Launch KL divergence kernel with optimized grid
+    kl_div_kernel[(grid_batch, grid_inner)](
+        predictions, targets, row_sums,
+        batch_size, inner_dim,
+        BLOCK_INNER=BLOCK_INNER,
+        BLOCK_BATCH=BLOCK_BATCH,
+        num_warps=8,
+        num_stages=3
+    )
+    
+    # Launch final mean reduction
+    output = torch.zeros(1, dtype=torch.float32, device=predictions.device)
+    BLOCK_REDUCE = 1024
+    grid_reduce = triton.cdiv(batch_size, BLOCK_REDUCE)
+    
+    final_mean_kernel[(grid_reduce,)](
+        row_sums, output, batch_size,
+        BLOCK_SIZE=BLOCK_REDUCE,
+        num_warps=4,
+        num_stages=1
+    )
+    
+    # Final division by batch_size
+    output.div_(batch_size)
+    
+    return output
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, predictions, targets):
+        return triton_kl_div(predictions, targets)

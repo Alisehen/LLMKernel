@@ -1,0 +1,76 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+import math
+
+@triton.jit
+def gelu_kernel(
+    x_ptr,
+    output_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """GELU activation kernel using exp-based tanh approximation."""
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    
+    # Load input
+    x = tl.load(x_ptr + offsets, mask=mask)
+    
+    # Compute x^3 with high accuracy (fused multiply)
+    x3 = x * x * x
+    
+    # GELU constants
+    a = 0.7978845608028654  # sqrt(2/π) precomputed
+    b = 0.044715
+    
+    # t = sqrt(2/π) * (x + 0.044715 * x^3)
+    t = a * tl.fma(b, x3, x)  # FMA: a*(b*x3 + x)
+    
+    # tanh(t) using exp-based formulation: 1 - 2/(exp(2t) + 1)
+    # More numerically stable: exp_neg_2t = exp(-2|t|)
+    neg_2abs_t = -2.0 * tl.abs(t)
+    exp_neg_2abs_t = tl.exp(neg_2abs_t)
+    
+    # tanh(t) = sign(t) * (1 - 2/(exp(2|t|) + 1))
+    # = sign(t) * ((exp(2|t|) - 1)/(exp(2|t|) + 1))
+    # Use: 1 - 2/(1 + exp(-2|t|)) = (1 - exp(-2|t|))/(1 + exp(-2|t|))
+    numerator = 1.0 - exp_neg_2abs_t
+    denominator = 1.0 + exp_neg_2abs_t
+    tanh_t = tl.where(t >= 0.0, numerator/denominator, -numerator/denominator)
+    
+    # GELU: 0.5 * x * (1 + tanh(t))
+    output = 0.5 * x * tl.fma(tanh_t, 1.0, 1.0)  # 0.5 * x * (1 + tanh_t)
+    
+    # Store result
+    tl.store(output_ptr + offsets, output, mask=mask)
+
+def triton_gelu(x: torch.Tensor) -> torch.Tensor:
+    """Triton-accelerated GELU activation."""
+    output = torch.empty_like(x)
+    n_elements = output.numel()
+    
+    # Optimize block size for 128 SMs
+    # Using 1024 threads maximizes occupancy while fitting registers
+    BLOCK_SIZE = 1024
+    
+    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
+    
+    # Launch kernel
+    gelu_kernel[grid](x, output, n_elements, BLOCK_SIZE=BLOCK_SIZE)
+    
+    return output
+
+class ModelNew(nn.Module):
+    """
+    Implementation of the GELU activation function with Triton acceleration.
+    Reference: Gaussian Error Linear Units (GELU) paper: https://arxiv.org/abs/1606.08415
+    """
+    def __init__(self) -> None:
+        super().__init__()
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_gelu(x)

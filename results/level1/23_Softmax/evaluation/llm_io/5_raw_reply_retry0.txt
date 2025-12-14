@@ -1,0 +1,197 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_stages=2),
+        triton.Config({}, num_stages=3),
+        triton.Config({}, num_stages=4),
+    ],
+    key=['n_cols'],
+)
+@triton.jit(num_warps=lambda args: args['BLOCK_SIZE'] // 32)
+def softmax_max_kernel(
+    x_ptr,
+    max_ptr,
+    stride_x0,
+    stride_x1,
+    n_rows,
+    n_cols,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Compute max along dim=1 for 2D tensor."""
+    row_idx = tl.program_id(0)
+    
+    if row_idx >= n_rows:
+        return
+    
+    row_start_ptr = x_ptr + row_idx * stride_x0
+    row_max = float('-inf')
+    
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+    for block_start in range(0, n_cols, BLOCK_SIZE):
+        col_indices = block_start + col_offsets
+        mask = col_indices < n_cols
+        
+        ptrs = row_start_ptr + col_indices * stride_x1
+        x_block = tl.load(ptrs, mask=mask, other=float('-inf'))
+        row_max = tl.maximum(row_max, tl.max(x_block, axis=0))
+    
+    tl.store(max_ptr + row_idx, row_max)
+
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_stages=2),
+        triton.Config({}, num_stages=3),
+        triton.Config({}, num_stages=4),
+    ],
+    key=['n_cols'],
+)
+@triton.jit(num_warps=lambda args: args['BLOCK_SIZE'] // 32)
+def softmax_exp_sum_kernel(
+    x_ptr,
+    max_ptr,
+    sum_ptr,
+    stride_x0,
+    stride_x1,
+    n_rows,
+    n_cols,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Compute sum of exp(x - max) along dim=1."""
+    row_idx = tl.program_id(0)
+    
+    if row_idx >= n_rows:
+        return
+    
+    row_max = tl.load(max_ptr + row_idx)
+    row_start_ptr = x_ptr + row_idx * stride_x0
+    
+    row_sum = 0.0
+    
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+    for block_start in range(0, n_cols, BLOCK_SIZE):
+        col_indices = block_start + col_offsets
+        mask = col_indices < n_cols
+        
+        ptrs = row_start_ptr + col_indices * stride_x1
+        x_block = tl.load(ptrs, mask=mask, other=0.0)
+        shifted = x_block - row_max
+        exp_block = tl.exp(shifted)
+        
+        row_sum += tl.sum(exp_block, axis=0)
+    
+    tl.store(sum_ptr + row_idx, row_sum)
+
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_stages=2),
+        triton.Config({}, num_stages=3),
+        triton.Config({}, num_stages=4),
+    ],
+    key=['n_cols'],
+)
+@triton.jit(num_warps=lambda args: args['BLOCK_SIZE'] // 32)
+def softmax_final_kernel(
+    x_ptr,
+    max_ptr,
+    sum_ptr,
+    output_ptr,
+    stride_x0,
+    stride_x1,
+    stride_out0,
+    stride_out1,
+    n_rows,
+    n_cols,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Compute final softmax: exp(x - max) / sum."""
+    row_idx = tl.program_id(0)
+    
+    if row_idx >= n_rows:
+        return
+    
+    row_max = tl.load(max_ptr + row_idx)
+    row_sum = tl.load(sum_ptr + row_idx)
+    
+    row_start_x = x_ptr + row_idx * stride_x0
+    row_start_out = output_ptr + row_idx * stride_out0
+    
+    inv_sum = 1.0 / (row_sum + 1e-8)
+    
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+    for block_start in range(0, n_cols, BLOCK_SIZE):
+        col_indices = block_start + col_offsets
+        mask = col_indices < n_cols
+        
+        x_ptrs = row_start_x + col_indices * stride_x1
+        x_block = tl.load(x_ptrs, mask=mask, other=0.0)
+        
+        shifted = x_block - row_max
+        exp_block = tl.exp(shifted)
+        output_block = exp_block * inv_sum
+        
+        out_ptrs = row_start_out + col_indices * stride_out1
+        tl.store(out_ptrs, output_block, mask=mask)
+
+def triton_softmax(x: torch.Tensor) -> torch.Tensor:
+    """
+    Softmax along dim=1 using Triton kernels.
+    Memory-efficient three-stage approach.
+    """
+    output = torch.empty_like(x)
+    batch_size, n_cols = x.shape
+    
+    max_vals = torch.empty(batch_size, dtype=x.dtype, device=x.device)
+    row_sums = torch.empty(batch_size, dtype=x.dtype, device=x.device)
+    
+    BLOCK_SIZE = 1024 if n_cols % 1024 == 0 else 512
+    
+    grid = (batch_size,)
+    
+    softmax_max_kernel[grid](
+        x, max_vals,
+        x.stride(0), x.stride(1),
+        batch_size, n_cols,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
+    
+    softmax_exp_sum_kernel[grid](
+        x, max_vals, row_sums,
+        x.stride(0), x.stride(1),
+        batch_size, n_cols,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
+    
+    softmax_final_kernel[grid](
+        x, max_vals, row_sums, output,
+        x.stride(0), x.stride(1),
+        output.stride(0), output.stride(1),
+        batch_size, n_cols,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
+    
+    return output
+
+class ModelNew(nn.Module):
+    """
+    Simple model that performs a Softmax activation using optimized Triton kernels.
+    """
+    def __init__(self):
+        super().__init__()
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies Softmax activation to the input tensor along dim=1.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, num_features).
+
+        Returns:
+            torch.Tensor: Output tensor with Softmax applied, same shape as input.
+        """
+        return triton_softmax(x)
+```

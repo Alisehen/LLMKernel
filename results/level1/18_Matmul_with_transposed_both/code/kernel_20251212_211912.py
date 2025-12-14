@@ -1,0 +1,158 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.autotune(
+    configs=[
+        # Original configs with optimized stages/warps
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_stages=4, num_warps=8),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_stages=4, num_warps=8),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=2, num_warps=8),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 128}, num_stages=2, num_warps=8),
+        
+        # New configs based on NCU analysis
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_stages=3, num_warps=16),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_stages=3, num_warps=16),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=3, num_warps=16),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 128}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_stages=2, num_warps=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_stages=2, num_warps=16),
+    ],
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def matmul_kernel(
+    a_ptr, b_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr = 8,
+):
+    """
+    Optimized matrix multiplication kernel for C = A.T @ B.T
+    A: (K, M) in memory, accessed as (M, K) for A.T
+    B: (N, K) in memory, accessed as (K, N) for B.T
+    """
+    
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    num_pid_in_group = GROUP_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+    
+    # Offsets for the current block
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    
+    # Masks for boundary checks
+    m_mask = offs_m < M
+    n_mask = offs_n < N
+    
+    # Initialize accumulator
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    # Compute pointers to A and B
+    a_ptrs = a_ptr + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
+    
+    # Main accumulation loop
+    for k in range(0, tl.cdiv(K, BLOCK_K)):
+        k_remaining = K - k * BLOCK_K
+        k_size = min(BLOCK_K, k_remaining)
+        
+        # Load A block (access A.T which is shape (M, K))
+        a = tl.load(a_ptrs, 
+                    mask=m_mask[:, None] & (offs_k[None, :] < k_size), 
+                    other=0.0)
+        
+        # Load B block (access B.T which is shape (K, N))
+        b = tl.load(b_ptrs,
+                    mask=(offs_k[:, None] < k_size) & n_mask[None, :],
+                    other=0.0)
+        
+        # Matrix multiplication
+        accumulator += tl.dot(a, b)
+        
+        # Update pointers for next K block
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+    
+    # Convert accumulator to output dtype
+    c = accumulator.to(c_ptr.dtype.element_ty)
+    
+    # Store result
+    c_ptrs = c_ptr + (offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn)
+    tl.store(c_ptrs, c, mask=m_mask[:, None] & n_mask[None, :])
+
+def triton_matmul(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    """
+    Wrapper function for Triton matrix multiplication.
+    Computes C = A.T @ B.T efficiently.
+    
+    Input shapes:
+    - A: (K, M)
+    - B: (N, K)
+    Output shape: (M, N)
+    """
+    assert A.dim() == 2 and B.dim() == 2
+    
+    # Extract dimensions
+    K1, M = A.shape
+    N, K2 = B.shape
+    
+    assert K1 == K2, f"Dimension mismatch: A.shape={A.shape}, B.shape={B.shape}"
+    K = K1
+    
+    # Create output tensor
+    C = torch.empty((M, N), device=A.device, dtype=A.dtype)
+    
+    # Calculate grid size with grouping
+    GROUP_M = 8
+    
+    # Use 1D grid with grouping for better load balancing
+    grid = lambda META: (
+        triton.cdiv(M, META['BLOCK_M']) * triton.cdiv(N, META['BLOCK_N']),
+    )
+    
+    # Launch kernel
+    matmul_kernel[grid](
+        A, B, C,
+        M, N, K,
+        A.stride(1), A.stride(0),  # stride_am, stride_ak for A.T
+        B.stride(1), B.stride(0),  # stride_bk, stride_bn for B.T
+        C.stride(0), C.stride(1),
+        GROUP_M=GROUP_M,
+    )
+    
+    return C
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs matrix multiplication (C = A.T @ B.T)
+    using high-performance Triton kernels.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+    
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        """
+        Performs matrix multiplication using Triton kernels.
+        
+        Args:
+            A: Input tensor of shape (K, M)
+            B: Input tensor of shape (N, K)
+            
+        Returns:
+            Output tensor of shape (M, N) = A.T @ B.T
+        """
+        return triton_matmul(A, B)

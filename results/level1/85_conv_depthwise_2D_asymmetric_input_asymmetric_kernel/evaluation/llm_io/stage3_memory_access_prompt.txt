@@ -1,0 +1,250 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU
+GPU Name: 4090
+Architecture: Ada Lovelace
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+[OPTIMIZATION STAGE]
+
+## Current Optimization Stage
+
+Focus: Memory efficiency & latency hiding.
+
+Metrics:
+- dram__throughput.avg.pct_of_peak_sustained_elapsed
+- lts__t_sector_hit_rate.pct
+- smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct (<20%)
+
+Rules:
+- Increase num_stages only if memory stalls are high
+- Do not rewrite access patterns without metric evidence
+- Larger BLOCK_K improves reuse but increases register pressure
+
+Autotune:
+- If unsure, try num_stages ∈ {1,2,3} on kernel
+
+
+
+[CURRENT CODE]
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def depthwise_conv2d_kernel(
+    x_ptr,
+    w_ptr,
+    bias_ptr,
+    y_ptr,
+    N,
+    C,
+    H,
+    W,
+    KH,
+    KW,
+    stride_h,
+    stride_w,
+    pad_h,
+    pad_w,
+    dil_h,
+    dil_w,
+    H_out,
+    W_out,
+    has_bias,
+    BLOCK_HW: tl.constexpr,
+    OUTPUT_DTYPE: tl.constexpr,
+):
+    pid_hw = tl.program_id(axis=0)
+    pid_c = tl.program_id(axis=1)
+    pid_n = tl.program_id(axis=2)
+
+    hw_start = pid_hw * BLOCK_HW
+    hw_offsets = hw_start + tl.arange(0, BLOCK_HW)
+    mask_hw = hw_offsets < (H_out * W_out)
+
+    oh = hw_offsets // W_out
+    ow = hw_offsets % W_out
+
+    base_x = ((pid_n * C + pid_c) * H) * W
+    base_y = ((pid_n * C + pid_c) * H_out) * W_out
+
+    acc = tl.zeros([BLOCK_HW], dtype=tl.float32)
+
+    for kh in range(0, KH):
+        ih = oh * stride_h - pad_h + kh * dil_h
+        mask_h = (ih >= 0) & (ih < H)
+        for kw in range(0, KW):
+            iw = ow * stride_w - pad_w + kw * dil_w
+            mask_w = (iw >= 0) & (iw < W)
+            mask = mask_hw & mask_h & mask_w
+
+            x_idx = base_x + ih * W + iw
+            w_idx = (pid_c * KH + kh) * KW + kw
+
+            x_val = tl.load(x_ptr + x_idx, mask=mask, other=0.0).to(tl.float32)
+            w_val = tl.load(w_ptr + w_idx).to(tl.float32)
+            acc += x_val * w_val
+
+    if has_bias:
+        bias_val = tl.load(bias_ptr + pid_c).to(tl.float32)
+        acc += bias_val
+
+    output = acc.to(OUTPUT_DTYPE)
+    tl.store(y_ptr + base_y + hw_offsets, output, mask=mask_hw)
+
+
+def triton_depthwise_conv2d(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    stride_h: int,
+    stride_w: int,
+    padding_h: int,
+    padding_w: int,
+    dilation_h: int,
+    dilation_w: int,
+) -> torch.Tensor:
+    assert x.is_cuda and weight.is_cuda
+    N, C, H, W = x.shape
+    KH, KW = weight.shape[-2:]
+    H_out = (H + 2 * padding_h - dilation_h * (KH - 1) - 1) // stride_h + 1
+    W_out = (W + 2 * padding_w - dilation_w * (KW - 1) - 1) // stride_w + 1
+
+    y = torch.empty((N, C, H_out, W_out), dtype=x.dtype, device=x.device)
+
+    BLOCK_HW = 128
+    has_bias = 1 if bias is not None else 0
+    bias_ptr = bias if bias is not None else weight
+
+    x_flat = x.contiguous().view(-1)
+    y_flat = y.contiguous().view(-1)
+    w_flat = weight.contiguous().view(-1)
+
+    output_dtype = tl.float16 if x.dtype == torch.float16 else tl.float32
+
+    grid = lambda meta: (
+        triton.cdiv(H_out * W_out, meta["BLOCK_HW"]),
+        C,
+        N,
+    )
+
+    depthwise_conv2d_kernel[grid](
+        x_flat,
+        w_flat,
+        bias_ptr,
+        y_flat,
+        N,
+        C,
+        H,
+        W,
+        KH,
+        KW,
+        stride_h,
+        stride_w,
+        padding_h,
+        padding_w,
+        dilation_h,
+        dilation_w,
+        H_out,
+        W_out,
+        has_bias,
+        BLOCK_HW=BLOCK_HW,
+        OUTPUT_DTYPE=output_dtype,
+    )
+
+    return y
+
+
+class ModelNew(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size_h: int,
+        kernel_size_w: int,
+        stride_h: int = 1,
+        stride_w: int = 1,
+        padding_h: int = 0,
+        padding_w: int = 0,
+        dilation_h: int = 1,
+        dilation_w: int = 1,
+        groups: int = 1,
+        bias: bool = False,
+    ):
+        super().__init__()
+        assert in_channels == out_channels
+        assert groups == in_channels
+        self.stride_h = stride_h
+        self.stride_w = stride_w
+        self.padding_h = padding_h
+        self.padding_w = padding_w
+        self.dilation_h = dilation_h
+        self.dilation_w = dilation_w
+        self.weight = nn.Parameter(
+            torch.empty(out_channels, 1, kernel_size_h, kernel_size_w)
+        )
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_channels))
+        else:
+            self.register_parameter("bias", None)
+        nn.init.kaiming_uniform_(self.weight, a=5 ** 0.5)
+        if self.bias is not None:
+            fan_in = kernel_size_h * kernel_size_w
+            bound = 1 / (fan_in ** 0.5)
+            nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_depthwise_conv2d(
+            x,
+            self.weight.view(self.weight.shape[0], self.weight.shape[2], self.weight.shape[3]),
+            self.bias,
+            self.stride_h,
+            self.stride_w,
+            self.padding_h,
+            self.padding_w,
+            self.dilation_h,
+            self.dilation_w,
+        )
+```
+
+[NCU PROFILING METRICS]
+{
+  "depthwise_conv2d_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 75.81,
+    "launch__grid_size": 1011712,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 92.41,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 49.76,
+    "lts__t_sector_hit_rate.pct": 77.15
+  }
+}
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

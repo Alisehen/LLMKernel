@@ -1,0 +1,216 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU
+GPU Name: 4090
+Architecture: Ada Lovelace
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+[OPTIMIZATION STAGE]
+
+## Current Optimization Stage
+
+**Focus**: Optimize grid layout and parallel work distribution.
+
+**NCU Metrics to Check**:
+• `sm__throughput.avg.pct_of_peak_sustained_elapsed`: Overall SM utilization (target: >60%)
+• `launch__grid_size`: Total number of blocks (controlled by BLOCK_M/N)
+
+**Guidelines**:
+- 2D outputs → 2D grid `(cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))`; 1D ops → 1D grid
+- 3D outputs (e.g., batch×M×N) → 3D grid `(batch, cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))`
+- 4D+ outputs → **flatten** to 3D: `(batch*dim1, dim2, dim3)` or `(cdiv(batch*dim1, BLOCK), dim2, dim3)`
+- Prefer adding parallelism via batch/head/expert dims before reducing BLOCK sizes
+- Only change grid if SM utilization is clearly low; otherwise keep original
+- Always verify `grid = (...)` matches kernel indexing logic
+
+**Important Safety Rule**:
+If unsure about grid mapping, do **not** modify it. Never use more than 3 dimensions!
+
+**Autotune Tip (safe)**:
+Try 2–3 small grid variants using minimal `@autotune` on **kernel function only**.
+
+
+
+[CURRENT CODE]
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def rms_norm_kernel(
+    input_ptr,
+    output_ptr,
+    stride_batch,
+    stride_feat,
+    stride_h,
+    stride_w,
+    batch_size,
+    features,
+    dim_h,
+    dim_w,
+    eps,
+    BLOCK_SIZE_FEAT: tl.constexpr,
+    BLOCK_SIZE_SPATIAL: tl.constexpr,
+):
+    # Compute spatial block and batch
+    pid_spatial = tl.program_id(0)
+    pid_batch = tl.program_id(1)
+    
+    # Reconstruct spatial indices
+    spatial_blocks_w = tl.cdiv(dim_w, BLOCK_SIZE_SPATIAL)
+    block_h = pid_spatial // spatial_blocks_w
+    block_w = pid_spatial % spatial_blocks_w
+    
+    # Compute offsets
+    h_offsets = block_h * BLOCK_SIZE_SPATIAL + tl.arange(0, BLOCK_SIZE_SPATIAL)
+    w_offsets = block_w * BLOCK_SIZE_SPATIAL + tl.arange(0, BLOCK_SIZE_SPATIAL)
+    
+    # Create masks for spatial dimensions
+    h_mask = h_offsets < dim_h
+    w_mask = w_offsets < dim_w
+    
+    # Initialize accumulator for sum of squares
+    sum_sq = tl.zeros([BLOCK_SIZE_SPATIAL, BLOCK_SIZE_SPATIAL], dtype=tl.float32)
+    
+    # Loop over features in blocks
+    for feat_start in range(0, features, BLOCK_SIZE_FEAT):
+        feat_offsets = feat_start + tl.arange(0, BLOCK_SIZE_FEAT)
+        feat_mask = feat_offsets < features
+        
+        # Create combined mask
+        mask = feat_mask[:, None, None] & h_mask[None, :] & w_mask[None, None, :]
+        
+        # Compute pointer offsets for this block
+        batch_offset = pid_batch * stride_batch
+        feat_offset = feat_offsets[:, None, None] * stride_feat
+        h_offset = h_offsets[None, :, None] * stride_h
+        w_offset = w_offsets[None, None, :] * stride_w
+        
+        # Load input block
+        block_ptrs = input_ptr + batch_offset + feat_offset + h_offset + w_offset
+        x = tl.load(block_ptrs, mask=mask, other=0.0)
+        
+        # Accumulate sum of squares
+        sum_sq += tl.sum(x * x, axis=0)
+    
+    # Compute RMS: sqrt(mean + eps)
+    mean_sq = sum_sq / features
+    rms = tl.sqrt(mean_sq + eps)
+    
+    # Normalize and store
+    for feat_start in range(0, features, BLOCK_SIZE_FEAT):
+        feat_offsets = feat_start + tl.arange(0, BLOCK_SIZE_FEAT)
+        feat_mask = feat_offsets < features
+        
+        # Create combined mask
+        mask = feat_mask[:, None, None] & h_mask[None, :] & w_mask[None, None, :]
+        
+        # Compute pointer offsets for this block
+        batch_offset = pid_batch * stride_batch
+        feat_offset = feat_offsets[:, None, None] * stride_feat
+        h_offset = h_offsets[None, :, None] * stride_h
+        w_offset = w_offsets[None, None, :] * stride_w
+        
+        # Load input block
+        input_ptrs = input_ptr + batch_offset + feat_offset + h_offset + w_offset
+        x = tl.load(input_ptrs, mask=mask, other=0.0)
+        
+        # Normalize
+        normalized = x / rms[None, :, :]
+        
+        # Store result
+        output_ptrs = output_ptr + batch_offset + feat_offset + h_offset + w_offset
+        tl.store(output_ptrs, normalized, mask=mask)
+
+
+def triton_rms_norm(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+    output = torch.empty_like(x)
+    
+    # Get tensor shape and strides
+    batch_size, features, dim_h, dim_w = x.shape
+    strides = x.stride()
+    
+    # Choose block sizes based on feature dimension
+    if features <= 128:
+        # Use larger spatial blocks for small features
+        BLOCK_SIZE_FEAT = 128
+        BLOCK_SIZE_SPATIAL = 16
+    else:
+        # Use smaller blocks for large features
+        BLOCK_SIZE_FEAT = 64
+        BLOCK_SIZE_SPATIAL = 8
+    
+    # Calculate grid
+    grid_spatial = triton.cdiv(dim_h, BLOCK_SIZE_SPATIAL) * triton.cdiv(dim_w, BLOCK_SIZE_SPATIAL)
+    grid_batch = batch_size
+    
+    # Launch kernel
+    rms_norm_kernel[(grid_spatial, grid_batch)](
+        x,
+        output,
+        strides[0],
+        strides[1],
+        strides[2],
+        strides[3],
+        batch_size,
+        features,
+        dim_h,
+        dim_w,
+        eps,
+        BLOCK_SIZE_FEAT=BLOCK_SIZE_FEAT,
+        BLOCK_SIZE_SPATIAL=BLOCK_SIZE_SPATIAL,
+    )
+    
+    return output
+
+
+class ModelNew(nn.Module):
+    def __init__(self, num_features: int, eps: float = 1e-5):
+        super(ModelNew, self).__init__()
+        self.num_features = num_features
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_rms_norm(x, self.eps)
+```
+
+[NCU PROFILING METRICS]
+{
+  "rms_norm_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 10.14,
+    "launch__grid_size": 114688,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 15.43,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 77.69,
+    "lts__t_sector_hit_rate.pct": 81.43
+  }
+}
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

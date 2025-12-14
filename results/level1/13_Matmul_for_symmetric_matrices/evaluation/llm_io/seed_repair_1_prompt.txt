@@ -1,0 +1,157 @@
+Fix the Triton kernel errors. Generate correct, high-performance code.
+
+Current Error Log:
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 619, in compare_and_bench
+    raise ValueError(
+ValueError: Outputs are not close (atol=0.001, rtol=0.001). max_abs_err=inf, mean_abs_err=inf
+
+History Error:
+None
+
+
+PyTorch Reference:
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs a single matrix multiplication (C = A * B) with A and B being symmetric matrices.
+    """
+    def __init__(self):
+        super(Model, self).__init__()
+    
+    def forward(self, A, B):
+        """
+        Performs matrix multiplication of two symmetric matrices.
+
+        Args:
+            A (torch.Tensor): Input matrix A, shape (N, N), symmetric.
+            B (torch.Tensor): Input matrix B, shape (N, N), symmetric.
+
+        Returns:
+            torch.Tensor: Output matrix C, shape (N, N).
+        """
+        return torch.matmul(A, B)
+
+N = 4096
+
+def get_inputs():
+    """
+    Generates a pair of random symmetric matrices for testing.
+
+    Returns:
+        list: List containing two symmetric tensors A and B.
+    """
+    A = torch.rand(N, N)
+    A = (A + A.T) / 2  # Ensure symmetry
+    B = torch.rand(N, N)
+    B = (B + B.T) / 2  # Ensure symmetry
+    return [A, B]
+
+def get_init_inputs():
+    """
+    No specific initialization inputs needed for this model.
+
+    Returns:
+        list: Empty list.
+    """
+    return []
+```
+
+Broken Code:
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def matmul_kernel(
+    a_ptr, b_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    USE_TF32: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    rk = tl.arange(0, BLOCK_K)
+    
+    a_ptrs = a_ptr + rm[:, None] * stride_am + rk[None, :] * stride_ak
+    b_ptrs = b_ptr + rk[:, None] * stride_bk + rn[None, :] * stride_bn
+    
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    for k in range(0, tl.cdiv(K, BLOCK_K)):
+        mask_a = (rm[:, None] < M) & (rk[None, :] < K - k * BLOCK_K)
+        mask_b = (rk[:, None] < K - k * BLOCK_K) & (rn[None, :] < N)
+        
+        a = tl.load(a_ptrs, mask=mask_a, other=0.0)
+        b = tl.load(b_ptrs, mask=mask_b, other=0.0)
+        
+        acc += tl.dot(a, b, acc, out_dtype=tl.float32, allow_tf32=USE_TF32)
+        
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+    
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    c_ptrs = c_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn
+    mask = (rm[:, None] < M) & (rn[None, :] < N)
+    tl.store(c_ptrs, acc, mask=mask)
+
+def triton_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    assert a.dim() == 2 and b.dim() == 2
+    M, K = a.shape
+    K2, N = b.shape
+    assert K == K2
+    
+    c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+    
+    BLOCK_M = 128
+    BLOCK_N = 128
+    BLOCK_K = 32
+    
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+    
+    matmul_kernel[grid](
+        a, b, c,
+        M, N, K,
+        a.stride(0), a.stride(1),
+        b.stride(0), b.stride(1),
+        c.stride(0), c.stride(1),
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        USE_TF32=True,
+        num_warps=8,
+        num_stages=3,
+    )
+    
+    return c
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+    
+    def forward(self, A, B):
+        return triton_matmul(A, B)
+```
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+3. Learn from previous repair attempts to avoid repeating the same mistakes
+
+```python
+# <corrected code>
+```

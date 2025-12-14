@@ -1,0 +1,255 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU
+GPU Name: 4090
+Architecture: Ada Lovelace
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+[OPTIMIZATION STAGE]
+
+## Current Optimization Stage
+
+**Focus**: Optimize memory access patterns and latency hiding.
+
+**NCU Metrics to Check**:
+• `dram__throughput.avg.pct_of_peak_sustained_elapsed`
+• `lts__t_sector_hit_rate.pct`
+• `smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct` (target: <20%)
+
+**Guidelines**:
+- Increase `num_stages` only if memory stalls are high; otherwise keep it small.
+- Improve locality or coalescing only when metrics show issues; avoid unnecessary rewrites.
+- Larger BLOCK_K increases reuse but can raise register pressure; adjust only when metrics justify it.
+
+**Autotune Tip (safe)**:
+If unsure, try a tiny set varying `num_stages` (e.g., {1, 2, 3}) via autotune on the **kernel**.
+
+
+
+[CURRENT CODE]
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 128}, num_warps=1, num_stages=1),
+        triton.Config({'BLOCK_SIZE': 256}, num_warps=2, num_stages=1),
+        triton.Config({'BLOCK_SIZE': 512}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=8, num_stages=3),
+    ],
+    key=['n_elements'],
+)
+@triton.jit
+def leaky_relu_kernel_optimized(
+    x_ptr,
+    output_ptr,
+    negative_slope,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Optimized LeakyReLU kernel with better SM utilization."""
+    pid = tl.program_id(axis=0)
+    
+    # Vectorized operations for better memory throughput
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    
+    # Fused load-compute-store with vectorization hint
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    
+    # Branchless LeakyReLU using tl.where
+    # Using multiplication is faster than additional comparison
+    output = tl.where(x >= 0, x, x * negative_slope)
+    
+    tl.store(output_ptr + offsets, output, mask=mask)
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32}, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64}, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64}, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 32}, num_warps=8),
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 128}, num_warps=8),
+    ],
+    key=['M', 'N'],
+)
+@triton.jit
+def leaky_relu_kernel_2d_optimized(
+    x_ptr,
+    output_ptr,
+    negative_slope,
+    M, N,
+    stride_m, stride_n,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+):
+    """Optimized 2D LeakyReLU kernel with tuned grid layout."""
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+    
+    # Create block offsets with proper masking
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    
+    # Create masks for efficient boundary handling
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+    
+    # Compute memory offsets with coalesced access pattern
+    # (BLOCK_SIZE_M, BLOCK_SIZE_N) block with proper strides
+    x_ptrs = x_ptr + offs_m[:, None] * stride_m + offs_n[None, :] * stride_n
+    mask = mask_m[:, None] & mask_n[None, :]
+    
+    # Load data with proper masking
+    x = tl.load(x_ptrs, mask=mask, other=0.0)
+    
+    # Branchless LeakyReLU computation
+    output = tl.where(x >= 0, x, x * negative_slope)
+    
+    # Store with same mask
+    tl.store(x_ptrs, output, mask=mask)
+
+def triton_leaky_relu_optimized(x: torch.Tensor, negative_slope: float = 0.01) -> torch.Tensor:
+    """High-performance LeakyReLU implementation with optimized grid layout."""
+    output = torch.empty_like(x)
+    
+    # Handle batched 3D/4D tensors by flattening independent dimensions
+    if x.ndim > 2:
+        # Flatten batch/head/expert dimensions for better parallelism
+        original_shape = x.shape
+        if x.ndim == 3:
+            # batch x M x N -> (batch * M) x N
+            x_2d = x.view(-1, x.shape[-1])
+            output_2d = output.view(-1, x.shape[-1])
+            M, N = x_2d.shape
+            
+            grid = lambda META: (
+                triton.cdiv(M, META['BLOCK_SIZE_M']),
+                triton.cdiv(N, META['BLOCK_SIZE_N']),
+            )
+            
+            leaky_relu_kernel_2d_optimized[grid](
+                x_2d, output_2d, negative_slope,
+                M, N,
+                x_2d.stride(0), x_2d.stride(1)
+            )
+            return output
+        elif x.ndim == 4:
+            # batch x heads x M x N -> (batch * heads) x M x N
+            x_3d = x.view(-1, x.shape[-2], x.shape[-1])
+            output_3d = output.view(-1, x.shape[-2], x.shape[-1])
+            
+            # Process each (M, N) slice in parallel
+            batch_size = x_3d.shape[0]
+            M, N = x_3d.shape[1], x_3d.shape[2]
+            
+            # 3D grid: (batch, M, N)
+            grid = lambda META: (
+                batch_size,
+                triton.cdiv(M, META['BLOCK_SIZE_M']),
+                triton.cdiv(N, META['BLOCK_SIZE_N']),
+            )
+            
+            leaky_relu_kernel_2d_optimized[grid](
+                x_3d, output_3d, negative_slope,
+                M, N,
+                x_3d.stride(1), x_3d.stride(2)
+            )
+            return output
+    
+    # Handle 1D and 2D tensors
+    if x.ndim == 1 or (x.ndim == 2 and x.is_contiguous()):
+        # Use 1D kernel for contiguous tensors
+        n_elements = x.numel()
+        
+        grid = lambda META: (triton.cdiv(n_elements, META['BLOCK_SIZE']),)
+        
+        leaky_relu_kernel_optimized[grid](
+            x, output, negative_slope, n_elements
+        )
+    else:
+        # Use 2D kernel for non-contiguous 2D tensors
+        M, N = x.shape[-2], x.shape[-1]
+        
+        grid = lambda META: (
+            triton.cdiv(M, META['BLOCK_SIZE_M']),
+            triton.cdiv(N, META['BLOCK_SIZE_N']),
+        )
+        
+        leaky_relu_kernel_2d_optimized[grid](
+            x, output, negative_slope,
+            M, N,
+            x.stride(-2) if x.ndim > 1 else 1,
+            x.stride(-1)
+        )
+    
+    return output
+
+class ModelNew(nn.Module):
+    """
+    High-performance LeakyReLU model using optimized Triton kernels.
+    """
+    def __init__(self, negative_slope: float = 0.01):
+        """
+        Initializes the LeakyReLU module.
+
+        Args:
+            negative_slope (float, optional): The negative slope of the activation function. Defaults to 0.01.
+        """
+        super(ModelNew, self).__init__()
+        self.negative_slope = negative_slope
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies LeakyReLU activation to the input tensor using optimized Triton kernel.
+
+        Args:
+            x (torch.Tensor): Input tensor of any shape.
+
+        Returns:
+            torch.Tensor: Output tensor with LeakyReLU applied, same shape as input.
+        """
+        return triton_leaky_relu_optimized(x, negative_slope=self.negative_slope)
+```
+
+[NCU PROFILING METRICS]
+{
+  "leaky_relu_kernel_optimized": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 1.96,
+    "launch__grid_size": 6291456,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 89.56,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 93.3,
+    "lts__t_sector_hit_rate.pct": 50.0
+  }
+}
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

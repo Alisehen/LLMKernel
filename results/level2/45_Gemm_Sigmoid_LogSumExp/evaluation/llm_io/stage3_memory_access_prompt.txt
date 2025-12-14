@@ -1,0 +1,333 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU
+GPU Name: 4090
+Architecture: Ada Lovelace
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+[OPTIMIZATION STAGE]
+
+## Current Optimization Stage
+
+Focus: Memory efficiency & latency hiding.
+
+Metrics:
+- dram__throughput.avg.pct_of_peak_sustained_elapsed
+- lts__t_sector_hit_rate.pct
+- smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct (<20%)
+
+Rules:
+- Increase num_stages only if memory stalls are high
+- Do not rewrite access patterns without metric evidence
+- Larger BLOCK_K improves reuse but increases register pressure
+
+Autotune:
+- If unsure, try num_stages ∈ {1,2,3} on kernel
+
+
+
+[CURRENT CODE]
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+# ==================== OPTIMIZED MATMUL + BIAS + SIGMOID KERNEL ====================
+@triton.jit
+def matmul_bias_sigmoid_kernel(
+    a_ptr, b_ptr, c_ptr, bias_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    # ---- 2D grid with group ordering for better L2 cache reuse ----
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    num_pid_in_group = GROUP_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+    
+    # ---- Matrix multiplication with tensor cores ----
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+    
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    for k in range(0, K, BLOCK_K):
+        a = tl.load(a_ptrs, 
+                    mask=(offs_m[:, None] < M) & (offs_k[None, :] < K - k), 
+                    other=0.0)
+        b = tl.load(b_ptrs,
+                    mask=(offs_k[:, None] < K - k) & (offs_n[None, :] < N),
+                    other=0.0)
+        accumulator += tl.dot(a, b)
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+    
+    # ---- Add bias if provided ----
+    if bias_ptr is not None:
+        bias_ptrs = bias_ptr + offs_n
+        bias = tl.load(bias_ptrs, mask=offs_n < N, other=0.0)
+        accumulator += bias[None, :]
+    
+    # ---- Sigmoid activation ----
+    output = 1.0 / (1.0 + tl.exp(-accumulator))
+    
+    # ---- Store result ----
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, output, mask=mask)
+
+
+# ==================== OPTIMIZED MATMUL + BIAS KERNEL ====================
+@triton.jit
+def matmul_bias_kernel(
+    a_ptr, b_ptr, c_ptr, bias_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    # ---- 2D grid with group ordering ----
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    num_pid_in_group = GROUP_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+    
+    # ---- Matrix multiplication ----
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+    
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    for k in range(0, K, BLOCK_K):
+        a = tl.load(a_ptrs,
+                    mask=(offs_m[:, None] < M) & (offs_k[None, :] < K - k),
+                    other=0.0)
+        b = tl.load(b_ptrs,
+                    mask=(offs_k[:, None] < K - k) & (offs_n[None, :] < N),
+                    other=0.0)
+        accumulator += tl.dot(a, b)
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+    
+    # ---- Add bias if provided ----
+    if bias_ptr is not None:
+        bias_ptrs = bias_ptr + offs_n
+        bias = tl.load(bias_ptrs, mask=offs_n < N, other=0.0)
+        accumulator += bias[None, :]
+    
+    # ---- Store result ----
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, accumulator, mask=mask)
+
+
+# ==================== OPTIMIZED LOGSUMEXP KERNEL ====================
+@triton.jit
+def logsumexp_kernel(
+    x_ptr, output_ptr,
+    M, N,
+    stride_xm, stride_xn,
+    stride_om,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    # ---- 1D grid over rows ----
+    pid_m = tl.program_id(0)
+    
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    
+    # ---- Vectorized memory access ----
+    x_ptrs = x_ptr + offs_m[:, None] * stride_xm + offs_n[None, :] * stride_xn
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    
+    # ---- Load with vectorized pattern ----
+    x = tl.load(x_ptrs, mask=mask, other=-float('inf'))
+    
+    # ---- Compute max per row ----
+    row_max = tl.max(x, axis=1)
+    
+    # ---- Subtract max and compute exp ----
+    x_normalized = x - row_max[:, None]
+    exp_x = tl.exp(x_normalized)
+    
+    # ---- Sum exponentials ----
+    row_sum = tl.sum(exp_x, axis=1)
+    
+    # ---- Final logsumexp ----
+    result = tl.log(row_sum) + row_max
+    
+    # ---- Store ----
+    output_ptrs = output_ptr + offs_m * stride_om
+    tl.store(output_ptrs, result, mask=offs_m < M)
+
+
+# ==================== OPTIMIZED WRAPPER FUNCTIONS ====================
+def triton_linear_sigmoid(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    M, K = x.shape
+    N = weight.shape[0]
+    
+    output = torch.empty((M, N), device=x.device, dtype=x.dtype)
+    
+    # ---- Reduced block sizes to fit shared memory constraints ----
+    BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32
+    
+    # ---- Optimized grid with group ordering ----
+    def grid(META):
+        return (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),)
+    
+    matmul_bias_sigmoid_kernel[grid](
+        x, weight.T, output, bias,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        weight.stride(1), weight.stride(0),
+        output.stride(0), output.stride(1),
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, GROUP_M=8,
+        num_warps=4, num_stages=1  # Reduced stages to lower shared memory usage
+    )
+    
+    return output
+
+
+def triton_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    M, K = x.shape
+    N = weight.shape[0]
+    
+    output = torch.empty((M, N), device=x.device, dtype=x.dtype)
+    
+    # ---- Same reduced block sizes ----
+    BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32
+    
+    # ---- Same optimized grid ----
+    def grid(META):
+        return (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),)
+    
+    matmul_bias_kernel[grid](
+        x, weight.T, output, bias,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        weight.stride(1), weight.stride(0),
+        output.stride(0), output.stride(1),
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, GROUP_M=8,
+        num_warps=4, num_stages=1  # Reduced stages to lower shared memory usage
+    )
+    
+    return output
+
+
+def triton_logsumexp(x: torch.Tensor, dim: int = 1) -> torch.Tensor:
+    if dim != 1:
+        raise ValueError("Only dim=1 is supported")
+    
+    M, N = x.shape
+    output = torch.empty(M, device=x.device, dtype=x.dtype)
+    
+    # ---- Conservative block sizes for shared memory safety ----
+    BLOCK_M, BLOCK_N = 64, min(1024, N)
+    
+    # ---- Adjust grid size based on block dimensions ----
+    def grid(META):
+        return (triton.cdiv(M, BLOCK_M),)
+    
+    logsumexp_kernel[grid](
+        x, output,
+        M, N,
+        x.stride(0), x.stride(1),
+        output.stride(0),
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+        num_warps=4, num_stages=1
+    )
+    
+    return output
+
+
+# ==================== OPTIMIZED MODEL ====================
+class ModelNew(nn.Module):
+    def __init__(self, input_size: int, hidden_size: int, output_size: int):
+        super().__init__()
+        self.linear1 = nn.Linear(input_size, hidden_size)
+        self.linear2 = nn.Linear(hidden_size, output_size)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = triton_linear_sigmoid(x, self.linear1.weight, self.linear1.bias)
+        x = triton_linear(x, self.linear2.weight, self.linear2.bias)
+        x = triton_logsumexp(x, dim=1)
+        return x
+```
+
+[NCU PROFILING METRICS]
+{
+  "matmul_bias_sigmoid_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 44.6,
+    "launch__grid_size": 16384,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 33.07,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 10.0,
+    "lts__t_sector_hit_rate.pct": 99.04
+  },
+  "matmul_bias_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 44.09,
+    "launch__grid_size": 4096,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 32.41,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 16.31,
+    "lts__t_sector_hit_rate.pct": 96.7
+  },
+  "logsumexp_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 10.81,
+    "launch__grid_size": 256,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 16.65,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 75.13,
+    "lts__t_sector_hit_rate.pct": 63.55
+  }
+}
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

@@ -1,0 +1,88 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+import math
+
+@triton.autotune(
+    configs=[
+        # Small tensors
+        triton.Config({'BLOCK_SIZE': 256}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 256}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 256}, num_warps=8, num_stages=2),
+        
+        # Medium tensors
+        triton.Config({'BLOCK_SIZE': 512}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 512}, num_warps=8, num_stages=4),
+        triton.Config({'BLOCK_SIZE': 512}, num_warps=16, num_stages=3),
+        
+        # Large tensors
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=8, num_stages=4),
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=16, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=16, num_stages=4),
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=16, num_stages=5),
+    ],
+    key=['n_elements'],
+)
+@triton.jit
+def gelu_kernel(
+    x_ptr,
+    output_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Optimized GELU kernel for Ada Lovelace architecture."""
+    pid = tl.program_id(axis=0)
+    
+    # Calculate block start and offsets
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    
+    # Load input
+    x = tl.load(x_ptr + offsets, mask=mask)
+    
+    # GELU constants
+    a = 0.7978845608028654  # sqrt(2/π)
+    b = 0.044715
+    
+    # Compute GELU with optimized instruction scheduling
+    x_sq = x * x
+    x_cu = x_sq * x
+    t = a * (x + b * x_cu)
+    
+    # Optimized tanh approximation
+    t_sq = t * t
+    numerator = t * (27.0 + t_sq)
+    denominator = 27.0 + 9.0 * t_sq
+    tanh_t = numerator / denominator
+    
+    # Final GELU
+    output = 0.5 * x * (1.0 + tanh_t)
+    
+    # Store result
+    tl.store(output_ptr + offsets, output, mask=mask)
+
+def triton_gelu(x: torch.Tensor) -> torch.Tensor:
+    """Optimized Triton-accelerated GELU activation."""
+    output = torch.empty_like(x)
+    n_elements = output.numel()
+    
+    # Calculate optimal grid size
+    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
+    
+    # Launch kernel
+    gelu_kernel[grid](
+        x, output, n_elements
+    )
+    
+    return output
+
+class ModelNew(nn.Module):
+    """Optimized GELU implementation with autotuned Triton kernels."""
+    def __init__(self) -> None:
+        super().__init__()
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_gelu(x)

@@ -1,0 +1,191 @@
+# <complete ModelNew code with optimized Triton kernels>
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+import math
+
+
+@triton.jit
+def conv1d_kernel(
+    x_ptr,
+    w_ptr,
+    y_ptr,
+    B,
+    C_IN,
+    L_IN,
+    C_OUT,
+    L_OUT,
+    KERNEL_SIZE,
+    STRIDE,
+    PADDING,
+    DILATION,
+    K_TOTAL,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_b = tl.program_id(0)
+    pid_l = tl.program_id(1)
+    pid_co = tl.program_id(2)
+
+    l_offsets = pid_l * BLOCK_M + tl.arange(0, BLOCK_M)
+    co_offsets = pid_co * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    mask_b = pid_b < B
+    mask_l = l_offsets < L_OUT
+    mask_co = co_offsets < C_OUT
+
+    in_positions = l_offsets * STRIDE - PADDING
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    x_batch_ptr = x_ptr + pid_b * C_IN * L_IN
+    y_batch_ptr = y_ptr + pid_b * C_OUT * L_OUT
+
+    for k_start in range(0, K_TOTAL, BLOCK_K):
+        k_idx = k_start + tl.arange(0, BLOCK_K)
+        k_mask = k_idx < K_TOTAL
+
+        ci = k_idx // KERNEL_SIZE
+        kk = k_idx % KERNEL_SIZE
+
+        pos = in_positions[:, None] + kk[None, :] * DILATION
+        valid_pos = (pos >= 0) & (pos < L_IN)
+        pos_clamped = tl.where(valid_pos, pos, 0)
+
+        x_ptrs = x_batch_ptr + ci[None, :] * L_IN + pos_clamped
+        x_mask = mask_l[:, None] & k_mask[None, :] & valid_pos & mask_b
+        x_vals = tl.load(x_ptrs, mask=x_mask, other=0.0)
+
+        w_ptrs = w_ptr + co_offsets[None, :] * K_TOTAL + k_idx[:, None]
+        w_mask = mask_co[None, :] & k_mask[:, None]
+        w_vals = tl.load(w_ptrs, mask=w_mask, other=0.0)
+
+        acc += tl.dot(x_vals, w_vals)
+
+    y_ptrs = y_batch_ptr + co_offsets[None, :] * L_OUT + l_offsets[:, None]
+    y_mask = mask_l[:, None] & mask_co[None, :] & mask_b
+    tl.store(y_ptrs, acc, mask=y_mask)
+
+
+def triton_conv1d(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor = None,
+    stride: int = 1,
+    padding: int = 0,
+    dilation: int = 1,
+) -> torch.Tensor:
+    assert x.is_cuda and weight.is_cuda, "Inputs must be CUDA tensors."
+    assert x.dtype == torch.float32 and weight.dtype == torch.float32, "Only float32 is supported."
+
+    B, C_IN, L_IN = x.shape
+    C_OUT, C_W, KERNEL_SIZE = weight.shape
+    assert C_W == C_IN, "in_channels mismatch."
+
+    L_OUT = (L_IN + 2 * padding - dilation * (KERNEL_SIZE - 1) - 1) // stride + 1
+    assert L_OUT > 0, "Calculated output length must be positive."
+
+    y = torch.empty((B, C_OUT, L_OUT), device=x.device, dtype=x.dtype)
+
+    if L_OUT >= 256:
+        BLOCK_M = 128
+    elif L_OUT >= 64:
+        BLOCK_M = 64
+    else:
+        BLOCK_M = 32
+
+    if C_OUT >= 256:
+        BLOCK_N = 128
+        num_warps = 8
+    elif C_OUT >= 64:
+        BLOCK_N = 64
+        num_warps = 4
+    else:
+        BLOCK_N = 32
+        num_warps = 4
+
+    BLOCK_K = 64 if C_IN * KERNEL_SIZE >= 128 else 32
+
+    grid = (
+        B,
+        triton.cdiv(L_OUT, BLOCK_M),
+        triton.cdiv(C_OUT, BLOCK_N),
+    )
+
+    conv1d_kernel[grid](
+        x,
+        weight,
+        y,
+        B,
+        C_IN,
+        L_IN,
+        C_OUT,
+        L_OUT,
+        KERNEL_SIZE,
+        stride,
+        padding,
+        dilation,
+        C_IN * KERNEL_SIZE,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        num_warps=num_warps,
+        num_stages=3,
+    )
+
+    if bias is not None:
+        y += bias.view(1, -1, 1)
+
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-accelerated 1D convolution module (supports stride, padding, dilation, groups=1).
+    """
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        stride: int = 1,
+        padding: int = 0,
+        dilation: int = 1,
+        groups: int = 1,
+        bias: bool = False,
+    ):
+        super().__init__()
+        if groups != 1:
+            raise NotImplementedError("This implementation currently supports only groups=1.")
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+
+        self.weight = nn.Parameter(torch.empty(out_channels, in_channels, kernel_size))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_channels))
+        else:
+            self.register_parameter("bias", None)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in = self.in_channels * self.kernel_size
+            bound = 1 / math.sqrt(fan_in)
+            nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_conv1d(
+            x,
+            self.weight,
+            self.bias,
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation,
+        )

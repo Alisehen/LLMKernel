@@ -1,0 +1,92 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def tanh_kernel(
+    x_ptr,
+    output_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    # 1D grid of blocks
+    pid = tl.program_id(axis=0)
+    
+    # Offset for this block
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    
+    # Mask to avoid out-of-bounds access
+    mask = offsets < n_elements
+    
+    # Load input
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    
+    # Optimized tanh using exponential formulation: tanh(x) = (exp(2x) - 1) / (exp(2x) + 1)
+    # Compute exp(2x) efficiently
+    exp_2x = tl.exp(2.0 * x)
+    
+    # Compute tanh using the formula
+    output = (exp_2x - 1.0) / (exp_2x + 1.0)
+    
+    # Store result
+    tl.store(output_ptr + offsets, output, mask=mask)
+
+
+def triton_tanh(x: torch.Tensor) -> torch.Tensor:
+    """
+    Apply tanh activation using Triton kernel.
+    
+    Args:
+        x: Input tensor of any shape
+        
+    Returns:
+        Output tensor with tanh applied, same shape as input
+    """
+    # Create output tensor
+    output = torch.empty_like(x)
+    
+    # Flatten to 1D for kernel processing
+    output_flat = output.view(-1)
+    x_flat = x.view(-1)
+    
+    n_elements = x_flat.numel()
+    
+    # Choose optimal block size based on problem size
+    # For large problems, use larger blocks to improve memory throughput
+    if n_elements >= 1048576:  # 1M elements
+        BLOCK_SIZE = 1024
+    elif n_elements >= 262144:  # 256K elements
+        BLOCK_SIZE = 512
+    else:
+        BLOCK_SIZE = 256
+    
+    # Calculate grid size
+    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
+    
+    # Launch kernel
+    tanh_kernel[grid](x_flat, output_flat, n_elements, BLOCK_SIZE=BLOCK_SIZE)
+    
+    return output
+
+
+class ModelNew(nn.Module):
+    """
+    Simple model that performs a Tanh activation using Triton kernels.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies Tanh activation to the input tensor using Triton kernel.
+
+        Args:
+            x (torch.Tensor): Input tensor of any shape.
+
+        Returns:
+            torch.Tensor: Output tensor with Tanh applied, same shape as input.
+        """
+        return triton_tanh(x)

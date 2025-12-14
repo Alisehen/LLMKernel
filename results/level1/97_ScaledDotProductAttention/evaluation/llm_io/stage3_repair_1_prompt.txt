@@ -1,0 +1,268 @@
+Fix the Triton kernel errors. Generate correct, high-performance code.
+
+Current Error Log:
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 536, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251213_163716_97_ScaledDotProductAttention_openai_deepseek/97_ScaledDotProductAttention/code/kernel_20251213_165355.py", line 195, in forward
+    return triton_scaled_dot_product_attention(Q, K, V)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251213_163716_97_ScaledDotProductAttention_openai_deepseek/97_ScaledDotProductAttention/code/kernel_20251213_165355.py", line 157, in triton_scaled_dot_product_attention
+    assert D <= 128, "This optimized kernel assumes head_dim <= 128 for best performance."
+           ^^^^^^^^
+AssertionError: This optimized kernel assumes head_dim <= 128 for best performance.
+
+History Error:
+None
+
+
+PyTorch Reference:
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    def __init__(self):
+        super(Model, self).__init__()
+
+    def forward(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
+        out = torch.nn.functional.scaled_dot_product_attention(Q, K, V)
+        return out
+
+batch_size = 32
+num_heads = 32
+sequence_length = 512
+embedding_dimension = 1024
+
+def get_inputs():
+    Q = torch.rand(batch_size, num_heads, sequence_length, embedding_dimension, device='cuda', dtype=torch.float16)
+    K = torch.rand(batch_size, num_heads, sequence_length, embedding_dimension, device='cuda', dtype=torch.float16)
+    V = torch.rand(batch_size, num_heads, sequence_length, embedding_dimension, device='cuda', dtype=torch.float16)
+    return [Q, K, V]
+
+def get_init_inputs():
+    return []
+```
+
+Broken Code:
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_D": 128},
+            num_warps=4,
+            num_stages=2,
+        ),
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_D": 128},
+            num_warps=8,
+            num_stages=2,
+        ),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_D": 128},
+            num_warps=8,
+            num_stages=3,
+        ),
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_D": 128},
+            num_warps=8,
+            num_stages=3,
+        ),
+    ],
+    key=["S"],
+)
+@triton.jit
+def flash_attn_fwd_kernel(
+    Q_ptr, K_ptr, V_ptr, O_ptr,
+    BATCH, S, D,
+    stride_qb, stride_qm, stride_qk,
+    stride_kb, stride_kn, stride_kk,
+    stride_vb, stride_vn, stride_vk,
+    stride_ob, stride_om, stride_ok,
+    scale,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """
+    Fused scaled dot-product attention forward pass:
+        O = softmax(Q @ K^T * scale) @ V
+
+    Shapes (flat over batch*heads):
+        Q, K, V: [BATCH, S, D]
+        O:       [BATCH, S, D]
+    """
+    pid_m = tl.program_id(axis=0)  # block index along sequence (queries)
+    pid_b = tl.program_id(axis=1)  # batch-head index
+
+    # Offsets
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, BLOCK_D)
+
+    m_mask = offs_m < S
+    n_mask_init = offs_n < S
+    d_mask = offs_d < D
+
+    # Base pointers for this batch-head
+    Q_batch = Q_ptr + pid_b * stride_qb
+    K_batch = K_ptr + pid_b * stride_kb
+    V_batch = V_ptr + pid_b * stride_vb
+    O_batch = O_ptr + pid_b * stride_ob
+
+    # Load Q block: [BLOCK_M, BLOCK_D] (masked along S and D)
+    q_ptrs = Q_batch + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qk
+    q = tl.load(q_ptrs, mask=m_mask[:, None] & d_mask[None, :], other=0.0)
+
+    # Initialize online softmax state
+    m_i = tl.full((BLOCK_M,), -float("inf"), dtype=tl.float32)
+    l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
+
+    # Loop over K/V blocks along sequence dimension
+    start_n = 0
+    while start_n < S:
+        offs_n_curr = start_n + offs_n
+        n_mask = offs_n_curr < S
+
+        # Load K block: [BLOCK_N, BLOCK_D]
+        k_ptrs = K_batch + offs_n_curr[:, None] * stride_kn + offs_d[None, :] * stride_kk
+        k = tl.load(k_ptrs, mask=n_mask[:, None] & d_mask[None, :], other=0.0)
+
+        # Load V block: [BLOCK_N, BLOCK_D]
+        v_ptrs = V_batch + offs_n_curr[:, None] * stride_vn + offs_d[None, :] * stride_vk
+        v = tl.load(v_ptrs, mask=n_mask[:, None] & d_mask[None, :], other=0.0)
+
+        # qk = Q @ K^T  -> [BLOCK_M, BLOCK_N], accumulate in FP32
+        qk = tl.dot(q, tl.trans(k))
+        qk = qk * scale
+
+        # Mask out-of-range positions (rows or columns)
+        qk = tl.where(m_mask[:, None] & n_mask[None, :], qk, -float("inf"))
+
+        # Compute max logits per row for the current block
+        current_max = tl.max(qk, axis=1)
+        m_i_new = tl.maximum(m_i, current_max)
+
+        # Compute exp(logits - new_max)
+        logits_shifted = qk - m_i_new[:, None]
+        p = tl.exp(logits_shifted)
+
+        # Update l_i (normalizer) with the online softmax formula
+        exp_scale = tl.exp(m_i - m_i_new)
+        l_i_scaled = l_i * exp_scale
+        p_sum = tl.sum(p, axis=1)
+        l_i_new = l_i_scaled + p_sum
+
+        # Rescale previous accumulator contribution
+        alpha = l_i_scaled / l_i_new
+        acc = acc * alpha[:, None]
+
+        # Add new contribution: (p @ V) / l_i_new
+        pv = tl.dot(p.to(tl.float16), v)  # [BLOCK_M, BLOCK_D], FP32 accumulation
+        beta = 1.0 / l_i_new
+        acc = acc + pv * beta[:, None]
+
+        # Update running stats
+        m_i = m_i_new
+        l_i = l_i_new
+
+        start_n += BLOCK_N
+
+    # Write back O block
+    o_ptrs = O_batch + offs_m[:, None] * stride_om + offs_d[None, :] * stride_ok
+    tl.store(o_ptrs, acc.to(tl.float16), mask=m_mask[:, None] & d_mask[None, :])
+
+
+def triton_scaled_dot_product_attention(Q: torch.Tensor,
+                                        K: torch.Tensor,
+                                        V: torch.Tensor) -> torch.Tensor:
+    """
+    Fused Triton implementation of scaled dot-product attention:
+
+        attn = softmax(Q @ K^T / sqrt(d_k))
+        out  = attn @ V
+
+    Inputs:
+        Q, K, V: [B, H, S, D], dtype=float16, CUDA tensors
+    Output:
+        out: [B, H, S, D], dtype=float16
+
+    Constraints:
+        This optimized kernel currently supports head_dim D <= 128.
+    """
+    assert Q.is_cuda and K.is_cuda and V.is_cuda, "Inputs must be CUDA tensors"
+    assert Q.dtype == torch.float16 and K.dtype == torch.float16 and V.dtype == torch.float16
+    assert Q.shape == K.shape == V.shape
+
+    B, H, S, D = Q.shape
+    assert D <= 128, "This optimized kernel assumes head_dim <= 128 for best performance."
+
+    BH = B * H
+
+    # Flatten [B, H] -> batch dimension for the kernel
+    Q_flat = Q.contiguous().view(BH, S, D)
+    K_flat = K.contiguous().view(BH, S, D)
+    V_flat = V.contiguous().view(BH, S, D)
+
+    O_flat = torch.empty_like(Q_flat)
+
+    scale = 1.0 / float(D ** 0.5)
+
+    def grid(meta):
+        return (
+            triton.cdiv(S, meta["BLOCK_M"]),
+            BH,
+        )
+
+    flash_attn_fwd_kernel[grid](
+        Q_flat, K_flat, V_flat, O_flat,
+        BH, S, D,
+        Q_flat.stride(0), Q_flat.stride(1), Q_flat.stride(2),
+        K_flat.stride(0), K_flat.stride(1), K_flat.stride(2),
+        V_flat.stride(0), V_flat.stride(1), V_flat.stride(2),
+        O_flat.stride(0), O_flat.stride(1), O_flat.stride(2),
+        scale,
+    )
+
+    out = O_flat.view(B, H, S, D)
+    return out
+
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
+        return triton_scaled_dot_product_attention(Q, K, V)
+```
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl, AND any other modules used (e.g., import math if using math.sqrt)
+   2. @triton.jit decorated kernel function(s) — NO continue/break/return inside loops (use masking)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels — THIS CLASS IS REQUIRED
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+3. Learn from previous repair attempts to avoid repeating the same mistakes
+4. Ensure ALL imports are included at the top (common mistake: forgetting `import math`)
+
+```python
+# <corrected code>
+```

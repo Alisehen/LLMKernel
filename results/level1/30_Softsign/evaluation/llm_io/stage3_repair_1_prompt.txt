@@ -1,0 +1,252 @@
+Fix the Triton kernel errors. Generate correct, high-performance code.
+
+Current Error Log:
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 535, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251212_170043_batch_range5to40_deepseek_deepseek/30_Softsign/code/kernel_20251213_005907.py", line 163, in forward
+    return triton_softsign(x)
+           ^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251212_170043_batch_range5to40_deepseek_deepseek/30_Softsign/code/kernel_20251213_005907.py", line 136, in triton_softsign
+    softsign_kernel_autotuned[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 347, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 192, in run
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 192, in <dictcomp>
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 145, in _bench
+    raise ValueError(f"Conflicting meta-parameters: {', '.join(conflicts)}."
+ValueError: Conflicting meta-parameters: USE_FAST_DIV. Make sure that you don't re-define auto-tuned symbols.
+
+History Error:
+None
+
+
+PyTorch Reference:
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs a Softsign activation.
+    """
+    def __init__(self):
+        super(Model, self).__init__()
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies Softsign activation to the input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor of any shape.
+
+        Returns:
+            torch.Tensor: Output tensor with Softsign applied, same shape as input.
+        """
+        return x / (1 + torch.abs(x))
+
+batch_size = 4096
+dim = 393216
+
+def get_inputs():
+    x = torch.rand(batch_size, dim)
+    return [x]
+
+def get_init_inputs():
+    return []  # No special initialization inputs needed
+```
+
+Broken Code:
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def softsign_kernel_optimized(
+    x_ptr,
+    output_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+    VECTOR_SIZE: tl.constexpr,
+    USE_FAST_DIV: tl.constexpr,
+    num_stages: tl.constexpr,
+):
+    """
+    Optimized Softsign kernel with vectorized memory access and configurable pipeline stages.
+    
+    Key optimizations:
+    1. Vectorized loads/stores for better memory coalescing
+    2. Configurable pipeline stages to hide memory latency
+    3. Optimized division based on data type
+    4. Reduced register pressure through smart operation ordering
+    """
+    pid = tl.program_id(axis=0)
+    block_start = pid * (BLOCK_SIZE * VECTOR_SIZE)
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)[:, None] * VECTOR_SIZE + tl.arange(0, VECTOR_SIZE)[None, :]
+    offsets_flat = tl.view(offsets, BLOCK_SIZE * VECTOR_SIZE)
+    
+    # Create mask for the entire vectorized block
+    mask_flat = offsets_flat < n_elements
+    mask_reshaped = tl.view(mask_flat, (BLOCK_SIZE, VECTOR_SIZE))
+    
+    # Vectorized load with proper mask
+    x_vec = tl.load(x_ptr + offsets, mask=mask_reshaped, other=0.0)
+    
+    # Compute absolute value (fused operations)
+    abs_x_vec = tl.abs(x_vec)
+    
+    # Optimized computation based on USE_FAST_DIV flag
+    if USE_FAST_DIV:
+        # Use native division for Tensor Core architectures
+        # Compiler optimizes this pattern for Ampere/Ada
+        output_vec = x_vec * tl.math.rcp(1.0 + abs_x_vec)
+    else:
+        # Standard computation with fused multiply-add
+        denominator = 1.0 + abs_x_vec
+        output_vec = x_vec / denominator
+    
+    # Vectorized store
+    tl.store(output_ptr + offsets, output_vec, mask=mask_reshaped)
+
+
+@triton.autotune(
+    configs=[
+        # Large block size for maximum occupancy (FP32)
+        triton.Config({'BLOCK_SIZE': 512, 'VECTOR_SIZE': 2, 'USE_FAST_DIV': False, 'num_stages': 2},
+                      num_warps=16),
+        triton.Config({'BLOCK_SIZE': 256, 'VECTOR_SIZE': 4, 'USE_FAST_DIV': False, 'num_stages': 3},
+                      num_warps=8),
+        # Fast division for half precision (Tensor Core optimized)
+        triton.Config({'BLOCK_SIZE': 512, 'VECTOR_SIZE': 4, 'USE_FAST_DIV': True, 'num_stages': 2},
+                      num_warps=16),
+        triton.Config({'BLOCK_SIZE': 256, 'VECTOR_SIZE': 8, 'USE_FAST_DIV': True, 'num_stages': 3},
+                      num_warps=8),
+        # Small tensor configurations
+        triton.Config({'BLOCK_SIZE': 128, 'VECTOR_SIZE': 4, 'USE_FAST_DIV': False, 'num_stages': 1},
+                      num_warps=4),
+        triton.Config({'BLOCK_SIZE': 64, 'VECTOR_SIZE': 8, 'USE_FAST_DIV': False, 'num_stages': 1},
+                      num_warps=2),
+    ],
+    key=['n_elements', 'dtype'],
+)
+@triton.jit
+def softsign_kernel_autotuned(
+    x_ptr,
+    output_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+    VECTOR_SIZE: tl.constexpr,
+    USE_FAST_DIV: tl.constexpr,
+    num_stages: tl.constexpr,
+):
+    """Autotuned version with optimized configurations for different tensor sizes."""
+    pid = tl.program_id(axis=0)
+    block_elems = BLOCK_SIZE * VECTOR_SIZE
+    block_start = pid * block_elems
+    
+    # Vectorized offsets calculation
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)[:, None] * VECTOR_SIZE + tl.arange(0, VECTOR_SIZE)[None, :]
+    offsets_flat = tl.reshape(offsets, block_elems)
+    
+    # Vectorized mask
+    mask_flat = offsets_flat < n_elements
+    mask = tl.reshape(mask_flat, (BLOCK_SIZE, VECTOR_SIZE))
+    
+    # Coalesced vector load
+    x_vec = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    
+    # Compute with minimal register pressure
+    if USE_FAST_DIV:
+        # Optimized for Tensor Cores: x * rcp(1 + |x|)
+        abs_x = tl.abs(x_vec)
+        output_vec = x_vec * tl.math.rcp(1.0 + abs_x)
+    else:
+        # Standard precision: x / (1 + |x|)
+        output_vec = x_vec / (1.0 + tl.abs(x_vec))
+    
+    # Coalesced vector store
+    tl.store(output_ptr + offsets, output_vec, mask=mask)
+
+
+def triton_softsign(x: torch.Tensor) -> torch.Tensor:
+    """
+    Optimized Triton wrapper for Softsign activation.
+    
+    Uses autotuned kernel configurations for optimal performance across:
+    - Tensor sizes (small to large)
+    - Data types (FP32, FP16, BF16)
+    - Memory access patterns
+    """
+    output = torch.empty_like(x)
+    n_elements = output.numel()
+    
+    if n_elements == 0:
+        return output
+    
+    # Calculate optimal grid size
+    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE'] * meta['VECTOR_SIZE']),)
+    
+    # Determine if we should use fast division (optimized for Tensor Cores)
+    use_fast_div = x.dtype in (torch.float16, torch.bfloat16)
+    
+    # Use autotuned kernel for best performance
+    softsign_kernel_autotuned[grid](
+        x, output, n_elements,
+        USE_FAST_DIV=use_fast_div,
+        dtype=x.dtype
+    )
+    
+    return output
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model using Triton kernels with autotuning and vectorized memory access.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies optimized Softsign activation to the input tensor.
+        
+        Args:
+            x (torch.Tensor): Input tensor of any shape.
+        
+        Returns:
+            torch.Tensor: Output tensor with Softsign applied, same shape as input.
+        """
+        # Use autotuned Triton kernel for optimal performance
+        return triton_softsign(x)
+```
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+3. Learn from previous repair attempts to avoid repeating the same mistakes
+
+```python
+# <corrected code>
+```

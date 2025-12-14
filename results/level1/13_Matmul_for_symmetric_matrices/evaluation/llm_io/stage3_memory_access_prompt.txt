@@ -1,0 +1,160 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU
+GPU Name: 4090
+Architecture: Ada Lovelace
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+[OPTIMIZATION STAGE]
+
+## Current Optimization Stage
+
+**Focus**: Optimize memory access patterns and latency hiding.
+
+**NCU Metrics to Check**:
+• `dram__throughput.avg.pct_of_peak_sustained_elapsed`
+• `lts__t_sector_hit_rate.pct`
+• `smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct` (target: <20%)
+
+**Guidelines**:
+- Increase `num_stages` only if memory stalls are high; otherwise keep it small.
+- Improve locality or coalescing only when metrics show issues; avoid unnecessary rewrites.
+- Larger BLOCK_K increases reuse but can raise register pressure; adjust only when metrics justify it.
+
+**Autotune Tip (safe)**:
+If unsure, try a tiny set varying `num_stages` (e.g., {1, 2, 3}) via autotune on the **kernel**.
+
+
+
+[CURRENT CODE]
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4, num_stages=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_warps=8, num_stages=3),
+    ],
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def matmul_kernel(
+    a_ptr, b_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    USE_TF32: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    
+    pid_m = pid // num_pid_n
+    pid_n = pid % num_pid_n
+    
+    # Create pointers for A and B blocks
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    
+    a_ptrs = a_ptr + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
+    
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    for k in range(0, tl.cdiv(K, BLOCK_K)):
+        # Load A and B with boundary checks
+        a = tl.load(a_ptrs, mask=offs_m[:, None] < M, other=0.0)
+        b = tl.load(b_ptrs, mask=offs_n[None, :] < N, other=0.0)
+        
+        # Accumulate
+        accumulator += tl.dot(a, b, allow_tf32=USE_TF32)
+        
+        # Update pointers
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+    
+    # Store result with boundary check
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, accumulator, mask=c_mask)
+
+def triton_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    assert a.dim() == 2 and b.dim() == 2
+    M, K = a.shape
+    K2, N = b.shape
+    assert K == K2, f"Shape mismatch: a={a.shape}, b={b.shape}"
+    
+    c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+    
+    # Use TF32 for float32, otherwise use regular precision
+    USE_TF32 = a.dtype == torch.float32
+    
+    # Dynamic grid size calculation
+    grid = lambda meta: (triton.cdiv(M, meta['BLOCK_M']) * triton.cdiv(N, meta['BLOCK_N']),)
+    
+    matmul_kernel[grid](
+        a, b, c,
+        M, N, K,
+        a.stride(0), a.stride(1),
+        b.stride(0), b.stride(1),
+        c.stride(0), c.stride(1),
+        USE_TF32=USE_TF32,
+    )
+    
+    return c
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+    
+    def forward(self, A, B):
+        return triton_matmul(A, B)
+```
+
+[NCU PROFILING METRICS]
+{
+  "matmul_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 46.39,
+    "launch__grid_size": 1024,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 16.66,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 30.52,
+    "lts__t_sector_hit_rate.pct": 87.49
+  }
+}
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

@@ -1,0 +1,267 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def triplet_margin_loss_kernel_optimized(
+    anchor_ptr,
+    positive_ptr,
+    negative_ptr,
+    loss_ptr,
+    margin,
+    batch_size,
+    feature_size,
+    BLOCK_SIZE_FEAT: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+):
+    """
+    Optimized kernel for Triplet Margin Loss with improved memory access patterns.
+    - Vectorized loads for better coalescing
+    - Increased memory-level parallelism
+    - Optimized block size for feature dimension
+    """
+    pid = tl.program_id(axis=0)  # batch index
+    
+    if pid >= batch_size:
+        return
+    
+    # Initialize accumulators for squared distances
+    pos_sum_sq = 0.0
+    neg_sum_sq = 0.0
+    
+    # Base pointers for current sample with prefetching
+    base_offset = pid * feature_size
+    base_anchor = anchor_ptr + base_offset
+    base_positive = positive_ptr + base_offset
+    base_negative = negative_ptr + base_offset
+    
+    # Process features in blocks with vectorized loads
+    for feat_start in range(0, feature_size, BLOCK_SIZE_FEAT):
+        # Create offsets for this block
+        feat_offsets = feat_start + tl.arange(0, BLOCK_SIZE_FEAT)
+        mask = feat_offsets < feature_size
+        
+        # Vectorized loads with better coalescing
+        anchor = tl.load(base_anchor + feat_offsets, mask=mask, other=0.0)
+        positive = tl.load(base_positive + feat_offsets, mask=mask, other=0.0)
+        negative = tl.load(base_negative + feat_offsets, mask=mask, other=0.0)
+        
+        # Fused computation with pipelining
+        pos_diff = anchor - positive
+        neg_diff = anchor - negative
+        
+        # Early reduction to minimize register pressure
+        pos_sum_sq += tl.sum(pos_diff * pos_diff, axis=0)
+        neg_sum_sq += tl.sum(neg_diff * neg_diff, axis=0)
+    
+    # Compute distances with optimized numerical stability
+    pos_dist = tl.sqrt(pos_sum_sq + 1e-12)
+    neg_dist = tl.sqrt(neg_sum_sq + 1e-12)
+    
+    # Compute final triplet loss with margin
+    loss_val = tl.maximum(pos_dist - neg_dist + margin, 0.0)
+    tl.store(loss_ptr + pid, loss_val)
+
+def triton_triplet_margin_loss_optimized(
+    anchor: torch.Tensor,
+    positive: torch.Tensor,
+    negative: torch.Tensor,
+    margin: float = 1.0
+) -> torch.Tensor:
+    """
+    Compute Triplet Margin Loss using optimized Triton kernels.
+    
+    Args:
+        anchor: Tensor of shape (batch_size, feature_dim)
+        positive: Tensor of shape (batch_size, feature_dim)
+        negative: Tensor of shape (batch_size, feature_dim)
+        margin: Margin for the triplet loss
+        
+    Returns:
+        Scalar loss value
+    """
+    assert anchor.shape == positive.shape == negative.shape
+    assert anchor.is_cuda and positive.is_cuda and negative.is_cuda
+    
+    batch_size, feature_size = anchor.shape
+    
+    # Allocate output for per-sample losses
+    sample_losses = torch.zeros(batch_size, device=anchor.device, dtype=anchor.dtype)
+    
+    # Autotune configuration based on feature size
+    # Larger block sizes increase reuse but need to fit in registers
+    if feature_size <= 512:
+        BLOCK_SIZE_FEAT = 256
+        NUM_STAGES = 2
+    elif feature_size <= 2048:
+        BLOCK_SIZE_FEAT = 512
+        NUM_STAGES = 3
+    else:
+        BLOCK_SIZE_FEAT = 1024
+        NUM_STAGES = 3
+    
+    # Configure kernel launch with optimal parameters
+    grid = (batch_size,)
+    
+    # Launch optimized kernel with compilation hints
+    kernel = triplet_margin_loss_kernel_optimized[grid]
+    
+    # Use num_stages to increase memory-level parallelism
+    kernel(
+        anchor,
+        positive,
+        negative,
+        sample_losses,
+        margin,
+        batch_size,
+        feature_size,
+        BLOCK_SIZE_FEAT=BLOCK_SIZE_FEAT,
+        NUM_STAGES=NUM_STAGES,
+        num_warps=8,  # Optimal for 4090 (8 warps = 256 threads)
+        num_stages=NUM_STAGES  # Increases pipeline depth for memory ops
+    )
+    
+    # Average across batch
+    return sample_losses.mean()
+
+@triton.jit
+def triplet_margin_loss_kernel_batched(
+    anchor_ptr,
+    positive_ptr,
+    negative_ptr,
+    loss_ptr,
+    margin,
+    batch_size,
+    feature_size,
+    BLOCK_SIZE_FEAT: tl.constexpr,
+    BLOCK_SIZE_BATCH: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+):
+    """
+    Advanced kernel with batched processing for better occupancy.
+    Processes multiple samples per thread block.
+    """
+    # Program ID for batch dimension (cooperative blocks)
+    pid_batch = tl.program_id(axis=0)
+    pid_feat = tl.program_id(axis=1)  # Feature dimension partitioning
+    
+    # Thread ID within block
+    tid = tl.local_program_id(axis=0)
+    
+    # Initialize shared memory for partial reductions
+    pos_acc = tl.zeros((BLOCK_SIZE_BATCH, BLOCK_SIZE_FEAT), dtype=tl.float32)
+    neg_acc = tl.zeros((BLOCK_SIZE_BATCH, BLOCK_SIZE_FEAT), dtype=tl.float32)
+    
+    # Process multiple samples per thread block
+    batch_start = pid_batch * BLOCK_SIZE_BATCH
+    batch_end = tl.minimum(batch_start + BLOCK_SIZE_BATCH, batch_size)
+    
+    feat_start = pid_feat * BLOCK_SIZE_FEAT
+    feat_end = tl.minimum(feat_start + BLOCK_SIZE_FEAT, feature_size)
+    
+    # Early exit if no work
+    if batch_start >= batch_size or feat_start >= feature_size:
+        return
+    
+    # Process feature block for multiple samples
+    for b_idx in range(batch_start, batch_end):
+        b_local = b_idx - batch_start
+        
+        for f_idx in range(feat_start, feat_end, 32):  # Process 32 features at a time
+            f_local = f_idx - feat_start
+            
+            # Vectorized load pattern for better coalescing
+            if f_local < BLOCK_SIZE_FEAT:
+                a_offset = b_idx * feature_size + f_idx
+                p_offset = b_idx * feature_size + f_idx
+                n_offset = b_idx * feature_size + f_idx
+                
+                anchor_val = tl.load(anchor_ptr + a_offset)
+                positive_val = tl.load(positive_ptr + p_offset)
+                negative_val = tl.load(negative_ptr + n_offset)
+                
+                # Compute squared differences
+                pos_diff = anchor_val - positive_val
+                neg_diff = anchor_val - negative_val
+                
+                # Accumulate in shared memory
+                pos_acc[b_local, f_local] += pos_diff * pos_diff
+                neg_acc[b_local, f_local] += neg_diff * neg_diff
+    
+    # Synchronize threads
+    tl.barrier()
+    
+    # Final reduction per sample
+    if tid == 0 and batch_start < batch_size:
+        for b_local in range(batch_end - batch_start):
+            b_idx = batch_start + b_local
+            
+            # Reduce across features
+            pos_sum_sq = tl.sum(pos_acc[b_local, :], axis=0)
+            neg_sum_sq = tl.sum(neg_acc[b_local, :], axis=0)
+            
+            # Compute loss
+            pos_dist = tl.sqrt(pos_sum_sq + 1e-12)
+            neg_dist = tl.sqrt(neg_sum_sq + 1e-12)
+            loss_val = tl.maximum(pos_dist - neg_dist + margin, 0.0)
+            
+            tl.store(loss_ptr + b_idx, loss_val)
+
+class ModelNew(nn.Module):
+    """
+    A model that computes Triplet Margin Loss using optimized Triton kernels.
+    
+    Parameters:
+        margin (float): The margin between the positive and negative samples.
+        use_batched_kernel (bool): Whether to use the batched kernel for large inputs.
+    """
+    def __init__(self, margin: float = 1.0, use_batched_kernel: bool = False):
+        super(ModelNew, self).__init__()
+        self.margin = margin
+        self.use_batched_kernel = use_batched_kernel
+
+    def forward(self, anchor: torch.Tensor, positive: torch.Tensor, negative: torch.Tensor) -> torch.Tensor:
+        if self.use_batched_kernel and anchor.shape[0] > 1024:
+            return self._forward_batched(anchor, positive, negative)
+        return triton_triplet_margin_loss_optimized(anchor, positive, negative, self.margin)
+    
+    def _forward_batched(self, anchor: torch.Tensor, positive: torch.Tensor, negative: torch.Tensor) -> torch.Tensor:
+        """Use batched kernel for very large batch sizes."""
+        assert anchor.shape == positive.shape == negative.shape
+        assert anchor.is_cuda and positive.is_cuda and negative.is_cuda
+        
+        batch_size, feature_size = anchor.shape
+        
+        # Allocate output
+        sample_losses = torch.zeros(batch_size, device=anchor.device, dtype=anchor.dtype)
+        
+        # Configure kernel parameters for 4090
+        BLOCK_SIZE_FEAT = min(512, feature_size)
+        BLOCK_SIZE_BATCH = min(32, batch_size)
+        NUM_STAGES = 3
+        
+        # Calculate grid
+        grid_batch = triton.cdiv(batch_size, BLOCK_SIZE_BATCH)
+        grid_feat = triton.cdiv(feature_size, BLOCK_SIZE_FEAT)
+        grid = (grid_batch, grid_feat)
+        
+        # Launch batched kernel
+        triplet_margin_loss_kernel_batched[grid](
+            anchor,
+            positive,
+            negative,
+            sample_losses,
+            self.margin,
+            batch_size,
+            feature_size,
+            BLOCK_SIZE_FEAT=BLOCK_SIZE_FEAT,
+            BLOCK_SIZE_BATCH=BLOCK_SIZE_BATCH,
+            NUM_STAGES=NUM_STAGES,
+            num_warps=8,
+            num_stages=NUM_STAGES
+        )
+        
+        return sample_losses.mean()
+```

@@ -1,0 +1,146 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def add_fn(a, b):
+    return a + b
+
+
+# Kernel for 1D scan (cumsum) along columns for 2D tensors
+@triton.jit
+def scan_kernel_1d(
+    input_ptr,
+    output_ptr,
+    block_sum_ptr,
+    n_rows,
+    n_cols,
+    stride_inp_row,
+    stride_inp_col,
+    stride_out_row,
+    stride_out_col,
+    block_sum_stride,
+    BLOCK_SIZE_COL: tl.constexpr,
+):
+    # Each program processes one row
+    row_idx = tl.program_id(0)
+    
+    if row_idx >= n_rows:
+        return
+    
+    row_start_input = row_idx * stride_inp_row
+    row_start_output = row_idx * stride_out_row
+    
+    # Number of column blocks needed for this row
+    num_blocks = tl.cdiv(n_cols, BLOCK_SIZE_COL)
+    
+    # Track prefix sum across blocks
+    prefix = 0.0
+    
+    for block_idx in range(num_blocks):
+        col_offset = block_idx * BLOCK_SIZE_COL
+        
+        # Load block for current row
+        col_indices = tl.arange(0, BLOCK_SIZE_COL)
+        col_offsets = col_offset + col_indices
+        col_mask = col_offsets < n_cols
+        
+        input_ptrs = input_ptr + row_start_input + col_offsets * stride_inp_col
+        block_vals = tl.load(input_ptrs, mask=col_mask, other=0.0)
+        
+        # Compute cumulative sum within the block
+        block_scan = tl.associative_scan(block_vals, 0, combine_fn=add_fn)
+        
+        # Add prefix from previous blocks
+        block_scan = block_scan + prefix
+        
+        # Store results
+        output_ptrs = output_ptr + row_start_output + col_offsets * stride_out_col
+        tl.store(output_ptrs, block_scan, mask=col_mask)
+        
+        # Update prefix with sum of current block
+        if block_idx < num_blocks - 1:  # Don't need last block's sum
+            block_sum = tl.sum(block_vals)
+            prefix = prefix + block_sum
+            
+            # Store block sum if needed (for debugging or multi-stage)
+            block_sum_index = row_idx * block_sum_stride + block_idx
+            tl.store(block_sum_ptr + block_sum_index, prefix)
+
+
+def triton_cumsum(x: torch.Tensor, dim: int) -> torch.Tensor:
+    """
+    Triton implementation of cumulative sum (prefix scan).
+    
+    Args:
+        x: Input tensor (2D)
+        dim: Dimension along which to compute cumulative sum (0 or 1)
+    
+    Returns:
+        Tensor with cumulative sum along specified dimension
+    """
+    if x.dim() != 2:
+        # Handle non-2D tensors by reshaping
+        original_shape = x.shape
+        x = x.reshape(-1, x.shape[-1])
+        result = triton_cumsum(x, dim=1)
+        return result.reshape(original_shape)
+    
+    # For column-wise scan (dim=1), use kernel directly
+    if dim == 1:
+        x = x.contiguous()
+        output = torch.empty_like(x)
+        
+        n_rows, n_cols = x.shape
+        
+        # Use optimized block size for column dimension
+        BLOCK_SIZE_COL = 2048  # Good balance for GPU memory hierarchy
+        
+        # Allocate block sums (for potential multi-stage optimization)
+        num_blocks = (n_cols + BLOCK_SIZE_COL - 1) // BLOCK_SIZE_COL
+        block_sums = torch.zeros((n_rows, num_blocks), device=x.device, dtype=x.dtype)
+        
+        # Launch kernel - one thread block per row
+        grid = (n_rows,)
+        
+        scan_kernel_1d[grid](
+            x,
+            output,
+            block_sums,
+            n_rows,
+            n_cols,
+            x.stride(0),
+            x.stride(1),
+            output.stride(0),
+            output.stride(1),
+            block_sums.stride(0),
+            BLOCK_SIZE_COL=BLOCK_SIZE_COL,
+        )
+        
+        return output
+    
+    # For row-wise scan (dim=0), transpose and use column-wise kernel
+    elif dim == 0:
+        return triton_cumsum(x.t(), dim=1).t()
+    else:
+        raise ValueError(f"dim must be 0 or 1 for 2D tensor, got {dim}")
+
+
+class ModelNew(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass computing cumulative sum along specified dimension.
+        
+        Args:
+            x: Input tensor of any shape
+            
+        Returns:
+            Tensor of same shape with cumulative sum along specified dimension
+        """
+        return triton_cumsum(x, dim=self.dim)

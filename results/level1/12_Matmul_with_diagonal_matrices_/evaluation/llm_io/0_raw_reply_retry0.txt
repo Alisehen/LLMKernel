@@ -1,0 +1,183 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def diag_matmul_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    n, m,
+    stride_a,
+    stride_b0, stride_b1,
+    stride_c0, stride_c1,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+):
+    """
+    Computes C = diag(A) @ B using diagonal broadcasting.
+    Each program processes a 2D tile of size (BLOCK_SIZE_N, BLOCK_SIZE_M).
+    """
+    pid_n = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    
+    # Row offsets for the tile
+    row_start = pid_n * BLOCK_SIZE_N
+    row_offsets = row_start + tl.arange(0, BLOCK_SIZE_N)
+    row_mask = row_offsets < n
+    
+    # Load diagonal elements for this tile's rows
+    a = tl.load(a_ptr + row_offsets * stride_a, mask=row_mask)
+    
+    # Column offsets for the tile
+    col_start = pid_m * BLOCK_SIZE_M
+    col_offsets = col_start + tl.arange(0, BLOCK_SIZE_M)
+    col_mask = col_offsets < m
+    
+    # Create 2D masks and indices
+    row_idx = tl.reshape(row_offsets, (BLOCK_SIZE_N, 1))
+    col_idx = tl.reshape(col_offsets, (1, BLOCK_SIZE_M))
+    
+    # Load B tile with 2D mask
+    b_ptrs = b_ptr + row_idx * stride_b0 + col_idx * stride_b1
+    b_mask = tl.reshape(row_mask, (BLOCK_SIZE_N, 1)) & tl.reshape(col_mask, (1, BLOCK_SIZE_M))
+    b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+    
+    # Compute C = diag(A) * B
+    a_expanded = tl.reshape(a, (BLOCK_SIZE_N, 1))
+    c = a_expanded * b
+    
+    # Store C tile
+    c_ptrs = c_ptr + row_idx * stride_c0 + col_idx * stride_c1
+    tl.store(c_ptrs, c, mask=b_mask)
+
+@triton.jit
+def diag_matmul_optimized_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    n, m,
+    stride_a,
+    stride_b0, stride_b1,
+    stride_c0, stride_c1,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    VEC_SIZE: tl.constexpr,
+):
+    """
+    Optimized version with vectorized loads/stores for better memory throughput.
+    Each thread processes VEC_SIZE consecutive elements in the column dimension.
+    """
+    pid_n = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    
+    # Row offsets
+    row_start = pid_n * BLOCK_SIZE_N
+    row_offsets = row_start + tl.arange(0, BLOCK_SIZE_N)
+    row_mask = row_offsets < n
+    
+    # Load diagonal elements
+    a = tl.load(a_ptr + row_offsets * stride_a, mask=row_mask)
+    
+    # Column offsets with vectorization
+    col_start = pid_m * BLOCK_SIZE_M * VEC_SIZE
+    col_offsets_base = col_start + tl.arange(0, BLOCK_SIZE_M) * VEC_SIZE
+    
+    # Create 2D indices with vectorization
+    row_idx = tl.reshape(row_offsets, (BLOCK_SIZE_N, 1))
+    col_idx_vec = tl.reshape(col_offsets_base, (1, BLOCK_SIZE_M, 1))
+    col_offsets_full = col_idx_vec + tl.arange(0, VEC_SIZE)
+    
+    # Load B with vectorized access
+    b_ptrs_base = b_ptr + row_idx * stride_b0
+    b_mask_rows = tl.reshape(row_mask, (BLOCK_SIZE_N, 1, 1))
+    b_mask_cols = col_offsets_full < m
+    b_mask = b_mask_rows & b_mask_cols
+    
+    b_ptrs = b_ptrs_base + col_offsets_full * stride_b1
+    b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+    
+    # Compute C = diag(A) * B
+    a_expanded = tl.reshape(a, (BLOCK_SIZE_N, 1, 1))
+    c = a_expanded * b
+    
+    # Store C with vectorized access
+    c_ptrs_base = c_ptr + row_idx * stride_c0
+    c_ptrs = c_ptrs_base + col_offsets_full * stride_c1
+    tl.store(c_ptrs, c, mask=b_mask)
+
+def triton_diag_matmul(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    """
+    Computes C = diag(A) @ B using Triton kernels.
+    
+    Args:
+        A: 1D tensor of shape (N,)
+        B: 2D tensor of shape (N, M)
+        
+    Returns:
+        C: 2D tensor of shape (N, M)
+    """
+    assert A.dim() == 1 and B.dim() == 2, "A must be 1D and B must be 2D"
+    N, M = B.shape
+    assert A.shape[0] == N, "A must have same length as B's rows"
+    
+    C = torch.empty_like(B)
+    
+    # Choose kernel based on tensor size for optimal performance
+    if N * M <= 16384:  # Small tensors
+        BLOCK_SIZE_N = min(64, triton.next_power_of_2(N))
+        BLOCK_SIZE_M = min(64, triton.next_power_of_2(M))
+        grid = (triton.cdiv(N, BLOCK_SIZE_N), triton.cdiv(M, BLOCK_SIZE_M))
+        
+        diag_matmul_kernel[grid](
+            A, B, C,
+            N, M,
+            A.stride(0),
+            B.stride(0), B.stride(1),
+            C.stride(0), C.stride(1),
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+        )
+    else:  # Large tensors - use optimized kernel
+        BLOCK_SIZE_N = 128
+        BLOCK_SIZE_M = 32
+        VEC_SIZE = 4
+        
+        grid = (triton.cdiv(N, BLOCK_SIZE_N), triton.cdiv(M, BLOCK_SIZE_M * VEC_SIZE))
+        
+        diag_matmul_optimized_kernel[grid](
+            A, B, C,
+            N, M,
+            A.stride(0),
+            B.stride(0), B.stride(1),
+            C.stride(0), C.stride(1),
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            VEC_SIZE=VEC_SIZE,
+        )
+    
+    return C
+
+class ModelNew(nn.Module):
+    """
+    Simple model that performs a matrix multiplication of a diagonal matrix with another matrix.
+    C = diag(A) * B
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+    
+    def forward(self, A, B):
+        """
+        Performs the matrix multiplication.
+
+        Args:
+            A (torch.Tensor): A 1D tensor representing the diagonal of the diagonal matrix. Shape: (N,).
+            B (torch.Tensor): A 2D tensor representing the second matrix. Shape: (N, M).
+
+        Returns:
+            torch.Tensor: The result of the matrix multiplication. Shape: (N, M).
+        """
+        return triton_diag_matmul(A, B)
+```

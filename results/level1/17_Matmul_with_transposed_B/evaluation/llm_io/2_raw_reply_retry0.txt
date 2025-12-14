@@ -1,0 +1,121 @@
+Looking at the error, the issue is that `num_stages` is being passed incorrectly to the Triton kernel. In Triton autotune, `num_stages` should be part of the configs, not passed as a separate argument to the kernel call. Let me fix this by moving `num_stages` to the configs and optimizing the kernel.
+
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 32}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=8, num_stages=3),
+    ],
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def matmul_kernel(
+    a_ptr, b_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    USE_TF32: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    
+    offs_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
+    offs_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
+    offs_k = tl.arange(0, BLOCK_K)
+    
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+    
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    for k in range(0, tl.cdiv(K, BLOCK_K)):
+        a_mask = (offs_m[:, None] < M) & (offs_k[None, :] < K)
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        
+        b_mask = (offs_k[:, None] < K) & (offs_n[None, :] < N)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+        
+        if USE_TF32:
+            accumulator += tl.dot(a, b, allow_tf32=True)
+        else:
+            accumulator += tl.dot(a, b)
+        
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+    
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, accumulator, mask=c_mask)
+
+def triton_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    assert a.dim() == 2 and b.dim() == 2
+    assert a.size(1) == b.size(1), f"K dimension mismatch: {a.size(1)} != {b.size(1)}"
+    
+    M, K = a.shape
+    N, K_b = b.shape
+    assert K == K_b
+    
+    c = torch.empty(M, N, device=a.device, dtype=a.dtype)
+    
+    if a.is_cuda:
+        USE_TF32 = a.dtype == torch.float32
+        
+        grid = lambda META: (
+            triton.cdiv(M, META['BLOCK_M']),
+            triton.cdiv(N, META['BLOCK_N']),
+        )
+        
+        matmul_kernel[grid](
+            a, b, c,
+            M, N, K,
+            a.stride(0), a.stride(1),
+            b.stride(1), b.stride(0),
+            c.stride(0), c.stride(1),
+            USE_TF32=USE_TF32,
+        )
+    else:
+        c = torch.matmul(a, b.T)
+    
+    return c
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super(ModelNew, self).__init__()
+    
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        return triton_matmul(A, B)
+```
+
+Key changes made to fix the error and optimize performance:
+
+1. **Moved `num_stages` to configs**: The error was caused by passing `num_stages=3` to the kernel call. I moved it to each `triton.Config` in the autotune list, which is the correct way to specify compilation hints.
+
+2. **Fixed mask calculation**: Simplified the mask calculations by using the full K dimension in masks, since we're already checking bounds with modulo operations on the offsets.
+
+3. **Optimized loop mask calculation**: Instead of computing `K - k * BLOCK_K` for each iteration, I used `K` directly since we're already using modulo for offsets and checking bounds with masks.
+
+4. **Separated offset calculations for loading and storing**: Used modulo for loading offsets to ensure safe memory access, but used direct calculations for storing to write to the correct positions in the output tensor.
+
+5. **Maintained high-performance optimizations**:
+   - Kept `USE_TF32` parameter for TensorFloat-32 support on Ampere+ GPUs
+   - Used 2D grid structure for better workload distribution
+   - Maintained the autotune configuration for various block sizes
+
+The kernel now correctly computes `C = A × B^T` with high performance while avoiding the `num_stages` parameter error.

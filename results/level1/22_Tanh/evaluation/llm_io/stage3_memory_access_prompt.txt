@@ -1,0 +1,161 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU
+GPU Name: 4090
+Architecture: Ada Lovelace
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+[OPTIMIZATION STAGE]
+
+## Current Optimization Stage
+
+**Focus**: Optimize memory access patterns and latency hiding.
+
+**NCU Metrics to Check**:
+• `dram__throughput.avg.pct_of_peak_sustained_elapsed`
+• `lts__t_sector_hit_rate.pct`
+• `smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct` (target: <20%)
+
+**Guidelines**:
+- Increase `num_stages` only if memory stalls are high; otherwise keep it small.
+- Improve locality or coalescing only when metrics show issues; avoid unnecessary rewrites.
+- Larger BLOCK_K increases reuse but can raise register pressure; adjust only when metrics justify it.
+
+**Autotune Tip (safe)**:
+If unsure, try a tiny set varying `num_stages` (e.g., {1, 2, 3}) via autotune on the **kernel**.
+
+
+
+[CURRENT CODE]
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def tanh_kernel(
+    x_ptr,
+    output_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    # 1D grid of blocks
+    pid = tl.program_id(axis=0)
+    
+    # Offset for this block
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    
+    # Mask to avoid out-of-bounds access
+    mask = offsets < n_elements
+    
+    # Load input
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    
+    # Optimized tanh using exponential formulation: tanh(x) = (exp(2x) - 1) / (exp(2x) + 1)
+    # Compute exp(2x) efficiently
+    exp_2x = tl.exp(2.0 * x)
+    
+    # Compute tanh using the formula
+    output = (exp_2x - 1.0) / (exp_2x + 1.0)
+    
+    # Store result
+    tl.store(output_ptr + offsets, output, mask=mask)
+
+
+def triton_tanh(x: torch.Tensor) -> torch.Tensor:
+    """
+    Apply tanh activation using Triton kernel.
+    
+    Args:
+        x: Input tensor of any shape
+        
+    Returns:
+        Output tensor with tanh applied, same shape as input
+    """
+    # Create output tensor
+    output = torch.empty_like(x)
+    
+    # Flatten to 1D for kernel processing
+    output_flat = output.view(-1)
+    x_flat = x.view(-1)
+    
+    n_elements = x_flat.numel()
+    
+    # Choose optimal block size based on problem size
+    # For large problems, use larger blocks to improve memory throughput
+    if n_elements >= 1048576:  # 1M elements
+        BLOCK_SIZE = 1024
+    elif n_elements >= 262144:  # 256K elements
+        BLOCK_SIZE = 512
+    else:
+        BLOCK_SIZE = 256
+    
+    # Calculate grid size
+    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
+    
+    # Launch kernel
+    tanh_kernel[grid](x_flat, output_flat, n_elements, BLOCK_SIZE=BLOCK_SIZE)
+    
+    return output
+
+
+class ModelNew(nn.Module):
+    """
+    Simple model that performs a Tanh activation using Triton kernels.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies Tanh activation to the input tensor using Triton kernel.
+
+        Args:
+            x (torch.Tensor): Input tensor of any shape.
+
+        Returns:
+            torch.Tensor: Output tensor with Tanh applied, same shape as input.
+        """
+        return triton_tanh(x)
+```
+
+[NCU PROFILING METRICS]
+{
+  "tanh_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 5.0,
+    "launch__grid_size": 1572864,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 81.61,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 92.94,
+    "lts__t_sector_hit_rate.pct": 50.0
+  }
+}
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

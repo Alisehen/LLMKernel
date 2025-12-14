@@ -1,0 +1,180 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def conv2d_kernel(
+    x_ptr,
+    w_ptr,
+    b_ptr,
+    out_ptr,
+    n_elements,
+    N,
+    C_IN,
+    H_IN,
+    W_IN,
+    C_OUT,
+    H_OUT,
+    W_OUT,
+    stride_h,
+    stride_w,
+    pad_h,
+    pad_w,
+    dil_h,
+    dil_w,
+    groups,
+    C_IN_PER_G,
+    C_OUT_PER_G,
+    HAS_BIAS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    K_H: tl.constexpr,
+    K_W: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+
+    n_stride = C_OUT * H_OUT * W_OUT
+    c_stride = H_OUT * W_OUT
+
+    n = offsets // n_stride
+    rem = offsets % n_stride
+    co = rem // c_stride
+    rem = rem % c_stride
+    oh = rem // W_OUT
+    ow = rem % W_OUT
+
+    acc = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+
+    if HAS_BIAS:
+        bias_vals = tl.load(b_ptr + co, mask=mask, other=0.0)
+        acc += bias_vals.to(tl.float32)
+    else:
+        pass
+
+    group_id = co // C_OUT_PER_G
+    cin_base = group_id * C_IN_PER_G
+
+    for kh in range(K_H):
+        ih = oh * stride_h - pad_h + kh * dil_h
+        valid_h = (ih >= 0) & (ih < H_IN)
+        ih_safe = tl.where(valid_h, ih, 0)
+        for kw in range(K_W):
+            iw = ow * stride_w - pad_w + kw * dil_w
+            valid_w = (iw >= 0) & (iw < W_IN)
+            valid_hw = valid_h & valid_w
+            iw_safe = tl.where(valid_w, iw, 0)
+
+            spatial_valid = mask & valid_hw
+            for ci in range(C_IN_PER_G):
+                in_c = cin_base + ci
+                x_offset = (((n * C_IN) + in_c) * H_IN + ih_safe) * W_IN + iw_safe
+                x_vals = tl.load(x_ptr + x_offset, mask=spatial_valid, other=0.0).to(tl.float32)
+
+                w_offset = (((co * C_IN_PER_G) + ci) * K_H + kh) * K_W + kw
+                w_vals = tl.load(w_ptr + w_offset, mask=mask, other=0.0).to(tl.float32)
+
+                acc += x_vals * w_vals
+
+    tl.store(out_ptr + offsets, acc, mask=mask)
+
+
+def triton_conv2d(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    stride: tuple,
+    padding: tuple,
+    dilation: tuple,
+    groups: int,
+) -> torch.Tensor:
+    x = x.contiguous()
+    weight = weight.contiguous()
+    if bias is not None:
+        bias = bias.contiguous()
+
+    N, C_IN, H_IN, W_IN = x.shape
+    C_OUT, _, K_H, K_W = weight.shape
+
+    stride_h, stride_w = stride
+    pad_h, pad_w = padding
+    dil_h, dil_w = dilation
+
+    H_OUT = (H_IN + 2 * pad_h - dil_h * (K_H - 1) - 1) // stride_h + 1
+    W_OUT = (W_IN + 2 * pad_w - dil_w * (K_W - 1) - 1) // stride_w + 1
+
+    out = torch.empty((N, C_OUT, H_OUT, W_OUT), device=x.device, dtype=x.dtype)
+
+    total_elements = out.numel()
+    BLOCK_SIZE = 128
+
+    grid = (triton.cdiv(total_elements, BLOCK_SIZE),)
+
+    conv2d_kernel[grid](
+        x,
+        weight,
+        bias if bias is not None else x,
+        out,
+        total_elements,
+        N,
+        C_IN,
+        H_IN,
+        W_IN,
+        C_OUT,
+        H_OUT,
+        W_OUT,
+        stride_h,
+        stride_w,
+        pad_h,
+        pad_w,
+        dil_h,
+        dil_w,
+        groups,
+        weight.shape[1],
+        C_OUT // groups,
+        HAS_BIAS=bias is not None,
+        BLOCK_SIZE=BLOCK_SIZE,
+        K_H=K_H,
+        K_W=K_W,
+    )
+
+    return out
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: tuple, stride: int = 1, padding: int = 0, dilation: int = 1, groups: int = 1, bias: bool = False):
+        super().__init__()
+        if isinstance(stride, int):
+            stride = (stride, stride)
+        if isinstance(padding, int):
+            padding = (padding, padding)
+        if isinstance(dilation, int):
+            dilation = (dilation, dilation)
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+        self.groups = groups
+        self.weight = nn.Parameter(torch.empty(out_channels, in_channels // groups, kernel_size[0], kernel_size[1]))
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_channels))
+            fan_in = in_channels * kernel_size[0] * kernel_size[1]
+            bound = 1 / math.sqrt(fan_in)
+            nn.init.uniform_(self.bias, -bound, bound)
+        else:
+            self.bias = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_conv2d(
+            x,
+            self.weight,
+            self.bias,
+            self.stride,
+            self.padding,
+            self.dilation,
+            self.groups,
+        )
+```

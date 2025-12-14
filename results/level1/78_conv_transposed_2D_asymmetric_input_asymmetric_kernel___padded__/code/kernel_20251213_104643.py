@@ -1,0 +1,181 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_CO': 32, 'BLOCK_CI': 16}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_CO': 32, 'BLOCK_CI': 32}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_CO': 64, 'BLOCK_CI': 16}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_CO': 64, 'BLOCK_CI': 32}, num_warps=8, num_stages=3),
+    ],
+    key=['Cout', 'Cin', 'H_out', 'W_out'],
+)
+@triton.jit
+def conv_transpose2d_kernel(
+    x_ptr,
+    w_ptr,
+    b_ptr,
+    out_ptr,
+    B,
+    Cin,
+    Cout,
+    H_in,
+    W_in,
+    H_out,
+    W_out,
+    Kh: tl.constexpr,
+    Kw: tl.constexpr,
+    stride_h: tl.constexpr,
+    stride_w: tl.constexpr,
+    pad_h: tl.constexpr,
+    pad_w: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    BLOCK_CO: tl.constexpr,
+    BLOCK_CI: tl.constexpr,
+):
+    pid_spatial = tl.program_id(axis=0)
+    pid_cout = tl.program_id(axis=1)
+
+    total_spatial = B * H_out * W_out
+    if pid_spatial >= total_spatial:
+        return
+
+    co_start = pid_cout * BLOCK_CO
+    if co_start >= Cout:
+        return
+
+    hw = H_out * W_out
+    b = pid_spatial // hw
+    rem = pid_spatial % hw
+    oh = rem // W_out
+    ow = rem % W_out
+
+    co_offsets = co_start + tl.arange(0, BLOCK_CO)
+    mask_co = co_offsets < Cout
+    co_offsets64 = co_offsets.to(tl.int64)
+
+    out_ptrs = (((b * Cout + co_offsets64) * H_out + oh) * W_out + ow) + out_ptr
+    acc = tl.zeros((BLOCK_CO,), dtype=tl.float32)
+
+    stride_ci = H_in * W_in
+    batch_base = b * Cin * stride_ci
+    ci_rel = tl.arange(0, BLOCK_CI)
+    KhKw = Kh * Kw
+
+    for kh in range(Kh):
+        oh_k = oh + pad_h - kh
+        if (oh_k < 0) or (oh_k % stride_h != 0):
+            continue
+        ih = oh_k // stride_h
+        if (ih < 0) or (ih >= H_in):
+            continue
+        for kw in range(Kw):
+            ow_k = ow + pad_w - kw
+            if (ow_k < 0) or (ow_k % stride_w != 0):
+                continue
+            iw = ow_k // stride_w
+            if (iw < 0) or (iw >= W_in):
+                continue
+
+            spatial_offset = ih * W_in + iw
+            base_in = batch_base + spatial_offset
+            kernel_offset = kh * Kw + kw
+
+            for ci_start in range(0, Cin, BLOCK_CI):
+                ci_offsets = ci_start + ci_rel
+                ci_mask = ci_offsets < Cin
+                if tl.sum(ci_mask, axis=0) == 0:
+                    continue
+
+                ci_offsets64 = ci_offsets.to(tl.int64)
+                x_ptrs = x_ptr + base_in + ci_offsets64 * stride_ci
+                x_vals = tl.load(x_ptrs, mask=ci_mask, other=0.0).to(tl.float32)
+
+                ci_bc = tl.reshape(ci_offsets64, (BLOCK_CI, 1))
+                co_bc = tl.reshape(co_offsets64, (1, BLOCK_CO))
+                w_idx = ((ci_bc * Cout + co_bc) * KhKw + kernel_offset)
+                mask_bc = tl.reshape(ci_mask, (BLOCK_CI, 1)) & tl.reshape(mask_co, (1, BLOCK_CO))
+                w_vals = tl.load(w_ptr + w_idx, mask=mask_bc, other=0.0).to(tl.float32)
+
+                x_bc = tl.reshape(x_vals, (BLOCK_CI, 1))
+                acc += tl.sum(w_vals * x_bc, axis=0)
+
+    if HAS_BIAS:
+        bias_vals = tl.load(b_ptr + co_offsets, mask=mask_co, other=0.0).to(tl.float32)
+        acc += bias_vals
+
+    tl.store(out_ptrs, acc.to(out_ptr.dtype.element_ty), mask=mask_co)
+
+
+def triton_conv_transpose2d(x, weight, bias, stride, padding):
+    B, Cin, H_in, W_in = x.shape
+    Cout = weight.shape[1]
+    Kh, Kw = weight.shape[2], weight.shape[3]
+    stride_h, stride_w = stride
+    pad_h, pad_w = padding
+
+    H_out = (H_in - 1) * stride_h - 2 * pad_h + Kh
+    W_out = (W_in - 1) * stride_w - 2 * pad_w + Kw
+
+    out = torch.empty((B, Cout, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    grid = lambda META: (
+        B * H_out * W_out,
+        triton.cdiv(Cout, META['BLOCK_CO']),
+    )
+
+    conv_transpose2d_kernel[grid](
+        x,
+        weight,
+        bias if bias is not None else out,
+        out,
+        B,
+        Cin,
+        Cout,
+        H_in,
+        W_in,
+        H_out,
+        W_out,
+        Kh=Kh,
+        Kw=Kw,
+        stride_h=stride_h,
+        stride_w=stride_w,
+        pad_h=pad_h,
+        pad_w=pad_w,
+        HAS_BIAS=bias is not None,
+    )
+
+    return out
+
+
+class ModelNew(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: tuple,
+        stride: tuple = (1, 1),
+        padding: tuple = (0, 0),
+        bias: bool = False,
+    ):
+        super().__init__()
+        self.conv_transpose2d = nn.ConvTranspose2d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            bias=bias,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_conv_transpose2d(
+            x,
+            self.conv_transpose2d.weight,
+            self.conv_transpose2d.bias,
+            self.conv_transpose2d.stride,
+            self.conv_transpose2d.padding,
+        )

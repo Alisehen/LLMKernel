@@ -1,0 +1,157 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def fused_activation_bias_kernel(
+    x_ptr,
+    bias_ptr,
+    output_ptr,
+    batch_size,
+    channels,
+    spatial_size,
+    batch_stride,
+    channel_stride,
+    spatial_stride,
+    BLOCK_SIZE_SPATIAL: tl.constexpr,
+    VEC_SIZE: tl.constexpr,
+    NUM_VECTORS_PER_THREAD: tl.constexpr,
+):
+    # 3D grid: batch, channel, spatial blocks
+    pid_batch = tl.program_id(axis=0)
+    pid_channel = tl.program_id(axis=1)
+    pid_spatial = tl.program_id(axis=2)
+    
+    # Check bounds
+    if pid_batch >= batch_size or pid_channel >= channels:
+        return
+    
+    # Base pointers for this batch and channel
+    batch_offset = pid_batch * batch_stride
+    channel_offset = pid_channel * channel_stride
+    base_offset = batch_offset + channel_offset
+    
+    # Load bias (scalar per channel) once per block
+    bias_scalar = tl.load(bias_ptr + pid_channel)
+    
+    # Thread block configuration
+    BLOCK_SIZE = 256  # Fixed thread block size
+    tid = tl.program_id(axis=0)  # Thread ID within block
+    
+    # Spatial block starting index
+    spatial_start = pid_spatial * BLOCK_SIZE_SPATIAL
+    
+    # Constants for GELU approximation
+    GELU_CONST = 0.7978845608028654  # sqrt(2/pi)
+    GELU_COEF = 0.044715
+    
+    # Process multiple vectors per thread
+    for i in range(NUM_VECTORS_PER_THREAD):
+        # Compute vector offset
+        vec_start = spatial_start + tid * VEC_SIZE + i * (BLOCK_SIZE * VEC_SIZE)
+        vec_offsets = vec_start + tl.arange(0, VEC_SIZE)
+        
+        # Boundary check
+        vec_mask = vec_offsets < spatial_size
+        
+        # Vectorized load
+        x_vec = tl.load(
+            x_ptr + base_offset + vec_offsets * spatial_stride,
+            mask=vec_mask,
+            other=0.0
+        )
+        
+        # ReLU
+        x_act = tl.maximum(x_vec, 0.0)
+        
+        # GELU approximation
+        gelu_x = x_act
+        gelu_inner = GELU_CONST * (gelu_x + GELU_COEF * gelu_x * gelu_x * gelu_x)
+        gelu_tanh_approx = gelu_inner * (27.0 + gelu_inner * gelu_inner) / (27.0 + 9.0 * gelu_inner * gelu_inner)
+        gelu_result = 0.5 * gelu_x * (1.0 + gelu_tanh_approx)
+        
+        # Sigmoid with stable computation
+        sigmoid_x = tl.where(gelu_result >= 0,
+                            1.0 / (1.0 + tl.exp(-gelu_result)),
+                            tl.exp(gelu_result) / (1.0 + tl.exp(gelu_result)))
+        
+        # Add bias (broadcast scalar to vector)
+        result = sigmoid_x + bias_scalar
+        
+        # Vectorized store
+        tl.store(
+            output_ptr + base_offset + vec_offsets * spatial_stride,
+            result,
+            mask=vec_mask
+        )
+
+def fused_activation_bias(x: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    Fused activation and bias addition for 5D tensors.
+    x shape: [batch, channels, depth, height, width]
+    bias shape: [channels, 1, 1, 1] or [channels]
+    """
+    output = torch.empty_like(x)
+    
+    batch_size, channels, depth, height, width = x.shape
+    spatial_size = depth * height * width
+    
+    # Flatten spatial dimensions
+    x_reshaped = x.reshape(batch_size, channels, spatial_size)
+    output_reshaped = output.reshape(batch_size, channels, spatial_size)
+    
+    # Compute strides
+    batch_stride = channels * spatial_size
+    channel_stride = spatial_size
+    spatial_stride = 1
+    
+    # Ensure bias is correctly shaped
+    if bias.dim() == 4:
+        bias = bias.squeeze(-1).squeeze(-1).squeeze(-1)
+    
+    # Optimized kernel configuration
+    VEC_SIZE = 4
+    NUM_VECTORS_PER_THREAD = 4
+    BLOCK_SIZE = 256
+    BLOCK_SIZE_SPATIAL = BLOCK_SIZE * VEC_SIZE * NUM_VECTORS_PER_THREAD  # 4096 elements per block
+    
+    grid = (
+        batch_size,
+        channels,
+        triton.cdiv(spatial_size, BLOCK_SIZE_SPATIAL),
+    )
+    
+    # Launch kernel with optimized parameters
+    fused_activation_bias_kernel[grid](
+        x_reshaped,
+        bias,
+        output_reshaped,
+        batch_size,
+        channels,
+        spatial_size,
+        batch_stride,
+        channel_stride,
+        spatial_stride,
+        BLOCK_SIZE_SPATIAL,
+        VEC_SIZE,
+        NUM_VECTORS_PER_THREAD,
+        num_warps=8,
+        num_stages=3
+    )
+    
+    return output
+
+class ModelNew(nn.Module):
+    """
+    Model that performs a 3D convolution, applies fused activations and bias.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, bias_shape):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size)
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = fused_activation_bias(x, self.bias)
+        return x

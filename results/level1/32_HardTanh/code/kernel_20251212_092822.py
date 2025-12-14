@@ -1,0 +1,88 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 1024, 'VEC_SIZE': 1, 'num_stages': 1, 'num_warps': 32}),
+        triton.Config({'BLOCK_SIZE': 1024, 'VEC_SIZE': 1, 'num_stages': 2, 'num_warps': 32}),
+        triton.Config({'BLOCK_SIZE': 1024, 'VEC_SIZE': 1, 'num_stages': 3, 'num_warps': 32}),
+        triton.Config({'BLOCK_SIZE': 1024, 'VEC_SIZE': 2, 'num_stages': 2, 'num_warps': 32}),
+        triton.Config({'BLOCK_SIZE': 1024, 'VEC_SIZE': 4, 'num_stages': 2, 'num_warps': 32}),
+        triton.Config({'BLOCK_SIZE': 512, 'VEC_SIZE': 2, 'num_stages': 2, 'num_warps': 16}),
+        triton.Config({'BLOCK_SIZE': 512, 'VEC_SIZE': 4, 'num_stages': 3, 'num_warps': 16}),
+    ],
+    key=['n_elements'],
+)
+@triton.jit
+def hardtanh_kernel(
+    x_ptr,
+    out_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+    VEC_SIZE: tl.constexpr,
+    num_stages: tl.constexpr,
+    num_warps: tl.constexpr,
+):
+    """Optimized HardTanh kernel with vectorization and memory access optimizations."""
+    pid = tl.program_id(axis=0)
+    
+    # Vectorized offsets for coalesced memory access
+    base_offset = pid * BLOCK_SIZE * VEC_SIZE
+    offsets = base_offset + tl.arange(0, BLOCK_SIZE)[:, None] * VEC_SIZE + tl.arange(0, VEC_SIZE)[None, :]
+    offsets = tl.reshape(offsets, (-1,))
+    
+    mask = offsets < n_elements
+    
+    # Load input data with vectorization for better memory throughput
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    
+    # HardTanh: clamp to [-1, 1] using efficient min/max operations
+    # Fused computation to reduce register pressure
+    out = tl.minimum(tl.maximum(x, -1.0), 1.0)
+    
+    # Store result with vectorized write
+    tl.store(out_ptr + offsets, out, mask=mask)
+
+def triton_hardtanh(x: torch.Tensor) -> torch.Tensor:
+    """Triton-accelerated HardTanh activation function with optimized memory patterns."""
+    output = torch.empty_like(x)
+    n_elements = output.numel()
+    
+    # Ensure input is contiguous for optimal memory access
+    if not x.is_contiguous():
+        x = x.contiguous()
+    
+    # Calculate grid size - 1D grid covering all elements with vectorization
+    BLOCK_SIZE = 1024  # Base block size, kernel may override
+    VEC_SIZE = 1  # Base vector size, kernel may override
+    grid = (triton.cdiv(n_elements, BLOCK_SIZE * VEC_SIZE),)
+    
+    # Launch optimized kernel with autotuned parameters
+    hardtanh_kernel[grid](
+        x, output, n_elements,
+        BLOCK_SIZE=BLOCK_SIZE,
+        VEC_SIZE=VEC_SIZE,
+        num_stages=2,  # Will be overridden by autotuner
+        num_warps=32,  # Will be overridden by autotuner
+    )
+    
+    return output
+
+class ModelNew(nn.Module):
+    """Optimized model using Triton kernels for HardTanh activation."""
+    def __init__(self):
+        super(ModelNew, self).__init__()
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies HardTanh activation using optimized Triton kernel.
+        
+        Args:
+            x (torch.Tensor): Input tensor of any shape.
+            
+        Returns:
+            torch.Tensor: Output tensor with HardTanh applied.
+        """
+        return triton_hardtanh(x)

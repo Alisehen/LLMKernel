@@ -1,0 +1,371 @@
+Fix the Triton kernel errors. Generate correct, high-performance code.
+
+Current Error Log:
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 535, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251212_170112_batch_range40to70_deepseek_deepseek/41_Max_Pooling_1D/code/kernel_20251212_173950.py", line 205, in forward
+    return triton_maxpool1d(
+           ^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251212_170112_batch_range40to70_deepseek_deepseek/41_Max_Pooling_1D/code/kernel_20251212_173950.py", line 159, in triton_maxpool1d
+    maxpool1d_forward_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 347, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 569, in run
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 230, in compile
+    key = f"{triton_key()}-{src.hash()}-{backend.hash()}-{options.hash()}-{str(sorted(env_vars.items()))}"
+                            ^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 77, in hash
+    key = f"{self.fn.cache_key}-{str(self.attrs)}-{sorted_sig}-{constants_key}"
+             ^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 665, in cache_key
+    dependencies_finder.visit(self.parse())
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 418, in visit
+    return visitor(node)
+           ^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 426, in generic_visit
+    self.visit(item)
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 418, in visit
+    return visitor(node)
+           ^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 149, in visit_FunctionDef
+    self.generic_visit(node)
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 426, in generic_visit
+    self.visit(item)
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 418, in visit
+    return visitor(node)
+           ^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 215, in visit_For
+    self.generic_visit(node)
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 426, in generic_visit
+    self.visit(item)
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 418, in visit
+    return visitor(node)
+           ^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 203, in visit_Assign
+    self.generic_visit(node)
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 428, in generic_visit
+    self.visit(value)
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 418, in visit
+    return visitor(node)
+           ^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 426, in generic_visit
+    self.visit(item)
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 418, in visit
+    return visitor(node)
+           ^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 428, in generic_visit
+    self.visit(value)
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 418, in visit
+    return visitor(node)
+           ^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 137, in visit_Attribute
+    lhs = self.visit(node.value)
+          ^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 418, in visit
+    return visitor(node)
+           ^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 142, in visit_Attribute
+    ret = getattr(lhs, node.attr)
+          ^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: module 'triton.language' has no attribute 'CacheModifier'
+
+History Error:
+None
+
+
+PyTorch Reference:
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs Max Pooling 1D.
+    """
+    def __init__(self, kernel_size: int, stride: int = None, padding: int = 0, dilation: int = 1, return_indices: bool = False):
+        """
+        Initializes the Max Pooling 1D layer.
+
+        Args:
+            kernel_size (int): Size of the window to take a max over.
+            stride (int, optional): Stride of the window. Defaults to None (same as kernel_size).
+            padding (int, optional): Implicit zero padding to be added on both sides. Defaults to 0.
+            dilation (int, optional): Spacing between kernel elements. Defaults to 1.
+            return_indices (bool, optional): Whether to return the indices of the maximum values. Defaults to False.
+        """
+        super(Model, self).__init__()
+        self.maxpool = nn.MaxPool1d(kernel_size=kernel_size, stride=stride, padding=padding, dilation=dilation, return_indices=return_indices)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies Max Pooling 1D to the input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, num_features, sequence_length).
+
+        Returns:
+            torch.Tensor: Output tensor with Max Pooling 1D applied, shape (batch_size, num_features, output_sequence_length).
+        """
+        return self.maxpool(x)
+
+batch_size = 64
+features = 192
+sequence_length = 65536
+
+kernel_size = 8
+stride      = 1
+padding     = 4
+dilation    = 3            
+
+return_indices = False
+
+def get_inputs():
+    x = torch.rand(batch_size, features, sequence_length)
+    return [x]
+
+def get_init_inputs():
+    return [kernel_size, stride, padding, dilation, return_indices]
+```
+
+Broken Code:
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def maxpool1d_forward_kernel(
+    x_ptr,
+    output_ptr,
+    B,
+    C,
+    L_in,
+    L_out,
+    kernel_size: tl.constexpr,
+    stride: tl.constexpr,
+    padding: tl.constexpr,
+    dilation: tl.constexpr,
+    BLOCK_SIZE_IN: tl.constexpr,
+    BLOCK_SIZE_C: tl.constexpr,
+    num_stages: tl.constexpr = 3,
+):
+    """
+    Optimized MaxPool1D kernel with improved memory access patterns and latency hiding.
+    
+    Key optimizations:
+    1. Precompute offsets to reduce address calculation overhead
+    2. Use vectorized loads for better memory coalescing
+    3. Optimized loop structure for better ILP
+    4. Increased num_stages to hide memory latency (safe for Ada Lovelace)
+    5. Better register usage and thread occupancy
+    """
+    # 2D grid: (C * triton.cdiv(L_out, BLOCK_SIZE_IN), B)
+    pid_c_out = tl.program_id(0)
+    pid_b = tl.program_id(1)
+    
+    # Decompose first dimension
+    grid_c = (C + BLOCK_SIZE_C - 1) // BLOCK_SIZE_C
+    grid_out = (L_out + BLOCK_SIZE_IN - 1) // BLOCK_SIZE_IN
+    pid_c_block = pid_c_out // grid_out
+    pid_out_block = pid_c_out % grid_out
+    
+    # Channel offsets with vectorization
+    c_start = pid_c_block * BLOCK_SIZE_C
+    c_offsets = c_start + tl.arange(0, BLOCK_SIZE_C)
+    c_mask = c_offsets < C
+    
+    # Output position offsets with vectorization
+    out_start = pid_out_block * BLOCK_SIZE_IN
+    out_offsets = out_start + tl.arange(0, BLOCK_SIZE_IN)
+    out_mask = out_offsets < L_out
+    
+    # Precompute base offsets to reduce address calculation
+    batch_offset = pid_b * C * L_in
+    channel_offsets_base = c_offsets[:, None] * L_in
+    
+    # Initialize max values efficiently
+    max_vals = tl.full((BLOCK_SIZE_C, BLOCK_SIZE_IN), float('-inf'), dtype=tl.float32)
+    
+    # Process kernel positions with improved memory access pattern
+    # Use static unrolling with constexpr kernel_size for better ILP
+    for k_idx in tl.static_range(kernel_size):
+        # Calculate input positions for all output positions in block
+        # This is more efficient than computing per-element
+        input_positions = out_offsets * stride - padding + k_idx * dilation
+        
+        # Check input bounds - vectorized
+        input_valid = (input_positions >= 0) & (input_positions < L_in)
+        
+        # Create 2D mask for loading efficiently
+        load_mask_2d = out_mask[None, :] & input_valid[None, :] & c_mask[:, None]
+        
+        # Compute offsets using precomputed bases
+        # This reduces the number of arithmetic operations
+        input_positions_2d = input_positions[None, :]
+        offsets_2d = batch_offset + channel_offsets_base + input_positions_2d
+        
+        # Load values with vectorized access pattern
+        # The compiler will optimize this for better coalescing
+        values = tl.load(
+            x_ptr + offsets_2d,
+            mask=load_mask_2d,
+            other=float('-inf'),
+            cache_modifier=tl.CacheModifier.CG,  # Cache global for better L2 utilization
+        )
+        
+        # Update max values using efficient element-wise operation
+        max_vals = tl.maximum(max_vals, values)
+    
+    # Store results with optimized memory pattern
+    store_mask = out_mask[None, :] & c_mask[:, None]
+    output_offset_base = pid_b * C * L_out + channel_offsets_base[:, :1] * (L_out // L_in) + out_offsets[None, :]
+    tl.store(
+        output_ptr + output_offset_base,
+        max_vals,
+        mask=store_mask,
+        cache_modifier=tl.CacheModifier.WB,  # Write-back for better L2 usage
+    )
+
+
+def triton_maxpool1d(
+    x: torch.Tensor,
+    kernel_size: int,
+    stride: int = None,
+    padding: int = 0,
+    dilation: int = 1,
+    return_indices: bool = False
+) -> torch.Tensor:
+    """
+    Optimized Max Pooling 1D with improved kernel selection and autotuning.
+    
+    Key improvements:
+    1. Dynamic block size selection based on problem dimensions
+    2. Optimized grid configuration for better SM occupancy
+    3. Memory access pattern optimization for Ada Lovelace
+    """
+    if stride is None:
+        stride = kernel_size
+    
+    B, C, L_in = x.shape
+    
+    # Calculate output length
+    L_out = (L_in + 2 * padding - dilation * (kernel_size - 1) - 1) // stride + 1
+    
+    # Create output tensor
+    output = torch.empty(B, C, L_out, device=x.device, dtype=x.dtype)
+    
+    # Optimized block size selection for Ada Lovelace architecture
+    # Based on SM count and register pressure considerations
+    if L_out >= 128:
+        BLOCK_SIZE_IN = 128  # Larger blocks for better locality
+    elif L_out >= 64:
+        BLOCK_SIZE_IN = 64
+    else:
+        BLOCK_SIZE_IN = 32
+    
+    if C >= 64:
+        BLOCK_SIZE_C = 64  # Increased for better channel parallelism
+    elif C >= 32:
+        BLOCK_SIZE_C = 32
+    else:
+        BLOCK_SIZE_C = 16
+    
+    # Adjust for register pressure and thread occupancy
+    total_threads = BLOCK_SIZE_IN * BLOCK_SIZE_C
+    if total_threads > 1024:
+        # Scale down to fit within thread block limits
+        scale_factor = (1024 / total_threads) ** 0.5
+        BLOCK_SIZE_IN = max(32, int(BLOCK_SIZE_IN * scale_factor))
+        BLOCK_SIZE_C = max(16, int(BLOCK_SIZE_C * scale_factor))
+    
+    # Calculate grid with optimal configuration
+    grid_c = (C + BLOCK_SIZE_C - 1) // BLOCK_SIZE_C
+    grid_out = (L_out + BLOCK_SIZE_IN - 1) // BLOCK_SIZE_IN
+    grid = (grid_c * grid_out, B)
+    
+    # Launch kernel with optimized parameters for Ada Lovelace
+    # Increased num_stages to hide memory latency (safe with 72MB L2 cache)
+    maxpool1d_forward_kernel[grid](
+        x,
+        output,
+        B,
+        C,
+        L_in,
+        L_out,
+        kernel_size=kernel_size,
+        stride=stride,
+        padding=padding,
+        dilation=dilation,
+        BLOCK_SIZE_IN=BLOCK_SIZE_IN,
+        BLOCK_SIZE_C=BLOCK_SIZE_C,
+        num_stages=3,  # Optimized for memory-bound operations
+        num_warps=8 if BLOCK_SIZE_IN * BLOCK_SIZE_C >= 512 else 4,
+    )
+    
+    return output
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs Max Pooling 1D with highly tuned Triton kernels.
+    
+    Key features:
+    - Memory access pattern optimized for Ada Lovelace architecture
+    - Better thread occupancy and latency hiding
+    - Optimized for the specific NCU metrics provided
+    """
+    def __init__(self, kernel_size: int, stride: int = None, padding: int = 0, dilation: int = 1, return_indices: bool = False):
+        super(ModelNew, self).__init__()
+        self.kernel_size = kernel_size
+        self.stride = stride if stride is not None else kernel_size
+        self.padding = padding
+        self.dilation = dilation
+        self.return_indices = return_indices
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies optimized Max Pooling 1D to the input tensor.
+        
+        Uses Triton kernels specifically tuned for:
+        - High DRAM throughput utilization
+        - Good L1/L2 cache hit rates
+        - Minimal memory dependency stalls
+        """
+        return triton_maxpool1d(
+            x,
+            kernel_size=self.kernel_size,
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation,
+            return_indices=self.return_indices
+        )
+```
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+3. Learn from previous repair attempts to avoid repeating the same mistakes
+
+```python
+# <corrected code>
+```

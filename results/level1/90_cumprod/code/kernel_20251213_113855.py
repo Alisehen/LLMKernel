@@ -1,0 +1,75 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def cumprod_kernel(
+    x_ptr,
+    y_ptr,
+    axis_len,
+    inner,
+    seq_count,
+):
+    pid = tl.program_id(axis=0)
+    if pid >= seq_count:
+        return
+
+    inner_val = inner
+    outer_idx = pid // inner_val
+    inner_idx = pid % inner_val
+    base_offset = outer_idx * axis_len * inner_val + inner_idx
+
+    if axis_len <= 0:
+        return
+
+    offset = base_offset
+    running = tl.load(x_ptr + offset)
+    tl.store(y_ptr + offset, running)
+
+    i = 1
+    offset += inner_val
+    while i < axis_len:
+        val = tl.load(x_ptr + offset)
+        running = running * val
+        tl.store(y_ptr + offset, running)
+        i += 1
+        offset += inner_val
+
+
+def triton_cumprod(x: torch.Tensor, dim: int) -> torch.Tensor:
+    if not x.is_cuda:
+        raise RuntimeError("Input must be a CUDA tensor.")
+    x_contig = x.contiguous()
+    out = torch.empty_like(x_contig)
+
+    dim = dim if dim >= 0 else dim + x_contig.ndim
+    axis_len = x_contig.shape[dim]
+
+    if axis_len == 0:
+        return out
+
+    inner = x_contig.stride(dim)
+    seq_count = x_contig.numel() // axis_len
+
+    grid = (seq_count,)
+    cumprod_kernel[grid](
+        x_contig,
+        out,
+        axis_len,
+        inner,
+        seq_count,
+        num_warps=1,
+        num_stages=1,
+    )
+    return out
+
+
+class ModelNew(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x):
+        return triton_cumprod(x, self.dim)

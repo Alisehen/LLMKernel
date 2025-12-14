@@ -1,0 +1,123 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def smooth_l1_loss_kernel(
+    predictions_ptr,
+    targets_ptr,
+    output_ptr,
+    n_elements,
+    beta,
+    BLOCK_SIZE: tl.constexpr,
+    USE_TENSOR_CORES: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    
+    # Create block offsets - FIXED: Use compile-time constants for arange
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    
+    # Use tensor cores for FP16/BF16 if available
+    if USE_TENSOR_CORES:
+        # Load in FP16/BF16 for tensor cores and convert to float32 for precise computation
+        preds = tl.load(predictions_ptr + offsets, mask=offsets < n_elements, other=0.0)
+        targets = tl.load(targets_ptr + offsets, mask=offsets < n_elements, other=0.0)
+        preds_f32 = preds.to(tl.float32)
+        targets_f32 = targets.to(tl.float32)
+        diff = preds_f32 - targets_f32
+    else:
+        # Load in native precision
+        preds = tl.load(predictions_ptr + offsets, mask=offsets < n_elements, other=0.0)
+        targets = tl.load(targets_ptr + offsets, mask=offsets < n_elements, other=0.0)
+        diff = preds - targets
+    
+    abs_diff = tl.abs(diff)
+    
+    # Smooth L1 Loss: 0.5 * x^2 / beta if |x| < beta else |x| - 0.5 * beta
+    is_small = abs_diff < beta
+    smooth_loss = 0.5 * diff * diff / beta
+    linear_loss = abs_diff - 0.5 * beta
+    
+    loss = tl.where(is_small, smooth_loss, linear_loss)
+    
+    # Efficient reduction using Triton's built-in reduction
+    block_sum = tl.sum(loss, axis=0)
+    
+    # Use atomic operations to accumulate results
+    # Output pointer should be a single-element tensor for reduction
+    tl.atomic_add(output_ptr, block_sum)
+
+def triton_smooth_l1_loss(predictions: torch.Tensor, targets: torch.Tensor, beta: float = 1.0) -> torch.Tensor:
+    assert predictions.shape == targets.shape, "Predictions and targets must have same shape"
+    
+    # Ensure tensors are contiguous
+    predictions = predictions.contiguous()
+    targets = targets.contiguous()
+    
+    n_elements = predictions.numel()
+    
+    # Choose optimal configuration based on tensor size and dtype
+    dtype = predictions.dtype
+    
+    # Autotune configurations
+    configs = [
+        triton.Config({'BLOCK_SIZE': 256, 'USE_TENSOR_CORES': False}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 512, 'USE_TENSOR_CORES': False}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 1024, 'USE_TENSOR_CORES': False}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 2048, 'USE_TENSOR_CORES': False}, num_warps=8, num_stages=3),
+    ]
+    
+    # Add tensor core configurations for supported dtypes
+    if dtype in [torch.float16, torch.bfloat16]:
+        configs.extend([
+            triton.Config({'BLOCK_SIZE': 512, 'USE_TENSOR_CORES': True}, num_warps=4, num_stages=3),
+            triton.Config({'BLOCK_SIZE': 1024, 'USE_TENSOR_CORES': True}, num_warps=8, num_stages=3),
+        ])
+    
+    # Allocate output tensor for reduction
+    device = predictions.device
+    output = torch.zeros(1, device=device, dtype=torch.float32)
+    
+    # Define kernel with autotuning
+    @triton.autotune(configs=configs, key=['n_elements'])
+    @triton.jit
+    def kernel_wrapper(
+        predictions_ptr,
+        targets_ptr,
+        output_ptr,
+        n_elements,
+        beta,
+        BLOCK_SIZE: tl.constexpr,
+        USE_TENSOR_CORES: tl.constexpr,
+    ):
+        smooth_l1_loss_kernel(
+            predictions_ptr, targets_ptr, output_ptr, 
+            n_elements, beta, BLOCK_SIZE, USE_TENSOR_CORES
+        )
+    
+    # Calculate grid size
+    grid = lambda META: (triton.cdiv(n_elements, META['BLOCK_SIZE']),)
+    
+    # Launch kernel
+    kernel_wrapper[grid](
+        predictions,
+        targets,
+        output,
+        n_elements,
+        beta=beta,
+    )
+    
+    # Normalize by number of elements
+    return output / n_elements
+
+class ModelNew(nn.Module):
+    """
+    A model that computes Smooth L1 (Huber) Loss for regression tasks.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+
+    def forward(self, predictions, targets):
+        return triton_smooth_l1_loss(predictions, targets)

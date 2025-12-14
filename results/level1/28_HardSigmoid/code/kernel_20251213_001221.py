@@ -1,0 +1,58 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def hardsigmoid_kernel(
+    x_ptr,
+    output_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    
+    x = tl.load(x_ptr + offsets, mask=mask)
+    
+    # HardSigmoid: clamp(x/6 + 0.5, 0, 1)
+    # Optimized using FMA and min/max operations
+    one_sixth = 0.1666666716337204  # 1/6 as float32
+    half = 0.5
+    
+    # Compute x/6 + 0.5 using FMA-like optimization
+    # tl.fma not available, using explicit multiply-add
+    linear = x * one_sixth + half
+    
+    # Clamp to [0, 1] using min/max
+    # This is faster than conditionals
+    clamped = tl.minimum(tl.maximum(linear, 0.0), 1.0)
+    
+    tl.store(output_ptr + offsets, clamped, mask=mask)
+
+def triton_hardsigmoid(x: torch.Tensor) -> torch.Tensor:
+    output = torch.empty_like(x)
+    n_elements = output.numel()
+    
+    # Choose optimal block size based on tensor size
+    # For large tensors, use larger blocks to improve memory throughput
+    if n_elements > 65536:
+        BLOCK_SIZE = 1024
+    elif n_elements > 4096:
+        BLOCK_SIZE = 512
+    else:
+        BLOCK_SIZE = 256
+    
+    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
+    
+    hardsigmoid_kernel[grid](x, output, n_elements, BLOCK_SIZE=BLOCK_SIZE)
+    return output
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super(ModelNew, self).__init__()
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_hardsigmoid(x)

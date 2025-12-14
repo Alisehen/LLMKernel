@@ -1,0 +1,194 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def softsign_kernel_3d(
+    x_ptr,
+    output_ptr,
+    n_rows,
+    n_cols,
+    stride_batch,
+    stride_row,
+    stride_col,
+    BLOCK_ROW: tl.constexpr,
+    BLOCK_COL: tl.constexpr,
+):
+    """
+    3D grid implementation for better occupancy
+    Optimized for tensor shape [batch, rows, cols]
+    """
+    # 3D grid: (batch_id, row_block_id, col_block_id)
+    batch_id = tl.program_id(0)
+    row_block_id = tl.program_id(1)
+    col_block_id = tl.program_id(2)
+    
+    # Compute row offsets
+    row_start = row_block_id * BLOCK_ROW
+    row_offsets = row_start + tl.arange(0, BLOCK_ROW)
+    row_mask = row_offsets < n_rows
+    
+    # Compute column offsets
+    col_start = col_block_id * BLOCK_COL
+    col_offsets = col_start + tl.arange(0, BLOCK_COL)
+    col_mask = col_offsets < n_cols
+    
+    # 2D mask for the block
+    block_mask = row_mask[:, None] & col_mask[None, :]
+    
+    # Compute base pointer for this batch
+    batch_offset = batch_id * stride_batch
+    x_batch_ptr = x_ptr + batch_offset
+    output_batch_ptr = output_ptr + batch_offset
+    
+    # Load block with 2D offsets
+    x_ptrs = x_batch_ptr + row_offsets[:, None] * stride_row + col_offsets[None, :] * stride_col
+    x_block = tl.load(x_ptrs, mask=block_mask, other=0.0)
+    
+    # Compute softsign: x / (1 + |x|)
+    abs_x = tl.abs(x_block)
+    output = x_block / (1.0 + abs_x)
+    
+    # Store result
+    output_ptrs = output_batch_ptr + row_offsets[:, None] * stride_row + col_offsets[None, :] * stride_col
+    tl.store(output_ptrs, output, mask=block_mask)
+
+
+@triton.jit
+def softsign_kernel_2d(
+    x_ptr,
+    output_ptr,
+    n_elements,
+    stride_batch,
+    stride_element,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    2D grid implementation for simpler cases
+    """
+    batch_id = tl.program_id(0)
+    element_block_id = tl.program_id(1)
+    
+    # Compute element offsets
+    element_start = element_block_id * BLOCK_SIZE
+    offsets = element_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    
+    # Compute base pointer for this batch
+    batch_offset = batch_id * stride_batch
+    x_batch_ptr = x_ptr + batch_offset
+    output_batch_ptr = output_ptr + batch_offset
+    
+    # Load block
+    x_ptrs = x_batch_ptr + offsets * stride_element
+    x_block = tl.load(x_ptrs, mask=mask, other=0.0)
+    
+    # Compute softsign
+    abs_x = tl.abs(x_block)
+    output = x_block / (1.0 + abs_x)
+    
+    # Store result
+    output_ptrs = output_batch_ptr + offsets * stride_element
+    tl.store(output_ptrs, output, mask=mask)
+
+
+def triton_softsign_optimized(x: torch.Tensor) -> torch.Tensor:
+    """
+    Optimized Triton implementation for Softsign activation
+    """
+    output = torch.empty_like(x)
+    
+    # Get dimensions and strides
+    if x.ndim == 2:
+        batch_size, n_elements = x.shape
+        stride_batch = x.stride(0)
+        stride_element = x.stride(1)
+        
+        # Choose kernel based on tensor size
+        if batch_size >= 256 and n_elements >= 8192:
+            # Use 3D kernel for large tensors by reshaping to 3D
+            # Find good factorization for 3D grid
+            n_rows = 1024
+            n_cols = triton.cdiv(n_elements, n_rows)
+            
+            # Reshape to 3D [batch, rows, cols]
+            x_reshaped = x.view(batch_size, n_rows, n_cols)
+            output_reshaped = output.view(batch_size, n_rows, n_cols)
+            
+            # Get 3D strides
+            stride_batch_3d = x_reshaped.stride(0)
+            stride_row = x_reshaped.stride(1)
+            stride_col = x_reshaped.stride(2)
+            
+            # Configuration for 3D kernel
+            BLOCK_ROW = 32
+            BLOCK_COL = 32
+            
+            grid = (
+                batch_size,
+                triton.cdiv(n_rows, BLOCK_ROW),
+                triton.cdiv(n_cols, BLOCK_COL)
+            )
+            
+            softsign_kernel_3d[grid](
+                x_reshaped, output_reshaped,
+                n_rows, n_cols,
+                stride_batch_3d, stride_row, stride_col,
+                BLOCK_ROW=BLOCK_ROW,
+                BLOCK_COL=BLOCK_COL,
+                num_warps=8,
+                num_stages=3
+            )
+        else:
+            # Use 2D kernel for smaller tensors
+            BLOCK_SIZE = 1024
+            grid = (batch_size, triton.cdiv(n_elements, BLOCK_SIZE))
+            
+            softsign_kernel_2d[grid](
+                x, output,
+                n_elements,
+                stride_batch, stride_element,
+                BLOCK_SIZE=BLOCK_SIZE,
+                num_warps=8,
+                num_stages=3
+            )
+    else:
+        # Handle 1D or 3D+ tensors by reshaping to 2D
+        original_shape = x.shape
+        x_flat = x.view(-1)
+        output_flat = output.view(-1)
+        
+        batch_size = 1
+        n_elements = x_flat.shape[0]
+        stride_batch = 0
+        stride_element = 1
+        
+        BLOCK_SIZE = 1024
+        grid = (batch_size, triton.cdiv(n_elements, BLOCK_SIZE))
+        
+        softsign_kernel_2d[grid](
+            x_flat, output_flat,
+            n_elements,
+            stride_batch, stride_element,
+            BLOCK_SIZE=BLOCK_SIZE,
+            num_warps=8,
+            num_stages=3
+        )
+    
+    return output
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model with Triton kernels for Softsign activation
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies optimized Softsign activation using Triton kernels
+        """
+        return triton_softsign_optimized(x)

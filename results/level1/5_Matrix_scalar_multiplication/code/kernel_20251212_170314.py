@@ -1,0 +1,137 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def mul_scalar_kernel_2d(
+    a_ptr,
+    s,
+    out_ptr,
+    M, N,
+    stride_am, stride_an,
+    stride_om, stride_on,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+):
+    """2D tiled kernel for matrix-scalar multiplication with optimized memory access"""
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    
+    # Create offsets for block
+    rm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    rn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    
+    # Create masks
+    mask_m = rm < M
+    mask_n = rn < N
+    
+    # Broadcast masks for 2D
+    mask = mask_m[:, None] & mask_n[None, :]
+    
+    # Calculate pointers with striding
+    a_ptrs = a_ptr + rm[:, None] * stride_am + rn[None, :] * stride_an
+    out_ptrs = out_ptr + rm[:, None] * stride_om + rn[None, :] * stride_on
+    
+    # Load block with mask
+    a_block = tl.load(a_ptrs, mask=mask, other=0.0)
+    
+    # Compute multiplication
+    out_block = a_block * s
+    
+    # Store result with mask
+    tl.store(out_ptrs, out_block, mask=mask)
+
+
+@triton.jit
+def mul_scalar_kernel_1d(
+    a_ptr,
+    s,
+    out_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """1D kernel for matrix-scalar multiplication with contiguous tensors"""
+    pid = tl.program_id(0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    
+    # Load elements
+    a = tl.load(a_ptr + offsets, mask=mask)
+    
+    # Compute multiplication
+    output = a * s
+    
+    # Store result
+    tl.store(out_ptr + offsets, output, mask=mask)
+
+
+def triton_mul_scalar(A: torch.Tensor, s: float) -> torch.Tensor:
+    """
+    Optimized matrix-scalar multiplication using Triton.
+    
+    Args:
+        A: Input matrix of shape (M, N)
+        s: Scalar value
+        
+    Returns:
+        Resulting matrix of shape (M, N)
+    """
+    output = torch.empty_like(A)
+    
+    # Use 1D kernel for contiguous tensors (faster)
+    if A.is_contiguous():
+        n_elements = A.numel()
+        BLOCK_SIZE = 1024  # Max threads per block
+        grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
+        
+        mul_scalar_kernel_1d[grid](
+            A, s, output, n_elements,
+            BLOCK_SIZE=BLOCK_SIZE
+        )
+    else:
+        # Use 2D kernel for non-contiguous tensors
+        M, N = A.shape
+        stride_am, stride_an = A.stride()
+        stride_om, stride_on = output.stride()
+        
+        # Use 32x32 blocks for good occupancy and memory coalescing
+        BLOCK_SIZE_M = 32
+        BLOCK_SIZE_N = 32
+        
+        grid = (
+            triton.cdiv(M, BLOCK_SIZE_M),
+            triton.cdiv(N, BLOCK_SIZE_N)
+        )
+        
+        mul_scalar_kernel_2d[grid](
+            A, s, output, M, N,
+            stride_am, stride_an, stride_om, stride_on,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_N=BLOCK_SIZE_N
+        )
+    
+    return output
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs matrix-scalar multiplication using Triton.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+    
+    def forward(self, A: torch.Tensor, s: float) -> torch.Tensor:
+        """
+        Performs matrix-scalar multiplication using optimized Triton kernels.
+        
+        Args:
+            A: Input matrix of shape (M, N)
+            s: Scalar value
+            
+        Returns:
+            C: Resulting matrix of shape (M, N)
+        """
+        return triton_mul_scalar(A, s)

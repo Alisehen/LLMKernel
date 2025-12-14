@@ -1,5 +1,6 @@
 from agents.llm_local import get_llm, GenerationConfig
 import os
+import datetime
 
 from utils.print_utils import print_bold
 
@@ -116,8 +117,8 @@ def query_server(
             from openai import OpenAI
             # client = OpenAI(api_key=OPENAI_KEY)
             client = OpenAI(api_key=OPENAI_KEY, base_url="https://api.jiekou.ai/openai/v1")
-            model = "gpt-5.1-codex"
-            use_responses_api = True  # This API uses Responses API
+            model = "gpt-5.1"
+            use_responses_api = False  # This API uses Responses API
 
         case _:
             raise NotImplementedError(f"Unsupported server_type: {server_type}")
@@ -176,8 +177,6 @@ def query_server(
             print(usage_str)
             if log_path and log_path != "":
                 try:
-                    import os
-                    import datetime
                     file_exists = os.path.exists(log_path)
                     with open(log_path, "a", encoding="utf-8") as f:
                         if not file_exists:
@@ -245,8 +244,6 @@ def query_server(
             print(usage_str)
             if log_path and log_path != "":
                 try:
-                    import os
-                    import datetime
                     file_exists = os.path.exists(log_path)
                     with open(log_path, "a", encoding="utf-8") as f:
                         if not file_exists:
@@ -334,7 +331,6 @@ def query_server(
 
         if log_path and log_path != "":
             try:
-                import datetime
                 file_exists = os.path.exists(log_path)
                 with open(log_path, "a", encoding="utf-8") as f:
                     if not file_exists:
@@ -366,6 +362,7 @@ def query_server(
                     model=model,
                     messages=messages,
                     reasoning_effort=reasoning_effort,
+                    temperature=0.1,
                 )
             else:
                 response = client.chat.completions.create(
@@ -405,8 +402,6 @@ def query_server(
             print(usage_str)
             if log_path and log_path != "":
                 try:
-                    import os
-                    import datetime
                     file_exists = os.path.exists(log_path)
                     with open(log_path, "a", encoding="utf-8") as f:
                         if not file_exists:

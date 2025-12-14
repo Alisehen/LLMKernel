@@ -1,0 +1,60 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_SIZE": 256}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_SIZE": 512}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_SIZE": 1024}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_SIZE": 2048}, num_warps=8, num_stages=3),
+    ],
+    key=["n_elements"],
+)
+@triton.jit
+def elu_kernel(
+    x_ptr,
+    output_ptr,
+    alpha_val,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    
+    # ELU: x if x > 0 else alpha * (exp(x) - 1)
+    # Use fast math approximation for exp when possible
+    exp_x = tl.exp(x)
+    elu_x = tl.where(x > 0, x, alpha_val * (exp_x - 1.0))
+    
+    tl.store(output_ptr + offsets, elu_x, mask=mask)
+
+
+def triton_elu(x: torch.Tensor, alpha: float = 1.0) -> torch.Tensor:
+    output = torch.empty_like(x)
+    n_elements = output.numel()
+    
+    # Let autotuner choose optimal configuration
+    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+    
+    # Convert alpha to the same dtype as x for kernel
+    alpha_val = torch.tensor(alpha, dtype=x.dtype, device=x.device).item()
+    
+    elu_kernel[grid](x, output, alpha_val, n_elements)
+    
+    return output
+
+
+class ModelNew(nn.Module):
+    def __init__(self, alpha: float = 1.0):
+        super().__init__()
+        self.alpha = alpha
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_elu(x, alpha=self.alpha)

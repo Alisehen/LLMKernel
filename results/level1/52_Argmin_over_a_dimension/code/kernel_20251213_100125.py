@@ -1,0 +1,175 @@
+# import section
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+import math
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_K": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_K": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_K": 256}, num_warps=8, num_stages=3),
+    ],
+    key=["K"],
+)
+@triton.jit
+def argmin_reduce_stage_kernel(
+    values_in_ptr,
+    indices_in_ptr,
+    values_out_ptr,
+    indices_out_ptr,
+    N,
+    M_in,
+    M_out,
+    K,
+    stride_in_n,
+    stride_in_m,
+    stride_in_k,
+    stride_ind_in_n,
+    stride_ind_in_m,
+    stride_ind_in_k,
+    stride_out_n,
+    stride_out_m,
+    stride_out_k,
+    stride_ind_out_n,
+    stride_ind_out_m,
+    stride_ind_out_k,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    HAS_INDICES_IN: tl.constexpr,
+):
+    pid_n = tl.program_id(axis=0)
+    pid_k = tl.program_id(axis=1)
+    pid_group = tl.program_id(axis=2)
+
+    if (pid_n >= N) or (pid_group >= M_out):
+        return
+
+    k_offsets = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+    mask_k = k_offsets < K
+
+    group_start = pid_group * GROUP_SIZE
+
+    best_vals = tl.full((BLOCK_K,), float("inf"), dtype=tl.float32)
+    best_idx = tl.full((BLOCK_K,), 0, dtype=tl.int32)
+
+    base_in = pid_n * stride_in_n
+    base_idx_in = pid_n * stride_ind_in_n
+    base_out = pid_n * stride_out_n + pid_group * stride_out_m
+    base_idx_out = pid_n * stride_ind_out_n + pid_group * stride_ind_out_m
+
+    for i in range(GROUP_SIZE):
+        m_index = group_start + i
+        m_valid = m_index < M_in
+        load_mask = mask_k & m_valid
+
+        vals_ptr = values_in_ptr + base_in + m_index * stride_in_m + k_offsets * stride_in_k
+        vals = tl.load(vals_ptr, mask=load_mask, other=float("inf"))
+        vals_f32 = vals.to(tl.float32)
+
+        if HAS_INDICES_IN:
+            idx_ptr = indices_in_ptr + base_idx_in + m_index * stride_ind_in_m + k_offsets * stride_ind_in_k
+            src_idx = tl.load(idx_ptr, mask=load_mask, other=0)
+        else:
+            src_idx = tl.full((BLOCK_K,), m_index, dtype=tl.int32)
+
+        better = load_mask & (vals_f32 < best_vals)
+        best_vals = tl.where(better, vals_f32, best_vals)
+        best_idx = tl.where(better, src_idx, best_idx)
+
+    out_ptr = values_out_ptr + base_out + k_offsets * stride_out_k
+    idx_out_ptr = indices_out_ptr + base_idx_out + k_offsets * stride_ind_out_k
+    tl.store(out_ptr, best_vals, mask=mask_k)
+    tl.store(idx_out_ptr, best_idx, mask=mask_k)
+
+
+def triton_argmin(x: torch.Tensor, dim: int) -> torch.Tensor:
+    if (not x.is_cuda) or (x.dtype != torch.float32):
+        return torch.argmin(x, dim=dim)
+
+    dim = dim if dim >= 0 else dim + x.ndim
+    if dim < 0 or dim >= x.ndim:
+        raise ValueError("Invalid dimension for argmin.")
+
+    shape = x.shape
+    reduction = shape[dim]
+    output_shape = tuple(shape[:dim] + shape[dim + 1 :])
+
+    if reduction == 0:
+        raise RuntimeError("Argmin cannot operate on zero-length dimension.")
+    if reduction == 1:
+        return torch.zeros(output_shape, dtype=torch.int64, device=x.device)
+
+    outer = math.prod(shape[:dim]) if dim > 0 else 1
+    inner = math.prod(shape[dim + 1 :]) if dim + 1 < x.ndim else 1
+
+    x_work = x.contiguous().view(outer, reduction, inner)
+
+    GROUP_SIZE = 64
+
+    curr_vals = x_work
+    curr_indices = None
+    curr_M = reduction
+
+    dummy_index = torch.empty(1, dtype=torch.int32, device=x.device)
+
+    while curr_M > 1:
+        next_M = (curr_M + GROUP_SIZE - 1) // GROUP_SIZE
+        out_shape = (outer, next_M, inner)
+
+        out_vals = torch.empty(out_shape, dtype=torch.float32, device=x.device)
+        out_idx = torch.empty(out_shape, dtype=torch.int32, device=x.device)
+
+        stride_in = curr_vals.stride()
+        stride_ind_in = curr_indices.stride() if curr_indices is not None else (0, 0, 0)
+        stride_out = out_vals.stride()
+        stride_ind_out = out_idx.stride()
+
+        grid = lambda META: (
+            outer,
+            triton.cdiv(inner, META["BLOCK_K"]),
+            triton.cdiv(curr_M, GROUP_SIZE),
+        )
+
+        argmin_reduce_stage_kernel[grid](
+            curr_vals,
+            curr_indices if curr_indices is not None else dummy_index,
+            out_vals,
+            out_idx,
+            outer,
+            curr_M,
+            next_M,
+            inner,
+            stride_in[0],
+            stride_in[1],
+            stride_in[2],
+            stride_ind_in[0],
+            stride_ind_in[1],
+            stride_ind_in[2],
+            stride_out[0],
+            stride_out[1],
+            stride_out[2],
+            stride_ind_out[0],
+            stride_ind_out[1],
+            stride_ind_out[2],
+            GROUP_SIZE=GROUP_SIZE,
+            HAS_INDICES_IN=curr_indices is not None,
+        )
+
+        curr_vals = out_vals
+        curr_indices = out_idx
+        curr_M = next_M
+
+    final_indices = curr_indices.view(outer, inner).to(torch.int64)
+    return final_indices.reshape(output_shape)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_argmin(x, self.dim)

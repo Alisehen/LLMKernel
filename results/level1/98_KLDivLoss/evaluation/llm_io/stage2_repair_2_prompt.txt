@@ -1,0 +1,266 @@
+Fix the Triton kernel errors. Generate correct, high-performance code.
+
+Current Error Log:
+Traceback (most recent call last):
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 34, in wrapper
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 2000, in store
+    return semantic.store(pointer, value, mask, boundary_check, cache_modifier, eviction_policy, _builder)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/semantic.py", line 1361, in store
+    return _store_legacy(ptr, val, mask, boundary_check, cache, eviction, builder)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/semantic.py", line 1317, in _store_legacy
+    raise ValueError("Value argument cannot be block type if pointer argument is not a block")
+ValueError: Value argument cannot be block type if pointer argument is not a block
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 535, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251212_170115_batch_range70to100_deepseek_deepseek/98_KLDivLoss/code/kernel_20251213_031141.py", line 133, in forward
+    return triton_kl_div(predictions.log(), targets)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251212_170115_batch_range70to100_deepseek_deepseek/98_KLDivLoss/code/kernel_20251213_031141.py", line 117, in triton_kl_div
+    batch_mean_kernel[(grid_reduce,)](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 347, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 192, in run
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 192, in <dictcomp>
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 170, in _bench
+    return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/testing.py", line 145, in do_bench
+    fn()
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 156, in kernel_call
+    self.fn.run(
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 569, in run
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 278, in compile
+    module = src.make_ir(options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 81, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 20:8:
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < batch_size
+
+    row_sums = tl.load(row_sums_ptr + offsets, mask=mask, other=0.0)
+
+    total = tl.sum(row_sums, axis=0)
+
+    if pid == 0:
+        # Divide by batch_size for batchmean reduction
+        batch_size_float = tl.full((1,), batch_size, dtype=tl.float32)
+        result = total / batch_size_float
+        tl.store(output_ptr, result)
+        ^
+
+History Error:
+Previous Repair Attempts (avoid repeating these errors):
+Attempt 1:
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 619, in compare_and_bench
+    raise ValueError(
+ValueError: Outputs are not close (atol=0.001, rtol=0.001). max_abs_err=9.360e+03, mean_abs_err=9.360e+03
+
+
+
+PyTorch Reference:
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    A model that computes Kullback-Leibler Divergence for comparing two distributions.
+
+    Parameters:
+        None
+    """
+    def __init__(self):
+        super(Model, self).__init__()
+
+    def forward(self, predictions, targets):
+        return torch.nn.functional.kl_div(torch.log(predictions), targets, reduction='batchmean')
+
+batch_size = 8192 * 2
+input_shape = (8192 * 2,)
+dim = 1
+
+def get_inputs():
+    scale = torch.rand(())
+    return [(torch.rand(batch_size, *input_shape)*scale).softmax(dim=-1), torch.rand(batch_size, *input_shape).softmax(dim=-1)]
+
+def get_init_inputs():
+    return []
+```
+
+Broken Code:
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_BATCH': 64, 'BLOCK_INNER': 256}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_BATCH': 128, 'BLOCK_INNER': 128}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_BATCH': 256, 'BLOCK_INNER': 64}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_BATCH': 32, 'BLOCK_INNER': 512}, num_warps=8, num_stages=3),
+    ],
+    key=['batch_size', 'inner_dim'],
+)
+@triton.jit
+def kl_div_kernel(
+    predictions_ptr,
+    targets_ptr,
+    output_ptr,
+    batch_size,
+    inner_dim,
+    BLOCK_INNER: tl.constexpr,
+    BLOCK_BATCH: tl.constexpr,
+):
+    pid_batch = tl.program_id(axis=0)
+    pid_inner = tl.program_id(axis=1)
+    
+    batch_start = pid_batch * BLOCK_BATCH
+    batch_offsets = batch_start + tl.arange(0, BLOCK_BATCH)
+    batch_mask = batch_offsets < batch_size
+    
+    inner_start = pid_inner * BLOCK_INNER
+    inner_offsets = inner_start + tl.arange(0, BLOCK_INNER)
+    inner_mask = inner_offsets < inner_dim
+    
+    batch_idx = batch_offsets[:, None]
+    inner_idx = inner_offsets[None, :]
+    
+    pred_ptrs = predictions_ptr + batch_idx * inner_dim + inner_idx
+    target_ptrs = targets_ptr + batch_idx * inner_dim + inner_idx
+    
+    mask = batch_mask[:, None] & inner_mask[None, :]
+    
+    pred_block = tl.load(pred_ptrs, mask=mask, other=0.0)
+    target_block = tl.load(target_ptrs, mask=mask, other=0.0)
+    
+    # KL divergence computation matching PyTorch's F.kl_div
+    # PyTorch expects: target * (log(target) - input) where input is log(predictions)
+    # So we compute: target * (log(target) - log(predictions))
+    epsilon = 1e-12
+    safe_pred = tl.maximum(pred_block, epsilon)
+    safe_target = tl.maximum(target_block, epsilon)
+    
+    kl_div = safe_target * (tl.log(safe_target) - tl.log(safe_pred))
+    
+    acc = tl.sum(kl_div, axis=1)
+    
+    # Atomic add to accumulate results
+    output_ptrs = output_ptr + batch_offsets
+    tl.atomic_add(output_ptrs, acc, mask=batch_mask)
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 4096}, num_warps=16),
+    ],
+    key=['batch_size'],
+)
+@triton.jit
+def batch_mean_kernel(
+    row_sums_ptr,
+    output_ptr,
+    batch_size,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < batch_size
+    
+    row_sums = tl.load(row_sums_ptr + offsets, mask=mask, other=0.0)
+    
+    total = tl.sum(row_sums, axis=0)
+    
+    if pid == 0:
+        # Divide by batch_size for batchmean reduction
+        batch_size_float = tl.full((1,), batch_size, dtype=tl.float32)
+        result = total / batch_size_float
+        tl.store(output_ptr, result)
+
+def triton_kl_div(predictions: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    # Ensure contiguous memory layout
+    predictions = predictions.contiguous()
+    targets = targets.contiguous()
+    
+    # Get tensor dimensions
+    batch_size = predictions.shape[0]
+    inner_dim = predictions.shape[-1]  # Last dimension for KL divergence
+    
+    # Allocate output tensors
+    row_sums = torch.zeros(batch_size, dtype=torch.float32, device=predictions.device)
+    output = torch.zeros(1, dtype=torch.float32, device=predictions.device)
+    
+    # Launch KL divergence kernel
+    grid_batch = triton.cdiv(batch_size, 32)  # Using minimum BLOCK_BATCH from configs
+    grid_inner = triton.cdiv(inner_dim, 64)   # Using minimum BLOCK_INNER from configs
+    
+    kl_div_kernel[(grid_batch, grid_inner)](
+        predictions, targets, row_sums,
+        batch_size, inner_dim,
+    )
+    
+    # Launch batch mean reduction kernel
+    grid_reduce = triton.cdiv(batch_size, 1024)  # Using minimum BLOCK_SIZE from configs
+    
+    batch_mean_kernel[(grid_reduce,)](
+        row_sums, output, batch_size,
+    )
+    
+    return output
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, predictions, targets):
+        # Apply log to predictions as required by PyTorch's kl_div
+        # and ensure both are probabilities (sum to 1)
+        predictions = predictions.float()
+        targets = targets.float()
+        
+        return triton_kl_div(predictions.log(), targets)
+```
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+3. Learn from previous repair attempts to avoid repeating the same mistakes
+
+```python
+# <corrected code>
+```

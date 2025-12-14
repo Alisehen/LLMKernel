@@ -1,0 +1,263 @@
+Fix the Triton kernel errors. Generate correct, high-performance code.
+
+Current Error Log:
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 535, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251213_080631_batch_range40to70_deepseek_deepseek/47_Conv3d_Mish_Tanh/code/kernel_20251213_114207.py", line 141, in forward
+    x = triton_mish_tanh_3d_optimized(x)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251213_080631_batch_range40to70_deepseek_deepseek/47_Conv3d_Mish_Tanh/code/kernel_20251213_114207.py", line 116, in triton_mish_tanh_3d_optimized
+    mish_tanh_kernel_3d_optimized[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 347, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 192, in run
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 192, in <dictcomp>
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 170, in _bench
+    return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/testing.py", line 145, in do_bench
+    fn()
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 156, in kernel_call
+    self.fn.run(
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 569, in run
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 278, in compile
+    module = src.make_ir(options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 81, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 38:7:
+
+    # Vectorized loading for better memory throughput
+    if VECTORIZE == 2:
+        offsets = spatial_start + tl.arange(0, BLOCK_SIZE, 2)[:, None] * 2 + tl.arange(0, 2)[None, :]
+        offsets = tl.reshape(offsets, (-1,))
+    else:
+        offsets = spatial_start + tl.arange(0, BLOCK_SIZE)
+
+    # Apply mask for spatial dimension
+    mask = offsets < spatial_size
+
+    if mask.any():
+       ^
+AttributeError("'tensor' object has no attribute 'any'")
+
+History Error:
+None
+
+
+PyTorch Reference:
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs a 3D convolution, applies Mish activation, and then applies Tanh activation.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0):
+        super(Model, self).__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding)
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_channels, D, H, W).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_channels, D', H', W').
+        """
+        x = self.conv(x)
+        x = torch.nn.functional.mish(x)
+        x = torch.tanh(x)
+        return x
+
+batch_size = 16
+in_channels = 32
+out_channels = 64
+D, H, W = 32, 64, 64
+kernel_size = 3
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, D, H, W)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size]
+```
+
+Broken Code:
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 256, 'VECTORIZE': 1}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 512, 'VECTORIZE': 1}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 1024, 'VECTORIZE': 1}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 2048, 'VECTORIZE': 2}, num_warps=8, num_stages=3),
+    ],
+    key=['n_elements'],
+)
+@triton.jit
+def mish_tanh_kernel_3d_optimized(
+    input_ptr,
+    output_ptr,
+    n_elements,
+    B: tl.constexpr,
+    C: tl.constexpr,
+    D: tl.constexpr,
+    H: tl.constexpr,
+    W: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    VECTORIZE: tl.constexpr,
+):
+    """
+    Optimized kernel with 3D grid for better parallelism.
+    Grid layout: (B * C, triton.cdiv(D * H * W, BLOCK_SIZE))
+    """
+    # Reconstruct 3D grid indices
+    pid_bc = tl.program_id(0)  # batch*channel dimension
+    pid_spatial = tl.program_id(1)  # spatial dimension
+    
+    batch_idx = pid_bc // C
+    channel_idx = pid_bc % C
+    
+    # Calculate spatial base offset
+    spatial_size = D * H * W
+    spatial_start = pid_spatial * BLOCK_SIZE
+    
+    # Vectorized loading for better memory throughput
+    if VECTORIZE == 2:
+        offsets = spatial_start + tl.arange(0, BLOCK_SIZE, 2)[:, None] * 2 + tl.arange(0, 2)[None, :]
+        offsets = tl.reshape(offsets, (-1,))
+    else:
+        offsets = spatial_start + tl.arange(0, BLOCK_SIZE)
+    
+    # Apply mask for spatial dimension
+    mask = offsets < spatial_size
+    
+    if mask.any():
+        # Calculate base pointer offset for this batch and channel
+        base_offset = ((batch_idx * C + channel_idx) * spatial_size)
+        input_offsets = base_offset + offsets
+        output_offsets = base_offset + offsets
+        
+        # Load input
+        x = tl.load(input_ptr + input_offsets, mask=mask, other=0.0)
+        
+        # Optimized Mish+Tanh with fast math approximations
+        # Use exp2 for faster exponential computation
+        x_clamped = tl.where(x > 20.0, 20.0, tl.where(x < -20.0, -20.0, x))
+        
+        # Mish activation: x * tanh(softplus(x))
+        # Softplus: log(1 + exp(x))
+        # Use fast approximation for large values
+        exp_neg_x = tl.exp2(-x_clamped * 1.442695)  # 1/log(2) ≈ 1.442695
+        softplus_x = tl.where(
+            x_clamped > 0,
+            x_clamped + tl.log2(1.0 + exp_neg_x) * 0.693147,  # log2 to ln: multiply by ln(2)
+            tl.log2(1.0 + tl.exp2(x_clamped * 1.442695)) * 0.693147
+        )
+        
+        # tanh(softplus_x) using optimized formula
+        exp_2x = tl.exp2(2.0 * softplus_x * 1.442695)
+        tanh_sp = tl.where(
+            softplus_x > 0,
+            1.0 - 2.0 / (1.0 + exp_2x),
+            (exp_2x - 1.0) / (exp_2x + 1.0)
+        )
+        mish_x = x * tanh_sp
+        
+        # Tanh activation
+        exp_2mish = tl.exp2(2.0 * mish_x * 1.442695)
+        result = tl.where(
+            mish_x > 0,
+            1.0 - 2.0 / (1.0 + exp_2mish),
+            (exp_2mish - 1.0) / (exp_2mish + 1.0)
+        )
+        
+        # Store result
+        tl.store(output_ptr + output_offsets, result, mask=mask)
+
+
+def triton_mish_tanh_3d_optimized(x: torch.Tensor) -> torch.Tensor:
+    """
+    Optimized wrapper with 3D grid layout for better SM utilization.
+    """
+    output = torch.empty_like(x)
+    
+    # Get tensor dimensions
+    B, C, D, H, W = x.shape
+    n_elements = x.numel()
+    spatial_size = D * H * W
+    
+    # Use 2D grid: (B*C, cdiv(spatial_size, BLOCK_SIZE))
+    # This maximizes parallelism across batch/channel and spatial dimensions
+    grid = lambda meta: (
+        B * C,
+        triton.cdiv(spatial_size, meta['BLOCK_SIZE']),
+    )
+    
+    mish_tanh_kernel_3d_optimized[grid](
+        x, output, n_elements,
+        B=B, C=C, D=D, H=H, W=W
+    )
+    return output
+
+
+class ModelNew(nn.Module):
+    """
+    Model that performs a 3D convolution, applies Mish activation, and then applies Tanh activation.
+    Uses optimized Triton kernel with 3D grid layout for better parallelism.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding)
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_channels, D, H, W).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_channels, D', H', W').
+        """
+        x = self.conv(x)
+        x = triton_mish_tanh_3d_optimized(x)
+        return x
+```
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+3. Learn from previous repair attempts to avoid repeating the same mistakes
+
+```python
+# <corrected code>
+```

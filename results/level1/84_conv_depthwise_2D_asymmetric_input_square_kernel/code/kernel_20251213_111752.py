@@ -1,0 +1,176 @@
+# <complete ModelNew code with optimized Triton kernels>
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+def _to_triton_dtype(dtype: torch.dtype):
+    if dtype == torch.float16:
+        return tl.float16
+    if dtype == torch.bfloat16:
+        return tl.bfloat16
+    if dtype == torch.float32:
+        return tl.float32
+    raise ValueError(f"Unsupported dtype: {dtype}")
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_W": 64}, num_warps=2, num_stages=1),
+        triton.Config({"BLOCK_W": 96}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_W": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_W": 160}, num_warps=8, num_stages=3),
+    ],
+    key=["OW"],
+)
+@triton.jit
+def depthwise_conv2d_kernel(
+    x_ptr,
+    w_ptr,
+    b_ptr,
+    out_ptr,
+    B,
+    C_in,
+    H_in,
+    W_in,
+    C_out,
+    OH,
+    OW,
+    stride_h,
+    stride_w,
+    pad_h,
+    pad_w,
+    channel_multiplier,
+    HAS_BIAS: tl.constexpr,
+    KH: tl.constexpr,
+    KW: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+    OUTPUT_DTYPE: tl.constexpr,
+):
+    pid_row = tl.program_id(0)
+    pid_col = tl.program_id(1)
+
+    total_per_batch = C_out * OH
+    n = pid_row // total_per_batch
+    rem = pid_row % total_per_batch
+    oc = rem // OH
+    oh = rem % OH
+
+    ow_idx = pid_col * BLOCK_W + tl.arange(0, BLOCK_W)
+    mask_ow = ow_idx < OW
+
+    if n >= B:
+        return
+
+    in_c = oc // channel_multiplier
+    base_nc = (n * C_in + in_c) * H_in
+
+    oh_in = oh * stride_h - pad_h
+    ow_in = ow_idx * stride_w - pad_w
+
+    acc = tl.zeros((BLOCK_W,), dtype=tl.float32)
+
+    for kh in range(KH):
+        iy = oh_in + kh
+        mask_y = (iy >= 0) & (iy < H_in)
+        row_base = tl.where(
+            mask_y,
+            (base_nc + iy) * W_in,
+            0,
+        )
+
+        for kw in range(KW):
+            ix = ow_in + kw
+            mask_x = (ix >= 0) & (ix < W_in)
+            mask = mask_ow & mask_y & mask_x
+
+            ptrs = x_ptr + row_base + ix
+            vals = tl.load(ptrs, mask=mask, other=0.0)
+
+            w_index = ((oc * KH) + kh) * KW + kw
+            w_val = tl.load(w_ptr + w_index)
+
+            acc += vals.to(tl.float32) * w_val.to(tl.float32)
+
+    if HAS_BIAS:
+        bias = tl.load(b_ptr + oc).to(tl.float32)
+        acc += bias
+
+    out_vals = acc.to(OUTPUT_DTYPE)
+    out_ptrs = (((n * C_out + oc) * OH) + oh) * OW + ow_idx
+    tl.store(out_ptr + out_ptrs, out_vals, mask=mask_ow)
+
+
+def triton_depthwise_conv2d(x, weight, bias, stride, padding):
+    assert x.is_cuda and weight.is_cuda, "Inputs must be CUDA tensors"
+    assert x.dtype == weight.dtype, "Input and weight dtypes must match"
+    assert weight.ndim == 4, "Weight must be (C_out, 1, KH, KW)"
+
+    if isinstance(stride, int):
+        stride_h = stride_w = stride
+    else:
+        stride_h, stride_w = stride
+    if isinstance(padding, int):
+        pad_h = pad_w = padding
+    else:
+        pad_h, pad_w = padding
+
+    B, C_in, H_in, W_in = x.shape
+    C_out, _, KH, KW = weight.shape
+    channel_multiplier = max(C_out // C_in, 1)
+
+    OH = (H_in + 2 * pad_h - KH) // stride_h + 1
+    OW = (W_in + 2 * pad_w - KW) // stride_w + 1
+
+    output = torch.empty((B, C_out, OH, OW), device=x.device, dtype=x.dtype)
+
+    has_bias = bias is not None
+    bias_ptr = bias if has_bias else output  # dummy pointer when no bias
+
+    grid = lambda META: (
+        B * C_out * OH,
+        triton.cdiv(OW, META["BLOCK_W"]),
+    )
+
+    depthwise_conv2d_kernel[grid](
+        x.contiguous(),
+        weight.contiguous().view(-1),
+        bias_ptr if has_bias else bias_ptr,
+        output,
+        B,
+        C_in,
+        H_in,
+        W_in,
+        C_out,
+        OH,
+        OW,
+        stride_h,
+        stride_w,
+        pad_h,
+        pad_w,
+        channel_multiplier,
+        HAS_BIAS=has_bias,
+        KH=KH,
+        KW=KW,
+        BLOCK_W=0,  # overridden by autotuner
+        OUTPUT_DTYPE=_to_triton_dtype(x.dtype),
+    )
+    return output
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, stride: int = 1, padding: int = 0, bias: bool = False):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(out_channels, 1, kernel_size, kernel_size))
+        self.bias = nn.Parameter(torch.empty(out_channels)) if bias else None
+        nn.init.kaiming_uniform_(self.weight, a=5 ** 0.5)
+        if bias:
+            fan_in = in_channels * kernel_size * kernel_size
+            bound = fan_in ** -0.5
+            nn.init.uniform_(self.bias, -bound, bound)
+        self.stride = stride
+        self.padding = padding
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_depthwise_conv2d(x, self.weight, self.bias, self.stride, self.padding)

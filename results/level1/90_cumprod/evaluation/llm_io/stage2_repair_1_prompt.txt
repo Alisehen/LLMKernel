@@ -1,0 +1,174 @@
+Fix the Triton kernel errors. Generate correct, high-performance code.
+
+Current Error Log:
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 535, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251213_091928_batch_range68to99_openai_deepseek/90_cumprod/code/kernel_20251213_114059.py", line 83, in forward
+    return triton_cumprod(x, self.dim)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251213_091928_batch_range68to99_openai_deepseek/90_cumprod/code/kernel_20251213_114059.py", line 65, in triton_cumprod
+    grid = ((seq_count + cumprod_kernel.BLOCK_SEQ - 1) // cumprod_kernel.BLOCK_SEQ,)
+                         ^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'Autotuner' object has no attribute 'BLOCK_SEQ'
+
+History Error:
+None
+
+
+PyTorch Reference:
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    A model that performs a cumulative product operation along a specified dimension.
+
+    Parameters:
+        dim (int): The dimension along which to perform the cumulative product operation.
+    """
+
+    def __init__(self, dim):
+        """
+        Initialize the CumulativeProductModel.
+
+        Args:
+            dim (int): The dimension along which to perform the cumulative product.
+        """
+        super(Model, self).__init__()
+        self.dim = dim
+
+    def forward(self, x):
+        """
+        Forward pass, computing the cumulative product along the specified dimension.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, *input_shape).
+
+        Returns:
+            torch.Tensor: Tensor of the same shape as `x` after applying cumulative product along `dim`.
+        """
+        return torch.cumprod(x, dim=self.dim)
+
+# Define input dimensions and parameters
+batch_size = 32768
+input_shape = (32768,)
+dim = 1
+
+def get_inputs():
+    return [torch.rand(batch_size, *input_shape)]
+
+def get_init_inputs():
+    return [dim]
+```
+
+Broken Code:
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SEQ': 32}, num_warps=1, num_stages=2),
+        triton.Config({'BLOCK_SEQ': 64}, num_warps=2, num_stages=2),
+        triton.Config({'BLOCK_SEQ': 128}, num_warps=4, num_stages=2),
+    ],
+    key=['seq_count'],
+)
+@triton.jit
+def cumprod_kernel(
+    x_ptr,
+    y_ptr,
+    axis_len,
+    inner,
+    seq_count,
+    BLOCK_SEQ: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    seq_ids = pid * BLOCK_SEQ + tl.arange(0, BLOCK_SEQ)
+    mask_seq = seq_ids < seq_count
+    if not tl.any(mask_seq):
+        return
+
+    axis_len_val = axis_len
+    if axis_len_val <= 0:
+        return
+
+    inner_val = inner
+    outer_idx = seq_ids // inner_val
+    inner_idx = seq_ids - outer_idx * inner_val
+    base_offset = outer_idx * axis_len_val * inner_val + inner_idx
+
+    offsets = base_offset
+    running = tl.load(x_ptr + offsets, mask=mask_seq, other=1)
+    tl.store(y_ptr + offsets, running, mask=mask_seq)
+
+    i = 1
+    while i < axis_len_val:
+        offsets += inner_val
+        vals = tl.load(x_ptr + offsets, mask=mask_seq, other=1)
+        running = running * vals
+        tl.store(y_ptr + offsets, running, mask=mask_seq)
+        i += 1
+
+
+def triton_cumprod(x: torch.Tensor, dim: int) -> torch.Tensor:
+    if not x.is_cuda:
+        raise RuntimeError("Input must be a CUDA tensor.")
+    x_contig = x.contiguous()
+    out = torch.empty_like(x_contig)
+
+    dim = dim if dim >= 0 else dim + x_contig.ndim
+    axis_len = x_contig.shape[dim]
+    if axis_len == 0:
+        return out
+
+    inner = x_contig.stride(dim)
+    seq_count = x_contig.numel() // axis_len
+    grid = ((seq_count + cumprod_kernel.BLOCK_SEQ - 1) // cumprod_kernel.BLOCK_SEQ,)
+
+    cumprod_kernel[grid](
+        x_contig,
+        out,
+        axis_len,
+        inner,
+        seq_count,
+    )
+    return out
+
+
+class ModelNew(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x):
+        return triton_cumprod(x, self.dim)
+```
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+3. Learn from previous repair attempts to avoid repeating the same mistakes
+
+```python
+# <corrected code>
+```

@@ -1,0 +1,262 @@
+Fix the Triton kernel errors. Generate correct, high-performance code.
+
+Current Error Log:
+Traceback (most recent call last):
+  File "/home/hyc/miniconda3/envs/hyc/lib/python3.11/site-packages/triton/language/core.py", line 43, in wrapper
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/hyc/lib/python3.11/site-packages/triton/language/core.py", line 2192, in store
+    return _semantic.store(pointer, value, mask, boundary_check, cache_modifier, eviction_policy)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/hyc/lib/python3.11/site-packages/triton/language/semantic.py", line 1297, in store
+    return self._store_legacy(ptr, val, mask, boundary_check, cache, eviction)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/hyc/lib/python3.11/site-packages/triton/language/semantic.py", line 1242, in _store_legacy
+    raise ValueError(f"Unsupported ptr type {ptr.type.__repr__()} in `tl.store`")
+ValueError: Unsupported ptr type <['128'], fp32> in `tl.store`
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 533, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 131, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/hyc/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/hyc/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251212_085222_batch_range20to30_deepseek_deepseek/37_FrobeniusNorm_/code/kernel_20251212_130116.py", line 133, in forward
+    return triton_fro_norm_normalize(x)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251212_085222_batch_range20to30_deepseek_deepseek/37_FrobeniusNorm_/code/kernel_20251212_130116.py", line 114, in triton_fro_norm_normalize
+    fused_fro_norm_normalize_kernel[(num_blocks, 1)](
+  File "/home/hyc/miniconda3/envs/hyc/lib/python3.11/site-packages/triton/runtime/jit.py", line 419, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/hyc/lib/python3.11/site-packages/triton/runtime/jit.py", line 733, in run
+    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/hyc/lib/python3.11/site-packages/triton/runtime/jit.py", line 861, in _do_compile
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/hyc/lib/python3.11/site-packages/triton/compiler/compiler.py", line 300, in compile
+    module = src.make_ir(target, options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/hyc/lib/python3.11/site-packages/triton/compiler/compiler.py", line 80, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 42:8:
+        local_sum += x * x
+
+    # Hierarchical reduction within thread block
+    block_sum = tl.sum(local_sum, axis=0)
+
+    # Use shared memory for global reduction
+    smem = tl.zeros((128,), dtype=tl.float32)  # 128 blocks per SM
+    smem_ptr = smem + tl.program_id(axis=1)
+
+    # Store block sum to shared memory
+    if tl.program_id(axis=0) < 128:  # First 128 blocks
+        tl.store(smem_ptr, block_sum)
+        ^
+Unsupported ptr type <['128'], fp32> in `tl.store`
+
+History Error:
+None
+
+
+PyTorch Reference:
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs Frobenius norm normalization.
+    """
+    def __init__(self):
+        """
+        Initializes the Frobenius norm normalization layer.
+        """
+        super(Model, self).__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies Frobenius norm normalization to the input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor of arbitrary shape.
+
+        Returns:
+            torch.Tensor: Output tensor with Frobenius norm normalization applied, same shape as input.
+        """
+        norm = torch.norm(x, p='fro')
+        return x / norm
+
+batch_size = 112
+features = 64
+dim1 = 512
+dim2 = 512
+
+def get_inputs():
+    x = torch.rand(batch_size, features, dim1, dim2)
+    return [x]
+
+def get_init_inputs():
+    return []
+```
+
+Broken Code:
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def fused_fro_norm_normalize_kernel(
+    x_ptr,
+    output_ptr,
+    n_elements,
+    EPS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    NUM_SUB_BLOCKS: tl.constexpr,
+    num_stages: tl.constexpr = 3,
+):
+    """
+    Fused kernel that computes Frobenius norm and normalizes in a single pass.
+    Uses hierarchical reduction with sub-blocks to improve cache locality.
+    """
+    pid = tl.program_id(axis=0)
+    num_blocks = tl.num_programs(axis=0)
+    
+    # Use sub-blocks within each thread block for better data reuse
+    block_start = pid * BLOCK_SIZE * NUM_SUB_BLOCKS
+    local_sum = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+    
+    # Load and process multiple sub-blocks per thread block
+    for sub in range(NUM_SUB_BLOCKS):
+        sub_start = block_start + sub * BLOCK_SIZE
+        offsets = sub_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        
+        # Coalesced memory access
+        x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+        
+        # Accumulate squares locally
+        local_sum += x * x
+    
+    # Hierarchical reduction within thread block
+    block_sum = tl.sum(local_sum, axis=0)
+    
+    # Use shared memory for global reduction
+    smem = tl.zeros((128,), dtype=tl.float32)  # 128 blocks per SM
+    smem_ptr = smem + tl.program_id(axis=1)
+    
+    # Store block sum to shared memory
+    if tl.program_id(axis=0) < 128:  # First 128 blocks
+        tl.store(smem_ptr, block_sum)
+    
+    tl.debug_barrier()
+    
+    # First block reduces all block sums
+    if pid == 0:
+        # Load all block sums from shared memory
+        block_sums = tl.load(smem + tl.arange(0, min(num_blocks, 128)))
+        global_sum = tl.sum(block_sums, axis=0)
+        norm_val = tl.sqrt(global_sum) + EPS
+        
+        # Broadcast norm to all threads
+        norm_ptr = tl.make_block_ptr(
+            output_ptr - 1,  # Use output memory for norm storage
+            (1,),
+            (0,),
+            (1,),
+            (0,),
+        )
+        tl.store(norm_ptr, norm_val)
+    
+    tl.debug_barrier()
+    
+    # All threads load the norm value
+    norm_ptr = tl.make_block_ptr(
+        output_ptr - 1,
+        (1,),
+        (0,),
+        (1,),
+        (0,),
+    )
+    norm_val = tl.load(norm_ptr)
+    
+    # Normalize and store results
+    for sub in range(NUM_SUB_BLOCKS):
+        sub_start = block_start + sub * BLOCK_SIZE
+        offsets = sub_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        
+        x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+        normalized = x / norm_val
+        tl.store(output_ptr + offsets, normalized, mask=mask)
+
+
+def triton_fro_norm_normalize(x: torch.Tensor) -> torch.Tensor:
+    output = torch.empty_like(x)
+    
+    # Flatten input for kernel processing
+    x_flat = x.reshape(-1)
+    output_flat = output.reshape(-1)
+    n_elements = x_flat.numel()
+    
+    # Configuration optimized for Ada Lovelace
+    BLOCK_SIZE = 256  # Smaller blocks for better occupancy
+    NUM_SUB_BLOCKS = 4  # Process 4 sub-blocks per thread block
+    
+    # Calculate grid size - aim for 128 blocks per SM
+    max_blocks_per_sm = 128  # Ada Lovelace can run 128 blocks concurrently
+    total_sms = 128
+    num_blocks = min(
+        triton.cdiv(n_elements, BLOCK_SIZE * NUM_SUB_BLOCKS),
+        max_blocks_per_sm * total_sms
+    )
+    
+    # Launch fused kernel
+    fused_fro_norm_normalize_kernel[(num_blocks, 1)](
+        x_flat,
+        output_flat,
+        n_elements,
+        EPS=1e-8,
+        BLOCK_SIZE=BLOCK_SIZE,
+        NUM_SUB_BLOCKS=NUM_SUB_BLOCKS,
+        num_stages=3,  # Increased to hide memory latency
+        num_warps=4,  # 4 warps = 128 threads
+    )
+    
+    return output
+
+
+class ModelNew(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_fro_norm_normalize(x)
+```
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+3. Learn from previous repair attempts to avoid repeating the same mistakes
+
+```python
+# <corrected code>
+```

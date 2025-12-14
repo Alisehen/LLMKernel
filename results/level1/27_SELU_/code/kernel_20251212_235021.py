@@ -1,0 +1,150 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def selu_kernel_optimized(
+    x_ptr,
+    output_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Optimized SELU kernel with better memory access patterns and compute density.
+    """
+    # 2D grid: pid0 for block groups, pid1 for vectorized lanes
+    pid0 = tl.program_id(axis=0)
+    pid1 = tl.program_id(axis=1)
+    
+    # Each block processes BLOCK_SIZE elements
+    # Using 2D grid to process multiple elements per thread for better coalescing
+    block_start = pid0 * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    
+    # Add stride for 2D grid dimension to increase work per SM
+    stride = pid1 * BLOCK_SIZE * 128  # Large stride to ensure memory coalescing
+    offsets = offsets + stride
+    
+    mask = offsets < n_elements
+    
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    
+    # SELU parameters (precomputed constants)
+    ALPHA = 1.6732632423543772848170429916717
+    SCALE = 1.0507009873554804934193349852946
+    
+    # Fused SELU computation
+    # Use mathematical transformations to reduce conditionals
+    exp_x = tl.exp(x)
+    
+    # Compute both branches simultaneously
+    pos_part = tl.where(x > 0.0, x, 0.0)
+    neg_part = tl.where(x <= 0.0, ALPHA * (exp_x - 1.0), 0.0)
+    
+    result = SCALE * (pos_part + neg_part)
+    
+    tl.store(output_ptr + offsets, result, mask=mask)
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 256}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 512}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8, num_stages=4),
+    ],
+    key=['n_elements'],
+)
+@triton.jit
+def selu_kernel_optimized_autotune(
+    x_ptr,
+    output_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Autotuned version with optimal block sizes for different tensor sizes.
+    """
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    
+    # SELU parameters
+    ALPHA = 1.6732632423543772848170429916717
+    SCALE = 1.0507009873554804934193349852946
+    
+    # Optimized computation with fewer operations
+    # Use tl.maximum and tl.minimum for faster conditional operations
+    pos_part = tl.maximum(x, 0.0)
+    
+    # For negative values: alpha * (exp(x) - 1)
+    # Compute exp(x) only for negative values using masking
+    exp_x = tl.exp(tl.minimum(x, 0.0))  # exp(0) = 1 for positive values
+    neg_part = ALPHA * (exp_x - 1.0)
+    neg_part = tl.where(x <= 0.0, neg_part, 0.0)
+    
+    result = SCALE * (pos_part + neg_part)
+    
+    tl.store(output_ptr + offsets, result, mask=mask)
+
+
+def triton_selu(x: torch.Tensor) -> torch.Tensor:
+    output = torch.empty_like(x)
+    n_elements = output.numel()
+    
+    # Calculate optimal grid dimensions
+    # For large tensors, use 2D grid to increase work per SM
+    # For small tensors, use 1D grid with larger blocks
+    
+    if n_elements >= 1048576:  # 1M+ elements
+        # Use 2D grid for better SM utilization
+        BLOCK_SIZE = 1024
+        grid_m = triton.cdiv(n_elements, BLOCK_SIZE * 4)  # Reduce grid size
+        grid_n = min(4, triton.cdiv(n_elements, grid_m * BLOCK_SIZE))
+        
+        # Ensure grid_n doesn't exceed reasonable bounds
+        grid_n = min(grid_n, 128)
+        
+        grid = (grid_m, grid_n)
+        
+        # Use the 2D optimized kernel
+        selu_kernel_optimized[grid](
+            x, output, n_elements,
+            BLOCK_SIZE=BLOCK_SIZE,
+            num_warps=8,
+            num_stages=3
+        )
+    else:
+        # Use autotuned kernel for smaller tensors
+        grid = lambda META: (triton.cdiv(n_elements, META['BLOCK_SIZE']),)
+        
+        selu_kernel_optimized_autotune[grid](
+            x, output, n_elements
+        )
+    
+    return output
+
+
+class ModelNew(nn.Module):
+    """
+    Simple model that performs a SELU activation using optimized Triton kernels.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies SELU activation to the input tensor using Triton.
+
+        Args:
+            x (torch.Tensor): Input tensor of any shape.
+
+        Returns:
+            torch.Tensor: Output tensor with SELU applied, same shape as input.
+        """
+        return triton_selu(x)

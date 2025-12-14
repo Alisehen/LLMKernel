@@ -1,0 +1,181 @@
+
+Write a correct and reasonably fast Triton kernel to replace the given PyTorch operator.
+This is a SEED implementation: prioritize correctness and stable compilation.
+
+Rules:
+- Use `tl.program_id(axis)` (axis=0/1/2 only)
+- Use `tl.arange()` for block indices
+- Operate on blocks (no CUDA thread model)
+- No manual shared memory or synchronization
+
+Hard Constraints:
+- All BLOCK_* are `tl.constexpr` and powers of 2
+- `tl.arange(0, BLOCK)` requires BLOCK to be power-of-2
+- No dynamic `tl.reshape()` or view
+- `tl.load` / `tl.store`: scalar ptr → scalar, block ptr → block
+- No Python control flow on `tl.tensor` or BLOCK_*
+- Triton does NOT support `continue`, `break`, or `return` inside loops — use masking instead
+- Import ALL modules you use (e.g., `import math` if using `math.sqrt`)
+- Do NOT index tensors with loop variables: `tensor[:, i]` or `tensor[i, :]` where i is a loop var is INVALID
+- Shared memory limit ~100KB: for matmul, BLOCK_M*BLOCK_K + BLOCK_K*BLOCK_N < 25000 floats
+
+
+Performance Guidelines for Large-K Matrix Multiplication:
+For K > 100k, numerical precision is the PRIMARY challenge (more than performance).
+
+CRITICAL CONSTRAINTS:
+1. Shared memory limit ~100KB: BLOCK_M * BLOCK_K + BLOCK_K * BLOCK_N must fit
+   - BLOCK_M=128, BLOCK_N=128, BLOCK_K=128 needs 128KB → TOO LARGE!
+   - Safe config: BLOCK_M=64, BLOCK_N=64, BLOCK_K=64 or BLOCK_M=128, BLOCK_N=64, BLOCK_K=32
+2. Use larger BLOCK_K (64+) to reduce accumulation steps, but stay within shared memory
+
+RECOMMENDED APPROACH for extreme K (>500k):
+- Consider splitting K into chunks and accumulating in PyTorch:
+```python
+def large_k_matmul(A, B, chunk_size=65536):
+    M, K = A.shape
+    K_, N = B.shape
+    C = torch.zeros(M, N, device=A.device, dtype=A.dtype)
+    for k_start in range(0, K, chunk_size):
+        k_end = min(k_start + chunk_size, K)
+        C += triton_matmul(A[:, k_start:k_end], B[k_start:k_end, :])
+    return C
+```
+This reduces accumulation error by chunking.
+
+BLOCK SIZE GUIDE (for shared memory ~100KB):
+- BLOCK_M=64, BLOCK_N=64, BLOCK_K=64: uses ~32KB (safe)
+- BLOCK_M=128, BLOCK_N=64, BLOCK_K=32: uses ~24KB (safe)
+- BLOCK_M=128, BLOCK_N=128, BLOCK_K=32: uses ~32KB (safe)
+
+
+Output Format (STRICT):
+1. Imports (torch, torch.nn, triton, triton.language, and any other needed modules like math)
+2. `@triton.jit` kernel(s)
+3. Wrapper function(s)
+4. `class ModelNew(nn.Module)` — this class is REQUIRED
+
+Do NOT include testing code or `if __name__ == "__main__"`.
+
+Example PyTorch:
+'''
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class Model(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, a, b):
+        return a + b
+
+
+def get_inputs():
+    # randomly generate input tensors based on the model architecture
+    a = torch.randn(1, 128).cuda()
+    b = torch.randn(1, 128).cuda()
+    return [a, b]
+
+
+def get_init_inputs():
+    # randomly generate tensors required for initialization based on the model architecture
+    return []
+'''
+
+Example Triton:
+'''
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def add_kernel(
+    x_ptr,
+    y_ptr,
+    output_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+
+    x = tl.load(x_ptr + offsets, mask=mask)
+    y = tl.load(y_ptr + offsets, mask=mask)
+
+    output = x + y
+    tl.store(output_ptr + offsets, output, mask=mask)
+
+def triton_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    output = torch.empty_like(x)
+    n_elements = output.numel()
+    BLOCK_SIZE = 1024
+    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
+    add_kernel[grid](x, y, output, n_elements, BLOCK_SIZE=BLOCK_SIZE)
+
+    return output
+
+class ModelNew(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, a, b):
+        return triton_add(a, b)
+'''
+
+Hardware:
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+Target:
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs a single matrix multiplication (C = A * B) with a large K dimension
+    """
+    def __init__(self):
+        super(Model, self).__init__()
+    
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        """
+        Performs matrix multiplication of A and B.
+
+        Args:
+            A: Input tensor of shape (M, K)
+            B: Input tensor of shape (K, N)
+
+        Returns:
+            Output tensor of shape (M, N)
+        """
+        return torch.matmul(A, B)
+
+M = 256
+N = 256
+K = 131072 * 4
+
+def get_inputs():
+    A = torch.rand(M, K)
+    B = torch.rand(K, N)
+    return [A, B]
+
+def get_init_inputs():
+    return []  # No special initialization inputs needed

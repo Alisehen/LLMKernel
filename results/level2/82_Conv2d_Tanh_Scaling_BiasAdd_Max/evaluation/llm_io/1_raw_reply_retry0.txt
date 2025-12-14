@@ -1,0 +1,226 @@
+Looking at the NCU metrics, both kernels have low SM throughput (6.03% and 14.91%) despite high warps active and DRAM throughput. The grid sizes are very large (516128 and 65535), indicating excessive grid parallelism with poor SM utilization. Let me optimize both kernels with better grid layouts and autotuning.
+
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+from typing import Tuple
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 128, 'NUM_WARPS': 4}, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 256, 'NUM_WARPS': 4}, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 512, 'NUM_WARPS': 8}, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 1024, 'NUM_WARPS': 8}, num_stages=3),
+    ],
+    key=['n_elements', 'C', 'H', 'W']
+)
+@triton.jit
+def fused_activation_kernel(
+    x_ptr,
+    bias_ptr,
+    output_ptr,
+    scaling_factor,
+    n_elements,
+    C: tl.constexpr,
+    H: tl.constexpr,
+    W: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    NUM_WARPS: tl.constexpr,
+):
+    # 2D grid: (B*C, cdiv(H*W, BLOCK_SIZE))
+    pid_bc = tl.program_id(axis=0)
+    pid_hw = tl.program_id(axis=1)
+    
+    # Each block processes BLOCK_SIZE spatial positions for one batch-channel
+    hw_start = pid_hw * BLOCK_SIZE
+    offsets_hw = hw_start + tl.arange(0, BLOCK_SIZE)
+    mask_hw = offsets_hw < (H * W)
+    
+    # Compute channel and batch indices
+    bc_idx = pid_bc
+    c_idx = bc_idx % C
+    
+    # Base pointer for this batch-channel
+    base_offset = bc_idx * (H * W) + offsets_hw
+    mask = mask_hw & (base_offset < n_elements)
+    
+    # Load and process
+    x = tl.load(x_ptr + base_offset, mask=mask)
+    bias = tl.load(bias_ptr + c_idx)
+    
+    # Optimized tanh using exponential form
+    exp_2x = tl.exp(2.0 * x)
+    tanh_x = (exp_2x - 1.0) / (exp_2x + 1.0)
+    
+    activated = tanh_x * scaling_factor + bias
+    tl.store(output_ptr + base_offset, activated, mask=mask)
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 64, 'NUM_WARPS': 4}, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 128, 'NUM_WARPS': 4}, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 256, 'NUM_WARPS': 8}, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 512, 'NUM_WARPS': 8}, num_stages=3),
+    ],
+    key=['B', 'C', 'H', 'W', 'pool_h', 'pool_w', 'output_h', 'output_w']
+)
+@triton.jit
+def max_pool_2d_kernel(
+    input_ptr,
+    output_ptr,
+    B, C, H, W,
+    pool_h, pool_w,
+    stride_h, stride_w,
+    output_h, output_w,
+    BLOCK_SIZE: tl.constexpr,
+    NUM_WARPS: tl.constexpr,
+):
+    # 3D grid: (B, C, cdiv(output_h*output_w, BLOCK_SIZE))
+    pid_b = tl.program_id(axis=0)
+    pid_c = tl.program_id(axis=1)
+    pid_hw = tl.program_id(axis=2)
+    
+    # Each block processes BLOCK_SIZE output positions for one batch-channel
+    hw_start = pid_hw * BLOCK_SIZE
+    offsets = hw_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < (output_h * output_w)
+    
+    # Compute output indices
+    w_idx = offsets % output_w
+    h_idx = offsets // output_w
+    
+    # Input window indices
+    h_start = h_idx * stride_h
+    w_start = w_idx * stride_w
+    h_end = tl.minimum(h_start + pool_h, H)
+    w_end = tl.minimum(w_start + pool_w, W)
+    
+    # Precompute repeated indices for vectorization
+    b_idx_repeated = tl.full((BLOCK_SIZE,), pid_b, dtype=tl.int32)
+    c_idx_repeated = tl.full((BLOCK_SIZE,), pid_c, dtype=tl.int32)
+    
+    # Initialize max values
+    min_val = -3.4028235e38
+    max_val = tl.full((BLOCK_SIZE,), min_val, dtype=tl.float32)
+    
+    # Pooling window with loop unrolling hint
+    for ph in range(0, pool_h):
+        ph_actual = h_start + ph
+        h_in_bounds = (ph_actual < h_end) & (ph_actual >= 0)
+        
+        for pw in range(0, pool_w):
+            pw_actual = w_start + pw
+            w_in_bounds = (pw_actual < w_end) & (pw_actual >= 0)
+            
+            # Calculate input index efficiently
+            input_idx = (b_idx_repeated * C * H * W + 
+                        c_idx_repeated * H * W + 
+                        ph_actual * W + 
+                        pw_actual)
+            
+            # Load with bounds checking
+            load_mask = mask & h_in_bounds & w_in_bounds
+            val = tl.load(input_ptr + input_idx, mask=load_mask, other=min_val)
+            
+            # Vectorized max
+            max_val = tl.where(val > max_val, val, max_val)
+    
+    # Calculate output index and store
+    output_idx = (pid_b * C * output_h * output_w + 
+                 pid_c * output_h * output_w + 
+                 offsets)
+    tl.store(output_ptr + output_idx, max_val, mask=mask)
+
+
+def triton_fused_activation(x: torch.Tensor, scaling_factor: float, bias: torch.Tensor) -> torch.Tensor:
+    if bias.dim() > 1:
+        bias = bias.view(-1)
+    
+    output = torch.empty_like(x)
+    n_elements = output.numel()
+    B, C, H, W = x.shape
+    
+    # Optimized 2D grid layout
+    grid = lambda META: (
+        B * C,
+        triton.cdiv(H * W, META['BLOCK_SIZE'])
+    )
+    
+    fused_activation_kernel[grid](
+        x, bias, output, scaling_factor, n_elements,
+        C, H, W
+    )
+    return output
+
+
+def triton_max_pool2d(x: torch.Tensor, kernel_size: int) -> torch.Tensor:
+    B, C, H, W = x.shape
+    stride = kernel_size
+    pool_h = pool_w = kernel_size
+    
+    output_h = H // stride
+    output_w = W // stride
+    output = torch.empty((B, C, output_h, output_w), device=x.device, dtype=x.dtype)
+    
+    if output_h <= 0 or output_w <= 0:
+        raise ValueError(f"Invalid output dimensions: {output_h}x{output_w}")
+    
+    # Optimized 3D grid layout
+    grid = lambda META: (
+        B,
+        C,
+        triton.cdiv(output_h * output_w, META['BLOCK_SIZE'])
+    )
+    
+    max_pool_2d_kernel[grid](
+        x, output,
+        B, C, H, W,
+        pool_h, pool_w,
+        stride, stride,
+        output_h, output_w
+    )
+    return output
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, scaling_factor, bias_shape, pool_kernel_size):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.scaling_factor = scaling_factor
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.pool_kernel_size = pool_kernel_size
+        
+    def forward(self, x):
+        x = self.conv(x)
+        x = triton_fused_activation(x, self.scaling_factor, self.bias)
+        x = triton_max_pool2d(x, self.pool_kernel_size)
+        return x
+```
+
+Key optimizations:
+
+1. **Grid Layout Optimization**:
+   - Changed fused_activation from 1D to 2D grid (B*C × H*W/blocks)
+   - Changed max_pool from 1D to 3D grid (B × C × output_spatial/blocks)
+   - This reduces grid size while increasing SM utilization
+
+2. **Autotuning**:
+   - Added autotuning configurations for both kernels
+   - Tuning BLOCK_SIZE and NUM_WARPS for optimal occupancy
+   - Used stage-aware configurations for better pipeline utilization
+
+3. **Memory Access Patterns**:
+   - Fused activation now processes spatial positions contiguously within blocks
+   - Max pool uses 3D grid to better match tensor layout
+   - Precomputed repeated indices for vectorization
+
+4. **Performance Optimization**:
+   - Reduced excessive grid parallelism (516128 → optimal)
+   - Better SM utilization through improved work distribution
+   - Warp-level optimizations for Ada Lovelace architecture
+
+The new grid layouts should significantly improve SM throughput while maintaining correctness.

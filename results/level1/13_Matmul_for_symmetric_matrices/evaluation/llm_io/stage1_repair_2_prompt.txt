@@ -1,0 +1,240 @@
+Fix the Triton kernel errors. Generate correct, high-performance code.
+
+Current Error Log:
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 535, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251212_170043_batch_range5to40_deepseek_deepseek/13_Matmul_for_symmetric_matrices/code/kernel_20251212_190023.py", line 130, in forward
+    return triton_matmul(A, B)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251212_170043_batch_range5to40_deepseek_deepseek/13_Matmul_for_symmetric_matrices/code/kernel_20251212_190023.py", line 113, in triton_matmul
+    kernel_wrapper[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 347, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 192, in run
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 192, in <dictcomp>
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 145, in _bench
+    raise ValueError(f"Conflicting meta-parameters: {', '.join(conflicts)}."
+ValueError: Conflicting meta-parameters: GROUP_M. Make sure that you don't re-define auto-tuned symbols.
+
+History Error:
+Previous Repair Attempts (avoid repeating these errors):
+Attempt 1:
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 619, in compare_and_bench
+    raise ValueError(
+ValueError: Outputs are not close (atol=0.001, rtol=0.001). max_abs_err=nan, mean_abs_err=nan
+
+
+
+PyTorch Reference:
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs a single matrix multiplication (C = A * B) with A and B being symmetric matrices.
+    """
+    def __init__(self):
+        super(Model, self).__init__()
+    
+    def forward(self, A, B):
+        """
+        Performs matrix multiplication of two symmetric matrices.
+
+        Args:
+            A (torch.Tensor): Input matrix A, shape (N, N), symmetric.
+            B (torch.Tensor): Input matrix B, shape (N, N), symmetric.
+
+        Returns:
+            torch.Tensor: Output matrix C, shape (N, N).
+        """
+        return torch.matmul(A, B)
+
+N = 4096
+
+def get_inputs():
+    """
+    Generates a pair of random symmetric matrices for testing.
+
+    Returns:
+        list: List containing two symmetric tensors A and B.
+    """
+    A = torch.rand(N, N)
+    A = (A + A.T) / 2  # Ensure symmetry
+    B = torch.rand(N, N)
+    B = (B + B.T) / 2  # Ensure symmetry
+    return [A, B]
+
+def get_init_inputs():
+    """
+    No specific initialization inputs needed for this model.
+
+    Returns:
+        list: Empty list.
+    """
+    return []
+```
+
+Broken Code:
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def matmul_kernel(
+    a_ptr, b_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    USE_TF32: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    # Simplified pid calculation without complex swizzling
+    pid = tl.program_id(0)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    pid_m = pid // num_pid_n
+    pid_n = pid % num_pid_n
+    
+    # Early return if out of bounds
+    if pid_m >= tl.cdiv(M, BLOCK_M):
+        return
+    
+    # Create offsets for the block
+    offs_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
+    offs_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
+    offs_k = tl.arange(0, BLOCK_K)
+    
+    # Initialize pointers to A and B blocks
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+    
+    # Initialize accumulator
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    # Loop over K dimension
+    for k in range(0, K, BLOCK_K):
+        # Load A block with boundary checks
+        a_mask = (offs_m[:, None] < M) & ((k + offs_k[None, :]) < K)
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        
+        # Load B block with boundary checks  
+        b_mask = ((k + offs_k[:, None]) < K) & (offs_n[None, :] < N)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+        
+        # Accumulate matrix product
+        accumulator += tl.dot(a, b, allow_tf32=USE_TF32)
+        
+        # Move pointers to next K block
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+    
+    # Write back result with boundary checks
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, accumulator, mask=c_mask)
+
+def triton_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    assert a.dim() == 2 and b.dim() == 2
+    M, K = a.shape
+    K2, N = b.shape
+    assert K == K2, f"Shape mismatch: a={a.shape}, b={b.shape}"
+    
+    c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+    
+    def grid(META):
+        return (triton.cdiv(M, META['BLOCK_M']) * triton.cdiv(N, META['BLOCK_N']),)
+    
+    # Optimized configurations for NVIDIA GPUs
+    configs = [
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_warps=4, num_stages=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_warps=4, num_stages=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_warps=4, num_stages=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_warps=4, num_stages=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_warps=4, num_stages=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_warps=4, num_stages=5),
+    ]
+    
+    # Add configurations for smaller matrices
+    if M * N <= 4096 * 4096:
+        configs.extend([
+            triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_warps=4, num_stages=3),
+            triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 32, 'GROUP_M': 8}, num_warps=2, num_stages=3),
+        ])
+    
+    @triton.autotune(configs=configs, key=['M', 'N', 'K'])
+    @triton.jit
+    def kernel_wrapper(
+        a_ptr, b_ptr, c_ptr,
+        M, N, K,
+        stride_am, stride_ak,
+        stride_bk, stride_bn,
+        stride_cm, stride_cn,
+        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+        USE_TF32: tl.constexpr,
+        GROUP_M: tl.constexpr,
+    ):
+        matmul_kernel(
+            a_ptr, b_ptr, c_ptr,
+            M, N, K,
+            stride_am, stride_ak,
+            stride_bk, stride_bn,
+            stride_cm, stride_cn,
+            BLOCK_M, BLOCK_N, BLOCK_K,
+            USE_TF32, GROUP_M
+        )
+    
+    kernel_wrapper[grid](
+        a, b, c,
+        M, N, K,
+        a.stride(0), a.stride(1),
+        b.stride(0), b.stride(1),
+        c.stride(0), c.stride(1),
+        USE_TF32=a.dtype == torch.float32,
+        GROUP_M=8,
+    )
+    
+    return c
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+    
+    def forward(self, A, B):
+        return triton_matmul(A, B)
+```
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+3. Learn from previous repair attempts to avoid repeating the same mistakes
+
+```python
+# <corrected code>
+```

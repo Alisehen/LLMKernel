@@ -1,0 +1,139 @@
+# <complete ModelNew code with optimized Triton kernels>
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 128, 'BLOCK_R': 64}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 128, 'BLOCK_R': 128}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_R': 64}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 256, 'BLOCK_R': 64}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 64, 'BLOCK_R': 256}, num_warps=4, num_stages=3),
+    ],
+    key=['M', 'N', 'R'],
+)
+@triton.jit
+def sum_reduce_dim_kernel(
+    x_ptr,
+    out_ptr,
+    M,
+    R,
+    N,
+    stride_m,
+    stride_r,
+    stride_n,
+    out_stride_m,
+    out_stride_n,
+    OUTPUT_DTYPE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    m_offsets = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    n_offsets = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_m = m_offsets < M
+    mask_n = n_offsets < N
+
+    m_offsets_i64 = m_offsets.to(tl.int64)
+    n_offsets_i64 = n_offsets.to(tl.int64)
+    stride_m = tl.full((), stride_m, tl.int64)
+    stride_r = tl.full((), stride_r, tl.int64)
+    stride_n = tl.full((), stride_n, tl.int64)
+    out_stride_m = tl.full((), out_stride_m, tl.int64)
+    out_stride_n = tl.full((), out_stride_n, tl.int64)
+
+    base_ptrs = x_ptr + (
+        m_offsets_i64[:, None, None] * stride_m
+        + n_offsets_i64[None, :, None] * stride_n
+    )
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for r_start in range(0, R, BLOCK_R):
+        r_offsets = r_start + tl.arange(0, BLOCK_R)
+        r_mask = r_offsets < R
+        r_offsets_i64 = r_offsets.to(tl.int64)
+
+        ptrs = base_ptrs + r_offsets_i64[None, None, :] * stride_r
+        mask = (
+            mask_m[:, None, None]
+            & mask_n[None, :, None]
+            & r_mask[None, None, :]
+        )
+        vals = tl.load(ptrs, mask=mask, other=0.0).to(tl.float32)
+        acc += tl.sum(vals, axis=2)
+
+    out_ptrs = out_ptr + (
+        m_offsets_i64[:, None] * out_stride_m
+        + n_offsets_i64[None, :] * out_stride_n
+    )
+    out_mask = mask_m[:, None] & mask_n[None, :]
+    tl.store(out_ptrs, acc.to(OUTPUT_DTYPE), mask=out_mask)
+
+
+_TORCH_DTYPE_TO_TL = {
+    torch.float16: tl.float16,
+    torch.bfloat16: tl.bfloat16,
+    torch.float32: tl.float32,
+}
+
+
+def sum_reduce_keepdim(x: torch.Tensor, dim: int) -> torch.Tensor:
+    if dim < 0:
+        dim += x.ndim
+    if not (0 <= dim < x.ndim):
+        raise RuntimeError(f"Invalid reduction dimension {dim} for tensor with {x.ndim} dims.")
+    if x.numel() == 0 or x.shape[dim] == 0 or x.dtype not in _TORCH_DTYPE_TO_TL:
+        return torch.sum(x, dim=dim, keepdim=True)
+
+    x_contig = x.contiguous()
+    shape = x_contig.shape
+
+    M = 1
+    for i in range(dim):
+        M *= shape[i]
+    R = shape[dim]
+    N = 1
+    for i in range(dim + 1, x_contig.ndim):
+        N *= shape[i]
+
+    x_view = x_contig.view(M, R, N)
+    out_buffer = torch.empty((M, 1, N), dtype=x.dtype, device=x.device)
+    out_matrix = out_buffer.view(M, N)
+
+    grid = lambda META: (
+        triton.cdiv(M, META['BLOCK_M']),
+        triton.cdiv(N, META['BLOCK_N']),
+    )
+    dtype_enum = _TORCH_DTYPE_TO_TL[x.dtype]
+
+    sum_reduce_dim_kernel[grid](
+        x_view,
+        out_matrix,
+        M,
+        R,
+        N,
+        R * N,
+        N,
+        1,
+        N,
+        1,
+        OUTPUT_DTYPE=dtype_enum,
+    )
+
+    return out_buffer.reshape(*shape[:dim], 1, *shape[dim + 1:])
+
+
+class ModelNew(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return sum_reduce_keepdim(x, self.dim)

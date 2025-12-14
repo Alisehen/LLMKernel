@@ -1,0 +1,234 @@
+```python
+# complete ModelNew code with optimized Triton kernels
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def conv2d_fwd_kernel(
+    x_ptr,         # float*  [N, C_in, H, W]   (contiguous, NCHW)
+    w_ptr,         # float*  [C_out, C_in, KH, KW] (contiguous)
+    b_ptr,         # float*  [C_out]
+    out_ptr,       # float*  [N, C_out, OH, OW]
+
+    N, C_in, H, W,
+    C_out, KH, KW,
+    OH, OW,
+    stride_h, stride_w,
+    pad_h, pad_w,
+
+    BLOCK_M: tl.constexpr,  # tile over output positions (N*OH*OW)
+    BLOCK_N: tl.constexpr,  # tile over output channels
+    BLOCK_K: tl.constexpr,  # tile over K = C_in * KH * KW (we take one big tile with masking)
+):
+    # -------------------------------------------------------------------------
+    # Program ids
+    # -------------------------------------------------------------------------
+    pid_m = tl.program_id(axis=0)  # over output positions
+    pid_n = tl.program_id(axis=1)  # over output channels
+
+    # -------------------------------------------------------------------------
+    # Offsets for M (output positions) and N (output channels)
+    # -------------------------------------------------------------------------
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # [BM]
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # [BN]
+
+    M_total = N * OH * OW
+
+    mask_m = offs_m < M_total       # [BM]
+    mask_n = offs_n < C_out         # [BN]
+
+    # -------------------------------------------------------------------------
+    # Decode linear output index m -> (n, oh, ow)
+    # m in [0, N*OH*OW)
+    # -------------------------------------------------------------------------
+    tmp = offs_m
+    n_idx = tmp // (OH * OW)
+    rem = tmp % (OH * OW)
+    oh = rem // OW
+    ow = rem % OW
+
+    # -------------------------------------------------------------------------
+    # K dimension: C_in * KH * KW
+    # We handle all K in a single tile of size BLOCK_K (>= K_total) with masking.
+    # -------------------------------------------------------------------------
+    K_total = C_in * KH * KW
+    offs_k = tl.arange(0, BLOCK_K)          # [BK]
+    k_mask = offs_k < K_total               # [BK]
+
+    # Map linear k -> (ic, kh, kw)
+    ic = offs_k // (KH * KW)
+    rem_k = offs_k % (KH * KW)
+    kh = rem_k // KW
+    kw = rem_k % KW
+
+    # -------------------------------------------------------------------------
+    # Compute input coordinates for each (m, k) pair
+    # ih = oh * stride_h - pad_h + kh
+    # iw = ow * stride_w - pad_w + kw
+    # -------------------------------------------------------------------------
+    oh_b = oh[:, None]            # [BM,1]
+    ow_b = ow[:, None]            # [BM,1]
+    kh_b = kh[None, :]            # [1,BK]
+    kw_b = kw[None, :]            # [1,BK]
+
+    ih = oh_b * stride_h - pad_h + kh_b   # [BM,BK]
+    iw = ow_b * stride_w - pad_w + kw_b   # [BM,BK]
+
+    n_b = n_idx[:, None]          # [BM,1]
+    ic_b = ic[None, :]            # [1,BK]
+
+    # Valid input mask for each (m, k)
+    mask_in = (
+        (n_b >= 0) & (n_b < N) &
+        (ih >= 0) & (ih < H) &
+        (iw >= 0) & (iw < W)
+    )
+
+    mask_m_b = mask_m[:, None]        # [BM,1]
+    mask_k_b = k_mask[None, :]        # [1,BK]
+    mask_a = mask_in & mask_m_b & mask_k_b  # [BM,BK]
+
+    # -------------------------------------------------------------------------
+    # Compute linear offsets into input tensor (treated as contiguous 1D)
+    # index = ((n * C_in + ic) * H + ih) * W + iw
+    # -------------------------------------------------------------------------
+    x_offsets = ((n_b * C_in + ic_b) * H + ih) * W + iw  # [BM,BK]
+    a_ptrs = x_ptr + x_offsets
+
+    a = tl.load(a_ptrs, mask=mask_a, other=0.0)
+    a = a.to(tl.float32)  # accumulate in fp32
+
+    # -------------------------------------------------------------------------
+    # Load weights as a [K, C_out] tile (logical), using strides:
+    # physical layout: index = oc * K_total + k
+    # so element B[k, oc] -> index = oc * K_total + k
+    # -> stride_bk = 1, stride_bn = K_total
+    # -------------------------------------------------------------------------
+    offs_k_b = offs_k[:, None]    # [BK,1]
+    offs_n_b = offs_n[None, :]    # [1,BN]
+
+    mask_b = (offs_k_b < K_total) & (offs_n_b < C_out)  # [BK,BN]
+
+    w_offsets = offs_n_b * K_total + offs_k_b           # [BK,BN]
+    b_ptrs = w_ptr + w_offsets
+
+    b = tl.load(b_ptrs, mask=mask_b, other=0.0)
+    b = b.to(tl.float32)  # to fp32 for dot
+
+    # -------------------------------------------------------------------------
+    # Matrix multiply: [BM,BK] x [BK,BN] -> [BM,BN]
+    # -------------------------------------------------------------------------
+    acc = tl.dot(a, b)
+
+    # -------------------------------------------------------------------------
+    # Add bias: bias[oc]
+    # -------------------------------------------------------------------------
+    bias = tl.load(b_ptr + offs_n, mask=mask_n, other=0.0)  # [BN]
+    acc += bias[None, :]  # broadcast over BM
+
+    # -------------------------------------------------------------------------
+    # Write back to output: out[n, oc, oh, ow]
+    # index = ((n * C_out + oc) * OH + oh) * OW + ow
+    # -------------------------------------------------------------------------
+    n_out = n_idx[:, None]        # [BM,1]
+    oh_out = oh[:, None]          # [BM,1]
+    ow_out = ow[:, None]          # [BM,1]
+    oc_out = offs_n[None, :]      # [1,BN]
+
+    out_offsets = ((n_out * C_out + oc_out) * OH + oh_out) * OW + ow_out  # [BM,BN]
+    out_ptrs = out_ptr + out_offsets
+
+    mask_out = mask_m_b & (oc_out < C_out)
+
+    tl.store(out_ptrs, acc, mask=mask_out)
+
+
+def triton_conv2d_nchw(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    stride: int,
+    padding: int,
+) -> torch.Tensor:
+    """
+    x:      [N, C_in, H, W],  contiguous, CUDA
+    weight: [C_out, C_in, KH, KW], contiguous, CUDA
+    bias:   [C_out], CUDA
+    stride, padding: int (assumed symmetric for H/W)
+    """
+    assert x.is_cuda and weight.is_cuda, "Inputs must be CUDA tensors"
+    assert x.dtype == torch.float32 and weight.dtype == torch.float32, "Only float32 supported"
+
+    x = x.contiguous()
+    weight = weight.contiguous()
+    bias = bias.contiguous()
+
+    N, C_in, H, W = x.shape
+    C_out, C_in_w, KH, KW = weight.shape
+    assert C_in_w == C_in, "Incompatible in_channels"
+
+    stride_h = stride_w = stride
+    pad_h = pad_w = padding
+
+    OH = (H + 2 * pad_h - KH) // stride_h + 1
+    OW = (W + 2 * pad_w - KW) // stride_w + 1
+
+    out = torch.empty((N, C_out, OH, OW), device=x.device, dtype=x.dtype)
+
+    # Tiling parameters (powers of 2, respect shared-memory-like budget)
+    BLOCK_M = 32   # output positions
+    BLOCK_N = 16   # output channels
+    BLOCK_K = 512  # >= C_in * KH * KW (=363 for this model)
+
+    M_total = N * OH * OW
+    grid = (
+        triton.cdiv(M_total, BLOCK_M),
+        triton.cdiv(C_out, BLOCK_N),
+    )
+
+    conv2d_fwd_kernel[grid](
+        x, weight, bias, out,
+        N, C_in, H, W,
+        C_out, KH, KW,
+        OH, OW,
+        stride_h, stride_w,
+        pad_h, pad_w,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+    )
+
+    return out
+
+
+class ModelNew(nn.Module):
+    def __init__(self, num_classes=1000) -> None:
+        super().__init__()
+        # Same conv1 definition as the original model
+        self.conv1 = nn.Conv2d(
+            in_channels=3,
+            out_channels=96,
+            kernel_size=11,
+            stride=4,
+            padding=2,
+            bias=True,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # CPU fallback for safety
+        if not x.is_cuda:
+            return self.conv1(x)
+
+        return triton_conv2d_nchw(
+            x,
+            self.conv1.weight,
+            self.conv1.bias,
+            stride=self.conv1.stride[0],
+            padding=self.conv1.padding[0],
+        )
+```

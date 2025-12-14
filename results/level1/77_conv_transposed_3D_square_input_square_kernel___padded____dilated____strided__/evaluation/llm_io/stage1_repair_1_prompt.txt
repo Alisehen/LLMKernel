@@ -1,0 +1,480 @@
+Fix the Triton kernel errors. Generate correct, high-performance code.
+
+Current Error Log:
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 535, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251213_140652_batch_range66to87_openai_deepseek/77_conv_transposed_3D_square_input_square_kernel___padded____dilated____strided__/code/kernel_20251213_150512.py", line 300, in forward
+    return triton_conv_transpose3d(
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251213_140652_batch_range66to87_openai_deepseek/77_conv_transposed_3D_square_input_square_kernel___padded____dilated____strided__/code/kernel_20251213_150512.py", line 223, in triton_conv_transpose3d
+    conv_transpose3d_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 347, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 192, in run
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 192, in <dictcomp>
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 170, in _bench
+    return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/testing.py", line 145, in do_bench
+    fn()
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 156, in kernel_call
+    self.fn.run(
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 569, in run
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 230, in compile
+    key = f"{triton_key()}-{src.hash()}-{backend.hash()}-{options.hash()}-{str(sorted(env_vars.items()))}"
+                            ^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 77, in hash
+    key = f"{self.fn.cache_key}-{str(self.attrs)}-{sorted_sig}-{constants_key}"
+             ^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 665, in cache_key
+    dependencies_finder.visit(self.parse())
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 418, in visit
+    return visitor(node)
+           ^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 426, in generic_visit
+    self.visit(item)
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 418, in visit
+    return visitor(node)
+           ^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 149, in visit_FunctionDef
+    self.generic_visit(node)
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 426, in generic_visit
+    self.visit(item)
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 418, in visit
+    return visitor(node)
+           ^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 215, in visit_For
+    self.generic_visit(node)
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 426, in generic_visit
+    self.visit(item)
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 418, in visit
+    return visitor(node)
+           ^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 203, in visit_Assign
+    self.generic_visit(node)
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 428, in generic_visit
+    self.visit(value)
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 418, in visit
+    return visitor(node)
+           ^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 428, in generic_visit
+    self.visit(value)
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 418, in visit
+    return visitor(node)
+           ^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 428, in generic_visit
+    self.visit(value)
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 418, in visit
+    return visitor(node)
+           ^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 428, in generic_visit
+    self.visit(value)
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 418, in visit
+    return visitor(node)
+           ^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 142, in visit_Attribute
+    ret = getattr(lhs, node.attr)
+          ^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: module 'triton.language.math' has no attribute 'fmod'
+
+History Error:
+None
+
+
+PyTorch Reference:
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Performs a 3D transposed convolution operation with square input and square kernel,
+    and supports padding, dilation, and stride.
+
+    Args:
+        in_channels (int): Number of channels in the input tensor.
+        out_channels (int): Number of channels produced by the convolution.
+        kernel_size (int): Size of the convolution kernel (square kernel, so only one value needed).
+        stride (int, optional): Stride of the convolution. Defaults to 1.
+        padding (int, optional): Padding applied to the input. Defaults to 0.
+        dilation (int, optional): Spacing between kernel elements. Defaults to 1.
+        bias (bool, optional): If `True`, adds a learnable bias to the output. Defaults to `False`.
+    """
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, stride: int = 1, padding: int = 0, dilation: int = 1, bias: bool = False):
+        super(Model, self).__init__()
+        self.conv_transpose3d = nn.ConvTranspose3d(in_channels, out_channels, kernel_size=(kernel_size, kernel_size, kernel_size), stride=stride, padding=padding, dilation=dilation, bias=bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Performs the 3D transposed convolution.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_channels, depth, height, width).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_channels, depth_out, height_out, width_out).
+        """
+        return self.conv_transpose3d(x)
+
+# Test code
+batch_size = 16
+in_channels = 32
+out_channels = 64
+kernel_size = 3
+depth = 16
+height = 32
+width = 32
+stride = 2
+padding = 1
+dilation = 2
+
+def get_inputs():
+    x = torch.rand(batch_size, in_channels, depth, height, width)
+    return [x]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, stride, padding, dilation]
+```
+
+Broken Code:
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+def _to_triton_dtype(torch_dtype: torch.dtype):
+    if torch_dtype == torch.float32:
+        return tl.float32
+    if torch_dtype == torch.float16:
+        return tl.float16
+    if torch_dtype == torch.bfloat16:
+        return tl.bfloat16
+    raise TypeError(f"Unsupported dtype for Triton conv_transpose3d: {torch_dtype}")
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=8, num_stages=4),
+        triton.Config({}, num_warps=4, num_stages=3),
+    ],
+    key=["N", "OC", "OD", "OH", "OW"],
+)
+@triton.jit
+def conv_transpose3d_kernel(
+    x_ptr,
+    w_ptr,
+    out_ptr,
+    N,
+    IC,
+    ID,
+    IH,
+    IW,
+    OC,
+    KD,
+    KH,
+    KW,
+    stride_d,
+    stride_h,
+    stride_w,
+    pad_d,
+    pad_h,
+    pad_w,
+    dil_d,
+    dil_h,
+    dil_w,
+    OD,
+    OH,
+    OW,
+    K_elems,
+    stride_xn,
+    stride_xc,
+    stride_xd,
+    stride_xh,
+    stride_xw,
+    stride_outn,
+    stride_outc,
+    stride_outd,
+    stride_outh,
+    stride_outw,
+    stride_wic,
+    stride_woc,
+    stride_wd,
+    stride_wh,
+    stride_ww,
+    NUM_K_TILES: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    OUT_DTYPE: tl.constexpr,
+):
+    pid_batch = tl.program_id(axis=0)
+    pid_spatial = tl.program_id(axis=1)
+    pid_outch = tl.program_id(axis=2)
+
+    spatial = OD * OH * OW
+    hw = OH * OW
+
+    m_offsets = pid_spatial * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = m_offsets < spatial
+
+    n_offsets = pid_outch * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = n_offsets < OC
+
+    od_idx = m_offsets // hw
+    rem = m_offsets % hw
+    oh_idx = rem // OW
+    ow_idx = rem % OW
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    k_idx = tl.arange(0, BLOCK_K)
+
+    x_batch_ptr = x_ptr + pid_batch * stride_xn
+    out_batch_ptr = out_ptr + pid_batch * stride_outn
+
+    for k_tile in range(NUM_K_TILES):
+        k_offsets = k_tile * BLOCK_K + k_idx
+        k_mask = k_offsets < K_elems
+
+        kw_idx = k_offsets % KW
+        tmp = k_offsets // KW
+        kh_idx = tmp % KH
+        tmp = tmp // KH
+        kd_idx = tmp % KD
+        ic_idx = tmp // KD
+
+        od_bc = od_idx[:, None]
+        oh_bc = oh_idx[:, None]
+        ow_bc = ow_idx[:, None]
+
+        kd_bc = kd_idx[None, :]
+        kh_bc = kh_idx[None, :]
+        kw_bc = kw_idx[None, :]
+        ic_bc = ic_idx[None, :]
+
+        num_d = od_bc + pad_d - kd_bc * dil_d
+        num_h = oh_bc + pad_h - kh_bc * dil_h
+        num_w = ow_bc + pad_w - kw_bc * dil_w
+
+        mask_d = (num_d >= 0) & (tl.math.fmod(num_d, stride_d) == 0)
+        mask_h = (num_h >= 0) & (tl.math.fmod(num_h, stride_h) == 0)
+        mask_w = (num_w >= 0) & (tl.math.fmod(num_w, stride_w) == 0)
+
+        id_idx = num_d // stride_d
+        ih_idx = num_h // stride_h
+        iw_idx = num_w // stride_w
+
+        mask_d = mask_d & (id_idx >= 0) & (id_idx < ID)
+        mask_h = mask_h & (ih_idx >= 0) & (ih_idx < IH)
+        mask_w = mask_w & (iw_idx >= 0) & (iw_idx < IW)
+
+        valid_in = mask_m[:, None] & k_mask[None, :] & mask_d & mask_h & mask_w
+
+        id_bc = id_idx
+        ih_bc = ih_idx
+        iw_bc = iw_idx
+
+        inp_offset = (
+            ic_bc.to(tl.int64) * stride_xc
+            + id_bc.to(tl.int64) * stride_xd
+            + ih_bc.to(tl.int64) * stride_xh
+            + iw_bc.to(tl.int64) * stride_xw
+        )
+        x_vals = tl.load(x_batch_ptr + inp_offset, mask=valid_in, other=0.0)
+
+        w_offset = (
+            ic_idx[:, None].to(tl.int64) * stride_wic
+            + n_offsets[None, :].to(tl.int64) * stride_woc
+            + kd_idx[:, None].to(tl.int64) * stride_wd
+            + kh_idx[:, None].to(tl.int64) * stride_wh
+            + kw_idx[:, None].to(tl.int64) * stride_ww
+        )
+        w_mask = k_mask[:, None] & mask_n[None, :]
+        w_vals = tl.load(w_ptr + w_offset, mask=w_mask, other=0.0)
+
+        acc += tl.dot(x_vals, w_vals)
+
+    out_mask = mask_m[:, None] & mask_n[None, :]
+    out_offset = (
+        n_offsets[None, :].to(tl.int64) * stride_outc
+        + od_idx[:, None].to(tl.int64) * stride_outd
+        + oh_idx[:, None].to(tl.int64) * stride_outh
+        + ow_idx[:, None].to(tl.int64) * stride_outw
+    )
+    out_vals = acc.to(OUT_DTYPE)
+    tl.store(out_batch_ptr + out_offset, out_vals, mask=out_mask)
+
+
+def triton_conv_transpose3d(x, weight, bias, stride, padding, dilation):
+    assert x.is_cuda and weight.is_cuda, "Inputs must be CUDA tensors."
+    assert x.dtype == weight.dtype, "Input and weight dtypes must match."
+
+    stride_d, stride_h, stride_w = stride if isinstance(stride, (tuple, list)) else (stride,) * 3
+    pad_d, pad_h, pad_w = padding if isinstance(padding, (tuple, list)) else (padding,) * 3
+    dil_d, dil_h, dil_w = dilation if isinstance(dilation, (tuple, list)) else (dilation,) * 3
+
+    x = x.contiguous()
+    weight = weight.contiguous()
+
+    N, IC, ID, IH, IW = x.shape
+    _, OC, KD, KH, KW = weight.shape
+
+    OD = (ID - 1) * stride_d - 2 * pad_d + dil_d * (KD - 1) + 1
+    OH = (IH - 1) * stride_h - 2 * pad_h + dil_h * (KH - 1) + 1
+    OW = (IW - 1) * stride_w - 2 * pad_w + dil_w * (KW - 1) + 1
+
+    out = torch.empty((N, OC, OD, OH, OW), device=x.device, dtype=x.dtype)
+
+    stride_xn = IC * ID * IH * IW
+    stride_xc = ID * IH * IW
+    stride_xd = IH * IW
+    stride_xh = IW
+    stride_xw = 1
+
+    stride_outn = OC * OD * OH * OW
+    stride_outc = OD * OH * OW
+    stride_outd = OH * OW
+    stride_outh = OW
+    stride_outw = 1
+
+    stride_wic = OC * KD * KH * KW
+    stride_woc = KD * KH * KW
+    stride_wd = KH * KW
+    stride_wh = KW
+    stride_ww = 1
+
+    BLOCK_M = 128
+    BLOCK_N = 64
+    BLOCK_K = 64
+
+    K_elems = IC * KD * KH * KW
+    NUM_K_TILES = triton.cdiv(K_elems, BLOCK_K)
+
+    grid = (
+        N,
+        triton.cdiv(OD * OH * OW, BLOCK_M),
+        triton.cdiv(OC, BLOCK_N),
+    )
+
+    out_dtype = _to_triton_dtype(x.dtype)
+
+    conv_transpose3d_kernel[grid](
+        x,
+        weight,
+        out,
+        N,
+        IC,
+        ID,
+        IH,
+        IW,
+        OC,
+        KD,
+        KH,
+        KW,
+        stride_d,
+        stride_h,
+        stride_w,
+        pad_d,
+        pad_h,
+        pad_w,
+        dil_d,
+        dil_h,
+        dil_w,
+        OD,
+        OH,
+        OW,
+        K_elems,
+        stride_xn,
+        stride_xc,
+        stride_xd,
+        stride_xh,
+        stride_xw,
+        stride_outn,
+        stride_outc,
+        stride_outd,
+        stride_outh,
+        stride_outw,
+        stride_wic,
+        stride_woc,
+        stride_wd,
+        stride_wh,
+        stride_ww,
+        NUM_K_TILES=NUM_K_TILES,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        OUT_DTYPE=out_dtype,
+    )
+
+    if bias is not None:
+        out += bias.view(1, -1, 1, 1, 1)
+
+    return out
+
+
+class ModelNew(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        stride: int = 1,
+        padding: int = 0,
+        dilation: int = 1,
+        bias: bool = False,
+    ) -> None:
+        super().__init__()
+        self.conv = nn.ConvTranspose3d(
+            in_channels,
+            out_channels,
+            kernel_size=(kernel_size, kernel_size, kernel_size),
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            bias=bias,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_conv_transpose3d(
+            x,
+            self.conv.weight,
+            self.conv.bias,
+            self.conv.stride,
+            self.conv.padding,
+            self.conv.dilation,
+        )
+```
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl, AND any other modules used (e.g., import math if using math.sqrt)
+   2. @triton.jit decorated kernel function(s) — NO continue/break/return inside loops (use masking)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels — THIS CLASS IS REQUIRED
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+3. Learn from previous repair attempts to avoid repeating the same mistakes
+4. Ensure ALL imports are included at the top (common mistake: forgetting `import math`)
+
+```python
+# <corrected code>
+```

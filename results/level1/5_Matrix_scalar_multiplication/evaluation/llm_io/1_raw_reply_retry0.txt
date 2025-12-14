@@ -1,0 +1,203 @@
+Looking at the NCU metrics, the main issue is extremely low SM throughput (1.57%) despite high DRAM throughput (93%). This indicates the kernel is memory-bound with insufficient compute parallelism. The grid size is huge (1,048,576) which suggests we're launching too many small blocks.
+
+**Analysis**:
+- The 1D kernel uses `BLOCK_SIZE=1024` (max threads)
+- With `n_elements=1,073,741,824` (typical for large tensors), grid = 1,048,576 blocks
+- Each block only does 1024 scalar operations → minimal compute per launch overhead
+- Warp active % is good (81.76%) but grid is oversaturated
+
+**Optimization Strategy**:
+1. **Increase work per block**: Process multiple elements per thread to reduce grid size
+2. **Vectorized memory access**: Use vectorized loads/stores for better memory efficiency
+3. **Tune grid for SM count**: Target ~10,000-100,000 blocks for good occupancy
+4. **Autotune block sizes** for optimal performance
+
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def mul_scalar_kernel_1d_optimized(
+    a_ptr,
+    s,
+    out_ptr,
+    n_elements,
+    BLOCK_ELEMENTS: tl.constexpr,
+    VECTOR_SIZE: tl.constexpr,
+):
+    """Optimized 1D kernel with vectorized memory access and increased work per thread"""
+    pid = tl.program_id(0)
+    
+    # Each block processes BLOCK_ELEMENTS elements
+    # Using vectorized access with VECTOR_SIZE elements per load/store
+    block_start = pid * BLOCK_ELEMENTS
+    offsets = block_start + tl.arange(0, BLOCK_ELEMENTS)
+    
+    # Create mask for boundary elements
+    mask = offsets < n_elements
+    
+    # Vectorized loads if VECTOR_SIZE > 1
+    if VECTOR_SIZE > 1:
+        # Load vectorized elements
+        offsets_vec = offsets // VECTOR_SIZE
+        mask_vec = mask & (offsets % VECTOR_SIZE == 0)
+        
+        # Vectorized load and compute
+        a_vec = tl.load(a_ptr + offsets_vec, mask=mask_vec, other=0.0)
+        out_vec = a_vec * s
+        tl.store(out_ptr + offsets_vec, out_vec, mask=mask_vec)
+    else:
+        # Scalar fallback
+        a = tl.load(a_ptr + offsets, mask=mask, other=0.0)
+        output = a * s
+        tl.store(out_ptr + offsets, output, mask=mask)
+
+
+@triton.jit
+def mul_scalar_kernel_2d_optimized(
+    a_ptr,
+    s,
+    out_ptr,
+    M, N,
+    stride_am, stride_an,
+    stride_om, stride_on,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    TILE_M: tl.constexpr,
+    TILE_N: tl.constexpr,
+):
+    """Optimized 2D kernel with tiled processing and vectorized memory access"""
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    
+    # Each thread processes TILE_M x TILE_N elements
+    rm_start = pid_m * BLOCK_SIZE_M * TILE_M
+    rn_start = pid_n * BLOCK_SIZE_N * TILE_N
+    
+    # Create offsets for tile
+    rm = rm_start + tl.arange(0, BLOCK_SIZE_M)[:, None] * TILE_M + tl.arange(0, TILE_M)[None, :]
+    rn = rn_start + tl.arange(0, BLOCK_SIZE_N)[:, None] * TILE_N + tl.arange(0, TILE_N)[None, :]
+    
+    # Create masks
+    mask_m = rm < M
+    mask_n = rn < N
+    mask = mask_m[:, :, None] & mask_n[:, None, :]
+    
+    # Reshape for vectorized access
+    rm_flat = rm.flatten()
+    rn_flat = rn.flatten()
+    mask_flat = mask.flatten()
+    
+    # Calculate pointers
+    a_ptrs = a_ptr + rm_flat * stride_am + rn_flat * stride_an
+    out_ptrs = out_ptr + rm_flat * stride_om + rn_flat * stride_on
+    
+    # Load and compute
+    a_block = tl.load(a_ptrs, mask=mask_flat, other=0.0)
+    out_block = a_block * s
+    
+    # Store result
+    tl.store(out_ptrs, out_block, mask=mask_flat)
+
+
+def triton_mul_scalar_optimized(A: torch.Tensor, s: float) -> torch.Tensor:
+    """
+    Optimized matrix-scalar multiplication with tuned grid and block sizes.
+    """
+    output = torch.empty_like(A)
+    
+    # Use optimized 1D kernel for contiguous tensors
+    if A.is_contiguous():
+        n_elements = A.numel()
+        
+        # Autotuned configurations for Ada Lovelace (4090)
+        # Each thread processes 8 elements (vectorized), blocks of 256 threads
+        # Grid size: n_elements / (256 * 8) = n_elements / 2048
+        # For 1B elements: ~488,000 blocks → good occupancy
+        configs = [
+            triton.Config({'BLOCK_ELEMENTS': 2048, 'VECTOR_SIZE': 8}, num_warps=8),
+            triton.Config({'BLOCK_ELEMENTS': 4096, 'VECTOR_SIZE': 8}, num_warps=8),
+            triton.Config({'BLOCK_ELEMENTS': 8192, 'VECTOR_SIZE': 8}, num_warps=8),
+            triton.Config({'BLOCK_ELEMENTS': 16384, 'VECTOR_SIZE': 8}, num_warps=8),
+        ]
+        
+        @triton.autotune(configs=configs, key=['n_elements'])
+        def tuned_kernel(a_ptr, s, out_ptr, n_elements, BLOCK_ELEMENTS, VECTOR_SIZE):
+            mul_scalar_kernel_1d_optimized[grid](
+                a_ptr, s, out_ptr, n_elements,
+                BLOCK_ELEMENTS=BLOCK_ELEMENTS,
+                VECTOR_SIZE=VECTOR_SIZE
+            )
+        
+        # Dynamic grid calculation based on autotuned BLOCK_ELEMENTS
+        grid = lambda META: (triton.cdiv(n_elements, META['BLOCK_ELEMENTS']),)
+        
+        tuned_kernel[grid](
+            A, s, output, n_elements,
+            BLOCK_ELEMENTS=None,  # Will be set by autotune
+            VECTOR_SIZE=None      # Will be set by autotune
+        )
+    
+    else:
+        # Use optimized 2D kernel for non-contiguous tensors
+        M, N = A.shape
+        stride_am, stride_an = A.stride()
+        stride_om, stride_on = output.stride()
+        
+        # Tuned 2D configuration
+        BLOCK_SIZE_M = 32
+        BLOCK_SIZE_N = 32
+        TILE_M = 2  # Each thread processes 2x2 tile
+        TILE_N = 2
+        
+        # Grid calculation
+        grid = (
+            triton.cdiv(M, BLOCK_SIZE_M * TILE_M),
+            triton.cdiv(N, BLOCK_SIZE_N * TILE_N)
+        )
+        
+        mul_scalar_kernel_2d_optimized[grid](
+            A, s, output, M, N,
+            stride_am, stride_an, stride_om, stride_on,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            TILE_M=TILE_M,
+            TILE_N=TILE_N
+        )
+    
+    return output
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs matrix-scalar multiplication using Triton.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+    
+    def forward(self, A: torch.Tensor, s: float) -> torch.Tensor:
+        """
+        Performs matrix-scalar multiplication using optimized Triton kernels.
+        
+        Args:
+            A: Input matrix of shape (M, N)
+            s: Scalar value
+            
+        Returns:
+            C: Resulting matrix of shape (M, N)
+        """
+        return triton_mul_scalar_optimized(A, s)
+```
+
+**Key optimizations**:
+
+1. **Increased work per thread**: Each thread processes multiple elements (8 in vectorized case, 2x2 tile in 2D case)
+2. **Vectorized memory access**: Uses `VECTOR_SIZE=8` for contiguous tensors to maximize memory throughput
+3. **Reduced grid size**: From 1M+ blocks to ~500K blocks for 1B elements, better matching SM count
+4. **Autotuning**: Multiple configurations to find optimal `BLOCK_ELEMENTS` for different tensor sizes
+5. **Better SM utilization**: Each block now processes 2048-16384 elements instead of 1024, increasing compute density
+
+This should significantly improve SM throughput by reducing launch overhead and increasing compute-to-memory ratio while maintaining high memory bandwidth utilization.

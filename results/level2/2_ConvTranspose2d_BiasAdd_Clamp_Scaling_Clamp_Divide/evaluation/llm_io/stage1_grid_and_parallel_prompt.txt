@@ -1,0 +1,184 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU
+GPU Name: 4090
+Architecture: Ada Lovelace
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+[OPTIMIZATION STAGE]
+
+## Current Optimization Stage
+
+Focus: Grid layout & parallelism.
+
+Metrics:
+- sm__throughput.avg.pct_of_peak_sustained_elapsed (>60%)
+- launch__grid_size
+
+Rules:
+- 1D: (cdiv(N, BLOCK))
+- 2D: (cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))
+- 3D: (batch, cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))
+- >3D: flatten ONLY independent dims
+- Prefer batch / head / expert parallelism before shrinking BLOCK
+- Change grid only if SM utilization is clearly low
+
+Safety:
+- Max 3 grid dims, static rank
+- grid=(G0,G1,G2) must match tl.program_id(0/1/2)
+- If unsure about correctness, do NOT change grid
+
+Autotune:
+- Autotune either BLOCK_* OR (num_warps, num_stages)
+- If autotuning BLOCK_*, use grid=lambda META: (...)
+- Never redefine BLOCK_* in both kernel and launch
+
+
+
+[CURRENT CODE]
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def post_process_kernel(
+    x_ptr,
+    bias_ptr,
+    output_ptr,
+    scaling_factor,
+    n_elements,
+    C, H, W,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    
+    # Load input
+    x = tl.load(x_ptr + offsets, mask=mask)
+    
+    # Calculate channel index for bias broadcasting
+    # For each element: idx = b*C*H*W + c*H*W + h*W + w
+    spatial_size = H * W
+    channel_size = C * spatial_size
+    
+    # Compute channel index (c)
+    idx_in_batch = offsets % channel_size
+    channel_idx = idx_in_batch // spatial_size
+    
+    # Load bias (broadcast across spatial dimensions)
+    bias = tl.load(bias_ptr + channel_idx, mask=mask)
+    
+    # Fused operations
+    # x = x + bias
+    # x = clamp(x, 0, 1)
+    # x = x * scaling_factor
+    # x = clamp(x, 0, 1)
+    # x = x / scaling_factor
+    
+    # Optimized version with common subexpression elimination
+    x = x + bias
+    x = tl.minimum(tl.maximum(x, 0.0), 1.0)
+    
+    # Scale operations
+    x = x * scaling_factor
+    x = tl.minimum(tl.maximum(x, 0.0), 1.0)
+    x = x * (1.0 / scaling_factor)
+    
+    # Store result
+    tl.store(output_ptr + offsets, x, mask=mask)
+
+def triton_post_process(
+    x: torch.Tensor,
+    bias: torch.Tensor,
+    scaling_factor: float
+) -> torch.Tensor:
+    # Ensure tensors are contiguous and on correct device
+    assert x.is_contiguous(), "Input tensor must be contiguous"
+    assert bias.is_contiguous(), "Bias tensor must be contiguous"
+    
+    # Reshape bias for broadcasting
+    bias_reshaped = bias.view(-1)
+    
+    # Allocate output
+    output = torch.empty_like(x)
+    
+    # Get tensor dimensions
+    B, C, H, W = x.shape
+    n_elements = output.numel()
+    
+    # Choose block size (power of 2)
+    BLOCK_SIZE = 1024
+    
+    # Calculate grid size
+    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
+    
+    # Launch kernel
+    post_process_kernel[grid](
+        x, bias_reshaped, output,
+        scaling_factor,
+        n_elements,
+        C, H, W,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
+    
+    return output
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, bias_shape, scaling_factor):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose2d(
+            in_channels, out_channels, kernel_size, 
+            stride=stride, padding=padding, output_padding=output_padding
+        )
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.scaling_factor = scaling_factor
+
+    def forward(self, x):
+        # First do the convolution (keep this in PyTorch)
+        x = self.conv_transpose(x)
+        
+        # Use Triton kernel for post-processing
+        return triton_post_process(x, self.bias, self.scaling_factor)
+```
+
+[NCU PROFILING METRICS]
+{
+  "post_process_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 5.86,
+    "launch__grid_size": 524288,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 86.86,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 92.89,
+    "lts__t_sector_hit_rate.pct": 50.01
+  }
+}
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

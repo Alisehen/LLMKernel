@@ -1,0 +1,155 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.autotune(
+    configs=[
+        # Optimized for memory-bound operation with increased stages for latency hiding
+        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 64, 'VEC_SIZE': 4}, num_warps=8, num_stages=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'VEC_SIZE': 4}, num_warps=8, num_stages=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256, 'VEC_SIZE': 4}, num_warps=8, num_stages=4),
+        # Configs with different stages to optimize memory dependency stalls
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64, 'VEC_SIZE': 4}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64, 'VEC_SIZE': 4}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64, 'VEC_SIZE': 4}, num_warps=8, num_stages=5),
+        # Configs with different vectorization for coalescing optimization
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'VEC_SIZE': 2}, num_warps=8, num_stages=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'VEC_SIZE': 8}, num_warps=8, num_stages=4),
+        # Configs with different warp counts for SM utilization
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'VEC_SIZE': 4}, num_warps=4, num_stages=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'VEC_SIZE': 4}, num_warps=8, num_stages=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'VEC_SIZE': 4}, num_warps=16, num_stages=4),
+    ],
+    key=['n', 'm'],
+)
+@triton.jit
+def diag_matmul_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    n, m,
+    stride_a,
+    stride_b0, stride_b1,
+    stride_c0, stride_c1,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    VEC_SIZE: tl.constexpr,
+):
+    """
+    Optimized diagonal matrix multiplication kernel with:
+    - Improved memory coalescing for B matrix access
+    - Optimized memory dependency stalls through increased stages
+    - Better SM utilization through warp count tuning
+    """
+    # Improved grid layout for better memory coalescing
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    
+    # Row block with optimized memory access pattern
+    row_start = pid_m * BLOCK_SIZE_M
+    row_offsets = row_start + tl.arange(0, BLOCK_SIZE_M)
+    row_mask = row_offsets < n
+    
+    # Load diagonal elements with type conversion
+    a = tl.load(a_ptr + row_offsets * stride_a, mask=row_mask, other=0.0)
+    a = a.to(b_ptr.dtype.element_ty)
+    
+    # Column block with optimized vectorization and coalescing
+    col_start = pid_n * BLOCK_SIZE_N * VEC_SIZE
+    col_offsets = col_start + tl.arange(0, BLOCK_SIZE_N * VEC_SIZE, VEC_SIZE)
+    col_mask = col_offsets < m
+    
+    # Pre-compute base pointers for better instruction scheduling
+    b_base = b_ptr + row_offsets[:, None] * stride_b0
+    c_base = c_ptr + row_offsets[:, None] * stride_c0
+    
+    # Process columns in vectorized chunks for better memory throughput
+    for col_chunk in range(0, BLOCK_SIZE_N * VEC_SIZE, VEC_SIZE):
+        col_idx = col_start + col_chunk
+        current_col_offsets = col_idx + tl.arange(0, VEC_SIZE)
+        current_col_mask = current_col_offsets < m
+        
+        # Combined mask for efficient 2D access
+        full_mask = row_mask[:, None] & current_col_mask[None, :]
+        
+        # Load B with improved coalescing pattern
+        b = tl.load(
+            b_base + current_col_offsets[None, :] * stride_b1,
+            mask=full_mask,
+            other=0.0
+        )
+        
+        # Compute C = diag(A) * B
+        c = a[:, None] * b
+        
+        # Store C with coalesced write pattern
+        tl.store(
+            c_base + current_col_offsets[None, :] * stride_c1,
+            c,
+            mask=full_mask
+        )
+
+def triton_diag_matmul(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    """
+    Computes C = diag(A) @ B using optimized Triton kernel.
+    
+    Args:
+        A: 1D tensor of shape (N,)
+        B: 2D tensor of shape (N, M)
+        
+    Returns:
+        C: 2D tensor of shape (N, M)
+    """
+    assert A.dim() == 1 and B.dim() == 2, "A must be 1D and B must be 2D"
+    N, M = B.shape
+    assert A.shape[0] == N, "A must have same length as B's rows"
+    
+    C = torch.empty_like(B)
+    
+    # Dynamic grid calculation based on problem size for optimal occupancy
+    # 4090 has 128 SMs, target 256-512 blocks for good utilization
+    grid_m = triton.cdiv(N, 256)  # Start with larger block size for rows
+    grid_n = triton.cdiv(M, 256)  # Will be auto-tuned by triton
+    
+    # Adjust grid for better occupancy on small problems
+    total_blocks = grid_m * grid_n
+    if total_blocks < 256:
+        if N < 512:
+            grid_m = max(2, triton.cdiv(N, 128))
+        if M < 512:
+            grid_n = max(2, triton.cdiv(M, 128))
+    
+    grid = (grid_m, grid_n)
+    
+    # Launch autotuned kernel
+    diag_matmul_kernel[grid](
+        A, B, C,
+        N, M,
+        A.stride(0),
+        B.stride(0), B.stride(1),
+        C.stride(0), C.stride(1),
+    )
+    
+    return C
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs matrix multiplication of a diagonal matrix
+    with another matrix using high-performance Triton kernels.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+    
+    def forward(self, A, B):
+        """
+        Performs the matrix multiplication C = diag(A) @ B.
+
+        Args:
+            A (torch.Tensor): A 1D tensor representing the diagonal. Shape: (N,).
+            B (torch.Tensor): A 2D tensor. Shape: (N, M).
+
+        Returns:
+            torch.Tensor: The result of the matrix multiplication. Shape: (N, M).
+        """
+        return triton_diag_matmul(A, B)

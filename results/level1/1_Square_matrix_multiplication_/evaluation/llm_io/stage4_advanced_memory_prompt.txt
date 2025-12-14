@@ -1,0 +1,326 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU
+GPU Name: 4090
+Architecture: Ada Lovelace
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+[OPTIMIZATION STAGE]
+
+## Current Optimization Stage
+**Stage**: Fine-tune cache policies and instruction-level optimizations.
+
+**Focus**: Fine-tune num_warps, num_stages, and explore autotune.
+
+**Parameters to Tune**:
+• `num_warps`: [2, 4, 8, 16] - more warps = higher occupancy but more register pressure
+• `num_stages`: [2, 3, 4] - higher stages hide memory latency but use more registers
+
+**Guidelines**:
+- Adjust num_warps only when clearly beneficial.
+- Change num_stages only by ±1 from current.
+- Use eviction_policy only when cache behavior is clearly suboptimal.
+
+**Autotune Tip**:
+Use 3–6 configs around current settings; always keep the original config.
+
+
+
+[CURRENT CODE]
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        # Optimized for Ada Lovelace - larger K for better L2 reuse
+        triton.Config({
+            'BLOCK_SIZE_M': 128,
+            'BLOCK_SIZE_N': 128,
+            'BLOCK_SIZE_K': 64,
+            'GROUP_SIZE_M': 8,
+        }, num_warps=8, num_stages=3),
+        # High occupancy configuration
+        triton.Config({
+            'BLOCK_SIZE_M': 64,
+            'BLOCK_SIZE_N': 128,
+            'BLOCK_SIZE_K': 64,
+            'GROUP_SIZE_M': 8,
+        }, num_warps=8, num_stages=4),
+        triton.Config({
+            'BLOCK_SIZE_M': 128,
+            'BLOCK_SIZE_N': 64,
+            'BLOCK_SIZE_K': 64,
+            'GROUP_SIZE_M': 8,
+        }, num_warps=8, num_stages=4),
+        # Better register pressure for smaller matrices
+        triton.Config({
+            'BLOCK_SIZE_M': 64,
+            'BLOCK_SIZE_N': 64,
+            'BLOCK_SIZE_K': 64,
+            'GROUP_SIZE_M': 8,
+        }, num_warps=4, num_stages=4),
+        # Larger M/N for better memory coalescing
+        triton.Config({
+            'BLOCK_SIZE_M': 128,
+            'BLOCK_SIZE_N': 128,
+            'BLOCK_SIZE_K': 32,
+            'GROUP_SIZE_M': 8,
+        }, num_warps=8, num_stages=4),
+        # Optimized for TF32 tensor cores (128x128x32)
+        triton.Config({
+            'BLOCK_SIZE_M': 128,
+            'BLOCK_SIZE_N': 128,
+            'BLOCK_SIZE_K': 32,
+            'GROUP_SIZE_M': 8,
+        }, num_warps=8, num_stages=3),
+    ],
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def matmul_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    
+    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        a = tl.load(
+            a_ptrs,
+            mask=(offs_am[:, None] < M) & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
+            other=0.0
+        )
+        b = tl.load(
+            b_ptrs,
+            mask=(offs_k[:, None] < K - k * BLOCK_SIZE_K) & (offs_bn[None, :] < N),
+            other=0.0
+        )
+        
+        a = a.to(tl.float16)
+        b = b.to(tl.float16)
+        
+        accumulator += tl.dot(a, b)
+        
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk
+
+    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = c_ptr + offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, accumulator, mask=c_mask)
+
+
+@triton.autotune(
+    configs=[
+        # TF32 tensor core optimized with larger K for better reuse
+        triton.Config({
+            'BLOCK_SIZE_M': 128,
+            'BLOCK_SIZE_N': 128,
+            'BLOCK_SIZE_K': 64,
+            'GROUP_SIZE_M': 8,
+        }, num_warps=8, num_stages=3),
+        triton.Config({
+            'BLOCK_SIZE_M': 64,
+            'BLOCK_SIZE_N': 128,
+            'BLOCK_SIZE_K': 64,
+            'GROUP_SIZE_M': 8,
+        }, num_warps=8, num_stages=4),
+        triton.Config({
+            'BLOCK_SIZE_M': 128,
+            'BLOCK_SIZE_N': 64,
+            'BLOCK_SIZE_K': 64,
+            'GROUP_SIZE_M': 8,
+        }, num_warps=8, num_stages=4),
+        triton.Config({
+            'BLOCK_SIZE_M': 64,
+            'BLOCK_SIZE_N': 64,
+            'BLOCK_SIZE_K': 64,
+            'GROUP_SIZE_M': 8,
+        }, num_warps=4, num_stages=4),
+        # Standard TF32 tile
+        triton.Config({
+            'BLOCK_SIZE_M': 128,
+            'BLOCK_SIZE_N': 128,
+            'BLOCK_SIZE_K': 32,
+            'GROUP_SIZE_M': 8,
+        }, num_warps=8, num_stages=3),
+    ],
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def matmul_kernel_tf32(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    
+    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        a = tl.load(
+            a_ptrs,
+            mask=(offs_am[:, None] < M) & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
+            other=0.0
+        )
+        b = tl.load(
+            b_ptrs,
+            mask=(offs_k[:, None] < K - k * BLOCK_SIZE_K) & (offs_bn[None, :] < N),
+            other=0.0
+        )
+        
+        accumulator += tl.dot(a, b)
+        
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk
+
+    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = c_ptr + offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, accumulator, mask=c_mask)
+
+
+def triton_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    assert a.dim() == 2 and b.dim() == 2
+    M, K = a.shape
+    K2, N = b.shape
+    assert K == K2, f"Dimension mismatch: {K} != {K2}"
+    
+    c = torch.empty((M, N), device=a.device, dtype=torch.float32)
+    
+    if a.dtype == torch.float32 and b.dtype == torch.float32:
+        grid = lambda META: (
+            triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']),
+        )
+        
+        if torch.backends.cuda.matmul.allow_tf32:
+            matmul_kernel_tf32[grid](
+                a, b, c,
+                M, N, K,
+                a.stride(0), a.stride(1),
+                b.stride(0), b.stride(1),
+                c.stride(0), c.stride(1),
+            )
+        else:
+            matmul_kernel[grid](
+                a, b, c,
+                M, N, K,
+                a.stride(0), a.stride(1),
+                b.stride(0), b.stride(1),
+                c.stride(0), c.stride(1),
+            )
+    else:
+        c = torch.matmul(a, b)
+    
+    return c
+
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super(ModelNew, self).__init__()
+    
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        return triton_matmul(A, B)
+```
+
+[NCU PROFILING METRICS]
+{
+  "matmul_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 42.46,
+    "launch__grid_size": 1024,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 16.66,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 28.78,
+    "lts__t_sector_hit_rate.pct": 92.28
+  }
+}
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

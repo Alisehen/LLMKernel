@@ -1,0 +1,237 @@
+
+Write a correct and reasonably fast Triton kernel to replace the given PyTorch operator.
+This is a SEED implementation: prioritize correctness and stable compilation.
+
+Rules:
+- Use `tl.program_id(axis)` (axis=0/1/2 only)
+- Use `tl.arange()` for block indices
+- Operate on blocks (no CUDA thread model)
+- No manual shared memory or synchronization
+
+Hard Constraints:
+- All BLOCK_* are `tl.constexpr` and powers of 2
+- `tl.arange(0, BLOCK)` requires BLOCK to be power-of-2
+- No dynamic `tl.reshape()` or view
+- `tl.load` / `tl.store`: scalar ptr → scalar, block ptr → block
+- No Python control flow on `tl.tensor` or BLOCK_*
+- Triton does NOT support `continue`, `break`, or `return` inside loops — use masking instead
+- Import ALL modules you use (e.g., `import math` if using `math.sqrt`)
+- Do NOT index tensors with loop variables: `tensor[:, i]` or `tensor[i, :]` where i is a loop var is INVALID
+- Shared memory limit ~100KB: for matmul, BLOCK_M*BLOCK_K + BLOCK_K*BLOCK_N < 25000 floats
+
+CRITICAL API Constraints:
+- Triton does NOT have `tl.any()` → use: `tl.sum(mask) > 0`
+- Triton does NOT have `tl.all()` → use: `tl.sum(mask) == mask.numel()`
+- Triton does NOT have `tl.reduce()` → use: `tl.sum()`, `tl.max()`, `tl.min()` with axis parameter
+- Do NOT use f-strings or .format() with tl.constexpr in assert/error messages
+
+Memory Best Practices:
+- Avoid unnecessary `.contiguous()` calls - Triton kernels work with strided tensors
+- Only call `.contiguous()` if you verified stride pattern causes correctness issues
+
+
+Performance Guidelines for STANDARD Convolution (Conv2d/Conv3d):
+⚠️ For TRANSPOSED convolution (ConvTranspose), see conv_transpose guidance instead!
+
+For STANDARD convolution only:
+- Use **implicit GEMM** approach — treat convolution as matrix multiplication:
+  * Output shape: (N*OH*OW, OC) for 2D, (N*OD*OH*OW, OC) for 3D
+  * Weight shape: (OC, IC*KH*KW) for 2D, (OC, IC*KD*KH*KW) for 3D
+  * Compute input indices on-the-fly from output position
+  * Use `tl.dot()` for the matrix multiply to leverage Tensor Cores
+
+- **Groups handling**:
+  * Split channels: each group processes (C_in/groups) → (C_out/groups)
+  * Use program_id for group parallelism
+  * Weight indexing: weight[group_oc, group_ic*K*H*W]
+
+- **Index Calculation** (2D example with proper broadcasting):
+  ```python
+  # Each thread block handles BLOCK_M output positions
+  pid_m = tl.program_id(0)
+  offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+
+  # Decode to (n, oh, ow)
+  n = offs_m // (OH * OW)
+  oh = (offs_m % (OH * OW)) // OW
+  ow = offs_m % OW
+
+  # Loop over kernel with broadcasting
+  for kh in range(KH):
+      for kw in range(KW):
+          # Compute input positions (vectorized)
+          ih = oh * stride - padding + kh  # Shape: (BLOCK_M,)
+          iw = ow * stride - padding + kw
+
+          # Boundary check
+          mask = (ih >= 0) & (ih < H) & (iw >= 0) & (iw < W)
+
+          # Load input: shape (BLOCK_M, C_in)
+          # Load weight: shape (C_out, C_in)
+          # Accumulate: (BLOCK_M, C_out) using tl.dot or manual multiply-add
+  ```
+
+- **For depthwise/separable convolution**:
+  * Depthwise: groups = in_channels = out_channels
+  * Each channel has its own kernel
+  * Much simpler than grouped conv
+
+- **For pointwise/1x1 convolution** (kernel_size=1):
+  * This is just a GEMM: (N*H*W, C_in) @ (C_in, C_out) → (N*H*W, C_out)
+  * Use tl.dot() with proper tiling
+  * Keep autotune configs minimal (2-3 max) - autotuning is SLOW!
+  * PyTorch 1x1 conv is already highly optimized (uses cuBLAS)
+  * Example:
+    ```python
+    @triton.autotune(
+        configs=[
+            triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64}, num_warps=8),
+            triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64}, num_warps=4),
+        ],
+        key=["M", "N", "K"],
+    )
+    @triton.jit
+    def pointwise_kernel(...): ...
+    ```
+
+- AVOID naive nested loops over kernel dimensions without vectorization
+- Use proper tiling (BLOCK_M, BLOCK_N, BLOCK_K) and iterate over K dimension in tiles
+
+
+Output Format (STRICT):
+1. Imports (torch, torch.nn, triton, triton.language, and any other needed modules like math)
+2. `@triton.jit` kernel(s)
+3. Wrapper function(s)
+4. `class ModelNew(nn.Module)` — this class is REQUIRED
+
+Do NOT include testing code or `if __name__ == "__main__"`.
+
+Example PyTorch:
+'''
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class Model(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, a, b):
+        return a + b
+
+
+def get_inputs():
+    # randomly generate input tensors based on the model architecture
+    a = torch.randn(1, 128).cuda()
+    b = torch.randn(1, 128).cuda()
+    return [a, b]
+
+
+def get_init_inputs():
+    # randomly generate tensors required for initialization based on the model architecture
+    return []
+'''
+
+Example Triton:
+'''
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def add_kernel(
+    x_ptr,
+    y_ptr,
+    output_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+
+    x = tl.load(x_ptr + offsets, mask=mask)
+    y = tl.load(y_ptr + offsets, mask=mask)
+
+    output = x + y
+    tl.store(output_ptr + offsets, output, mask=mask)
+
+def triton_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    output = torch.empty_like(x)
+    n_elements = output.numel()
+    BLOCK_SIZE = 1024
+    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
+    add_kernel[grid](x, y, output, n_elements, BLOCK_SIZE=BLOCK_SIZE)
+
+    return output
+
+class ModelNew(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, a, b):
+        return triton_add(a, b)
+'''
+
+Hardware:
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+Target:
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Performs a pointwise 2D convolution operation.
+
+    Args:
+        in_channels (int): Number of channels in the input tensor.
+        out_channels (int): Number of channels produced by the convolution.
+        bias (bool, optional): If `True`, adds a learnable bias to the output. Defaults to `False`.
+    """
+    def __init__(self, in_channels: int, out_channels: int, bias: bool = False):
+        super(Model, self).__init__()
+        self.conv1d = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0, bias=bias)
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Performs the pointwise 2D convolution.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_channels, height, width).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_channels, height, width).
+        """
+        return self.conv1d(x)
+
+# Test code
+batch_size = 16
+in_channels = 64
+out_channels = 128
+width = 1024
+height = 1024
+
+def get_inputs():
+    x = torch.rand(batch_size, in_channels, height, width)
+    return [x]
+
+def get_init_inputs():
+    return [in_channels, out_channels]

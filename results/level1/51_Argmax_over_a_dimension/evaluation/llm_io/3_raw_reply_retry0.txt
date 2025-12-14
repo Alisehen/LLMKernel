@@ -1,0 +1,119 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_INNER": 64, "BLOCK_K": 64}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_INNER": 64, "BLOCK_K": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_INNER": 128, "BLOCK_K": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_INNER": 128, "BLOCK_K": 128}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_INNER": 128, "BLOCK_K": 256}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_INNER": 256, "BLOCK_K": 128}, num_warps=8, num_stages=2),
+    ],
+    key=["inner_size", "reduce_size"],
+)
+@triton.jit
+def argmax_kernel(
+    x_ptr,
+    out_ptr,
+    outer_size,
+    reduce_size,
+    inner_size,
+    BLOCK_INNER: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_inner = tl.program_id(axis=0)
+    pid_outer = tl.program_id(axis=1)
+
+    if pid_outer >= outer_size:
+        return
+
+    inner_start = pid_inner * BLOCK_INNER
+    inner_offsets = inner_start + tl.arange(0, BLOCK_INNER)
+    inner_mask = inner_offsets < inner_size
+
+    if not tl.any(inner_mask):
+        return
+
+    outer_idx = pid_outer.to(tl.int64)
+    reduce_size_i64 = tl.full((), reduce_size, tl.int64)
+    inner_size_i64 = tl.full((), inner_size, tl.int64)
+    slice_base = outer_idx * reduce_size_i64 * inner_size_i64
+    out_base = outer_idx * inner_size_i64 + inner_offsets.to(tl.int64)
+
+    best_val = tl.full((BLOCK_INNER,), -float("inf"), tl.float32)
+    best_idx = tl.zeros((BLOCK_INNER,), dtype=tl.int32)
+
+    k = 0
+    k_range = tl.arange(0, BLOCK_K)
+    k_range_i64 = k_range.to(tl.int64)
+    inner_offsets_i64 = inner_offsets.to(tl.int64)
+
+    while k < reduce_size:
+        k_vec = k + k_range
+        k_mask = k_vec < reduce_size
+        k_vec_i64 = k_vec.to(tl.int64)
+
+        ptrs = slice_base + k_vec_i64[:, None] * inner_size_i64 + inner_offsets_i64[None, :]
+        load_mask = k_mask[:, None] & inner_mask[None, :]
+
+        vals = tl.load(x_ptr + ptrs, mask=load_mask, other=-float("inf"))
+        vals = vals.to(tl.float32)
+
+        chunk_max = tl.max(vals, axis=0)
+        chunk_arg = tl.argmax(vals, axis=0) + k
+
+        better = chunk_max > best_val
+        best_val = tl.where(better, chunk_max, best_val)
+        best_idx = tl.where(better, chunk_arg, best_idx)
+
+        k += BLOCK_K
+
+    tl.store(out_ptr + out_base, best_idx.to(tl.int64), mask=inner_mask)
+
+
+def triton_argmax(x: torch.Tensor, dim: int) -> torch.Tensor:
+    x = x.contiguous()
+    ndim = x.ndim
+    if dim < 0:
+        dim += ndim
+
+    reduce_size = x.shape[dim]
+    outer = x.shape[:dim]
+    inner = x.shape[dim + 1 :]
+
+    outer_size = int(torch.tensor(outer).prod().item() if len(outer) else 1)
+    inner_size = int(torch.tensor(inner).prod().item() if len(inner) else 1)
+
+    out_shape = x.shape[:dim] + x.shape[dim + 1 :]
+    out = torch.empty(out_shape, dtype=torch.int64, device=x.device)
+    if out.numel() == 0:
+        return out
+
+    grid = lambda META: (
+        triton.cdiv(inner_size, META["BLOCK_INNER"]),
+        outer_size,
+    )
+
+    argmax_kernel[grid](
+        x,
+        out.view(-1),
+        outer_size,
+        reduce_size,
+        inner_size,
+    )
+    return out
+
+
+class ModelNew(nn.Module):
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_argmax(x, self.dim)
+```

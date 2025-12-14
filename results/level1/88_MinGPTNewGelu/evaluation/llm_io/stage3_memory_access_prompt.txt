@@ -1,0 +1,145 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU
+GPU Name: 4090
+Architecture: Ada Lovelace
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+[OPTIMIZATION STAGE]
+
+## Current Optimization Stage
+
+**Focus**: Optimize memory access patterns and latency hiding.
+
+**NCU Metrics to Check**:
+• `dram__throughput.avg.pct_of_peak_sustained_elapsed`
+• `lts__t_sector_hit_rate.pct`
+• `smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct` (target: <20%)
+
+**Guidelines**:
+- Increase `num_stages` only if memory stalls are high; otherwise keep it small.
+- Improve locality or coalescing only when metrics show issues; avoid unnecessary rewrites.
+- Larger BLOCK_K increases reuse but can raise register pressure; adjust only when metrics justify it.
+
+**Autotune Tip (safe)**:
+If unsure, try a tiny set varying `num_stages` (e.g., {1, 2, 3}) via autotune on the **kernel**.
+
+
+
+[CURRENT CODE]
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+import math
+
+@triton.jit
+def gelu_kernel(
+    x_ptr,
+    output_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """GELU activation kernel using exp-based tanh approximation."""
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    
+    # Load input
+    x = tl.load(x_ptr + offsets, mask=mask)
+    
+    # Compute x^3 with high accuracy (fused multiply)
+    x3 = x * x * x
+    
+    # GELU constants
+    a = 0.7978845608028654  # sqrt(2/π) precomputed
+    b = 0.044715
+    
+    # t = sqrt(2/π) * (x + 0.044715 * x^3)
+    t = a * tl.fma(b, x3, x)  # FMA: a*(b*x3 + x)
+    
+    # tanh(t) using exp-based formulation: 1 - 2/(exp(2t) + 1)
+    # More numerically stable: exp_neg_2t = exp(-2|t|)
+    neg_2abs_t = -2.0 * tl.abs(t)
+    exp_neg_2abs_t = tl.exp(neg_2abs_t)
+    
+    # tanh(t) = sign(t) * (1 - 2/(exp(2|t|) + 1))
+    # = sign(t) * ((exp(2|t|) - 1)/(exp(2|t|) + 1))
+    # Use: 1 - 2/(1 + exp(-2|t|)) = (1 - exp(-2|t|))/(1 + exp(-2|t|))
+    numerator = 1.0 - exp_neg_2abs_t
+    denominator = 1.0 + exp_neg_2abs_t
+    tanh_t = tl.where(t >= 0.0, numerator/denominator, -numerator/denominator)
+    
+    # GELU: 0.5 * x * (1 + tanh(t))
+    output = 0.5 * x * tl.fma(tanh_t, 1.0, 1.0)  # 0.5 * x * (1 + tanh_t)
+    
+    # Store result
+    tl.store(output_ptr + offsets, output, mask=mask)
+
+def triton_gelu(x: torch.Tensor) -> torch.Tensor:
+    """Triton-accelerated GELU activation."""
+    output = torch.empty_like(x)
+    n_elements = output.numel()
+    
+    # Optimize block size for 128 SMs
+    # Using 1024 threads maximizes occupancy while fitting registers
+    BLOCK_SIZE = 1024
+    
+    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
+    
+    # Launch kernel
+    gelu_kernel[grid](x, output, n_elements, BLOCK_SIZE=BLOCK_SIZE)
+    
+    return output
+
+class ModelNew(nn.Module):
+    """
+    Implementation of the GELU activation function with Triton acceleration.
+    Reference: Gaussian Error Linear Units (GELU) paper: https://arxiv.org/abs/1606.08415
+    """
+    def __init__(self) -> None:
+        super().__init__()
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_gelu(x)
+```
+
+[NCU PROFILING METRICS]
+{
+  "gelu_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 9.59,
+    "launch__grid_size": 65536,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 79.08,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 93.51,
+    "lts__t_sector_hit_rate.pct": 50.03
+  }
+}
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

@@ -1,0 +1,317 @@
+# <complete ModelNew code with optimized Triton kernels>
+# <corrected code>
+import math
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+# Autotune configurations for matmul kernels
+matmul_configs = [
+    triton.Config(
+        {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32},
+        num_warps=8,
+        num_stages=2,
+    ),
+    triton.Config(
+        {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32},
+        num_warps=4,
+        num_stages=2,
+    ),
+    triton.Config(
+        {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 32},
+        num_warps=4,
+        num_stages=2,
+    ),
+    triton.Config(
+        {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32},
+        num_warps=4,
+        num_stages=1,
+    ),
+    triton.Config(
+        {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64},
+        num_warps=8,
+        num_stages=3,
+    ),
+    triton.Config(
+        {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64},
+        num_warps=4,
+        num_stages=3,
+    ),
+]
+
+
+@triton.autotune(configs=matmul_configs, key=["M", "N", "K"])
+@triton.jit
+def matmul_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # 2D program id: this program computes one tile of C of size [BLOCK_M, BLOCK_N]
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    tl.multiple_of(offs_m, BLOCK_M)
+    tl.multiple_of(offs_n, BLOCK_N)
+    tl.multiple_of(offs_k, BLOCK_K)
+
+    a_ptrs = a_ptr + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    m_mask = offs_m[:, None] < M
+    n_mask = offs_n[None, :] < N
+
+    k_remaining = K
+    while k_remaining > 0:
+        # Handle K tail with masks
+        k_mask_a = offs_k[None, :] < k_remaining
+        k_mask_b = offs_k[:, None] < k_remaining
+
+        a = tl.load(a_ptrs, mask=m_mask & k_mask_a, other=0.0)
+        b = tl.load(b_ptrs, mask=k_mask_b & n_mask, other=0.0)
+
+        acc += tl.dot(a, b)
+
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+        k_remaining -= BLOCK_K
+
+    c_ptrs = c_ptr + (offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn)
+    c_mask = m_mask & n_mask
+    tl.store(c_ptrs, acc, mask=c_mask)
+
+
+@triton.autotune(configs=matmul_configs, key=["M", "N", "K"])
+@triton.jit
+def matmul_kernel_splitk(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    SPLIT_K,  # runtime: number of K-splits
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """
+    Split-K matmul: each (pid_m, pid_n, pid_k) computes a partial sum over
+    a slice of K and atomically accumulates into C.
+    """
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+    pid_k = tl.program_id(axis=2)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    tl.multiple_of(offs_m, BLOCK_M)
+    tl.multiple_of(offs_n, BLOCK_N)
+    tl.multiple_of(offs_k, BLOCK_K)
+
+    # Compute K range for this split
+    k_per_split = (K + SPLIT_K - 1) // SPLIT_K
+    k_start = pid_k * k_per_split
+    k_end = tl.minimum(k_start + k_per_split, K)
+
+    # Guard against out-of-range splits without early return
+    valid_split = k_start < K
+    k_end = tl.where(valid_split, k_end, k_start)
+
+    a_ptrs = a_ptr + (
+        offs_m[:, None] * stride_am + (k_start + offs_k[None, :]) * stride_ak
+    )
+    b_ptrs = b_ptr + (
+        (k_start + offs_k[:, None]) * stride_bk + offs_n[None, :] * stride_bn
+    )
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    m_mask = offs_m[:, None] < M
+    n_mask = offs_n[None, :] < N
+
+    k_iter = k_start
+    while k_iter < k_end:
+        k_mask_a = (k_iter + offs_k[None, :]) < k_end
+        k_mask_b = (k_iter + offs_k[:, None]) < k_end
+
+        a = tl.load(a_ptrs, mask=m_mask & k_mask_a & valid_split, other=0.0)
+        b = tl.load(b_ptrs, mask=k_mask_b & n_mask & valid_split, other=0.0)
+
+        acc += tl.dot(a, b)
+
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+        k_iter += BLOCK_K
+
+    c_ptrs = c_ptr + (offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn)
+    c_mask = m_mask & n_mask & valid_split
+    tl.atomic_add(c_ptrs, acc, mask=c_mask)
+
+
+def _triton_matmul_single(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    """
+    Single-call Triton matmul: C = A @ B, float32 accumulate.
+    Uses a split-K kernel when 2D tiling alone cannot saturate the GPU.
+    """
+    assert A.is_cuda and B.is_cuda
+    assert A.dtype == torch.float32 and B.dtype == torch.float32
+
+    M, K = A.shape
+    Kb, N = B.shape
+    assert K == Kb
+
+    stride_am, stride_ak = A.stride()
+    stride_bk, stride_bn = B.stride()
+
+    # Heuristic estimates based on typical autotuned tile sizes.
+    BLOCK_M_EST = 128
+    BLOCK_N_EST = 128
+    BLOCK_K_EST = 32
+
+    tiles_m_est = triton.cdiv(M, BLOCK_M_EST)
+    tiles_n_est = triton.cdiv(N, BLOCK_N_EST)
+    num_tiles_2d_est = tiles_m_est * tiles_n_est
+
+    # For a 4090 (128 SMs), aim for at least ~4 blocks / SM
+    TARGET_MIN_BLOCKS = 4 * 128  # 512
+
+    # Ensure each split has at least a few K-steps
+    max_split_from_k = max(1, K // (BLOCK_K_EST * 4))
+
+    # Decide between standard and split-K execution.
+    if num_tiles_2d_est >= TARGET_MIN_BLOCKS or max_split_from_k == 1:
+        # Enough 2D parallelism: regular kernel
+        C = torch.empty((M, N), device=A.device, dtype=torch.float32)
+
+        def grid(meta):
+            return (
+                triton.cdiv(M, meta["BLOCK_M"]),
+                triton.cdiv(N, meta["BLOCK_N"]),
+            )
+
+        matmul_kernel[grid](
+            A,
+            B,
+            C,
+            M,
+            N,
+            K,
+            stride_am,
+            stride_ak,
+            stride_bk,
+            stride_bn,
+            C.stride(0),
+            C.stride(1),
+        )
+        return C
+    else:
+        # Use split-K to increase grid size (improves latency hiding)
+        desired_blocks = TARGET_MIN_BLOCKS
+        needed_splits = int(
+            math.ceil(desired_blocks / max(num_tiles_2d_est, 1))
+        )
+        SPLIT_K = int(min(32, max_split_from_k, max(1, needed_splits)))
+        SPLIT_K = max(SPLIT_K, 1)
+
+        C = torch.zeros((M, N), device=A.device, dtype=torch.float32)
+
+        def grid(meta):
+            return (
+                triton.cdiv(M, meta["BLOCK_M"]),
+                triton.cdiv(N, meta["BLOCK_N"]),
+                SPLIT_K,
+            )
+
+        matmul_kernel_splitk[grid](
+            A,
+            B,
+            C,
+            M,
+            N,
+            K,
+            stride_am,
+            stride_ak,
+            stride_bk,
+            stride_bn,
+            C.stride(0),
+            C.stride(1),
+            SPLIT_K,
+        )
+        return C
+
+
+def triton_large_k_matmul(
+    A: torch.Tensor, B: torch.Tensor, chunk_size: int = 65536
+) -> torch.Tensor:
+    """
+    Matmul with very large K using chunking across K and Triton kernels per chunk.
+    """
+    if (not A.is_cuda) or (not B.is_cuda):
+        return torch.matmul(A, B)
+
+    compute_dtype = torch.float32
+    A_ = A.to(compute_dtype)
+    B_ = B.to(compute_dtype)
+
+    M, K = A_.shape
+    Kb, N = B_.shape
+    assert K == Kb
+
+    C_accum = torch.zeros((M, N), device=A.device, dtype=compute_dtype)
+
+    for k_start in range(0, K, chunk_size):
+        k_end = min(k_start + chunk_size, K)
+        A_chunk = A_[:, k_start:k_end]
+        B_chunk = B_[k_start:k_end, :]
+        C_chunk = _triton_matmul_single(A_chunk, B_chunk)
+        C_accum += C_chunk
+
+    out_dtype = torch.result_type(A, B)
+    if out_dtype.is_floating_point:
+        return C_accum.to(out_dtype)
+    else:
+        return C_accum.to(out_dtype)
+
+
+class ModelNew(nn.Module):
+    """
+    Model using optimized Triton kernels for matrix multiplication with very large K.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        if A.is_cuda and B.is_cuda:
+            return triton_large_k_matmul(A, B)
+        else:
+            return torch.matmul(A, B)

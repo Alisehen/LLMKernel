@@ -1,0 +1,111 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+_TORCH_DTYPE_TO_TL = {
+    torch.float16: tl.float16,
+    torch.bfloat16: tl.bfloat16,
+    torch.float32: tl.float32,
+}
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_ROWS": 1, "BLOCK_SIZE": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_ROWS": 2, "BLOCK_SIZE": 256}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_ROWS": 4, "BLOCK_SIZE": 256}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_ROWS": 4, "BLOCK_SIZE": 512}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_ROWS": 8, "BLOCK_SIZE": 512}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_ROWS": 8, "BLOCK_SIZE": 1024}, num_warps=8, num_stages=4),
+    ],
+    key=["n_rows", "reduce_size"],
+)
+@triton.jit
+def max_reduce_lastdim_kernel(
+    x_ptr,
+    out_ptr,
+    n_rows,
+    reduce_size,
+    stride_row,
+    OUT_DTYPE: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    row_indices = pid * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    row_mask = row_indices < n_rows
+
+    offsets_row = row_indices[:, None] * stride_row
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+    acc = tl.full((BLOCK_ROWS,), -float("inf"), dtype=tl.float32)
+
+    col_start = 0
+    while col_start < reduce_size:
+        cols = col_start + col_offsets
+        col_mask = cols < reduce_size
+        mask = row_mask[:, None] & col_mask[None, :]
+        ptrs = x_ptr + offsets_row + cols[None, :]
+        values = tl.load(ptrs, mask=mask, other=-float("inf")).to(tl.float32)
+        row_max = tl.max(values, axis=1)
+        acc = tl.maximum(acc, row_max)
+        col_start += BLOCK_SIZE
+
+    tl.store(out_ptr + row_indices, acc.to(OUT_DTYPE), mask=row_mask)
+
+
+def triton_max_reduce(x: torch.Tensor, dim: int) -> torch.Tensor:
+    if x.dtype not in _TORCH_DTYPE_TO_TL:
+        raise TypeError(f"Unsupported dtype {x.dtype}")
+
+    ndim = x.ndim
+    if dim < 0:
+        dim += ndim
+    assert 0 <= dim < ndim
+
+    if dim == ndim - 1:
+        x_perm = x.contiguous()
+        perm = list(range(ndim))
+    else:
+        perm = list(range(ndim))
+        perm.pop(dim)
+        perm.append(dim)
+        x_perm = x.permute(perm).contiguous()
+
+    shape_perm = x_perm.shape
+    reduce_size = shape_perm[-1]
+    outer = x_perm.numel() // reduce_size
+
+    out = torch.empty(outer, device=x.device, dtype=x.dtype)
+
+    grid = lambda META: (triton.cdiv(outer, META["BLOCK_ROWS"]),)
+    max_reduce_lastdim_kernel[grid](
+        x_perm,
+        out,
+        outer,
+        reduce_size,
+        reduce_size,
+        OUT_DTYPE=_TORCH_DTYPE_TO_TL[x.dtype],
+    )
+
+    out = out.view(shape_perm[:-1])
+    if dim == ndim - 1:
+        return out
+    perm_wo_last = perm[:-1]
+    inverse = sorted(range(len(perm_wo_last)), key=lambda i: perm_wo_last[i])
+    return out.permute(inverse).contiguous()
+
+
+class ModelNew(nn.Module):
+    """
+    Max reduction over a specific dimension using an optimized Triton kernel.
+    """
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_max_reduce(x, self.dim)
+```

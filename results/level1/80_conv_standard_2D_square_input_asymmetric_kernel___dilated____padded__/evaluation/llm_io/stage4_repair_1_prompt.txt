@@ -1,0 +1,284 @@
+Fix the Triton kernel errors. Generate correct, high-performance code.
+
+Current Error Log:
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 524, in compare_and_bench
+    test_model = ModelNew(*init_args, **init_kwargs)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251213_091928_batch_range68to99_openai_deepseek/80_conv_standard_2D_square_input_asymmetric_kernel___dilated____padded__/code/kernel_20251213_110030.py", line 187, in __init__
+    self.reset_parameters()
+  File "/home/hyc/LLMKernel/run/20251213_091928_batch_range68to99_openai_deepseek/80_conv_standard_2D_square_input_asymmetric_kernel___dilated____padded__/code/kernel_20251213_110030.py", line 190, in reset_parameters
+    nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+                                            ^^^^
+NameError: name 'math' is not defined
+
+History Error:
+None
+
+
+PyTorch Reference:
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Performs a standard 2D convolution operation with square input and asymmetric kernel, with dilation and padding.
+
+    Args:
+        in_channels (int): Number of channels in the input tensor.
+        out_channels (int): Number of channels produced by the convolution.
+        kernel_size (tuple): Size of the convolution kernel (height, width). 
+        stride (int, optional): Stride of the convolution. Defaults to 1.
+        padding (tuple, optional): Padding applied to the input (top/bottom, left/right). Defaults to (0, 0).
+        dilation (tuple, optional): Spacing between kernel elements (height, width). Defaults to (1, 1).
+        bias (bool, optional): If `True`, adds a learnable bias to the output. Defaults to `False`.
+    """
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: tuple, stride: int = 1, padding: tuple = (0, 0), dilation: tuple = (1, 1), bias: bool = False):
+        super(Model, self).__init__()
+        self.conv2d = nn.Conv2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, dilation=dilation, bias=bias)
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Performs the 2D convolution.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_channels, height, width).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_channels, height_out, width_out).
+        """
+        return self.conv2d(x)
+
+# Test code
+batch_size = 8
+in_channels = 32
+out_channels = 64
+kernel_size = (5, 9)
+width = 512
+height = 512
+stride = 1
+padding = (2, 4)
+dilation = (2, 3)
+
+def get_inputs():
+    x = torch.rand(batch_size, in_channels, height, width)
+    return [x]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, stride, padding, dilation]
+```
+
+Broken Code:
+```python
+# optimized Triton code
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_OC': 32, 'BLOCK_HW': 128, 'BLOCK_K': 32}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_OC': 64, 'BLOCK_HW': 128, 'BLOCK_K': 32}, num_warps=16, num_stages=2),
+        triton.Config({'BLOCK_OC': 64, 'BLOCK_HW': 64, 'BLOCK_K': 64}, num_warps=8, num_stages=4),
+        triton.Config({'BLOCK_OC': 32, 'BLOCK_HW': 256, 'BLOCK_K': 32}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_OC': 64, 'BLOCK_HW': 256, 'BLOCK_K': 64}, num_warps=16, num_stages=4),
+    ],
+    key=['OC', 'HW'],
+)
+@triton.jit
+def conv2d_kernel(
+    x_ptr,
+    w_ptr,
+    b_ptr,
+    y_ptr,
+    B,
+    IC,
+    IH,
+    IW,
+    OC,
+    KH,
+    KW,
+    stride_h,
+    stride_w,
+    pad_h,
+    pad_w,
+    dil_h,
+    dil_w,
+    OH,
+    OW,
+    HW,
+    has_bias: tl.constexpr,
+    BLOCK_OC: tl.constexpr,
+    BLOCK_HW: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_hw = tl.program_id(0)
+    pid_oc = tl.program_id(1)
+    pid_b = tl.program_id(2)
+
+    hw_offsets = pid_hw * BLOCK_HW + tl.arange(0, BLOCK_HW)
+    oc_offsets = pid_oc * BLOCK_OC + tl.arange(0, BLOCK_OC)
+
+    mask_hw = hw_offsets < HW
+    mask_oc = oc_offsets < OC
+
+    oh = hw_offsets // OW
+    ow = hw_offsets % OW
+    ih_base = oh * stride_h - pad_h
+    iw_base = ow * stride_w - pad_w
+
+    x_bs = IC * IH * IW
+    x_cs = IH * IW
+    x_hs = IW
+
+    w_cs = KH * KW
+    w_hs = KW
+
+    y_bs = OC * OH * OW
+    y_cs = OH * OW
+    y_hs = OW
+
+    acc = tl.zeros((BLOCK_OC, BLOCK_HW), dtype=tl.float32)
+    K_total = IC * KH * KW
+
+    for k_start in range(0, K_total, BLOCK_K):
+        k_offsets = k_start + tl.arange(0, BLOCK_K)
+        mask_k = k_offsets < K_total
+
+        ic = tl.where(mask_k, k_offsets // (KH * KW), 0)
+        rem = tl.where(mask_k, k_offsets % (KH * KW), 0)
+        kh = rem // KW
+        kw = rem % KW
+
+        ih = ih_base[None, :] + kh[:, None] * dil_h
+        iw = iw_base[None, :] + kw[:, None] * dil_w
+        valid = (ih >= 0) & (ih < IH) & (iw >= 0) & (iw < IW)
+
+        x_ptrs = (
+            pid_b * x_bs
+            + ic[:, None] * x_cs
+            + ih * x_hs
+            + iw
+        )
+        x_vals = tl.load(x_ptr + x_ptrs, mask=mask_k[:, None] & mask_hw[None, :] & valid, other=0.0)
+
+        w_ptrs = (
+            oc_offsets[:, None] * (IC * KH * KW)
+            + ic[None, :] * w_cs
+            + kh[None, :] * w_hs
+            + kw[None, :]
+        )
+        w_vals = tl.load(w_ptr + w_ptrs, mask=mask_oc[:, None] & mask_k[None, :], other=0.0)
+
+        acc += tl.dot(w_vals, x_vals)
+
+    if has_bias:
+        bias_vals = tl.load(b_ptr + oc_offsets, mask=mask_oc, other=0.0)
+        acc += bias_vals[:, None]
+
+    y_ptrs = (
+        pid_b * y_bs
+        + oc_offsets[:, None] * y_cs
+        + oh[None, :] * y_hs
+        + ow[None, :]
+    )
+    tl.store(y_ptr + y_ptrs, acc, mask=mask_oc[:, None] & mask_hw[None, :])
+
+
+def triton_conv2d(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, stride: tuple, padding: tuple, dilation: tuple) -> torch.Tensor:
+    assert x.is_contiguous() and weight.is_contiguous()
+    stride_h, stride_w = stride
+    pad_h, pad_w = padding
+    dil_h, dil_w = dilation
+
+    B, IC, IH, IW = x.shape
+    OC, _, KH, KW = weight.shape
+
+    OH = (IH + 2 * pad_h - dil_h * (KH - 1) - 1) // stride_h + 1
+    OW = (IW + 2 * pad_w - dil_w * (KW - 1) - 1) // stride_w + 1
+    HW = OH * OW
+
+    y = torch.empty((B, OC, OH, OW), device=x.device, dtype=x.dtype)
+    has_bias = bias is not None
+    bias_ptr = bias.contiguous() if has_bias else x.new_empty(1, device=x.device, dtype=x.dtype)
+
+    grid = lambda meta: (
+        triton.cdiv(HW, meta['BLOCK_HW']),
+        triton.cdiv(OC, meta['BLOCK_OC']),
+        B,
+    )
+
+    conv2d_kernel[grid](
+        x,
+        weight,
+        bias_ptr,
+        y,
+        B,
+        IC,
+        IH,
+        IW,
+        OC,
+        KH,
+        KW,
+        stride_h,
+        stride_w,
+        pad_h,
+        pad_w,
+        dil_h,
+        dil_w,
+        OH,
+        OW,
+        HW,
+        has_bias=has_bias,
+    )
+    return y
+
+
+class ModelNew(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: tuple,
+        stride: int = 1,
+        padding: tuple = (0, 0),
+        dilation: tuple = (1, 1),
+        bias: bool = False,
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = (stride, stride) if isinstance(stride, int) else stride
+        self.padding = padding
+        self.dilation = dilation
+        self.weight = nn.Parameter(torch.empty(out_channels, in_channels, *kernel_size))
+        self.bias = nn.Parameter(torch.empty(out_channels)) if bias else None
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in = self.in_channels * self.kernel_size[0] * self.kernel_size[1]
+            bound = 1 / math.sqrt(fan_in)
+            nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_conv2d(x, self.weight, self.bias, self.stride, self.padding, self.dilation)
+```
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+3. Learn from previous repair attempts to avoid repeating the same mistakes
+
+```python
+# <corrected code>
+```
