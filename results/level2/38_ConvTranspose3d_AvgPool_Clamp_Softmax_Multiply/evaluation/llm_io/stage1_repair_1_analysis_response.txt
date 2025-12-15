@@ -1,0 +1,5 @@
+{
+  "critical_issue": "clamp_min and clamp_max are passed as device tensors (pointers) but used as scalar values in the Triton kernel.",
+  "why_it_matters": "Triton sees clamp_min as pointer<fp32>[]; calling clamp_min.to(tl.float32) tries to cast a pointer to fp32, triggering the 'cannot cast pointer<fp32>[] to fp32' assertion.",
+  "minimal_fix_hint": "Pass clamp_min and clamp_max as Python/host scalars (e.g., clamp_min.item()) so the kernel receives true scalar values, not pointers."
+}

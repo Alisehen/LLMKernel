@@ -1,0 +1,5 @@
+{
+  "critical_issue": "GroupNorm kernel computes unbiased variance (multiplies by group_size/(group_size-1)) while PyTorch GroupNorm uses biased variance (division by group_size only).",
+  "why_it_matters": "This systematically overestimates variance, reduces normalized activations' magnitude by several percent, and propagates through LeakyReLU and scaling, causing output differences well beyond the 1% relative tolerance in the test.",
+  "minimal_fix_hint": "Remove the unbiased correction: compute variance as E[x²]−mean² divided by group_size only (unbiased=False), matching PyTorch GroupNorm’s variance definition."
+}

@@ -1,0 +1,312 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def fused_relu_group_norm_stats_kernel(
+    x_ptr,
+    group_sum_ptr,
+    group_sum_sq_ptr,
+    N, C, D, H, W,
+    stride_n, stride_c, stride_d, stride_h, stride_w,
+    groups,
+    eps,
+    BLOCK_SIZE: tl.constexpr,
+    ELEMENTS_PER_THREAD: tl.constexpr,
+):
+    """
+    Optimized Phase 1: Compute group statistics with flattened grid and
+    thread-level parallelism for better SM utilization
+    """
+    pid = tl.program_id(0)
+    
+    total_groups = N * groups
+    group_channels = C // groups
+    DHW = D * H * W
+    total_elements_per_group = group_channels * DHW
+    
+    # Flatten grid: each thread block processes one group
+    if pid >= total_groups:
+        return
+    
+    # Decompose group index
+    n_idx = pid // groups
+    g_idx = pid % groups
+    group_start = g_idx * group_channels
+    
+    # Thread block configuration
+    tid = tl.arange(0, BLOCK_SIZE)
+    chunk_size = BLOCK_SIZE * ELEMENTS_PER_THREAD
+    
+    # Initialize accumulators
+    sum_val = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+    sum_sq = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+    
+    # Process elements in chunks
+    for chunk_start in range(0, total_elements_per_group, chunk_size):
+        # Each thread processes ELEMENTS_PER_THREAD elements
+        for i in range(ELEMENTS_PER_THREAD):
+            elem_idx = chunk_start + tid * ELEMENTS_PER_THREAD + i
+            
+            if elem_idx < total_elements_per_group:
+                # Convert flattened index to 5D tensor coordinates
+                c_in_group = elem_idx // DHW
+                spatial_idx = elem_idx % DHW
+                
+                d_idx = spatial_idx // (H * W)
+                hw_rem = spatial_idx % (H * W)
+                h_idx = hw_rem // W
+                w_idx = hw_rem % W
+                
+                c = group_start + c_in_group
+                
+                # Compute memory offset
+                offset = (
+                    n_idx * stride_n +
+                    c * stride_c +
+                    d_idx * stride_d +
+                    h_idx * stride_h +
+                    w_idx * stride_w
+                )
+                
+                # Load and apply ReLU
+                x_val = tl.load(x_ptr + offset)
+                x_relu = tl.maximum(x_val, 0.0)
+                
+                # Accumulate
+                sum_val = tl.where(tid < BLOCK_SIZE, sum_val + x_relu, sum_val)
+                sum_sq = tl.where(tid < BLOCK_SIZE, sum_sq + x_relu * x_relu, sum_sq)
+    
+    # Reduction within thread block using shared memory
+    # Use padding to avoid bank conflicts
+    num_warps = BLOCK_SIZE // 32
+    SHARED_SIZE = BLOCK_SIZE + (BLOCK_SIZE % num_warps)
+    shared_sum = tl.static_shared_memory((SHARED_SIZE,), dtype=tl.float32, offset=0)
+    shared_sum_sq = tl.static_shared_memory((SHARED_SIZE,), dtype=tl.float32, offset=SHARED_SIZE)
+    
+    if tid < BLOCK_SIZE:
+        shared_sum[tid] = sum_val
+        shared_sum_sq[tid] = sum_sq
+    
+    tl.debug_barrier()
+    
+    # Tree reduction
+    s = 1
+    while s < BLOCK_SIZE:
+        if tid % (2 * s) == 0 and tid + s < BLOCK_SIZE:
+            shared_sum[tid] += shared_sum[tid + s]
+            shared_sum_sq[tid] += shared_sum_sq[tid + s]
+        s *= 2
+        tl.debug_barrier()
+    
+    # Store result
+    if tid == 0:
+        tl.store(group_sum_ptr + pid, shared_sum[0])
+        tl.store(group_sum_sq_ptr + pid, shared_sum_sq[0])
+
+
+@triton.jit
+def fused_relu_group_norm_apply_kernel(
+    x_ptr,
+    weight_ptr,
+    bias_ptr,
+    group_sum_ptr,
+    group_sum_sq_ptr,
+    out_ptr,
+    N, C, D, H, W,
+    stride_n, stride_c, stride_d, stride_h, stride_w,
+    out_stride_n, out_stride_c, out_stride_d, out_stride_h, out_stride_w,
+    groups,
+    eps,
+    BLOCK_SIZE: tl.constexpr,
+    VECTOR_SIZE: tl.constexpr,
+):
+    """
+    Optimized Phase 2: Apply normalization with flattened output grid
+    and vectorized memory access patterns
+    """
+    pid = tl.program_id(0)
+    
+    total_groups = N * groups
+    group_channels = C // groups
+    DHW = D * H * W
+    total_elements_per_group = group_channels * DHW
+    
+    # Each thread block processes multiple output elements
+    num_blocks = tl.num_programs(0)
+    elements_per_block = (total_groups * total_elements_per_group + num_blocks - 1) // num_blocks
+    start_elem = pid * elements_per_block
+    end_elem = tl.minimum(start_elem + elements_per_block, total_groups * total_elements_per_group)
+    
+    # Process elements in vectorized chunks
+    for elem_base in range(start_elem, end_elem, VECTOR_SIZE):
+        elem_indices = elem_base + tl.arange(0, VECTOR_SIZE)
+        mask = elem_indices < end_elem
+        
+        # Convert flattened index to group and element indices
+        group_idx = elem_indices // total_elements_per_group
+        elem_in_group = elem_indices % total_elements_per_group
+        
+        # Decompose group index
+        n_idx = group_idx // groups
+        g_idx = group_idx % groups
+        
+        # Load group statistics (shared across all elements in group)
+        stats_idx = n_idx * groups + g_idx
+        group_sum = tl.load(group_sum_ptr + stats_idx)
+        group_sum_sq = tl.load(group_sum_sq_ptr + stats_idx)
+        count = tl.cast(group_channels * DHW, tl.float32)
+        
+        # Compute normalization parameters
+        safe_count = tl.maximum(count, 1.0)
+        mean = group_sum / safe_count
+        variance = tl.maximum(group_sum_sq / safe_count - mean * mean, 0.0)
+        inv_std = 1.0 / tl.sqrt(variance + eps)
+        
+        # Convert element index to 5D tensor coordinates
+        c_in_group = elem_in_group // DHW
+        spatial_idx = elem_in_group % DHW
+        
+        d_idx = spatial_idx // (H * W)
+        hw_rem = spatial_idx % (H * W)
+        h_idx = hw_rem // W
+        w_idx = hw_rem % W
+        
+        c = g_idx * group_channels + c_in_group
+        
+        # Compute input and output offsets
+        in_offsets = (
+            n_idx * stride_n +
+            c * stride_c +
+            d_idx * stride_d +
+            h_idx * stride_h +
+            w_idx * stride_w
+        )
+        
+        out_offsets = (
+            n_idx * out_stride_n +
+            c * out_stride_c +
+            d_idx * out_stride_d +
+            h_idx * out_stride_h +
+            w_idx * out_stride_w
+        )
+        
+        # Vectorized load and ReLU
+        x_vals = tl.load(x_ptr + in_offsets, mask=mask, other=0.0)
+        x_relu = tl.maximum(x_vals, 0.0)
+        
+        # Normalize
+        normalized = (x_relu - mean) * inv_std
+        
+        # Load weight and bias
+        weight_vals = tl.load(weight_ptr + c, mask=mask, other=1.0)
+        bias_vals = tl.load(bias_ptr + c, mask=mask, other=0.0)
+        
+        # Apply affine transformation
+        output = normalized * weight_vals + bias_vals
+        
+        # Vectorized store
+        tl.store(out_ptr + out_offsets, output, mask=mask)
+
+
+def fused_relu_group_norm(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, groups: int) -> torch.Tensor:
+    """
+    Wrapper for optimized fused ReLU + GroupNorm
+    """
+    N, C, D, H, W = x.shape
+    
+    # Validate dimensions
+    assert C % groups == 0, f"Channels {C} must be divisible by groups {groups}"
+    
+    # Create output tensor
+    out = torch.empty_like(x)
+    
+    # Group parameters
+    eps = 1e-5
+    group_channels = C // groups
+    
+    # Phase 1: Compute group statistics
+    total_groups = N * groups
+    group_sum = torch.zeros(total_groups, dtype=torch.float32, device=x.device)
+    group_sum_sq = torch.zeros(total_groups, dtype=torch.float32, device=x.device)
+    
+    # Launch optimized statistics kernel
+    BLOCK_SIZE_STATS = 256  # 8 warps
+    ELEMENTS_PER_THREAD = 4
+    
+    # Calculate grid size: one thread block per group
+    grid_stats = (total_groups,)
+    
+    fused_relu_group_norm_stats_kernel[grid_stats](
+        x, group_sum, group_sum_sq,
+        N, C, D, H, W,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
+        groups, eps,
+        BLOCK_SIZE=BLOCK_SIZE_STATS,
+        ELEMENTS_PER_THREAD=ELEMENTS_PER_THREAD,
+        num_warps=8,
+    )
+    
+    # Phase 2: Apply normalization
+    BLOCK_SIZE_APPLY = 128  # 4 warps
+    VECTOR_SIZE = 4  # Vectorized memory access
+    
+    # Calculate total number of output elements
+    total_elements = total_groups * group_channels * D * H * W
+    grid_apply = (triton.cdiv(total_elements, BLOCK_SIZE_APPLY * VECTOR_SIZE),)
+    
+    fused_relu_group_norm_apply_kernel[grid_apply](
+        x, weight, bias, group_sum, group_sum_sq, out,
+        N, C, D, H, W,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
+        out.stride(0), out.stride(1), out.stride(2), out.stride(3), out.stride(4),
+        groups, eps,
+        BLOCK_SIZE=BLOCK_SIZE_APPLY,
+        VECTOR_SIZE=VECTOR_SIZE,
+        num_warps=4,
+    )
+    
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    ConvTranspose3d (PyTorch native) + Fused ReLU + GroupNorm (Triton)
+    
+    Uses PyTorch's native ConvTranspose3d (complex index mapping) and fuses
+    the subsequent ReLU and GroupNorm operations in Triton for better performance.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, groups, bias=False):
+        super(ModelNew, self).__init__()
+        
+        # Keep ConvTranspose3d as PyTorch native - DO NOT reimplement in Triton
+        self.conv_transpose = nn.ConvTranspose3d(
+            in_channels, out_channels, kernel_size, bias=bias
+        )
+        
+        # GroupNorm parameters (learnable)
+        self.weight = nn.Parameter(torch.ones(out_channels))
+        self.bias = nn.Parameter(torch.zeros(out_channels))
+        self.groups = groups
+        
+        # Initialize weights
+        nn.init.ones_(self.weight)
+        nn.init.zeros_(self.bias)
+    
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_channels, D, H, W)
+        
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_channels, D, H, W)
+        """
+        # Step 1: PyTorch native ConvTranspose3d
+        x = self.conv_transpose(x)
+        
+        # Step 2: Fused ReLU + GroupNorm in Triton
+        x = fused_relu_group_norm(x, self.weight, self.bias, self.groups)
+        
+        return x

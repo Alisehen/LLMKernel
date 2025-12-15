@@ -1,0 +1,289 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU
+GPU Name: 4090
+Architecture: Ada Lovelace
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+[OPTIMIZATION STAGE]
+
+## Current Optimization Stage
+
+Focus: BLOCK_SIZE with register pressure awareness.
+
+Key Principle:
+- Fusion increases register usage (intermediates stay in registers)
+- Spill to local memory kills fusion benefit
+
+Register Pressure Signals (from NCU):
+- launch__registers_per_thread > 128 → likely spilling
+- launch__occupancy_limit_registers < other limits → register-bound
+
+Rules:
+- Start conservative: BLOCK_SIZE ∈ {256, 512} for element-wise
+- For matmul fusion: BLOCK_M/N ∈ {32, 64}, BLOCK_K ∈ {32}
+- If registers > 128: reduce BLOCK_* by half
+- Trade-off: recompute cheap ops (e.g., x*0.5) vs store intermediate
+
+When to Recompute vs Keep:
+- Keep: expensive ops (exp, log, div, sqrt)
+- Recompute: cheap ops (add, mul, max) if register pressure high
+- Example: `y = relu(x); z = y * scale` → keep y
+- Example: `y = x * 0.5; z = y + bias` → can recompute y if needed
+
+Autotune:
+- 2-3 BLOCK_SIZE configs, always include smaller fallback
+
+
+
+[CURRENT CODE]
+```python
+# <optimized Triton code>
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        # Larger, more compute-heavy tile, good for large matrices
+        triton.Config(
+            {'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32},
+            num_warps=8,
+            num_stages=4,
+        ),
+        # Slightly narrower N for tall matrices
+        triton.Config(
+            {'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=4,
+        ),
+        # Smaller M tiles – can help for small batch sizes
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=4,
+        ),
+        # Fallback conservative config
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+    ],
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def matmul_swish_add_two_biases_kernel(
+    a_ptr,            # [M, K] input
+    b_ptr,            # [K, N] weight^T
+    linear_bias_ptr,  # [N] bias of the linear layer (pre-activation)
+    extra_bias_ptr,   # [N] extra bias added after Swish
+    c_ptr,            # [M, N] output
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """
+    Compute C = Swish(A @ B + linear_bias) + extra_bias,
+    where Swish(x) = x * sigmoid(x).
+
+    Shapes:
+      A: [M, K]
+      B: [K, N]
+      linear_bias: [N]
+      extra_bias: [N]
+      C: [M, N]
+    """
+    # 1D launch grid mapped to 2D (pid_m, pid_n) over output tiles.
+    pid = tl.program_id(0)
+    grid_n = (N + BLOCK_N - 1) // BLOCK_N
+    pid_m = pid // grid_n
+    pid_n = pid % grid_n
+
+    # Offsets for this tile in M and N
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Masks corresponding to output tile; used by all fused elementwise ops
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+    out_mask = mask_m[:, None] & mask_n[None, :]
+
+    # Base pointers for A, B, C
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+
+    # Accumulator in FP32 for better precision and to leverage tensor cores / TF32
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Hoist masks that don't depend on k
+    a_mask_m = mask_m[:, None]
+    b_mask_n = mask_n[None, :]
+
+    # Matmul over K dimension: A[M,K] @ B[K,N] -> acc[M,N]
+    for k in range(0, K, BLOCK_K):
+        k_mask = (k + offs_k) < K
+
+        # Load A and B tiles with K-boundary masking
+        a = tl.load(
+            a_ptrs,
+            mask=a_mask_m & k_mask[None, :],
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptrs,
+            mask=k_mask[:, None] & b_mask_n,
+            other=0.0,
+        )
+
+        acc += tl.dot(a, b, allow_tf32=True)
+
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Load both biases once per tile (broadcast across M)
+    linear_bias = tl.load(
+        linear_bias_ptr + offs_n,
+        mask=mask_n,
+        other=0.0,
+    )
+    extra_bias = tl.load(
+        extra_bias_ptr + offs_n,
+        mask=mask_n,
+        other=0.0,
+    )
+
+    # Fused bias-add + Swish + extra-bias
+    # All elementwise ops share the same (offs_m, offs_n) and out_mask
+    x = acc + linear_bias[None, :]                  # [BLOCK_M, BLOCK_N]
+    sig = 1.0 / (1.0 + tl.exp(-x))                  # sigmoid(x)
+    x = x * sig                                     # Swish
+    x = x + extra_bias[None, :]                     # post-activation bias
+
+    # Store final result
+    tl.store(c_ptrs, x, mask=out_mask)
+
+
+def matmul_swish_add_bias(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    linear_bias: torch.Tensor,
+    extra_bias: torch.Tensor,
+) -> torch.Tensor:
+    """
+    x:           [M, K]
+    weight:      [N, K]  (nn.Linear weight: [out_features, in_features])
+    linear_bias: [N]     (nn.Linear bias: pre-activation)
+    extra_bias:  [N]     (additional bias applied after Swish)
+    returns:     [M, N]
+
+    Computes: Swish(x @ weight.T + linear_bias) + extra_bias
+    """
+    assert x.dim() == 2, "Input x must be 2D (batch_size, in_features)"
+    assert weight.dim() == 2, "Weight must be 2D (out_features, in_features)"
+    assert linear_bias.dim() == 1, "linear_bias must be 1D (out_features,)"
+    assert extra_bias.dim() == 1, "extra_bias must be 1D (out_features,)"
+
+    M, K = x.shape
+    out_features, in_features = weight.shape
+    assert K == in_features, "Incompatible shapes for matmul"
+    N = out_features
+    assert linear_bias.shape[0] == N, "linear_bias size mismatch"
+    assert extra_bias.shape[0] == N, "extra_bias size mismatch"
+
+    # Ensure contiguous layouts matching the kernel's assumptions:
+    # A: [M, K] row-major, B: [K, N] row-major
+    x_contig = x.contiguous()
+    b_t = weight.t().contiguous()  # [K, N]
+
+    c = torch.empty((M, N), device=x.device, dtype=x.dtype)
+
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta['BLOCK_M']) * triton.cdiv(N, meta['BLOCK_N']),
+        )
+
+    matmul_swish_add_two_biases_kernel[grid](
+        x_contig, b_t, linear_bias, extra_bias, c,
+        M, N, K,
+        x_contig.stride(0), x_contig.stride(1),
+        b_t.stride(0), b_t.stride(1),
+        c.stride(0), c.stride(1),
+    )
+    return c
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-accelerated version of the original model.
+
+    Pipeline:
+      1) Linear: x @ W^T + linear_bias
+      2) Swish activation: x * sigmoid(x)
+      3) Add extra bias term
+      4) GroupNorm over features (channels)
+    """
+    def __init__(self, in_features, out_features, num_groups, bias_shape):
+        super(ModelNew, self).__init__()
+        self.linear = nn.Linear(in_features, out_features, bias=True)
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.group_norm = nn.GroupNorm(num_groups, out_features)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: [batch_size, in_features]
+        returns: [batch_size, out_features]
+        """
+        x = matmul_swish_add_bias(x, self.linear.weight, self.linear.bias, self.bias)
+        x = self.group_norm(x)
+        return x
+```
+
+[NCU PROFILING METRICS]
+{
+  "matmul_swish_add_two_biases_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 43.09,
+    "launch__grid_size": 8192,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 16.66,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 15.23,
+    "lts__t_sector_hit_rate.pct": 98.35
+  }
+}
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+TRITON API CONSTRAINTS (CRITICAL):
+- Triton has NO: tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

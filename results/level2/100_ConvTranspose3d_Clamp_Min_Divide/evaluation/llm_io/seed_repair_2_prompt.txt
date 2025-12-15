@@ -1,0 +1,239 @@
+Fix the Triton kernel errors. Generate correct, high-performance code.
+
+Current Error Log:
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 538, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251214_114800_batch_range81to100_deepseek_deepseek/100_ConvTranspose3d_Clamp_Min_Divide/code/kernel_20251214_213330.py", line 121, in forward
+    x = fused_clamp_div(x, self.min_value, self.divisor)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251214_114800_batch_range81to100_deepseek_deepseek/100_ConvTranspose3d_Clamp_Min_Divide/code/kernel_20251214_213330.py", line 92, in fused_clamp_div
+    clamp_div_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 347, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 192, in run
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 192, in <dictcomp>
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 170, in _bench
+    return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/testing.py", line 145, in do_bench
+    fn()
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 156, in kernel_call
+    self.fn.run(
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 569, in run
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 230, in compile
+    key = f"{triton_key()}-{src.hash()}-{backend.hash()}-{options.hash()}-{str(sorted(env_vars.items()))}"
+                            ^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 77, in hash
+    key = f"{self.fn.cache_key}-{str(self.attrs)}-{sorted_sig}-{constants_key}"
+             ^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 665, in cache_key
+    dependencies_finder.visit(self.parse())
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 418, in visit
+    return visitor(node)
+           ^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 426, in generic_visit
+    self.visit(item)
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 418, in visit
+    return visitor(node)
+           ^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 149, in visit_FunctionDef
+    self.generic_visit(node)
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 426, in generic_visit
+    self.visit(item)
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 418, in visit
+    return visitor(node)
+           ^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 203, in visit_Assign
+    self.generic_visit(node)
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 428, in generic_visit
+    self.visit(value)
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 418, in visit
+    return visitor(node)
+           ^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 428, in generic_visit
+    self.visit(value)
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 418, in visit
+    return visitor(node)
+           ^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 137, in visit_Attribute
+    lhs = self.visit(node.value)
+          ^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 418, in visit
+    return visitor(node)
+           ^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 428, in generic_visit
+    self.visit(value)
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 418, in visit
+    return visitor(node)
+           ^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 142, in visit_Attribute
+    ret = getattr(lhs, node.attr)
+          ^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: module 'triton.language.math' has no attribute 'trunc'
+
+Main Critical Problem Analysis:
+Problem Analysis (from expert diagnosis):
+critical_issue: Using tl.math.trunc which doesn't exist in Triton, should use tl.math.floor instead for non-negative indices.
+why_it_matters: AttributeError occurs during kernel compilation because triton.language.math has no trunc function, causing compilation to fail.
+minimal_fix_hint: Replace all tl.math.trunc calls with tl.math.floor since indices are non-negative.
+
+Focus your fix on addressing the identified critical issue.
+
+
+Broken Code:
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 256}, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 512}, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=8),
+    ],
+    key=['total_elements']
+)
+@triton.jit
+def clamp_div_kernel(
+    x_ptr,
+    out_ptr,
+    N, C, D, H, W,
+    stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
+    min_value,
+    divisor,
+    total_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Fused kernel: clamp(min=min_value) + division by divisor
+    Input/Output: [N, C, D, H, W]
+    """
+    # 1D grid covering all elements
+    pid = tl.program_id(0)
+    
+    # Calculate block offset
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < total_elements
+    
+    # Compute 5D indices from 1D offset
+    # Using integer arithmetic to avoid expensive modulo operations
+    HW = H * W
+    DHW = D * HW
+    CDHW = C * DHW
+    
+    # Efficiently compute indices using integer division
+    # Note: Triton doesn't have integer division, so we use floating point with truncation
+    # This is OK since all values are positive integers
+    idx = offsets
+    n_idx = tl.math.trunc(idx / CDHW).to(tl.int64)
+    remainder = idx - n_idx * CDHW
+    c_idx = tl.math.trunc(remainder / DHW).to(tl.int64)
+    remainder = remainder - c_idx * DHW
+    d_idx = tl.math.trunc(remainder / HW).to(tl.int64)
+    remainder = remainder - d_idx * HW
+    h_idx = tl.math.trunc(remainder / W).to(tl.int64)
+    w_idx = remainder - h_idx * W
+    
+    # Compute memory offsets using strides
+    ptr_offsets = (n_idx * stride_xn + 
+                   c_idx * stride_xc + 
+                   d_idx * stride_xd + 
+                   h_idx * stride_xh + 
+                   w_idx * stride_xw)
+    
+    # Load data
+    x = tl.load(x_ptr + ptr_offsets, mask=mask)
+    
+    # Apply operations: clamp(min=min_value) + division
+    # Use tl.maximum for clamp(min=...)
+    x = tl.maximum(x, min_value)
+    x = x / divisor
+    
+    # Store result
+    tl.store(out_ptr + ptr_offsets, x, mask=mask)
+
+
+def fused_clamp_div(x, min_value, divisor):
+    """
+    Fused clamp(min=min_value) + division by divisor
+    """
+    N, C, D, H, W = x.shape
+    
+    # Create output tensor
+    out = torch.empty_like(x)
+    
+    # Calculate total elements
+    total_elements = N * C * D * H * W
+    
+    # Calculate grid
+    grid = (triton.cdiv(total_elements, 1024),)  # Max BLOCK_SIZE from configs
+    
+    # Launch kernel
+    clamp_div_kernel[grid](
+        x, out,
+        N, C, D, H, W,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
+        float(min_value), float(divisor),
+        total_elements,
+    )
+    
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    ConvTranspose3d (PyTorch native) + Fused clamp + division (Triton)
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, min_value, divisor):
+        super(ModelNew, self).__init__()
+        # Keep ConvTranspose3d as PyTorch native - DO NOT reimplement in Triton
+        self.conv_transpose = nn.ConvTranspose3d(
+            in_channels, out_channels, kernel_size,
+            stride=stride, padding=padding
+        )
+        self.min_value = min_value
+        self.divisor = divisor
+
+    def forward(self, x):
+        # Step 1: PyTorch native ConvTranspose3d
+        x = self.conv_transpose(x)
+        # Step 2: Fused clamp + division in Triton
+        x = fused_clamp_div(x, self.min_value, self.divisor)
+        return x
+```
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl, AND any other modules used (e.g., import math if using math.sqrt)
+   2. @triton.jit decorated kernel function(s) — NO continue/break/return inside loops (use masking)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels — THIS CLASS IS REQUIRED
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+3. Learn from previous repair attempts to avoid repeating the same mistakes
+4. Ensure ALL imports are included at the top (common mistake: forgetting `import math`)
+
+```python
+# <corrected code>
+```

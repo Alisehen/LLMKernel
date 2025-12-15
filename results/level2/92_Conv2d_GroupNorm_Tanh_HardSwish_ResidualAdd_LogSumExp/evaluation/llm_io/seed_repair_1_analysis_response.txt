@@ -1,0 +1,5 @@
+{
+  "critical_issue": "ModelNew defines standalone conv parameters (self.weight/self.bias) instead of a Conv2d module, so its state_dict keys don’t match the reference model’s conv.weight/conv.bias.",
+  "why_it_matters": "The harness cannot correctly copy the reference Conv2d parameters into ModelNew, causing the two models to use different convolution weights/biases and producing large numeric output mismatches.",
+  "minimal_fix_hint": "Make ModelNew’s convolution parameters structurally compatible with the reference (e.g., use self.conv = nn.Conv2d and feed self.conv.weight/bias into the Triton kernel)."
+}

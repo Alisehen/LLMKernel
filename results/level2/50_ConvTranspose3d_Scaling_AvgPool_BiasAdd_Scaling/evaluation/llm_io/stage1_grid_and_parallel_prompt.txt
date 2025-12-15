@@ -1,0 +1,252 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU
+GPU Name: 4090
+Architecture: Ada Lovelace
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+[OPTIMIZATION STAGE]
+
+## Current Optimization Stage
+
+Focus: Grid layout & indexing for FUSED operations.
+
+⚠️ FUSION EXCLUSIONS (do NOT apply fusion rules to these):
+- Reduction ops (sum, mean, softmax along axis)
+- Atomic operations
+- Irregular/data-dependent access patterns
+- Cross-block dependencies
+
+Key Principle:
+- All fused ops share the SAME grid AND the SAME (offsets, mask) tuple
+- Grid covers OUTPUT tensor dimensions
+
+Hard Rules:
+- Every fused op MUST use identical offset calculation
+- Every fused op MUST use identical boundary mask
+- If broadcast needed: explicit `[None, :]` or `[:, None]`, NOT different offsets
+- Element-wise: 1D grid, single `offs = pid * BLOCK + tl.arange(0, BLOCK)`
+- Matmul fusion: 2D grid, `offs_m/offs_n` shared by bias add & activation
+
+Verification:
+- Check: all tl.load/tl.store use same `offsets` variable
+- Check: all masks derived from same boundary condition
+- If ANY op needs different indexing → do NOT fuse, split kernel
+
+
+
+[CURRENT CODE]
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+import math
+
+
+@triton.jit
+def fused_scale_pool_bias_scale_kernel(
+    x_ptr, out_ptr,
+    scale1_ptr, bias_ptr, scale2_ptr,
+    N, C, D, H, W,
+    stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
+    stride_on, stride_oc, stride_od, stride_oh, stride_ow,
+    POOL_K: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    BLOCK_DHW: tl.constexpr,
+):
+    """
+    Fused kernel: Scale1 + AvgPool3d(2) + BiasAdd + Scale2
+    Input: [N, C, D, H, W] -> Output: [N, C, D//2, H//2, W//2]
+    POOL_K = 2 (pooling kernel size)
+    """
+    # Program indices
+    pid_n = tl.program_id(0)
+    pid_cdhw = tl.program_id(1)
+    
+    if pid_n >= N:
+        return
+    
+    # Decode channel and spatial indices
+    D_out = D // POOL_K
+    H_out = H // POOL_K
+    W_out = W // POOL_K
+    DHW_out = D_out * H_out * W_out
+    
+    # Total number of blocks in grid dimension 1
+    C_BLOCKS = tl.cdiv(C, BLOCK_C)
+    DHW_BLOCKS = tl.cdiv(DHW_out, BLOCK_DHW)
+    
+    # Correctly compute pid_c_block and spatial block index
+    total_blocks = C_BLOCKS * DHW_BLOCKS
+    if pid_cdhw >= total_blocks:
+        return
+    
+    pid_c_block = pid_cdhw // DHW_BLOCKS
+    pid_spatial_block = pid_cdhw % DHW_BLOCKS
+    
+    # Channel offsets
+    c_offs = pid_c_block * BLOCK_C + tl.arange(0, BLOCK_C)
+    c_mask = c_offs < C
+    
+    # Load parameters
+    scale1 = tl.load(scale1_ptr)
+    scale2 = tl.load(scale2_ptr)
+    bias_vals = tl.load(bias_ptr + c_offs, mask=c_mask, other=0.0)
+    
+    # Process multiple spatial positions within this block
+    for local_spatial_idx in range(BLOCK_DHW):
+        spatial_idx = pid_spatial_block * BLOCK_DHW + local_spatial_idx
+        
+        # Check spatial bounds - replace continue with conditional execution
+        if spatial_idx < DHW_out:
+            # Convert to 3D spatial indices
+            d_out = spatial_idx // (H_out * W_out)
+            hw_out = spatial_idx % (H_out * W_out)
+            h_out = hw_out // W_out
+            w_out = hw_out % W_out
+            
+            # Calculate input spatial offsets (2x2x2 pooling)
+            d_in_start = d_out * POOL_K
+            h_in_start = h_out * POOL_K
+            w_in_start = w_out * POOL_K
+            
+            # Accumulate for pooling (2x2x2 = 8 elements)
+            pool_sum = tl.zeros((BLOCK_C,), dtype=tl.float32)
+            
+            for dd in range(POOL_K):
+                d_in = d_in_start + dd
+                for dh in range(POOL_K):
+                    h_in = h_in_start + dh
+                    for dw in range(POOL_K):
+                        w_in = w_in_start + dw
+                        
+                        # Calculate pointer offsets
+                        x_offset = (pid_n * stride_xn + 
+                                   c_offs * stride_xc + 
+                                   d_in * stride_xd + 
+                                   h_in * stride_xh + 
+                                   w_in * stride_xw)
+                        
+                        x_vals = tl.load(x_ptr + x_offset, mask=c_mask, other=0.0)
+                        # Apply scale1 and accumulate
+                        pool_sum += x_vals * scale1
+            
+            # Average pooling (divide by 8)
+            pool_avg = pool_sum / (POOL_K * POOL_K * POOL_K)
+            
+            # Add bias and apply scale2
+            result = (pool_avg + bias_vals) * scale2
+            
+            # Store result
+            out_offset = (pid_n * stride_on + 
+                          c_offs * stride_oc + 
+                          d_out * stride_od + 
+                          h_out * stride_oh + 
+                          w_out * stride_ow)
+            
+            tl.store(out_ptr + out_offset, result, mask=c_mask)
+
+
+def fused_post_convtranspose(x, scale1, bias, scale2):
+    """
+    Fused: Scale1 + AvgPool3d(2) + BiasAdd + Scale2
+    """
+    N, C, D, H, W = x.shape
+    D_out, H_out, W_out = D // 2, H // 2, W // 2
+    out = torch.empty((N, C, D_out, H_out, W_out), 
+                      device=x.device, dtype=x.dtype)
+    
+    # Configuration
+    BLOCK_C = triton.next_power_of_2(C)
+    # Limit BLOCK_C to avoid register pressure
+    if BLOCK_C > 512:
+        BLOCK_C = 512
+    
+    # Spatial block size - process multiple spatial positions per program
+    MAX_SPATIAL_PER_BLOCK = 4
+    DHW_out = D_out * H_out * W_out
+    BLOCK_DHW = min(DHW_out, MAX_SPATIAL_PER_BLOCK)
+    
+    # Calculate grid
+    C_BLOCKS = (C + BLOCK_C - 1) // BLOCK_C
+    DHW_BLOCKS = (DHW_out + BLOCK_DHW - 1) // BLOCK_DHW
+    grid = (N, C_BLOCKS * DHW_BLOCKS)
+    
+    # Launch kernel
+    fused_scale_pool_bias_scale_kernel[grid](
+        x, out,
+        scale1, bias, scale2,
+        N, C, D, H, W,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
+        out.stride(0), out.stride(1), out.stride(2), out.stride(3), out.stride(4),
+        POOL_K=2,
+        BLOCK_C=BLOCK_C,
+        BLOCK_DHW=BLOCK_DHW,
+    )
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    ConvTranspose3d (PyTorch native) + Fused: Scale1 + AvgPool3d(2) + BiasAdd + Scale2 (Triton)
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, scale1, scale2, bias_shape):
+        super(ModelNew, self).__init__()
+        # Keep ConvTranspose as PyTorch native
+        self.conv_transpose = nn.ConvTranspose3d(
+            in_channels, out_channels, kernel_size, 
+            stride=stride, padding=padding
+        )
+        self.scale1 = nn.Parameter(torch.tensor(scale1, dtype=torch.float32))
+        self.bias = nn.Parameter(torch.randn(out_channels, 1, 1, 1, dtype=torch.float32))
+        self.scale2 = nn.Parameter(torch.tensor(scale2, dtype=torch.float32))
+    
+    def forward(self, x):
+        # Step 1: PyTorch native ConvTranspose3d
+        x = self.conv_transpose(x)
+        # Step 2: Fused post-ops in Triton
+        x = fused_post_convtranspose(x, self.scale1, self.bias, self.scale2)
+        return x
+```
+
+[NCU PROFILING METRICS]
+{
+  "fused_scale_pool_bias_scale_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 26.46,
+    "launch__grid_size": 461312,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 94.98,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 30.32,
+    "lts__t_sector_hit_rate.pct": 77.24
+  }
+}
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+TRITON API CONSTRAINTS (CRITICAL):
+- Triton has NO: tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

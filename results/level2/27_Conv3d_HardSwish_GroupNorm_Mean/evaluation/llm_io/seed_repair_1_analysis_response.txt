@@ -1,0 +1,5 @@
+{
+  "critical_issue": "ModelNew defines conv3d parameters as root-level `weight`/`bias` instead of a `conv` submodule, so its parameters don't match or get loaded from the reference PyTorch Conv3d.",
+  "why_it_matters": "The test harness copies conv weights by name from the reference model; because ModelNew's names differ, it uses random conv parameters, yielding large numerical discrepancies and the reported output mismatch.",
+  "minimal_fix_hint": "Define an nn.Conv3d submodule `self.conv` in ModelNew (matching the reference) or rename parameters so `conv.weight` and `conv.bias` exist and receive the reference model's values."
+}

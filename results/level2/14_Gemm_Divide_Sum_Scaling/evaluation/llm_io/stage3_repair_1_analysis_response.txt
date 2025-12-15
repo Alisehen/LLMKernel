@@ -1,0 +1,5 @@
+{
+  "critical_issue": "The Triton path computes (scaling_factor/2) * x @ weight.sum(dim=0) instead of (x @ weight.T / 2).sum(dim=1, keepdim=True) * scaling_factor.",
+  "why_it_matters": "This algebraic rewrite is not equivalent for arbitrary inputs, so the fused kernel implements a different mathematical operation, causing large numerical discrepancies versus the PyTorch reference.",
+  "minimal_fix_hint": "Make the Triton implementation directly mirror the original matmul/divide/sum/scale sequence without collapsing weight to weight.sum(dim=0)."
+}

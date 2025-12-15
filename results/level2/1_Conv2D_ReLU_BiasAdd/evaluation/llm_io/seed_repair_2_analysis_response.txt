@@ -1,0 +1,5 @@
+{
+  "critical_issue": "The fused Triton path omits nn.Conv2d’s built‑in bias and instead only applies a single post‑ReLU bias, changing the network from conv+b_conv→ReLU→+bias to conv→ReLU→+bias.",
+  "why_it_matters": "Dropping conv.bias alters pre‑ReLU activations and overall offsets, so ModelNew no longer matches the PyTorch reference computation, causing large numeric differences in the output comparison.",
+  "minimal_fix_hint": "Incorporate the original Conv2d bias into the fused kernel so it computes ReLU(x*W + conv_bias) + extra_bias, and ensure ModelNew exposes matching weight and bias parameters."
+}

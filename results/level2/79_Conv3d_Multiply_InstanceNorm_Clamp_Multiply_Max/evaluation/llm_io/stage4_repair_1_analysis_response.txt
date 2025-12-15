@@ -1,0 +1,5 @@
+{
+  "critical_issue": "Weight pointers are computed without adding the base w_ptr, so w_ptrs is an int32 offset, not a proper pointer, causing tl.load to see an unsupported ptr type.",
+  "why_it_matters": "tl.load requires a pointer-typed tensor; passing a plain int32 offset makes Triton’s semantic loader reject the argument, triggering the ‘Unsupported ptr type <[\"32\"], int32> in tl.load’ error.",
+  "minimal_fix_hint": "Include the weight base pointer in address calculations, e.g., w_base_out = w_ptr + offs_n * stride_wn so all subsequent w_* variables are true pointers."
+}

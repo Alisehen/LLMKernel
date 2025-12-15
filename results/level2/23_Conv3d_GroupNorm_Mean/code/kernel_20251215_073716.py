@@ -1,0 +1,282 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        # Conservative baseline (requested)
+        triton.Config(
+            {'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+        # Higher-parallelism, more compute-dense tile for Ada (compute-bound)
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_warps=8,
+            num_stages=2,
+        ),
+        # Smaller tile fallback for high register-pressure / odd sizes
+        triton.Config(
+            {'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+    ],
+    key=["N", "C_in", "D_out", "H_out", "W_out", "C_out"],
+)
+@triton.jit
+def conv3d_ncdhw_kernel(
+    x_ptr,  # [N, C_in, D_in, H_in, W_in]
+    w_ptr,  # [C_out, C_in, K_D, K_H, K_W]
+    b_ptr,  # [C_out]
+    y_ptr,  # [N, C_out, D_out, H_out, W_out]
+    N,
+    C_in,
+    D_in,
+    H_in,
+    W_in,
+    C_out,
+    K_D,
+    K_H,
+    K_W,
+    D_out,
+    H_out,
+    W_out,
+    stride_xn,
+    stride_xc,
+    stride_xd,
+    stride_xh,
+    stride_xw,
+    stride_wn,
+    stride_wc,
+    stride_wd,
+    stride_wh,
+    stride_ww,
+    stride_yn,
+    stride_yc,
+    stride_yd,
+    stride_yh,
+    stride_yw,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    tl.static_assert(BLOCK_K % 16 == 0)
+
+    # -------------------------------------------------------------------------
+    # Program IDs: 2D grid over (M = N*D_out*H_out*W_out, N = C_out)
+    # -------------------------------------------------------------------------
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    # Aranges reused across loop to reduce overhead
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k_base = tl.arange(0, BLOCK_K)
+
+    # Total number of output positions per sample
+    P = N * D_out * H_out * W_out
+    mask_m = offs_m < P
+    mask_n = offs_n < C_out
+
+    # Decode offs_m -> (n, od, oh, ow)
+    DHW = D_out * H_out * W_out
+    HW = H_out * W_out
+
+    n = offs_m // DHW
+    rem = offs_m - n * DHW
+    od = rem // HW
+    rem2 = rem - od * HW
+    oh = rem2 // W_out
+    ow = rem2 - oh * W_out
+
+    # Flattened reduction dimension size
+    K_total = C_in * K_D * K_H * K_W
+
+    # Precompute kernel-shape products once
+    KHW = K_H * K_W
+    KDKHW = K_D * KHW
+
+    # Accumulator in FP32
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Base pointer for all output pixels in this tile (independent of K)
+    x_base_ptrs = (
+        x_ptr
+        + n * stride_xn
+        + od * stride_xd
+        + oh * stride_xh
+        + ow * stride_xw
+    )
+
+    # Base pointer for each output channel (independent of K)
+    w_base = w_ptr + offs_n * stride_wn
+
+    # -------------------------------------------------------------------------
+    # Main implicit-GEMM loop over flattened (C_in * K_D * K_H * K_W) dimension
+    # -------------------------------------------------------------------------
+    for k0 in range(0, K_total, BLOCK_K):
+        offs_k = k0 + offs_k_base
+        k_mask = offs_k < K_total
+
+        # Decode flattened K index -> (ic, kd, kh, kw)
+        tmp = offs_k
+        ic = tmp // KDKHW
+        tmp = tmp - ic * KDKHW
+        kd = tmp // KHW
+        tmp = tmp - kd * KHW
+        kh = tmp // K_W
+        kw = tmp - kh * K_W
+
+        # Offsets in input and weight tensors for the K tile
+        x_k_offsets = (
+            ic * stride_xc
+            + kd * stride_xd
+            + kh * stride_xh
+            + kw * stride_xw
+        )
+        w_k_offsets = (
+            ic * stride_wc
+            + kd * stride_wd
+            + kh * stride_wh
+            + kw * stride_ww
+        )
+
+        # Input pointers for this (M, K) tile
+        x_ptrs = x_base_ptrs[:, None] + x_k_offsets[None, :]
+        # Weight pointers for this (K, N) tile
+        w_ptrs = w_base[None, :] + w_k_offsets[:, None]
+
+        # Masks for loads
+        mask_x = mask_m[:, None] & k_mask[None, :]
+        mask_w = k_mask[:, None] & mask_n[None, :]
+
+        # Load tiles; tl.dot will use Tensor Cores for fp16/bf16 and TF32 where applicable
+        x_vals = tl.load(x_ptrs, mask=mask_x, other=0.0)
+        w_vals = tl.load(w_ptrs, mask=mask_w, other=0.0)
+
+        # TensorCore-friendly dot: (BLOCK_M, BLOCK_K) x (BLOCK_K, BLOCK_N)
+        acc += tl.dot(x_vals, w_vals)
+
+    # Bias add
+    bias_vals = tl.load(b_ptr + offs_n, mask=mask_n, other=0.0)
+    acc += bias_vals[None, :]
+
+    # Store output [N, C_out, D_out, H_out, W_out]
+    y_ptrs = (
+        y_ptr
+        + n[:, None] * stride_yn
+        + offs_n[None, :] * stride_yc
+        + od[:, None] * stride_yd
+        + oh[:, None] * stride_yh
+        + ow[:, None] * stride_yw
+    )
+    mask_store = mask_m[:, None] & mask_n[None, :]
+    tl.store(y_ptrs, acc, mask=mask_store)
+
+
+def conv3d_triton(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    NCDHW Conv3d (stride=1, padding=0, dilation=1) using an implicit-GEMM Triton kernel.
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+    assert x.dtype == weight.dtype == bias.dtype
+
+    N, C_in, D_in, H_in, W_in = x.shape
+    C_out, C_in_w, K_D, K_H, K_W = weight.shape
+    assert C_in == C_in_w
+
+    D_out = D_in - K_D + 1
+    H_out = H_in - K_H + 1
+    W_out = W_in - K_W + 1
+    assert D_out > 0 and H_out > 0 and W_out > 0
+
+    y = torch.empty((N, C_out, D_out, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    def grid(meta):
+        return (
+            triton.cdiv(N * D_out * H_out * W_out, meta["BLOCK_M"]),
+            triton.cdiv(C_out, meta["BLOCK_N"]),
+        )
+
+    conv3d_ncdhw_kernel[grid](
+        x,
+        weight,
+        bias,
+        y,
+        N,
+        C_in,
+        D_in,
+        H_in,
+        W_in,
+        C_out,
+        K_D,
+        K_H,
+        K_W,
+        D_out,
+        H_out,
+        W_out,
+        x.stride(0),
+        x.stride(1),
+        x.stride(2),
+        x.stride(3),
+        x.stride(4),
+        weight.stride(0),
+        weight.stride(1),
+        weight.stride(2),
+        weight.stride(3),
+        weight.stride(4),
+        y.stride(0),
+        y.stride(1),
+        y.stride(2),
+        y.stride(3),
+        y.stride(4),
+    )
+
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    3D convolution via Triton, followed by GroupNorm and mean over (C, D, H, W).
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size, num_groups):
+        super(ModelNew, self).__init__()
+        if isinstance(kernel_size, int):
+            k_d = k_h = k_w = kernel_size
+        else:
+            k_d, k_h, k_w = kernel_size
+        assert k_d == k_h == k_w, "This implementation assumes cubic kernels."
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = k_d
+
+        # Conv3d parameters (NCDHW)
+        self.weight = nn.Parameter(
+            torch.empty(out_channels, in_channels, k_d, k_h, k_w)
+        )
+        self.bias = nn.Parameter(torch.empty(out_channels))
+
+        # Initialize similar to nn.Conv3d default
+        import math
+
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        fan_in = in_channels * k_d * k_h * k_w
+        bound = 1.0 / math.sqrt(fan_in)
+        nn.init.uniform_(self.bias, -bound, bound)
+
+        # GroupNorm (operates on [N, C_out, D, H, W])
+        self.group_norm = nn.GroupNorm(num_groups, out_channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Triton Conv3d
+        x = conv3d_triton(x, self.weight, self.bias)
+        # GroupNorm + mean over (C, D, H, W)
+        x = self.group_norm(x)
+        x = x.mean(dim=[1, 2, 3, 4])
+        return x.unsqueeze(1)

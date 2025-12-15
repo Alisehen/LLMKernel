@@ -1,0 +1,212 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def fused_bn_avgpool_kernel(
+    # Pointers to tensors
+    x_ptr, gamma_ptr, beta_ptr, mean_ptr, var_ptr, out_ptr,
+    # Tensor dimensions
+    N, C, D, H, W,
+    D_out, H_out, W_out,
+    # Strides for input tensor
+    stride_n, stride_c, stride_d, stride_h, stride_w,
+    # Strides for output tensor
+    out_stride_n, out_stride_c, out_stride_d, out_stride_h, out_stride_w,
+    # BatchNorm parameters
+    eps: tl.constexpr,
+    # Kernel configuration
+    BLOCK_D: tl.constexpr, BLOCK_H: tl.constexpr, BLOCK_W: tl.constexpr,
+):
+    """
+    Fused BatchNorm3d + AvgPool3d(kernel_size=2) + AvgPool3d(kernel_size=2) kernel.
+    Input: [N, C, D, H, W]
+    Output: [N, C, D_out, H_out, W_out] where D_out = D//4, H_out = H//4, W_out = W//4
+    
+    Uses provided batch statistics (mean, var) for normalization.
+    """
+    # Parallelize over channels and spatial dimensions
+    pid_n = tl.program_id(0)  # batch index
+    pid_c = tl.program_id(1)  # channel index
+    pid_s = tl.program_id(2)  # spatial index (combined D_out * H_out * W_out)
+    
+    if pid_n >= N or pid_c >= C:
+        return
+    
+    # Decode spatial index
+    num_h_out = H_out
+    num_w_out = W_out
+    d_out = pid_s // (num_h_out * num_w_out)
+    hw_rem = pid_s % (num_h_out * num_w_out)
+    h_out = hw_rem // num_w_out
+    w_out = hw_rem % num_w_out
+    
+    # Load BatchNorm parameters for this channel
+    gamma = tl.load(gamma_ptr + pid_c)
+    beta = tl.load(beta_ptr + pid_c)
+    
+    # Load statistics (provided from outside - batch statistics in training)
+    mean = tl.load(mean_ptr + pid_c)
+    var = tl.load(var_ptr + pid_c)
+    
+    # Precompute normalization factor
+    inv_std = 1.0 / tl.sqrt(var + eps)
+    
+    # Input spatial start indices
+    d_start = d_out * 4
+    h_start = h_out * 4
+    w_start = w_out * 4
+    
+    # Accumulate over 4x4x4 block
+    accum = 0.0
+    count = 0.0
+    
+    # Process 4x4x4 block in smaller chunks
+    for d_off in range(0, 4, BLOCK_D):
+        d_idx = d_start + d_off
+        d_mask = d_idx < D
+        
+        for h_off in range(0, 4, BLOCK_H):
+            h_idx = h_start + h_off
+            h_mask = h_idx < H
+            
+            for w_off in range(0, 4, BLOCK_W):
+                w_idx = w_start + w_off
+                w_mask = w_idx < W
+                
+                # Create mask for all active threads
+                mask = d_mask & h_mask & w_mask
+                
+                # Compute pointer offsets
+                base_offset = (
+                    pid_n * stride_n + 
+                    pid_c * stride_c + 
+                    d_idx * stride_d + 
+                    h_idx * stride_h + 
+                    w_idx * stride_w
+                )
+                
+                # Load input values
+                x_val = tl.load(x_ptr + base_offset, mask=mask, other=0.0)
+                
+                # Apply BatchNorm: y = (x - mean) / sqrt(var + eps) * gamma + beta
+                normalized = (x_val - mean) * inv_std
+                scaled = normalized * gamma + beta
+                
+                # Accumulate for average pooling
+                accum += tl.where(mask, scaled, 0.0)
+                count += tl.where(mask, 1.0, 0.0)
+    
+    # Compute average (handles boundary conditions)
+    result = accum / tl.maximum(count, 1.0)
+    
+    # Compute output index
+    out_offset = (
+        pid_n * out_stride_n + 
+        pid_c * out_stride_c + 
+        d_out * out_stride_d + 
+        h_out * out_stride_h + 
+        w_out * out_stride_w
+    )
+    
+    # Store result
+    tl.store(out_ptr + out_offset, result)
+
+
+def fused_batch_norm_avgpool(x, gamma, beta, running_mean, running_var, 
+                            training=False, eps=1e-5, momentum=0.1):
+    """
+    Fused BatchNorm3d + AvgPool3d(kernel_size=2) + AvgPool3d(kernel_size=2)
+    
+    Args:
+        x: Input tensor of shape [N, C, D, H, W]
+        gamma: Weight parameter of shape [C]
+        beta: Bias parameter of shape [C]
+        running_mean: Running mean of shape [C]
+        running_var: Running variance of shape [C]
+        training: Whether in training mode
+        eps: Added to denominator for numerical stability
+        momentum: Momentum for updating running statistics
+    
+    Returns:
+        Output tensor of shape [N, C, D//4, H//4, W//4]
+    """
+    N, C, D, H, W = x.shape
+    
+    # Use floor division for non-divisible dimensions
+    D_out, H_out, W_out = D // 4, H // 4, W // 4
+    out_shape = (N, C, D_out, H_out, W_out)
+    out = torch.empty(out_shape, device=x.device, dtype=x.dtype)
+    
+    # Compute statistics based on training mode
+    if training:
+        # Compute batch statistics
+        mean = x.mean(dim=(0, 2, 3, 4))
+        var = x.var(dim=(0, 2, 3, 4), unbiased=False)
+        
+        # Update running statistics
+        running_mean.mul_(1 - momentum).add_(mean, alpha=momentum)
+        running_var.mul_(1 - momentum).add_(var, alpha=momentum)
+    else:
+        # Use stored statistics
+        mean = running_mean
+        var = running_var
+    
+    # Grid configuration
+    grid = (N, C, D_out * H_out * W_out)
+    
+    # Launch kernel with computed statistics (batch stats in training, running stats in eval)
+    fused_bn_avgpool_kernel[grid](
+        x, gamma, beta, mean, var, out,
+        N, C, D, H, W,
+        D_out, H_out, W_out,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
+        out.stride(0), out.stride(1), out.stride(2), out.stride(3), out.stride(4),
+        eps,
+        BLOCK_D=2, BLOCK_H=2, BLOCK_W=2,
+    )
+    
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    ConvTranspose3d (PyTorch native) + Fused BatchNorm3d + 2x AvgPool3d (Triton fused)
+    
+    Note: ConvTranspose3d has complex index mapping - keep it in PyTorch.
+    Only fuse the subsequent operations (BatchNorm and two average pools) in Triton.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, bias_shape):
+        super(ModelNew, self).__init__()
+        # Keep ConvTranspose3d as PyTorch native
+        self.conv_transpose = nn.ConvTranspose3d(
+            in_channels, out_channels, kernel_size, 
+            stride=stride, padding=padding
+        )
+        
+        # Initialize BatchNorm parameters
+        self.gamma = nn.Parameter(torch.ones(out_channels))
+        self.beta = nn.Parameter(torch.zeros(out_channels))
+        self.register_buffer('running_mean', torch.zeros(out_channels))
+        self.register_buffer('running_var', torch.ones(out_channels))
+        
+        # Set default BatchNorm parameters
+        self.eps = 1e-5
+        self.momentum = 0.1
+    
+    def forward(self, x):
+        # Step 1: PyTorch native ConvTranspose3d
+        x = self.conv_transpose(x)
+        
+        # Step 2: Fused BatchNorm3d + AvgPool3d + AvgPool3d in Triton
+        x = fused_batch_norm_avgpool(
+            x, self.gamma, self.beta, 
+            self.running_mean, self.running_var,
+            training=self.training,
+            eps=self.eps,
+            momentum=self.momentum
+        )
+        
+        return x

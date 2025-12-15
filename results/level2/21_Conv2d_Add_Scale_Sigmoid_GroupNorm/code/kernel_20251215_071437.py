@@ -1,0 +1,265 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        # Main config: balanced tile, good tensor-core utilization, moderate registers
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=3,
+        ),
+        # More C_out parallelism, less M per block
+        triton.Config(
+            {'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=3,
+        ),
+        # More M parallelism, less C_out per block (fallback for register-heavy cases)
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32},
+            num_warps=2,
+            num_stages=2,
+        ),
+    ],
+    key=['P', 'C_out'],
+)
+@triton.jit
+def conv_bias_scale_sigmoid_kernel(
+    x_ptr,           # *f32/f16, input:  [N, C_in, H_in, W_in]
+    w_ptr,           # *f32/f16, weight: [C_out, C_in, KH, KW]
+    conv_bias_ptr,   # *f32,    conv bias: [C_out]
+    bias_ptr,        # *f32,    extra bias: [C_out]
+    scale_ptr,       # *f32,    scale: [C_out]
+    y_ptr,           # *f32/f16, output: [N, C_out, H_out, W_out]
+    N, C_in, H_in, W_in,
+    C_out, KH: tl.constexpr, KW: tl.constexpr,
+    H_out, W_out, P,  # P = N * H_out * W_out
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_wo, stride_wi, stride_wkh, stride_wkw,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # 2D program id: [P, C_out] -> [M-tile, N-tile]
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    # Offsets in flattened spatial+batch dimension and output-channel dimension
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    mask_m = offs_m < P
+    mask_n = offs_n < C_out
+
+    # Help compiler with alignment / vectorization
+    tl.multiple_of(offs_m, BLOCK_M)
+    tl.multiple_of(offs_n, BLOCK_N)
+
+    # Decode (n, oh, ow) from flat index offs_m
+    HW = H_out * W_out
+    n_idx = offs_m // HW
+    rem = offs_m % HW
+    oh_idx = rem // W_out
+    ow_idx = rem % W_out
+
+    # Accumulator in fp32 (even if inputs are fp16/bf16)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Total reduction length: K = C_in * KH * KW
+    K_total = C_in * KH * KW
+
+    # Precompute some index constants (KH, KW are constexpr)
+    k_hw = KH * KW
+
+    # Reduction over K dimension, tiled by BLOCK_K
+    k_start = 0
+    while k_start < K_total:
+        offs_k = k_start + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < K_total
+        tl.multiple_of(offs_k, BLOCK_K)
+
+        # Map flattened kernel index -> (ic, kh, kw)
+        ic = offs_k // k_hw
+        rem_k = offs_k % k_hw
+        kh = rem_k // KW
+        kw = rem_k % KW
+
+        # Input coordinates for this K-tile
+        ih = oh_idx[:, None] + kh[None, :]
+        iw = ow_idx[:, None] + kw[None, :]
+
+        # Load input tile: x[n, ic, ih, iw] -> [BLOCK_M, BLOCK_K]
+        x_ptrs = (
+            x_ptr
+            + n_idx[:, None] * stride_xn
+            + ic[None, :] * stride_xc
+            + ih * stride_xh
+            + iw * stride_xw
+        )
+        x_tile = tl.load(
+            x_ptrs,
+            mask=mask_m[:, None] & mask_k[None, :],
+            other=0.0,
+        )
+
+        # Load weight tile: w[co, ic, kh, kw] -> [BLOCK_K, BLOCK_N]
+        w_ptrs = (
+            w_ptr
+            + offs_n[None, :] * stride_wo
+            + ic[:, None] * stride_wi
+            + kh[:, None] * stride_wkh
+            + kw[:, None] * stride_wkw
+        )
+        w_tile = tl.load(
+            w_ptrs,
+            mask=mask_k[:, None] & mask_n[None, :],
+            other=0.0,
+        )
+
+        # Matrix multiply accumulate using tensor cores where possible
+        acc += tl.dot(x_tile, w_tile)
+
+        k_start += BLOCK_K
+
+    # Fused epilogue: conv_bias -> extra bias -> scale -> sigmoid
+    conv_b = tl.load(conv_bias_ptr + offs_n, mask=mask_n, other=0.0)
+    bias = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0)
+    scale = tl.load(scale_ptr + offs_n, mask=mask_n, other=0.0)
+
+    # Combine biases first to reduce extra temporaries per element
+    acc = acc + (conv_b[None, :] + bias[None, :])
+    acc = acc * scale[None, :]
+
+    # Sigmoid: 1 / (1 + exp(-x))
+    acc = 1.0 / (1.0 + tl.exp(-acc))
+
+    # Store output: y[n, co, oh, ow]
+    y_ptrs = (
+        y_ptr
+        + n_idx[:, None] * stride_yn
+        + offs_n[None, :] * stride_yc
+        + oh_idx[:, None] * stride_yh
+        + ow_idx[:, None] * stride_yw
+    )
+    tl.store(
+        y_ptrs,
+        acc,
+        mask=mask_m[:, None] & mask_n[None, :],
+    )
+
+
+def fused_conv_bias_scale_sigmoid(x, weight, conv_bias, bias, scale):
+    """
+    x:        [N, C_in, H_in, W_in]
+    weight:   [C_out, C_in, KH, KW]
+    conv_bias:[C_out]
+    bias:     [C_out, 1, 1]
+    scale:    [C_out, 1, 1]
+    returns:  [N, C_out, H_out, W_out]
+    """
+    assert x.ndim == 4
+    assert weight.ndim == 4
+
+    N, C_in, H_in, W_in = x.shape
+    C_out, Cw_in, KH, KW = weight.shape
+    assert Cw_in == C_in, "Weight in_channels must match input channels"
+
+    # Valid convolution (no padding, stride=1)
+    H_out = H_in - KH + 1
+    W_out = W_in - KW + 1
+    assert H_out > 0 and W_out > 0, "Invalid spatial size for given kernel"
+    P = N * H_out * W_out
+
+    # Flatten bias/scale to [C_out]
+    bias_flat = bias.view(C_out)
+    scale_flat = scale.view(C_out)
+
+    # Allocate output
+    y = torch.empty((N, C_out, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    # Grid covers the 2D output domain [P, C_out]
+    def grid(meta):
+        return (
+            triton.cdiv(P, meta['BLOCK_M']),
+            triton.cdiv(C_out, meta['BLOCK_N']),
+        )
+
+    conv_bias_scale_sigmoid_kernel[grid](
+        x,
+        weight,
+        conv_bias,
+        bias_flat,
+        scale_flat,
+        y,
+        N,
+        C_in,
+        H_in,
+        W_in,
+        C_out,
+        KH,
+        KW,
+        H_out,
+        W_out,
+        P,
+        x.stride(0),
+        x.stride(1),
+        x.stride(2),
+        x.stride(3),
+        weight.stride(0),
+        weight.stride(1),
+        weight.stride(2),
+        weight.stride(3),
+        y.stride(0),
+        y.stride(1),
+        y.stride(2),
+        y.stride(3),
+    )
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-based replacement for:
+      Conv2d -> add bias -> scale -> sigmoid -> GroupNorm
+
+    Convolution, conv.bias, extra bias, scale, and sigmoid are fused in a Triton kernel;
+    GroupNorm is applied using PyTorch.
+
+    A nn.Conv2d module named `conv` is kept so that state_dict key compatibility
+    with the reference model (`conv.weight` / `conv.bias`) is preserved.
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size, num_groups, bias_shape, scale_shape):
+        super(ModelNew, self).__init__()
+
+        if isinstance(kernel_size, int):
+            kh = kw = kernel_size
+        else:
+            kh, kw = kernel_size
+        self.kernel_size = (kh, kw)
+
+        # Conv module purely to hold parameters with names `conv.weight` / `conv.bias`
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, bias=True)
+
+        # Extra bias and scale (broadcast over spatial dims)
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.scale = nn.Parameter(torch.randn(scale_shape))
+
+        # GroupNorm as in the original model
+        self.group_norm = nn.GroupNorm(num_groups, out_channels)
+
+    def forward(self, x):
+        x = fused_conv_bias_scale_sigmoid(
+            x,
+            self.conv.weight,
+            self.conv.bias,
+            self.bias,
+            self.scale,
+        )
+        x = self.group_norm(x)
+        return x

@@ -1,0 +1,386 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU
+GPU Name: 4090
+Architecture: Ada Lovelace
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+[OPTIMIZATION STAGE]
+
+## Current Optimization Stage
+
+Focus: Grid layout & indexing for FUSED operations.
+
+⚠️ FUSION EXCLUSIONS (do NOT apply fusion rules to these):
+- Reduction ops (sum, mean, softmax along axis)
+- Atomic operations
+- Irregular/data-dependent access patterns
+- Cross-block dependencies
+
+Key Principle:
+- All fused ops share the SAME grid AND the SAME (offsets, mask) tuple
+- Grid covers OUTPUT tensor dimensions
+
+Hard Rules:
+- Every fused op MUST use identical offset calculation
+- Every fused op MUST use identical boundary mask
+- If broadcast needed: explicit `[None, :]` or `[:, None]`, NOT different offsets
+- Element-wise: 1D grid, single `offs = pid * BLOCK + tl.arange(0, BLOCK)`
+- Matmul fusion: 2D grid, `offs_m/offs_n` shared by bias add & activation
+
+Verification:
+- Check: all tl.load/tl.store use same `offsets` variable
+- Check: all masks derived from same boundary condition
+- If ANY op needs different indexing → do NOT fuse, split kernel
+
+
+
+[CURRENT CODE]
+```python
+import math
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+# ----------------------------
+# 1. GEMM (Linear) Kernel
+# ----------------------------
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32}, num_warps=4),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 32}, num_warps=4),
+    ],
+    key=["M", "N", "K"],
+)
+@triton.jit
+def linear_gemm_kernel(
+    a_ptr,  # [M, K]
+    b_ptr,  # [K, N]
+    bias_ptr,  # [N]
+    c_ptr,  # [M, N]
+    M, N, K,
+    stride_am, stride_ak,   # a strides
+    stride_bk, stride_bn,   # b strides
+    stride_cm, stride_cn,   # c strides
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    k = 0
+    while k < K:
+        k_remaining = K - k
+        k_mask = offs_k < k_remaining
+
+        a = tl.load(
+            a_ptrs,
+            mask=(offs_m[:, None] < M) & k_mask[None, :],
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptrs,
+            mask=k_mask[:, None] & (offs_n[None, :] < N),
+            other=0.0,
+        )
+        acc += tl.dot(a, b, allow_tf32=True)
+
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+        k += BLOCK_K
+
+    # Add bias (broadcast over M)
+    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc += bias[None, :]
+
+    # Store result
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, acc, mask=mask)
+
+
+# ----------------------------
+# 2. Row-wise Mean/Var Kernel
+#    Computes mean/var over features for each row
+#    Input:  x [B, N]
+#    Output: mean [B], var [B]
+# ----------------------------
+
+@triton.jit
+def row_mean_var_kernel(
+    x_ptr,        # [B, N]
+    mean_ptr,     # [B]
+    var_ptr,      # [B]
+    B, N,
+    stride_xm, stride_xn,
+    invN,         # 1.0 / N (float32)
+    BLOCK_N: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    row = pid
+
+    offs_n = tl.arange(0, BLOCK_N)
+
+    sum_val = tl.zeros((), dtype=tl.float32)
+    sum_sq_val = tl.zeros((), dtype=tl.float32)
+
+    col = 0
+    while col < N:
+        cols = col + offs_n
+        mask = (row < B) & (cols < N)
+        x = tl.load(
+            x_ptr + row * stride_xm + cols * stride_xn,
+            mask=mask,
+            other=0.0,
+        )
+        sum_val += tl.sum(x, axis=0)
+        sum_sq_val += tl.sum(x * x, axis=0)
+        col += BLOCK_N
+
+    mean = sum_val * invN
+    var = sum_sq_val * invN - mean * mean
+
+    mask_row = row < B
+    tl.store(mean_ptr + row, mean, mask=mask_row)
+    tl.store(var_ptr + row, var, mask=mask_row)
+
+
+# ----------------------------
+# 3. Instance-Norm + Residual Kernel
+#    y_out = ((x - mean[row]) / sqrt(var[row] + eps) + y) * y
+#    Shapes: x,y,out [B, N], mean,var [B]
+# ----------------------------
+
+@triton.jit
+def instancenorm_residual_kernel(
+    x_ptr,        # [B, N]
+    y_ptr,        # [B, N]
+    mean_ptr,     # [B]
+    var_ptr,      # [B]
+    out_ptr,      # [B, N]
+    B, N,
+    stride_xm, stride_xn,
+    stride_ym, stride_yn,
+    stride_om, stride_on,
+    eps,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    # Load row-wise mean/var
+    mean = tl.load(mean_ptr + offs_m, mask=offs_m < B, other=0.0)
+    var = tl.load(var_ptr + offs_m, mask=offs_m < B, other=0.0)
+    rstd = 1.0 / tl.sqrt(var + eps)
+
+    x_ptrs = x_ptr + offs_m[:, None] * stride_xm + offs_n[None, :] * stride_xn
+    y_ptrs = y_ptr + offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn
+    out_ptrs = out_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
+
+    mask = (offs_m[:, None] < B) & (offs_n[None, :] < N)
+
+    x = tl.load(x_ptrs, mask=mask, other=0.0)
+    y = tl.load(y_ptrs, mask=mask, other=0.0)
+
+    x_norm = (x - mean[:, None]) * rstd[:, None]
+    out = (x_norm + y) * y
+
+    tl.store(out_ptrs, out, mask=mask)
+
+
+# ----------------------------
+# 4. Python Wrapper
+# ----------------------------
+
+def fused_linear_instance_norm_residual(x, y, weight, bias, eps: float):
+    """
+    x: [B, in_features]
+    y: [B, out_features]
+    weight: [out_features, in_features]
+    bias: [out_features]
+    returns: [B, out_features]
+    """
+    assert x.is_cuda and y.is_cuda and weight.is_cuda and bias.is_cuda
+    assert x.dtype == torch.float32, "This implementation assumes float32 inputs."
+    assert y.dtype == torch.float32
+    assert weight.dtype == torch.float32
+    assert bias.dtype == torch.float32
+
+    B, K = x.shape
+    out_features, K_w = weight.shape
+    assert K_w == K
+    assert y.shape[0] == B and y.shape[1] == out_features
+
+    # GEMM: x @ weight.T + bias
+    # weight.T has shape [K, out_features]
+    w_t = weight.t().contiguous()
+    out_lin = torch.empty((B, out_features), device=x.device, dtype=x.dtype)
+
+    grid_gemm = lambda META: (
+        triton.cdiv(B, META["BLOCK_M"]),
+        triton.cdiv(out_features, META["BLOCK_N"]),
+    )
+
+    linear_gemm_kernel[grid_gemm](
+        x, w_t, bias, out_lin,
+        B, out_features, K,
+        x.stride(0), x.stride(1),
+        w_t.stride(0), w_t.stride(1),
+        out_lin.stride(0), out_lin.stride(1),
+    )
+
+    # Row-wise mean/var over features (dimension N)
+    mean = torch.empty(B, device=x.device, dtype=torch.float32)
+    var = torch.empty(B, device=x.device, dtype=torch.float32)
+    invN = 1.0 / float(out_features)
+
+    BLOCK_N = 1024  # power of 2
+
+    grid_mean_var = (triton.cdiv(B, 1),)
+
+    row_mean_var_kernel[grid_mean_var](
+        out_lin,
+        mean,
+        var,
+        B,
+        out_features,
+        out_lin.stride(0),
+        out_lin.stride(1),
+        invN,
+        BLOCK_N=BLOCK_N,
+    )
+
+    # Instance-norm-like normalization + residual add/mul
+    out = torch.empty_like(out_lin)
+
+    BLOCK_M = 32
+    BLOCK_N2 = 128
+
+    grid_norm = lambda META: (
+        triton.cdiv(B, META["BLOCK_M"]),
+        triton.cdiv(out_features, META["BLOCK_N"]),
+    )
+
+    instancenorm_residual_kernel[grid_norm](
+        out_lin,
+        y,
+        mean,
+        var,
+        out,
+        B,
+        out_features,
+        out_lin.stride(0),
+        out_lin.stride(1),
+        y.stride(0),
+        y.stride(1),
+        out.stride(0),
+        out.stride(1),
+        eps,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N2,
+    )
+
+    return out
+
+
+# ----------------------------
+# 5. nn.Module Wrapper
+# ----------------------------
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized version of:
+      - Linear (bmm)
+      - Instance-like normalization over features
+      - x = (norm(x) + y)
+      - x = x * y
+    """
+    def __init__(self, in_features, out_features, eps=1e-5, momentum=0.1):
+        super(ModelNew, self).__init__()
+        # Linear layer parameters
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias = nn.Parameter(torch.empty(out_features))
+        self.eps = eps
+        self.momentum = momentum  # kept for API parity, not used
+
+        # Initialize like nn.Linear
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+        bound = 1 / math.sqrt(fan_in)
+        nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x, y):
+        return fused_linear_instance_norm_residual(x, y, self.weight, self.bias, self.eps)
+```
+
+[NCU PROFILING METRICS]
+{
+  "linear_gemm_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 29.18,
+    "launch__grid_size": 1024,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 16.66,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 12.83,
+    "lts__t_sector_hit_rate.pct": 93.3
+  },
+  "row_mean_var_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 14.96,
+    "launch__grid_size": 1024,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 63.2,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 90.61,
+    "lts__t_sector_hit_rate.pct": 0.71
+  },
+  "instancenorm_residual_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 3.45,
+    "launch__grid_size": 2048,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 36.97,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 92.41,
+    "lts__t_sector_hit_rate.pct": 33.75
+  }
+}
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+TRITON API CONSTRAINTS (CRITICAL):
+- Triton has NO: tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

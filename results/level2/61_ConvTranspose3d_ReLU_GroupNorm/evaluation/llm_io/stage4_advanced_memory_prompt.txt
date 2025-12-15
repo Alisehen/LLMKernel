@@ -1,0 +1,360 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU
+GPU Name: 4090
+Architecture: Ada Lovelace
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+[OPTIMIZATION STAGE]
+
+## Current Optimization Stage
+
+Focus: Fine-tuning fused kernel parameters.
+
+Params:
+- num_warps ∈ {4, 8}
+- num_stages ∈ {2, 3}
+
+Conditional Rules (NOT one-size-fits-all):
+
+IF register pressure LOW (regs < 96, no spill):
+  - Try num_warps=8 for compute-bound fusion
+  - num_stages=3 may help hide latency
+
+IF register pressure HIGH (regs > 128 or occupancy_limit_registers):
+  - Use num_warps=4 (fewer warps = more registers per warp)
+  - Keep num_stages=2 (higher stages need more registers)
+
+IF multi-input fusion (3+ distinct loads):
+  - num_stages=2 preferred (each stage buffers all inputs)
+  - num_warps=4 often better than 8
+
+Autotune:
+- Max 2-3 configs to reduce compilation time
+- Always include conservative baseline (num_warps=4, num_stages=2)
+- Test before/after: revert if gain < 2%
+
+
+
+[CURRENT CODE]
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def fused_relu_group_norm_stats_kernel(
+    x_ptr,
+    group_sum_ptr,
+    group_sum_sq_ptr,
+    N, C, D, H, W,
+    stride_n, stride_c, stride_d, stride_h, stride_w,
+    groups,
+    eps,
+    BLOCK_C: tl.constexpr,
+    BLOCK_DHW: tl.constexpr,
+    num_spatial_blocks: tl.constexpr,
+    num_c_blocks: tl.constexpr,
+):
+    """Phase 1: Compute group statistics with atomic reduction for maximum parallelism"""
+    pid_n = tl.program_id(0)  # Batch index
+    pid_g = tl.program_id(1)  # Group index
+    pid_combined = tl.program_id(2)  # Combined channel-spatial block
+    
+    if pid_n >= N or pid_g >= groups:
+        return
+    
+    group_channels = C // groups
+    group_start = pid_g * group_channels
+    DHW = D * H * W
+    
+    # Decompose combined index into channel and spatial blocks
+    pid_c_block = pid_combined % num_c_blocks
+    pid_spatial_block = pid_combined // num_c_blocks
+    
+    if pid_c_block >= num_c_blocks or pid_spatial_block >= num_spatial_blocks:
+        return
+    
+    # Compute block offsets
+    c_offset = pid_c_block * BLOCK_C
+    dhw_offset = pid_spatial_block * BLOCK_DHW
+    
+    c_idx = tl.arange(0, BLOCK_C)
+    dhw_idx = tl.arange(0, BLOCK_DHW)
+    
+    c = group_start + c_offset + c_idx
+    global_dhw = dhw_offset + dhw_idx
+    
+    # Masks
+    c_mask = c < (group_start + group_channels)
+    spatial_mask = global_dhw < DHW
+    valid_mask = c_mask[:, None] & spatial_mask[None, :]
+    
+    # Compute spatial indices (optimized: avoid integer division in loop)
+    HW = H * W
+    d_idx = global_dhw // HW
+    hw_rem = global_dhw % HW
+    h_idx = hw_rem // W
+    w_idx = hw_rem % W
+    
+    # Compute offsets with pre-computed strides
+    offsets = (
+        pid_n * stride_n +
+        c[:, None] * stride_c +
+        d_idx[None, :] * stride_d +
+        h_idx[None, :] * stride_h +
+        w_idx[None, :] * stride_w
+    )
+    
+    # Load and apply ReLU
+    x_vals = tl.load(x_ptr + offsets, mask=valid_mask, other=0.0)
+    x_relu = tl.maximum(x_vals, 0.0)
+    
+    # Accumulate with direct reduction (no intermediate arrays)
+    sum_val = tl.sum(tl.where(valid_mask, x_relu, 0.0), axis=1)
+    x_relu_sq = x_relu * x_relu
+    sum_sq = tl.sum(tl.where(valid_mask, x_relu_sq, 0.0), axis=1)
+    
+    # Reduce across channels in this block
+    block_sum = tl.sum(sum_val)
+    block_sum_sq = tl.sum(sum_sq)
+    
+    # Atomic reduction to global memory
+    stats_idx = pid_n * groups + pid_g
+    if block_sum != 0:
+        tl.atomic_add(group_sum_ptr + stats_idx, block_sum)
+    if block_sum_sq != 0:
+        tl.atomic_add(group_sum_sq_ptr + stats_idx, block_sum_sq)
+
+
+@triton.jit
+def fused_relu_group_norm_apply_kernel(
+    x_ptr,
+    weight_ptr,
+    bias_ptr,
+    group_sum_ptr,
+    group_sum_sq_ptr,
+    out_ptr,
+    N, C, D, H, W,
+    stride_n, stride_c, stride_d, stride_h, stride_w,
+    out_stride_n, out_stride_c, out_stride_d, out_stride_h, out_stride_w,
+    groups,
+    eps,
+    BLOCK_C: tl.constexpr,
+    BLOCK_DHW: tl.constexpr,
+):
+    """Phase 2: Apply normalization with optimized memory access patterns"""
+    pid_n = tl.program_id(0)
+    pid_g = tl.program_id(1)
+    pid_spatial = tl.program_id(2)
+    
+    if pid_n >= N or pid_g >= groups:
+        return
+    
+    group_channels = C // groups
+    group_start = pid_g * group_channels
+    
+    # Read group statistics once per block
+    stats_idx = pid_n * groups + pid_g
+    group_sum = tl.load(group_sum_ptr + stats_idx)
+    group_sum_sq = tl.load(group_sum_sq_ptr + stats_idx)
+    
+    DHW = D * H * W
+    count = tl.cast(group_channels * DHW, tl.float32)
+    
+    # Compute normalization parameters (avoid division by zero)
+    safe_count = tl.maximum(count, 1.0)
+    mean = group_sum / safe_count
+    variance = tl.maximum(group_sum_sq / safe_count - mean * mean, 0.0)
+    inv_std = 1.0 / tl.sqrt(variance + eps)
+    
+    # Process spatial block
+    dhw_offset = pid_spatial * BLOCK_DHW
+    dhw_idx = tl.arange(0, BLOCK_DHW)
+    global_dhw = dhw_offset + dhw_idx
+    spatial_mask = global_dhw < DHW
+    
+    # Optimized spatial index computation
+    HW = H * W
+    d_idx = global_dhw // HW
+    hw_rem = global_dhw % HW
+    h_idx = hw_rem // W
+    w_idx = hw_rem % W
+    
+    # Process channels in blocks (kept in registers)
+    for c_offset in range(0, group_channels, BLOCK_C):
+        c_idx = tl.arange(0, BLOCK_C)
+        c = group_start + c_offset + c_idx
+        c_mask = c < (group_start + group_channels)
+        
+        # Broadcast masks
+        valid_mask = c_mask[:, None] & spatial_mask[None, :]
+        
+        # Compute input offsets
+        offsets_in = (
+            pid_n * stride_n +
+            c[:, None] * stride_c +
+            d_idx[None, :] * stride_d +
+            h_idx[None, :] * stride_h +
+            w_idx[None, :] * stride_w
+        )
+        
+        # Load input, apply ReLU, normalize in one fused operation
+        x_vals = tl.load(x_ptr + offsets_in, mask=valid_mask, other=0.0)
+        x_relu = tl.maximum(x_vals, 0.0)
+        
+        # Fused normalization and affine transform
+        normalized = (x_relu - mean) * inv_std
+        
+        # Load weight and bias once per channel block
+        weight_vals = tl.load(weight_ptr + c, mask=c_mask, other=0.0)
+        bias_vals = tl.load(bias_ptr + c, mask=c_mask, other=0.0)
+        
+        # Apply affine transform
+        output = normalized * weight_vals[:, None] + bias_vals[:, None]
+        
+        # Compute output offsets and store
+        offsets_out = (
+            pid_n * out_stride_n +
+            c[:, None] * out_stride_c +
+            d_idx[None, :] * out_stride_d +
+            h_idx[None, :] * out_stride_h +
+            w_idx[None, :] * out_stride_w
+        )
+        
+        tl.store(out_ptr + offsets_out, output, mask=valid_mask)
+
+
+def fused_relu_group_norm(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, groups: int) -> torch.Tensor:
+    """Optimized wrapper for fused ReLU + GroupNorm"""
+    N, C, D, H, W = x.shape
+    assert C % groups == 0, f"Channels {C} must be divisible by groups {groups}"
+    
+    out = torch.empty_like(x)
+    eps = 1e-5
+    group_channels = C // groups
+    DHW = D * H * W
+    
+    # Phase 1: Statistics with increased parallelism
+    group_sum = torch.zeros(N * groups, dtype=torch.float32, device=x.device)
+    group_sum_sq = torch.zeros(N * groups, dtype=torch.float32, device=x.device)
+    
+    # Optimized block sizes for Ada Lovelace
+    BLOCK_C_STATS = min(triton.next_power_of_2(group_channels), 32)
+    BLOCK_DHW_STATS = 64
+    
+    # Compute number of blocks
+    num_c_blocks = (group_channels + BLOCK_C_STATS - 1) // BLOCK_C_STATS
+    num_spatial_blocks = (DHW + BLOCK_DHW_STATS - 1) // BLOCK_DHW_STATS
+    num_blocks = num_c_blocks * num_spatial_blocks
+    
+    grid_stats = (N, groups, num_blocks)
+    
+    fused_relu_group_norm_stats_kernel[grid_stats](
+        x, group_sum, group_sum_sq,
+        N, C, D, H, W,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
+        groups, eps,
+        BLOCK_C=BLOCK_C_STATS,
+        BLOCK_DHW=BLOCK_DHW_STATS,
+        num_spatial_blocks=num_spatial_blocks,
+        num_c_blocks=num_c_blocks,
+        num_stages=2,
+    )
+    
+    # Phase 2: Apply normalization
+    BLOCK_C_APPLY = min(triton.next_power_of_2(group_channels), 32)
+    BLOCK_DHW_APPLY = 64
+    
+    spatial_blocks = (DHW + BLOCK_DHW_APPLY - 1) // BLOCK_DHW_APPLY
+    grid_apply = (N, groups, spatial_blocks)
+    
+    fused_relu_group_norm_apply_kernel[grid_apply](
+        x, weight, bias, group_sum, group_sum_sq, out,
+        N, C, D, H, W,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
+        out.stride(0), out.stride(1), out.stride(2), out.stride(3), out.stride(4),
+        groups, eps,
+        BLOCK_C=BLOCK_C_APPLY,
+        BLOCK_DHW=BLOCK_DHW_APPLY,
+        num_stages=2,
+    )
+    
+    return out
+
+
+class ModelNew(nn.Module):
+    """ConvTranspose3d + Optimized Fused ReLU + GroupNorm"""
+    def __init__(self, in_channels, out_channels, kernel_size, groups, bias=False):
+        super(ModelNew, self).__init__()
+        
+        self.conv_transpose = nn.ConvTranspose3d(
+            in_channels, out_channels, kernel_size, bias=bias
+        )
+        
+        self.weight = nn.Parameter(torch.ones(out_channels))
+        self.bias = nn.Parameter(torch.zeros(out_channels))
+        self.groups = groups
+        
+        nn.init.ones_(self.weight)
+        nn.init.zeros_(self.bias)
+    
+    def forward(self, x):
+        # PyTorch native ConvTranspose3d
+        x = self.conv_transpose(x)
+        
+        # Optimized fused ReLU + GroupNorm
+        x = fused_relu_group_norm(x, self.weight, self.bias, self.groups)
+        
+        return x
+```
+
+[NCU PROFILING METRICS]
+{
+  "fused_relu_group_norm_stats_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 29.71,
+    "launch__grid_size": 78720,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 85.4,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 73.25,
+    "lts__t_sector_hit_rate.pct": 11.32
+  },
+  "fused_relu_group_norm_apply_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 12.73,
+    "launch__grid_size": 78720,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 61.46,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 54.42,
+    "lts__t_sector_hit_rate.pct": 77.8
+  }
+}
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+TRITON API CONSTRAINTS (CRITICAL):
+- Triton has NO: tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

@@ -1,0 +1,5 @@
+{
+  "critical_issue": "Matrix multiply uses tl.dot with allow_tf32=False, while PyTorch nn.Linear relies on TF32 accumulation by default, causing systematic numeric mismatch.",
+  "why_it_matters": "Different accumulation precision changes rounding in large K=8192 dot-products, producing ~1e-2 deviations that violate the atol/rtol thresholds even though the activation pipeline is otherwise correct.",
+  "minimal_fix_hint": "Enable TF32 in tl.dot to mirror PyTorch matmul numerics, e.g., set allow_tf32=True or remove the explicit flag."
+}

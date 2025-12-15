@@ -1,0 +1,389 @@
+Fix the Triton kernel errors. Generate correct, high-performance code.
+
+Current Error Log:
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 538, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251214_114800_batch_range81to100_deepseek_deepseek/99_Matmul_GELU_Softmax/code/kernel_20251214_212237.py", line 273, in forward
+    return fused_gemm_gelu_softmax(x, self.weight)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251214_114800_batch_range81to100_deepseek_deepseek/99_Matmul_GELU_Softmax/code/kernel_20251214_212237.py", line 223, in fused_gemm_gelu_softmax
+    fused_gemm_gelu_softmax_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 347, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 192, in run
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 192, in <dictcomp>
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 170, in _bench
+    return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/testing.py", line 145, in do_bench
+    fn()
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 156, in kernel_call
+    self.fn.run(
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 569, in run
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 230, in compile
+    key = f"{triton_key()}-{src.hash()}-{backend.hash()}-{options.hash()}-{str(sorted(env_vars.items()))}"
+                            ^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 77, in hash
+    key = f"{self.fn.cache_key}-{str(self.attrs)}-{sorted_sig}-{constants_key}"
+             ^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 665, in cache_key
+    dependencies_finder.visit(self.parse())
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 418, in visit
+    return visitor(node)
+           ^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 426, in generic_visit
+    self.visit(item)
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 418, in visit
+    return visitor(node)
+           ^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 149, in visit_FunctionDef
+    self.generic_visit(node)
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 426, in generic_visit
+    self.visit(item)
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 418, in visit
+    return visitor(node)
+           ^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 215, in visit_For
+    self.generic_visit(node)
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 426, in generic_visit
+    self.visit(item)
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 418, in visit
+    return visitor(node)
+           ^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 426, in generic_visit
+    self.visit(item)
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 418, in visit
+    return visitor(node)
+           ^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 428, in generic_visit
+    self.visit(value)
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 418, in visit
+    return visitor(node)
+           ^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 428, in generic_visit
+    self.visit(value)
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/ast.py", line 418, in visit
+    return visitor(node)
+           ^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 142, in visit_Attribute
+    ret = getattr(lhs, node.attr)
+          ^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: module 'triton.language' has no attribute 'prefetch'
+
+Main Critical Problem Analysis:
+Problem Analysis (from expert diagnosis):
+critical_issue: Using undefined tl.prefetch() function in Triton kernel - no such built-in exists.
+why_it_matters: Triton compiler fails during AST parsing because 'prefetch' is not a valid attribute of triton.language module.
+minimal_fix_hint: Remove or replace tl.prefetch() calls with manual prefetch via regular loads.
+
+Focus your fix on addressing the identified critical issue.
+
+
+Broken Code:
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+import math
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64, 'num_warps': 4, 'num_stages': 2}),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32, 'num_warps': 8, 'num_stages': 3}),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32, 'num_warps': 8, 'num_stages': 3}),
+    ],
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def fused_gemm_gelu_softmax_kernel(
+    # Pointers to matrices
+    a_ptr, b_ptr, c_ptr,
+    # Matrix dimensions
+    M, N, K,
+    # Strides
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    # Block sizes
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    # Tuning parameters
+    num_warps: tl.constexpr, num_stages: tl.constexpr,
+):
+    """Fused GEMM + GELU + Softmax kernel with optimal block tiling."""
+    # Program ID
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    
+    # Offsets for this block
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    
+    # Initialize accumulator in shared memory for softmax reduction
+    # Use float32 for accumulation regardless of input dtype
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    # Pointers to A and B matrices
+    a_ptr_base = a_ptr
+    b_ptr_base = b_ptr
+    
+    # Loop over K dimension with software pipelining
+    for k in range(0, K, BLOCK_K):
+        # Prefetch next block
+        if k + BLOCK_K < K:
+            a_ptrs_next = a_ptr_base + BLOCK_K * stride_ak + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
+            b_ptrs_next = b_ptr_base + BLOCK_K * stride_bk + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
+            
+            a_mask_next = (offs_m[:, None] < M) & (offs_k[None, :] < K - k - BLOCK_K)
+            b_mask_next = (offs_k[:, None] < K - k - BLOCK_K) & (offs_n[None, :] < N)
+            
+            tl.prefetch(a_ptrs_next, mask=a_mask_next)
+            tl.prefetch(b_ptrs_next, mask=b_mask_next)
+        
+        # Load current block
+        a_ptrs = a_ptr_base + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
+        b_ptrs = b_ptr_base + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
+        
+        a_mask = (offs_m[:, None] < M) & (offs_k[None, :] < K - k)
+        b_mask = (offs_k[:, None] < K - k) & (offs_n[None, :] < N)
+        
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+        
+        # Tensor Core GEMM accumulation
+        acc += tl.dot(a, b, allow_tf32=True, out_dtype=tl.float32)
+        
+        # Advance pointers
+        a_ptr_base += BLOCK_K * stride_ak
+        b_ptr_base += BLOCK_K * stride_bk
+    
+    # === Apply GELU activation (optimized for Ada Lovelace) ===
+    # Fast GELU approximation with minimal operations
+    # GELU(x) ≈ 0.5x * (1 + tanh(0.7978845608 * (x + 0.044715 * x^3)))
+    # Optimized to use fused multiply-add operations
+    
+    # Compute x^3 efficiently
+    x_cubed = acc * acc * acc
+    # Fused multiply-add: inner = 0.7978845608 * (acc + 0.044715 * x_cubed)
+    inner = tl.math.fma(0.044715, x_cubed, acc) * 0.7978845608028654
+    
+    # Fast tanh approximation using expm1 for better numerical stability
+    # tanh(x) = (exp(2x) - 1) / (exp(2x) + 1) = 1 - 2/(1 + exp(2x))
+    two_inner = 2.0 * inner
+    exp_2x = tl.exp(two_inner)
+    tanh_inner = 1.0 - 2.0 / (1.0 + exp_2x)
+    
+    # Final GELU: 0.5 * x * (1 + tanh(inner))
+    gelu_out = 0.5 * acc * (1.0 + tanh_inner)
+    
+    # === Softmax within the same tile ===
+    # Each thread block processes BLOCK_M x BLOCK_N elements
+    # For row-wise softmax, we need reductions across N dimension
+    
+    # Store GELU output to shared memory for softmax reduction
+    # We'll use a two-pass softmax: compute max and sum, then normalize
+    
+    # Allocate shared memory for row-wise reductions
+    shmem_max = tl.zeros((BLOCK_M,), dtype=tl.float32) - float('inf')
+    shmem_sum = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    
+    # First: compute row max within this tile
+    row_max = tl.max(gelu_out, axis=1)
+    shmem_max = tl.maximum(shmem_max, row_max)
+    
+    # Compute exp(x - max) and sum
+    gelu_sub = gelu_out - shmem_max[:, None]
+    exp_vals = tl.exp(gelu_sub)
+    row_sum = tl.sum(exp_vals, axis=1)
+    shmem_sum += row_sum
+    
+    # Second: normalize
+    softmax_out = exp_vals / shmem_sum[:, None]
+    
+    # Write final result to global memory
+    mask_m = offs_m[:, None] < M
+    mask_n = offs_n[None, :] < N
+    mask = mask_m & mask_n
+    
+    c_ptrs = c_ptr + (offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn)
+    tl.store(c_ptrs, softmax_out, mask=mask)
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'num_warps': 4, 'num_stages': 2}),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'num_warps': 8, 'num_stages': 3}),
+    ],
+    key=['M', 'N'],
+)
+@triton.jit
+def softmax_fallback_kernel(
+    x_ptr,
+    M, N,
+    stride_xm, stride_xn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    num_warps: tl.constexpr, num_stages: tl.constexpr,
+):
+    """Fallback softmax for large rows that don't fit in shared memory."""
+    pid = tl.program_id(0)
+    
+    offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    row_mask = offs_m < M
+    
+    # Allocate shared memory for reductions (1 per row in block)
+    shmem_max = tl.zeros((BLOCK_M,), dtype=tl.float32) - float('inf')
+    shmem_sum = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    
+    # First pass: compute row max
+    for n_start in range(0, N, BLOCK_N):
+        offs_n = n_start + tl.arange(0, BLOCK_N)
+        
+        x_ptrs = x_ptr + (offs_m[:, None] * stride_xm + offs_n[None, :] * stride_xn)
+        mask = row_mask[:, None] & (offs_n[None, :] < N)
+        x_vals = tl.load(x_ptrs, mask=mask, other=-float('inf'))
+        
+        # Update row max
+        shmem_max = tl.maximum(shmem_max, tl.max(x_vals, axis=1))
+    
+    # Second pass: compute exp and sum
+    for n_start in range(0, N, BLOCK_N):
+        offs_n = n_start + tl.arange(0, BLOCK_N)
+        
+        x_ptrs = x_ptr + (offs_m[:, None] * stride_xm + offs_n[None, :] * stride_xn)
+        mask = row_mask[:, None] & (offs_n[None, :] < N)
+        x_vals = tl.load(x_ptrs, mask=mask, other=0.0)
+        
+        # Compute exp(x - max)
+        exp_vals = tl.exp(x_vals - shmem_max[:, None])
+        shmem_sum += tl.sum(exp_vals, axis=1)
+        
+        # Store back exponentials
+        tl.store(x_ptrs, exp_vals, mask=mask)
+    
+    # Third pass: normalize
+    for n_start in range(0, N, BLOCK_N):
+        offs_n = n_start + tl.arange(0, BLOCK_N)
+        
+        x_ptrs = x_ptr + (offs_m[:, None] * stride_xm + offs_n[None, :] * stride_xn)
+        mask = row_mask[:, None] & (offs_n[None, :] < N)
+        exp_vals = tl.load(x_ptrs, mask=mask, other=0.0)
+        
+        # Normalize
+        softmax_vals = exp_vals / shmem_sum[:, None]
+        tl.store(x_ptrs, softmax_vals, mask=mask)
+
+
+def fused_gemm_gelu_softmax(x, weight):
+    """Fused GEMM + GELU + Softmax operation with adaptive kernel selection."""
+    # Ensure inputs are contiguous
+    x = x.contiguous()
+    weight = weight.contiguous()
+    
+    # Get dimensions
+    M, K = x.shape
+    N = weight.shape[0]
+    
+    # Allocate output tensor with proper alignment
+    c = torch.empty((M, N), device=x.device, dtype=x.dtype)
+    
+    # Prepare weight for transposed access
+    b = weight
+    
+    # Determine optimal kernel based on dimensions
+    # For large enough N that fits in shared memory, use fused kernel
+    # Otherwise use separate kernels
+    max_shared_n = 128 * 256  # Approximate shared memory limit
+    
+    if N <= max_shared_n:
+        # Use fused kernel - all operations in one pass
+        grid = lambda META: (
+            triton.cdiv(M, META['BLOCK_M']),
+            triton.cdiv(N, META['BLOCK_N'])
+        )
+        
+        fused_gemm_gelu_softmax_kernel[grid](
+            x, b, c,
+            M, N, K,
+            x.stride(0), x.stride(1),
+            b.stride(1), b.stride(0),
+            c.stride(0), c.stride(1)
+        )
+    else:
+        # Use separate GEMM+GELU then softmax (better for very large N)
+        # First: GEMM + GELU
+        grid_gemm = lambda META: (
+            triton.cdiv(M, META['BLOCK_M']),
+            triton.cdiv(N, META['BLOCK_N'])
+        )
+        
+        # Allocate intermediate output
+        intermediate = torch.empty((M, N), device=x.device, dtype=x.dtype)
+        
+        fused_gemm_gelu_softmax_kernel[grid_gemm](
+            x, b, intermediate,
+            M, N, K,
+            x.stride(0), x.stride(1),
+            b.stride(1), b.stride(0),
+            intermediate.stride(0), intermediate.stride(1),
+            BLOCK_M=64, BLOCK_N=64, BLOCK_K=32,
+            num_warps=4, num_stages=2
+        )
+        
+        # Then: Softmax
+        grid_softmax = lambda META: (triton.cdiv(M, META['BLOCK_M']),)
+        
+        softmax_fallback_kernel[grid_softmax](
+            intermediate,
+            M, N,
+            intermediate.stride(0), intermediate.stride(1)
+        )
+        
+        c = intermediate
+    
+    return c
+
+
+class ModelNew(nn.Module):
+    """Optimized model with fused GEMM + GELU + Softmax."""
+    
+    def __init__(self, in_features, out_features):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+    
+    def forward(self, x):
+        return fused_gemm_gelu_softmax(x, self.weight)
+```
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl, AND any other modules used (e.g., import math if using math.sqrt)
+   2. @triton.jit decorated kernel function(s) — NO continue/break/return inside loops (use masking)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels — THIS CLASS IS REQUIRED
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+3. Learn from previous repair attempts to avoid repeating the same mistakes
+4. Ensure ALL imports are included at the top (common mistake: forgetting `import math`)
+
+```python
+# <corrected code>
+```

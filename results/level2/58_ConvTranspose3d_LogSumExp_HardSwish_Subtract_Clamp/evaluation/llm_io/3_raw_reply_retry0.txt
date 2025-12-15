@@ -1,0 +1,240 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+import math
+
+
+@triton.jit
+def fused_post_ops_kernel_optimized(
+    x_ptr,
+    bias_ptr,
+    out_ptr,
+    N, C, D, H, W,
+    stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
+    stride_on, stride_oc, stride_od, stride_oh, stride_ow,
+    BLOCK_C: tl.constexpr,
+    BLOCK_DHW: tl.constexpr,
+    VECTORIZE_LOAD: tl.constexpr,
+):
+    """
+    Optimized fused kernel with register pressure awareness
+    - Vectorized loads for better memory throughput
+    - Recomputed intermediates to reduce register pressure
+    - Optimized block sizes for Ada Lovelace
+    """
+    pid_n = tl.program_id(0)
+    pid_spatial = tl.program_id(1)
+    
+    if pid_n >= N:
+        return
+    
+    # Spatial indices - use 2D block for better cache locality
+    spatial_offsets = pid_spatial * BLOCK_DHW + tl.arange(0, BLOCK_DHW)
+    DHW = D * H * W
+    dhw_mask = spatial_offsets < DHW
+    
+    # Precompute spatial indices with integer arithmetic
+    HW = H * W
+    d_indices = spatial_offsets // HW
+    hw_remainder = spatial_offsets % HW
+    h_indices = hw_remainder // W
+    w_indices = hw_remainder % W
+    
+    # Channel block - smaller for register pressure
+    c_offsets = tl.arange(0, BLOCK_C)
+    c_mask = c_offsets < C
+    
+    # Initialize accumulators in registers
+    max_vals = tl.full([BLOCK_DHW], -float('inf'), dtype=tl.float32)
+    sum_exp_vals = tl.zeros([BLOCK_DHW], dtype=tl.float32)
+    
+    # Precompute base pointers for batch to reduce computation
+    x_batch_base = x_ptr + pid_n * stride_xn
+    out_batch_base = out_ptr + pid_n * stride_on
+    
+    # Loop over channel blocks with vectorized loads
+    for c_block_start in range(0, C, BLOCK_C):
+        current_c = c_block_start + c_offsets
+        current_c_mask = c_mask & (current_c < C)
+        
+        # Precompute channel offset once
+        channel_offset = current_c[:, None] * stride_xc
+        
+        # Vectorized load - unroll if VECTORIZE_LOAD > 1
+        if VECTORIZE_LOAD > 1:
+            # Use vectorized loads for better memory throughput
+            vec_size = VECTORIZE_LOAD
+            for vec_idx in range(0, BLOCK_C, vec_size):
+                vec_mask = (c_offsets[vec_idx:vec_idx+vec_size, None] < C) & dhw_mask[None, :]
+                if tl.sum(tl.cast(vec_mask, tl.int32)) > 0:
+                    vec_c = c_block_start + c_offsets[vec_idx:vec_idx+vec_size]
+                    vec_channel_offset = vec_c[:, None] * stride_xc
+                    
+                    # Compute pointer with spatial indices
+                    x_ptrs_vec = (
+                        x_batch_base +
+                        vec_channel_offset +
+                        d_indices[None, :] * stride_xd +
+                        h_indices[None, :] * stride_xh +
+                        w_indices[None, :] * stride_xw
+                    )
+                    
+                    # Load vectorized
+                    x_vals_vec = tl.load(
+                        x_ptrs_vec,
+                        mask=vec_mask,
+                        other=0.0
+                    )
+                    
+                    # Process vectorized values
+                    local_max_vec = tl.max(x_vals_vec, axis=0)
+                    exp_vals_vec = tl.exp(x_vals_vec - local_max_vec[None, :])
+                    local_sum_exp_vec = tl.sum(exp_vals_vec, axis=0)
+                    
+                    # Update accumulators
+                    new_max = tl.maximum(max_vals, local_max_vec)
+                    scale_prev = tl.exp(max_vals - new_max)
+                    scale_curr = tl.exp(local_max_vec - new_max)
+                    sum_exp_vals = scale_prev * sum_exp_vals + scale_curr * local_sum_exp_vec
+                    max_vals = new_max
+        else:
+            # Standard non-vectorized path for small blocks
+            x_ptrs = (
+                x_batch_base +
+                channel_offset +
+                d_indices[None, :] * stride_xd +
+                h_indices[None, :] * stride_xh +
+                w_indices[None, :] * stride_xw
+            )
+            
+            x_vals = tl.load(
+                x_ptrs,
+                mask=current_c_mask[:, None] & dhw_mask[None, :],
+                other=0.0
+            )
+            
+            # LogSumExp update with recomputation to save registers
+            local_max = tl.max(x_vals, axis=0)
+            exp_vals = tl.exp(x_vals - local_max[None, :])
+            local_sum_exp = tl.sum(exp_vals, axis=0)
+            
+            # Update with numerical stability
+            new_max = tl.maximum(max_vals, local_max)
+            scale_prev = tl.exp(max_vals - new_max)
+            scale_curr = tl.exp(local_max - new_max)
+            sum_exp_vals = scale_prev * sum_exp_vals + scale_curr * local_sum_exp
+            max_vals = new_max
+    
+    # Final LogSumExp - recompute log only once
+    logsumexp_vals = max_vals + tl.log(sum_exp_vals)
+    
+    # Fused HardSwish with recomputation to save registers
+    # HardSwish(x) = x * sigmoid(x + 3) / 6
+    x_plus_3 = logsumexp_vals + 3.0
+    sigmoid_in = 1.0 / (1.0 + tl.exp(-x_plus_3))  # Manual sigmoid
+    hardswish_vals = logsumexp_vals * sigmoid_in * (1.0 / 6.0)  # Multiply by 1/6
+    
+    # Load bias and subtract
+    bias = tl.load(bias_ptr)
+    result_vals = hardswish_vals - bias
+    
+    # Clamp with fused min/max
+    result_vals = tl.minimum(tl.maximum(result_vals, -1.0), 1.0)
+    
+    # Store results with coalesced writes
+    out_ptrs = (
+        out_batch_base +
+        d_indices * stride_od +
+        h_indices * stride_oh +
+        w_indices * stride_ow
+    )
+    tl.store(out_ptrs, result_vals, mask=dhw_mask)
+
+
+def fused_post_convtranspose_optimized(x, bias):
+    """
+    Optimized wrapper with autotuning for register pressure
+    """
+    N, C, D, H, W = x.shape
+    out = torch.empty((N, 1, D, H, W), device=x.device, dtype=x.dtype)
+    DHW = D * H * W
+    
+    # Autotune configurations - prioritize smaller blocks for register pressure
+    configs = []
+    
+    # Conservative configs for register-heavy operations
+    if DHW >= 512:
+        configs.append({'BLOCK_C': 32, 'BLOCK_DHW': 256, 'VECTORIZE_LOAD': 2})
+        configs.append({'BLOCK_C': 64, 'BLOCK_DHW': 128, 'VECTORIZE_LOAD': 2})
+    if DHW >= 256:
+        configs.append({'BLOCK_C': 32, 'BLOCK_DHW': 128, 'VECTORIZE_LOAD': 4})
+    
+    # Fallback config for small tensors
+    configs.append({'BLOCK_C': 16, 'BLOCK_DHW': 64, 'VECTORIZE_LOAD': 1})
+    
+    # Try configurations in order
+    for config in configs:
+        BLOCK_C = min(triton.next_power_of_2(C), config['BLOCK_C'])
+        BLOCK_DHW = config['BLOCK_DHW']
+        VECTORIZE_LOAD = config['VECTORIZE_LOAD']
+        
+        # Adjust for tensor sizes
+        if BLOCK_C > C:
+            BLOCK_C = triton.next_power_of_2(C)
+        
+        grid_n = N
+        grid_spatial = triton.cdiv(DHW, BLOCK_DHW)
+        
+        # Ensure block size doesn't exceed hardware limits
+        if BLOCK_DHW <= 1024:  # Max threads per block
+            try:
+                fused_post_ops_kernel_optimized[grid_n, grid_spatial](
+                    x, bias, out,
+                    N, C, D, H, W,
+                    x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
+                    out.stride(0), out.stride(1), out.stride(2), out.stride(3), out.stride(4),
+                    BLOCK_C=BLOCK_C,
+                    BLOCK_DHW=BLOCK_DHW,
+                    VECTORIZE_LOAD=VECTORIZE_LOAD,
+                )
+                return out
+            except Exception as e:
+                # Fall through to next configuration
+                continue
+    
+    # Last resort fallback
+    BLOCK_C = min(16, triton.next_power_of_2(C))
+    BLOCK_DHW = 64
+    grid_spatial = triton.cdiv(DHW, BLOCK_DHW)
+    
+    fused_post_ops_kernel_optimized[grid_n, grid_spatial](
+        x, bias, out,
+        N, C, D, H, W,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
+        out.stride(0), out.stride(1), out.stride(2), out.stride(3), out.stride(4),
+        BLOCK_C=BLOCK_C,
+        BLOCK_DHW=BLOCK_DHW,
+        VECTORIZE_LOAD=1,
+    )
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    ConvTranspose3d (PyTorch native) + Optimized fused post-ops (Triton)
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, bias_shape):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(
+            in_channels, out_channels, kernel_size, 
+            stride=stride, padding=padding
+        )
+        self.bias = nn.Parameter(torch.randn(1))
+        
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = fused_post_convtranspose_optimized(x, self.bias)
+        return x
+```

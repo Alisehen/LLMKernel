@@ -1,0 +1,5 @@
+{
+  "critical_issue": "tl.atomic_add to out_ptr is used inside an @triton.autotune kernel, so outputs from multiple tuning runs accumulate in the same tensor.",
+  "why_it_matters": "Autotune executes the kernel several times with the same out buffer; each run adds to prior results, making final outputs scaled and far from the PyTorch reference.",
+  "minimal_fix_hint": "Eliminate cross-run accumulation: avoid atomic_add for autotuned output, or zero/refresh out per run, or remove @triton.autotune for this kernel."
+}

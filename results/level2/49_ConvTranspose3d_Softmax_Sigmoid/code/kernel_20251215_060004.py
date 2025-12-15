@@ -1,0 +1,188 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_C": 32}, num_warps=2, num_stages=2),
+        triton.Config({"BLOCK_C": 64}, num_warps=2, num_stages=2),
+        triton.Config({"BLOCK_C": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_C": 256}, num_warps=4, num_stages=2),
+    ],
+    key=["C"],
+)
+@triton.jit
+def softmax_sigmoid_5d_kernel(
+    x_ptr, out_ptr,
+    N, C, D, H, W,
+    stride_n, stride_c, stride_d, stride_h, stride_w,
+    BLOCK_C: tl.constexpr,
+):
+    """
+    Fused Softmax(dim=1 over channels) + Sigmoid for 5D tensor [N, C, D, H, W].
+
+    Uses a numerically stable, *streaming* softmax algorithm that:
+      - Computes global max and sum(exp(x - max)) in a single streaming pass
+        over C using tile-wise aggregation.
+      - Produces final sigmoid(softmax(x)) in a second streaming pass.
+      - Eliminates the original third pass over memory (3 -> 2 passes over x).
+
+    Memory-fusion rules:
+      - Multiple tl.load() from `x_ptr` (same tensor) are OK.
+      - No intermediate tl.store(): all intermediate results stay in registers.
+      - Exactly one tl.store() for the final fused output.
+    """
+
+    pid = tl.program_id(0)
+
+    # Decode linear pid -> (n, d, h, w)
+    spatial = D * H * W
+    hw = H * W
+
+    n = pid // spatial
+    tmp = pid - n * spatial
+    d = tmp // hw
+    tmp = tmp - d * hw
+    h = tmp // W
+    w = tmp - h * W
+
+    # Base pointer offset for fixed (n, :, d, h, w)
+    base_offset = (
+        n * stride_n +
+        d * stride_d +
+        h * stride_h +
+        w * stride_w
+    )
+
+    # Channel indices handled per tile
+    offs_c = tl.arange(0, BLOCK_C)
+
+    # --------------------------------------------------------
+    # PASS 1: streaming softmax stats over C
+    #   Compute global max `m_val` and sum(exp(x - m_val)) `s_val`
+    #   using *tile-wise* aggregation:
+    #
+    #   For each tile k:
+    #     m_k = max(x_k)
+    #     s_k = sum(exp(x_k - m_k))
+    #
+    #   Combine with previous global stats (m, s):
+    #     m_new = max(m, m_k)
+    #     s_new = s * exp(m - m_new) + s_k * exp(m_k - m_new)
+    #
+    #   This is numerically stable and requires only ONE pass.
+    # --------------------------------------------------------
+
+    m_val = tl.full((), -float("inf"), dtype=tl.float32)
+    s_val = tl.zeros((), dtype=tl.float32)
+
+    c_start = 0
+    while c_start < C:
+        idx_c = c_start + offs_c
+        mask = idx_c < C
+
+        offsets = base_offset + idx_c * stride_c
+
+        x_vals = tl.load(x_ptr + offsets, mask=mask, other=-float("inf"))
+        x_vals = x_vals.to(tl.float32)
+
+        # Local tile max over channels
+        m_tile = tl.max(x_vals, axis=0)
+
+        # Local tile sum(exp(x - m_tile))
+        exp_vals = tl.exp(x_vals - m_tile)
+        s_tile = tl.sum(exp_vals, axis=0)
+
+        # Combine global stats with tile stats
+        m_new = tl.maximum(m_val, m_tile)
+        # s_new = s_val * exp(m_val - m_new) + s_tile * exp(m_tile - m_new)
+        s_val = s_val * tl.exp(m_val - m_new) + s_tile * tl.exp(m_tile - m_new)
+        m_val = m_new
+
+        c_start += BLOCK_C
+
+    # Now we have:
+    #   m_val: global max over C
+    #   s_val: sum_c exp(x_c - m_val)
+    inv_s_val = 1.0 / s_val
+
+    # --------------------------------------------------------
+    # PASS 2: compute sigmoid(softmax(x)) using m_val and inv_s_val
+    #   softmax(x_c) = exp(x_c - m_val) * inv_s_val
+    #   sigmoid(z)   = 1 / (1 + exp(-z))
+    #
+    # Single tl.store() of final fused result.
+    # --------------------------------------------------------
+
+    c_start = 0
+    while c_start < C:
+        idx_c = c_start + offs_c
+        mask = idx_c < C
+
+        offsets = base_offset + idx_c * stride_c
+
+        x_vals = tl.load(x_ptr + offsets, mask=mask, other=-float("inf"))
+        x_vals = x_vals.to(tl.float32)
+
+        # Softmax
+        exp_vals = tl.exp(x_vals - m_val)
+        softmax_vals = exp_vals * inv_s_val
+
+        # Sigmoid(softmax(x))
+        sigmoid_vals = 1.0 / (1.0 + tl.exp(-softmax_vals))
+
+        tl.store(out_ptr + offsets, sigmoid_vals, mask=mask)
+
+        c_start += BLOCK_C
+
+
+def fused_softmax_sigmoid_3d(x: torch.Tensor) -> torch.Tensor:
+    """
+    Fused Softmax(dim=1) + Sigmoid for a 5D tensor [N, C, D, H, W] using Triton.
+
+    Args:
+        x: Input tensor, expected shape [N, C, D, H, W], CUDA tensor.
+
+    Returns:
+        Tensor of same shape as x.
+    """
+    assert x.is_cuda, "Input must be a CUDA tensor"
+    assert x.dim() == 5, "Input must have shape [N, C, D, H, W]"
+
+    N, C, D, H, W = x.shape
+    y = torch.empty_like(x)
+
+    total_sites = N * D * H * W
+    grid = (total_sites,)
+
+    softmax_sigmoid_5d_kernel[grid](
+        x, y,
+        N, C, D, H, W,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
+    )
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    ConvTranspose3d (PyTorch native) + fused Softmax(dim=1) + Sigmoid (Triton).
+    """
+    def __init__(self, in_channels, out_channels, kernel_size,
+                 stride, padding, output_padding, bias=True):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            output_padding=output_padding,
+            bias=bias,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.conv_transpose(x)
+        x = fused_softmax_sigmoid_3d(x)
+        return x

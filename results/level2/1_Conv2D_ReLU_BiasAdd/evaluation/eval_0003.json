@@ -1,6 +1,56 @@
 {
-  "runnable": false,
-  "phase": "stage2_repair",
-  "error_type": "RuntimeError",
-  "message": "Traceback (most recent call last):\n  File \"/home/hyc/LLMKernel/utils/compile_and_run.py\", line 535, in compare_and_bench\n    test_out, _ = _run_once(test_model, inp, dev)\n                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/LLMKernel/utils/compile_and_run.py\", line 132, in _run_once\n    out = model(*inp)\n          ^^^^^^^^^^^\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py\", line 1751, in _wrapped_call_impl\n    return self._call_impl(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py\", line 1762, in _call_impl\n    return forward_call(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/LLMKernel/run/20251213_080709_batch_range1to40_deepseek_deepseek/1_Conv2D_ReLU_BiasAdd/code/kernel_20251213_082517.py\", line 141, in forward\n    x = triton_bias_add_optimized(x, self.bias)\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/LLMKernel/run/20251213_080709_batch_range1to40_deepseek_deepseek/1_Conv2D_ReLU_BiasAdd/code/kernel_20251213_082517.py\", line 115, in triton_bias_add_optimized\n    bias_add_kernel_2d_optimized[grid](\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py\", line 347, in <lambda>\n    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)\n                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py\", line 192, in run\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py\", line 192, in <dictcomp>\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py\", line 170, in _bench\n    return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/testing.py\", line 145, in do_bench\n    fn()\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py\", line 156, in kernel_call\n    self.fn.run(\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py\", line 569, in run\n    kernel = self.compile(src, target=target, options=options.__dict__)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py\", line 278, in compile\n    module = src.make_ir(options, codegen_fns, module_map, context)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py\", line 81, in make_ir\n    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\ntriton.compiler.errors.UnsupportedLanguageConstruct: at 44:12:\n    spatial_offsets = pid_s * BLOCK_M + tl.arange(0, BLOCK_M)\n    spatial_mask = spatial_offsets < spatial_size\n\n    # Load biases for channel block\n    bias_vals = tl.load(bias_ptr + channel_offsets, mask=channel_mask, other=0.0)\n\n    # Process multiple channels in parallel\n    for c_idx in tl.range(0, BLOCK_N, 1):\n        # Skip if beyond actual channels\n        channel_idx = pid_c * BLOCK_N + c_idx\n        if channel_idx >= channels:\n            break\n            ^\nunsupported AST node type: Break\n"
+  "timestamp": "2025-12-14T09:21:11",
+  "reference_file": "KernelBench/level2/1_Conv2D_ReLU_BiasAdd.py",
+  "candidate_file": "/home/hyc/LLMKernel/run/20251214_091600_batch_range1to5_openai_deepseek/1_Conv2D_ReLU_BiasAdd/code/kernel_20251214_092103.py",
+  "tolerance": 0.001,
+  "max_abs_err": 0.0005611777305603027,
+  "mean_abs_err": 5.39776965524652e-06,
+  "ref_latency_ms": {
+    "avg": 11.455520057678223,
+    "min": 11.44115161895752,
+    "max": 11.463680267333984,
+    "all": [
+      11.463680267333984,
+      11.462656021118164,
+      11.44115161895752,
+      11.45036792755127,
+      11.459744453430176
+    ]
+  },
+  "test_latency_ms": {
+    "avg": 9.215776062011718,
+    "min": 9.211808204650879,
+    "max": 9.219072341918945,
+    "all": [
+      9.218048095703125,
+      9.219072341918945,
+      9.21292781829834,
+      9.211808204650879,
+      9.217023849487305
+    ]
+  },
+  "num_runs": 5,
+  "model_init_args": [
+    64,
+    128,
+    3,
+    [
+      128,
+      1,
+      1
+    ]
+  ],
+  "model_init_kwargs": {},
+  "seed": 100,
+  "align_stats": {
+    "pair_aligner": 1,
+    "copied_same_shape": 1,
+    "mapped_shape": 0,
+    "skipped": 0,
+    "pair_key": "Model->ModelNew"
+  },
+  "runnable": true,
+  "phase": "stage1_grid_and_parallel",
+  "pytorch_baseline_ms": 11.510918426513673,
+  "score": 1.249044936536896
 }

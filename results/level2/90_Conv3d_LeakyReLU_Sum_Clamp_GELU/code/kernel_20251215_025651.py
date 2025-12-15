@@ -1,0 +1,276 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        # Small tiles – safe fallback / high occupancy
+        triton.Config({"BLOCK_M": 32, "BLOCK_N": 64, "BLOCK_K": 32}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 32, "BLOCK_K": 32}, num_warps=4, num_stages=2),
+        # Balanced tiles
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32}, num_warps=8, num_stages=2),
+        # Wider along C_out for better tensor-core utilization on Ada
+        triton.Config({"BLOCK_M": 32, "BLOCK_N": 128, "BLOCK_K": 32}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32}, num_warps=8, num_stages=2),
+    ],
+    key=["P", "C_out", "C_in"],
+)
+@triton.jit
+def conv3d_leakyrelu_add_clamp_gelu_kernel(
+    x_ptr,        # *[N, C_in, D_in, H_in, W_in]
+    w_ptr,        # *[C_out, C_in, Kd, Kh, Kw]
+    bias_ptr,     # *[C_out]
+    sum_ptr,      # *[C_out, 1, 1, 1]
+    out_ptr,      # *[N, C_out, D_out, H_out, W_out]
+    N, C_in, D_in, H_in, W_in,
+    C_out,
+    D_out, H_out, W_out,
+    stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
+    stride_wo, stride_wc, stride_wd, stride_wh, stride_ww,
+    stride_on, stride_oc, stride_od, stride_oh, stride_ow,
+    stride_sum_c,
+    P,                # N * D_out * H_out * W_out
+    negative_slope,   # LeakyReLU slope
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    Kd: tl.constexpr,
+    Kh: tl.constexpr,
+    Kw: tl.constexpr,
+):
+    # ------------------------------------------------------------------
+    # Program IDs: pid_m over flattened (N, D_out, H_out, W_out),
+    #              pid_n over output channels C_out.
+    # ------------------------------------------------------------------
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    mask_m = offs_m < P
+    mask_n = offs_n < C_out
+    mask_mn = mask_m[:, None] & mask_n[None, :]
+
+    # ------------------------------------------------------------------
+    # Decode offs_m -> (n_idx, od_idx, oh_idx, ow_idx)
+    # ------------------------------------------------------------------
+    DHW = D_out * H_out * W_out
+    HW = H_out * W_out
+
+    n_idx = offs_m // DHW
+    rem = offs_m - n_idx * DHW
+    od_idx = rem // HW
+    rem = rem - od_idx * HW
+    oh_idx = rem // W_out
+    ow_idx = rem - oh_idx * W_out
+
+    # ------------------------------------------------------------------
+    # Precompute base pointers for this tile (spatial + batch)
+    # x_base has shape [BLOCK_M, 1] – channel & kernel offsets added later
+    # ------------------------------------------------------------------
+    x_base = (
+        x_ptr
+        + n_idx[:, None] * stride_xn
+        + od_idx[:, None] * stride_xd
+        + oh_idx[:, None] * stride_xh
+        + ow_idx[:, None] * stride_xw
+    )
+
+    # Base for weights along output-channel dimension
+    # w_base has shape [1, BLOCK_N] – channel & kernel offsets added later
+    w_base = w_ptr + offs_n[None, :] * stride_wo
+
+    # ------------------------------------------------------------------
+    # Convolution core: accumulate in fp32 as a matmul over C_in
+    # ------------------------------------------------------------------
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Spatial kernel loops fully unrolled at compile-time
+    for kd in tl.static_range(0, Kd):
+        x_kd = x_base + kd * stride_xd
+        w_kd = w_base + kd * stride_wd
+        for kh in tl.static_range(0, Kh):
+            x_kdh = x_kd + kh * stride_xh
+            w_kdh = w_kd + kh * stride_wh
+            for kw in tl.static_range(0, Kw):
+                x_kdhw = x_kdh + kw * stride_xw
+                w_kdhw = w_kdh + kw * stride_ww
+
+                c0 = 0
+                # Reduction over C_in in BLOCK_K chunks
+                while c0 < C_in:
+                    offs_k = c0 + tl.arange(0, BLOCK_K)
+                    mask_k = offs_k < C_in
+
+                    # x[n, c, d+kd, h+kh, w+kw]
+                    x_ptrs = x_kdhw + offs_k[None, :] * stride_xc
+                    x_mask = mask_m[:, None] & mask_k[None, :]
+                    x_vals = tl.load(x_ptrs, mask=x_mask, other=0.0)
+
+                    # w[oc, c, kd, kh, kw]
+                    w_ptrs = w_kdhw + offs_k[:, None] * stride_wc
+                    w_mask = mask_k[:, None] & mask_n[None, :]
+                    w_vals = tl.load(w_ptrs, mask=w_mask, other=0.0)
+
+                    # Dot over BLOCK_K (tensor-core friendly for fp16/bf16)
+                    acc += tl.dot(x_vals, w_vals)
+
+                    c0 += BLOCK_K
+
+    # ------------------------------------------------------------------
+    # Bias add
+    # ------------------------------------------------------------------
+    bias_vals = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0)
+    acc += bias_vals[None, :]
+
+    # ------------------------------------------------------------------
+    # LeakyReLU: in-register, elementwise
+    # ------------------------------------------------------------------
+    zero = 0.0
+    acc = tl.where(acc >= zero, acc, acc * negative_slope)
+
+    # ------------------------------------------------------------------
+    # Residual add (sum_tensor: [C_out, 1, 1, 1])
+    # ------------------------------------------------------------------
+    sum_vals = tl.load(sum_ptr + offs_n * stride_sum_c, mask=mask_n, other=0.0)
+    acc += sum_vals[None, :]
+
+    # ------------------------------------------------------------------
+    # Clamp to [-1, 1]
+    # ------------------------------------------------------------------
+    acc = tl.minimum(tl.maximum(acc, -1.0), 1.0)
+
+    # ------------------------------------------------------------------
+    # GELU via fast erf approximation (A&S 7.1.26)
+    # All in-register, no intermediate stores.
+    # GELU(x) = 0.5 * x * (1 + erf(x / sqrt(2)))
+    # ------------------------------------------------------------------
+    inv_sqrt2 = 0.7071067811865476  # 1 / sqrt(2)
+    p = 0.3275911
+    a1 = 0.254829592
+    a2 = -0.284496736
+    a3 = 1.421413741
+    a4 = -1.453152027
+    a5 = 1.061405429
+
+    x = acc
+    ax = tl.abs(x) * inv_sqrt2
+    t = 1.0 / (1.0 + p * ax)
+
+    # Horner form polynomial to keep live ranges short
+    poly = a5
+    poly = poly * t + a4
+    poly = poly * t + a3
+    poly = poly * t + a2
+    poly = poly * t + a1
+    poly = poly * t
+
+    e = tl.exp(-ax * ax)
+    erf = 1.0 - poly * e
+    erf = tl.where(x >= 0.0, erf, -erf)
+
+    acc = 0.5 * x * (1.0 + erf)
+
+    # ------------------------------------------------------------------
+    # Final store: single tl.store for the fused output
+    # ------------------------------------------------------------------
+    out_ptrs = (
+        out_ptr
+        + n_idx[:, None] * stride_on
+        + offs_n[None, :] * stride_oc
+        + od_idx[:, None] * stride_od
+        + oh_idx[:, None] * stride_oh
+        + ow_idx[:, None] * stride_ow
+    )
+    tl.store(out_ptrs, acc, mask=mask_mn)
+
+
+def fused_conv3d_leakyrelu_add_clamp_gelu(x, weight, bias, sum_tensor):
+    """
+    x:          [N, C_in, D_in, H_in, W_in]
+    weight:     [C_out, C_in, Kd, Kh, Kw]
+    bias:       [C_out]
+    sum_tensor: [C_out, 1, 1, 1]
+
+    Assumes stride=1, padding=0, dilation=1.
+    Fuses: Conv3d -> LeakyReLU(0.2) -> + sum_tensor -> clamp[-1,1] -> GELU.
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda and sum_tensor.is_cuda
+    N, C_in, D_in, H_in, W_in = x.shape
+    C_out, C_in_w, Kd, Kh, Kw = weight.shape
+    assert C_in == C_in_w
+
+    # No padding, stride=1, dilation=1
+    D_out = D_in - Kd + 1
+    H_out = H_in - Kh + 1
+    W_out = W_in - Kw + 1
+
+    out = torch.empty((N, C_out, D_out, H_out, W_out),
+                      device=x.device, dtype=x.dtype)
+
+    P = N * D_out * H_out * W_out  # flattened spatial+batch
+
+    # Contiguous layouts for simpler stride math and better coalescing
+    x_contig = x.contiguous()
+    w_contig = weight.contiguous()
+    out_contig = out
+    sum_contig = sum_tensor.contiguous()
+    bias_contig = bias.contiguous()
+
+    def grid(meta):
+        return (
+            triton.cdiv(P, meta["BLOCK_M"]),
+            triton.cdiv(C_out, meta["BLOCK_N"]),
+        )
+
+    conv3d_leakyrelu_add_clamp_gelu_kernel[grid](
+        x_contig, w_contig, bias_contig, sum_contig, out_contig,
+        N, C_in, D_in, H_in, W_in,
+        C_out,
+        D_out, H_out, W_out,
+        x_contig.stride(0), x_contig.stride(1), x_contig.stride(2),
+        x_contig.stride(3), x_contig.stride(4),
+        w_contig.stride(0), w_contig.stride(1), w_contig.stride(2),
+        w_contig.stride(3), w_contig.stride(4),
+        out_contig.stride(0), out_contig.stride(1), out_contig.stride(2),
+        out_contig.stride(3), out_contig.stride(4),
+        sum_contig.stride(0),
+        P,
+        0.2,  # negative_slope for LeakyReLU
+        Kd=Kd, Kh=Kh, Kw=Kw,
+    )
+
+    return out_contig
+
+
+class ModelNew(nn.Module):
+    """
+    Fused:
+      Conv3d -> LeakyReLU(0.2) -> + sum_tensor -> clamp[-1,1] -> GELU
+    implemented with a high-performance Triton kernel.
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size, sum_tensor_shape):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv3d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=1,
+            padding=0,
+            dilation=1,
+            bias=True,
+        )
+        # sum_tensor parameter (broadcast over spatial dims)
+        self.sum_tensor = nn.Parameter(torch.randn(sum_tensor_shape))
+
+    def forward(self, x):
+        return fused_conv3d_leakyrelu_add_clamp_gelu(
+            x,
+            self.conv.weight,
+            self.conv.bias,
+            self.sum_tensor,
+        )

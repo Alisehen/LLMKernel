@@ -1,0 +1,208 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU
+GPU Name: 4090
+Architecture: Ada Lovelace
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+[OPTIMIZATION STAGE]
+
+## Current Optimization Stage
+
+Focus: Memory pattern for fused operations.
+
+Key Principle:
+- Fusion benefit = eliminated INTERMEDIATE stores
+- Multiple input loads are OK; intermediate stores are NOT
+
+Rules:
+- ✅ Multiple tl.load() for different inputs (x, weight, bias) - OK
+- ❌ tl.store() for intermediate results - NEVER (this is what fusion eliminates)
+- ✅ Single tl.store() for final output - required
+
+Verification:
+- Count tl.store() calls: should equal number of OUTPUT tensors (usually 1)
+- Intermediate values: must stay in registers between ops
+- If you see store-then-load pattern for same data → BUG, refactor
+
+Multi-input Fusion Pattern:
+```
+x = tl.load(input_ptr + offs, mask=mask)
+w = tl.load(weight_ptr + ..., mask=...)  # OK: different input
+b = tl.load(bias_ptr + ..., mask=...)    # OK: different input
+y = op1(x, w)  # in registers
+z = op2(y, b)  # in registers
+tl.store(out_ptr + offs, z, mask=mask)   # single output store
+```
+
+num_stages: start with 2, only increase if memory stalls high AND registers OK
+
+
+
+[CURRENT CODE]
+```python
+# <complete ModelNew code with optimized Triton kernels>
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_SIZE": 1024}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_SIZE": 2048}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_SIZE": 4096}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_SIZE": 8192}, num_warps=8, num_stages=2),
+    ],
+    key=["numel"],
+)
+@triton.jit
+def fused_add_min_gelu_mul_kernel(
+    x_ptr,
+    out_ptr,
+    numel: tl.int32,
+    add_value: tl.float32,
+    multiply_value: tl.float32,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Fused elementwise kernel:
+      y = x + add_value
+      y = min(y, 0.0)
+      y = GELU(y)                   # erf-based (exact formulation)
+      y = y * multiply_value
+
+    1D grid over the flattened tensor.
+    All fused ops share the SAME offsets and mask.
+    """
+    pid = tl.program_id(axis=0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < numel
+
+    # Streaming, contiguous load (no unsupported cache_modifier)
+    x = tl.load(
+        x_ptr + offsets,
+        mask=mask,
+        other=0.0,
+    )
+
+    # Add scalar
+    x = x + add_value
+
+    # Clamp max at 0.0
+    x = tl.minimum(x, 0.0)
+
+    # GELU: 0.5 * x * (1 + erf(x / sqrt(2)))
+    inv_sqrt2 = 0.7071067811865475  # 1 / sqrt(2)
+    x_scaled = x * inv_sqrt2
+    x_erf = tl.math.erf(x_scaled)
+    x = 0.5 * x * (1.0 + x_erf) * x
+
+    # Multiply scalar
+    x = x * multiply_value
+
+    # Store result (no unsupported cache_modifier)
+    tl.store(
+        out_ptr + offsets,
+        x,
+        mask=mask,
+    )
+
+
+def fused_post_convtranspose(
+    x: torch.Tensor,
+    add_value: float,
+    multiply_value: float,
+) -> torch.Tensor:
+    """
+    Fused post-processing after ConvTranspose2d:
+      y = x + add_value
+      y = min(y, 0.0)
+      y = GELU(y)
+      y = y * multiply_value
+
+    Implemented as a single Triton kernel over the flattened tensor.
+    Grid is 1D over output numel; all fused ops share offsets/mask.
+    """
+    assert x.is_cuda, "Input must be a CUDA tensor for Triton kernels."
+
+    out = torch.empty_like(x)
+    numel = x.numel()
+
+    # Grid depends on the autotuned BLOCK_SIZE selected by Triton.
+    grid = lambda META: (triton.cdiv(numel, META["BLOCK_SIZE"]),)
+
+    fused_add_min_gelu_mul_kernel[grid](
+        x,
+        out,
+        numel,
+        float(add_value),
+        float(multiply_value),
+    )
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    ConvTranspose2d (PyTorch native) +
+    Fused: AddValue + Min(., 0) + GELU + MultiplyValue (Triton)
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, add_value, multiply_value):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose2d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+        )
+        self.add_value = float(add_value)
+        self.multiply_value = float(multiply_value)
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = fused_post_convtranspose(x, self.add_value, self.multiply_value)
+        return x
+```
+
+[NCU PROFILING METRICS]
+{
+  "fused_add_min_gelu_mul_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 12.46,
+    "launch__grid_size": 270400,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 81.5,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 93.26,
+    "lts__t_sector_hit_rate.pct": 50.01
+  }
+}
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+TRITON API CONSTRAINTS (CRITICAL):
+- Triton has NO: tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

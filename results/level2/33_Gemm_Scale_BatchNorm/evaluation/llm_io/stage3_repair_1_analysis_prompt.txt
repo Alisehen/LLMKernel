@@ -1,0 +1,358 @@
+You are a Triton kernel debugging expert. Analyze the error and identify the root cause.
+
+## ERROR LOG
+```
+Traceback (most recent call last):
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 34, in wrapper
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 2579, in multiple_of
+    return semantic.multiple_of(input, values)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/semantic.py", line 1796, in multiple_of
+    raise ValueError("Shape of input to multiple_of does not match the length of values")
+ValueError: Shape of input to multiple_of does not match the length of values
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 538, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251215_024803_batch_range31to55_openai_deepseek/33_Gemm_Scale_BatchNorm/code/kernel_20251215_030821.py", line 208, in forward
+    y = fused_gemm_scale(x, self.gemm.weight, self.gemm.bias, self.scale)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251215_024803_batch_range31to55_openai_deepseek/33_Gemm_Scale_BatchNorm/code/kernel_20251215_030821.py", line 177, in fused_gemm_scale
+    fused_gemm_scale_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 347, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 192, in run
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 192, in <dictcomp>
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 170, in _bench
+    return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/testing.py", line 145, in do_bench
+    fn()
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 156, in kernel_call
+    self.fn.run(
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 569, in run
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 278, in compile
+    module = src.make_ir(options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 81, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 48:4:
+    in_bounds_m = offs_m < M
+    in_bounds_n = offs_n < N
+
+    # -------------------------------------------------------------------------
+    # Pointers for the first K tile
+    # -------------------------------------------------------------------------
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    # Alignment hints to help Triton / compiler generate vectorized memory ops
+    tl.multiple_of(offs_k, BLOCK_K)
+    tl.multiple_of(a_ptrs, 16)
+    ^
+```
+
+## Expected Behavior (PyTorch Reference)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs a GEMM (general matrix multiplication), applies scaling, 
+    and then batch normalization.
+    """
+    def __init__(self, in_features, out_features, scale_shape, eps=1e-5, momentum=0.1):
+        super(Model, self).__init__()
+        self.gemm = nn.Linear(in_features, out_features)
+        self.scale = nn.Parameter(torch.randn(scale_shape))
+        self.bn = nn.BatchNorm1d(out_features, eps=eps, momentum=momentum)
+
+    def forward(self, x):
+        x = self.gemm(x)
+        x = x * self.scale
+        x = self.bn(x)
+        return x
+
+batch_size = 1024
+in_features = 8192
+out_features = 8192
+scale_shape = (out_features,)
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features)]
+
+def get_init_inputs():
+    return [in_features, out_features, scale_shape]
+```
+
+## Current Implementation (Broken Triton Kernel)
+```python
+# <optimized Triton code>
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+# ---- Autotuned, high-performance fused GEMM(+bias)*scale kernel ----
+
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8},
+            num_warps=8,
+            num_stages=3,
+        ),
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8},
+            num_warps=4,
+            num_stages=3,
+        ),
+        triton.Config(
+            {'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8},
+            num_warps=4,
+            num_stages=3,
+        ),
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8},
+            num_warps=4,
+            num_stages=2,
+        ),
+        triton.Config(
+            {'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 4},
+            num_warps=8,
+            num_stages=4,
+        ),
+    ],
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def fused_gemm_scale_kernel(
+    a_ptr,  # [M, K]
+    b_ptr,  # [K, N]
+    bias_ptr,  # [N]
+    scale_ptr,  # [N]
+    c_ptr,  # [M, N]
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    # -------------------------------------------------------------------------
+    # 2D tiling with GROUP_M remapping for better L2 reuse of A / B tiles
+    # -------------------------------------------------------------------------
+    pid = tl.program_id(axis=0)
+
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    num_pid_in_group = GROUP_M * num_pid_n
+
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_M
+
+    group_size_m = tl.minimum(num_pid_m - first_pid_m, GROUP_M)
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Guard against out-of-bounds tiles
+    in_bounds_m = offs_m < M
+    in_bounds_n = offs_n < N
+
+    # -------------------------------------------------------------------------
+    # Pointers for the first K tile
+    # -------------------------------------------------------------------------
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    # Alignment hints to help Triton / compiler generate vectorized memory ops
+    tl.multiple_of(offs_k, BLOCK_K)
+    tl.multiple_of(a_ptrs, 16)
+    tl.multiple_of(b_ptrs, 16)
+
+    # Accumulator in fp32 (good for tf32 tensor cores as well)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # -------------------------------------------------------------------------
+    # K loop: matrix multiply using tensor cores via tl.dot(allow_tf32=True)
+    # -------------------------------------------------------------------------
+    k_iter = 0
+    while k_iter < K:
+        k_remaining = K - k_iter
+
+        a_mask = in_bounds_m[:, None] & (offs_k[None, :] < k_remaining)
+        b_mask = (offs_k[:, None] < k_remaining) & in_bounds_n[None, :]
+
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+        # Uses tensor cores on Ada for fp16/bf16 or tf32 when inputs are fp32
+        acc += tl.dot(a, b, allow_tf32=True)
+
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+        k_iter += BLOCK_K
+
+    # -------------------------------------------------------------------------
+    # Fused epilogue: (acc + bias) * scale
+    #   - Only one tl.store for final result (no intermediate stores)
+    # -------------------------------------------------------------------------
+    # Load bias and scale per output column
+    bias = tl.load(bias_ptr + offs_n, mask=in_bounds_n, other=0.0)
+    scale = tl.load(scale_ptr + offs_n, mask=in_bounds_n, other=1.0)
+
+    # Broadcast over rows
+    acc = acc + bias[None, :]
+    acc = acc * scale[None, :]
+
+    # -------------------------------------------------------------------------
+    # Final store
+    # -------------------------------------------------------------------------
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    c_mask = in_bounds_m[:, None] & in_bounds_n[None, :]
+
+    tl.store(c_ptrs, acc, mask=c_mask)
+
+
+# ---- Python wrapper ---------------------------------------------------------
+
+
+def fused_gemm_scale(x: torch.Tensor,
+                     weight: torch.Tensor,
+                     bias: torch.Tensor,
+                     scale: torch.Tensor) -> torch.Tensor:
+    """
+    Fused operation:
+        y = (x @ weight.T + bias) * scale
+
+    x:      [M, K]
+    weight: [N, K]  (same layout as nn.Linear.weight)
+    bias:   [N]
+    scale:  [N]
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda and scale.is_cuda, \
+        "All tensors must be on CUDA for Triton kernels."
+
+    M, K = x.shape
+    N = weight.shape[0]
+    assert weight.shape[1] == K, "weight shape must be [N, K]"
+    assert bias.shape[0] == N and scale.shape[0] == N, "bias/scale must have shape [N]"
+
+    # Output tensor
+    out = torch.empty((M, N), device=x.device, dtype=x.dtype)
+
+    # Use weight.T as B in GEMM, and make K the contiguous dimension for coalesced loads
+    b = weight.t().contiguous()  # [K, N]
+
+    # Strides
+    stride_am, stride_ak = x.stride()
+    stride_bk, stride_bn = b.stride()
+    stride_cm, stride_cn = out.stride()
+
+    # 1D grid over tiles, 2D mapping is computed inside the kernel
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta['BLOCK_M']) *
+            triton.cdiv(N, meta['BLOCK_N']),
+        )
+
+    fused_gemm_scale_kernel[grid](
+        x, b, bias, scale, out,
+        M, N, K,
+        stride_am, stride_ak,
+        stride_bk, stride_bn,
+        stride_cm, stride_cn,
+    )
+
+    return out
+
+
+# ---- Module wrapper ---------------------------------------------------------
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-accelerated version of the original model:
+
+        x -> Linear -> elementwise scale -> BatchNorm1d
+
+    GEMM + bias + scale are fused into a single Triton kernel.
+    BatchNorm remains in PyTorch for correctness.
+    """
+    def __init__(self, in_features, out_features, scale_shape, eps=1e-5, momentum=0.1):
+        super(ModelNew, self).__init__()
+        self.gemm = nn.Linear(in_features, out_features)
+        self.scale = nn.Parameter(torch.randn(scale_shape))
+        self.bn = nn.BatchNorm1d(out_features, eps=eps, momentum=momentum)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Fused GEMM + bias + scale
+        y = fused_gemm_scale(x, self.gemm.weight, self.gemm.bias, self.scale)
+        # BatchNorm remains in PyTorch
+        y = self.bn(y)
+        return y
+```
+
+---
+
+## Your Task
+
+Identify the **single most critical issue** that causes the error above.
+
+### Analysis Guidelines
+
+1. **Focus on root cause**, not symptoms
+   - Bad: "Output is wrong"
+   - Good: "BLOCK_K loop missing, only processes first 32 elements of K dimension"
+
+2. **Be specific about WHAT and WHERE**
+   - Bad: "Memory access issue"
+   - Good: "Line 45: tl.atomic_add(c_block_ptr, acc) - atomic_add requires scalar pointer, not block_ptr"
+
+3. **Prioritize by impact**
+   - Correctness bugs > Performance issues > Style problems
+   - Algorithm errors > Implementation details
+
+### Output Format
+
+**CRITICAL: You MUST output ONLY valid JSON. No other text allowed.**
+
+```json
+{
+  "critical_issue": "<Concise description of THE root cause, max 30 words>",
+  "why_it_matters": "<Why this causes the observed error, max 35 words>",
+  "minimal_fix_hint": "<What needs to change (not how), max 30 words>"
+}
+```
+
+**Remember**: Output ONLY the JSON block. No explanations, no commentary, no additional text.

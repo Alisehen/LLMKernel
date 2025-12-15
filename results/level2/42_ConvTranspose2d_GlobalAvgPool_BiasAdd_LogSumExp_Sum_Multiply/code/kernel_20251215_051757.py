@@ -1,0 +1,130 @@
+# 1. Imports
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+# 2. Triton kernel(s)
+@triton.jit
+def fused_gap_bias_logsumexp_kernel(
+    x_ptr,          # *f32, [N, C, H, W]
+    bias_ptr,       # *f32, [C]
+    out_ptr,        # *f32, [N, 1]
+    N, C, H, W,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    BLOCK_C: tl.constexpr,
+):
+    """
+    Fused kernel: GlobalAvgPool (H,W) + BiasAdd + LogSumExp over C + Multiply(10.0)
+    Input:  x [N, C, H, W]
+    Output: out [N, 1]
+    """
+    pid_n = tl.program_id(0)  # batch/program index
+
+    if pid_n >= N:
+        return
+
+    offs_c = tl.arange(0, BLOCK_C)
+    mask_c = offs_c < C
+
+    # Accumulator for global average pooling over H and W per channel
+    acc = tl.zeros((BLOCK_C,), dtype=tl.float32)
+
+    # Global average pooling over H and W
+    for h in range(0, H):
+        for w in range(0, W):
+            x_ptrs = (
+                x_ptr
+                + pid_n * stride_xn
+                + offs_c * stride_xc
+                + h * stride_xh
+                + w * stride_xw
+            )
+            x_vals = tl.load(x_ptrs, mask=mask_c, other=0.0)
+            acc += x_vals
+
+    # Divide by H * W to get mean
+    hw = H * W
+    acc = acc / hw
+
+    # Add bias (per channel)
+    bias_vals = tl.load(bias_ptr + offs_c, mask=mask_c, other=0.0)
+    acc = acc + bias_vals
+
+    # LogSumExp over channels (C)
+    max_val = tl.max(acc, axis=0)
+    exp_vals = tl.exp(acc - max_val)
+    sum_exp = tl.sum(exp_vals, axis=0)
+    logsumexp_val = max_val + tl.log(sum_exp)
+
+    # Multiply by 10.0
+    result = logsumexp_val * 10.0
+
+    # Store result [N, 1] — one scalar per batch element
+    tl.store(out_ptr + pid_n, result)
+
+
+# 3. Wrapper function(s)
+def fused_post_convtranspose(x: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    Fused operations after ConvTranspose2d:
+      x: [N, C, H, W]
+      bias: [C] (1D view of original [C, 1, 1] parameter)
+
+    Computes:
+      y = mean(x, dim=(2, 3), keepdim=True)  # [N, C, 1, 1]
+      y = y + bias
+      y = logsumexp(y, dim=1, keepdim=True)  # [N, 1, 1, 1]
+      y = sum(y, dim=(2, 3))                 # [N, 1]
+      y = y * 10.0
+    """
+    assert x.is_cuda, "Triton kernels require CUDA tensors"
+    assert bias.is_cuda, "Bias must be on CUDA device"
+    assert x.dim() == 4, "x must be [N, C, H, W]"
+    N, C, H, W = x.shape
+    assert bias.numel() == C, "Bias must have C elements"
+
+    # Allocate output [N, 1]
+    out = torch.empty((N, 1), device=x.device, dtype=x.dtype)
+
+    # Choose BLOCK_C as the next power-of-2 >= C (required by tl.arange)
+    BLOCK_C = 1
+    while BLOCK_C < C:
+        BLOCK_C *= 2
+
+    grid = (N,)
+    fused_gap_bias_logsumexp_kernel[grid](
+        x, bias, out,
+        N, C, H, W,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        BLOCK_C=BLOCK_C,
+    )
+    return out
+
+
+# 4. ModelNew definition
+class ModelNew(nn.Module):
+    """
+    Model that performs a transposed convolution (PyTorch native),
+    followed by fused Triton kernel for:
+      GlobalAvgPool + BiasAdd + LogSumExp + Sum + Multiply
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, bias_shape):
+        super(ModelNew, self).__init__()
+        # Keep ConvTranspose2d as native PyTorch (indexing is complex)
+        self.conv_transpose = nn.ConvTranspose2d(
+            in_channels, out_channels, kernel_size
+        )
+        # Match original bias shape, e.g., (out_channels, 1, 1)
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Transposed convolution (PyTorch)
+        x = self.conv_transpose(x)
+
+        # Fused post-ops with Triton
+        # bias: [C, 1, 1] -> [C]
+        bias_1d = self.bias.view(-1)
+        x = fused_post_convtranspose(x, bias_1d)
+        return x

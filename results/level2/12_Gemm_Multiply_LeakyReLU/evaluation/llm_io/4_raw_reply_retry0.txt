@@ -1,0 +1,246 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+import math
+
+
+@triton.jit
+def fused_gemm_mul_leaky_relu_kernel(
+    # Pointers to matrices
+    a_ptr, b_ptr, bias_ptr, c_ptr,
+    # Matrix dimensions
+    M, N, K,
+    # Strides
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    # Scalar parameters
+    multiplier,
+    negative_slope,
+    # Tile sizes
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+    # Allow TF32 for tensor cores
+    USE_TF32: tl.constexpr = True,
+    # Prefetch settings
+    num_stages: tl.constexpr = 2,
+    num_warps: tl.constexpr = 8,
+):
+    """
+    Optimized fused kernel for: GEMM → Bias Add → Multiply → LeakyReLU
+    Computes: C = LeakyReLU((A @ B^T + bias) * multiplier)
+    
+    Key optimizations:
+    1. Swizzled block ordering with GROUP_M for better L2 cache reuse
+    2. Software pipelining with double buffering
+    3. Optimized tile sizes for Ada Lovelace tensor cores
+    4. Reduced register pressure by fusing operations in-place
+    """
+    # -----------------------------------------------------------
+    # Program ID mapping with swizzling for better L2 reuse
+    pid = tl.program_id(0)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    
+    # Swizzling: group blocks along M dimension for better cache reuse
+    GROUP_SIZE = tl.minimum(GROUP_M, num_pid_m)
+    group_id = pid // GROUP_SIZE
+    group_size = tl.minimum(num_pid_m - group_id * GROUP_SIZE, GROUP_SIZE)
+    pid_in_group = pid % GROUP_SIZE
+    
+    # First pid in the group
+    first_pid_m = group_id * GROUP_SIZE
+    grid_m = first_pid_m + pid_in_group
+    grid_n = group_id % num_pid_n
+    
+    pid_m = grid_m
+    pid_n = grid_n
+    
+    # ----------------------------------------------------------
+    # Create pointers for the first blocks of A and B
+    offs_am = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_bn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    
+    # ----------------------------------------------------------
+    # Initialize double buffers for A and B
+    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + 
+                     tl.arange(0, BLOCK_K)[None, :] * stride_ak)
+    b_ptrs = b_ptr + (tl.arange(0, BLOCK_K)[:, None] * stride_bk + 
+                     offs_bn[None, :] * stride_bn)
+    
+    # ----------------------------------------------------------
+    # Initialize accumulator
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    # ----------------------------------------------------------
+    # Prefetch first blocks
+    a_mask = (offs_am[:, None] < M) & (tl.arange(0, BLOCK_K)[None, :] < K)
+    b_mask = (tl.arange(0, BLOCK_K)[:, None] < K) & (offs_bn[None, :] < N)
+    
+    a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+    b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+    
+    # ----------------------------------------------------------
+    # Main K loop with software pipelining
+    for k in range(0, tl.cdiv(K, BLOCK_K)):
+        # Prefetch next blocks
+        next_k = k + 1
+        if next_k * BLOCK_K < K:
+            next_a_ptrs = a_ptrs + BLOCK_K * stride_ak
+            next_b_ptrs = b_ptrs + BLOCK_K * stride_bk
+            
+            next_a_mask = (offs_am[:, None] < M) & \
+                         ((tl.arange(0, BLOCK_K) + next_k * BLOCK_K)[None, :] < K)
+            next_b_mask = ((tl.arange(0, BLOCK_K) + next_k * BLOCK_K)[:, None] < K) & \
+                         (offs_bn[None, :] < N)
+            
+            next_a = tl.load(next_a_ptrs, mask=next_a_mask, other=0.0)
+            next_b = tl.load(next_b_ptrs, mask=next_b_mask, other=0.0)
+        
+        # Compute on current blocks
+        acc += tl.dot(a, b, allow_tf32=USE_TF32)
+        
+        # Rotate buffers
+        if next_k * BLOCK_K < K:
+            a = next_a
+            b = next_b
+            a_ptrs = next_a_ptrs
+            b_ptrs = next_b_ptrs
+    
+    # ----------------------------------------------------------
+    # Add bias (broadcast over rows) - fused with multiply
+    bias_ptrs = bias_ptr + offs_bn
+    bias_mask = offs_bn < N
+    bias = tl.load(bias_ptrs, mask=bias_mask, other=0.0)
+    
+    # Fused: (acc + bias) * multiplier
+    acc = tl.math.fma(acc, multiplier, bias[None, :] * multiplier)
+    
+    # ----------------------------------------------------------
+    # Optimized LeakyReLU using fma and max
+    # Equivalent to: x >= 0 ? x : x * negative_slope
+    zero = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    # Compute mask for negative values
+    negative_mask = acc < 0.0
+    # For negative values: x * negative_slope
+    # For positive values: x (already in acc)
+    # This avoids extra operations compared to min/max approach
+    acc = tl.where(negative_mask, acc * negative_slope, acc)
+    
+    # ----------------------------------------------------------
+    # Write back with coalesced access pattern
+    offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    
+    c_ptrs = c_ptr + (offs_cm[:, None] * stride_cm + 
+                      offs_cn[None, :] * stride_cn)
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, acc, mask=c_mask)
+
+
+def fused_gemm_mul_leaky_relu(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    multiplier: float,
+    negative_slope: float,
+    configs=None
+) -> torch.Tensor:
+    """
+    Fused GEMM + Bias Add + Multiply + LeakyReLU operation.
+    """
+    # Check inputs
+    assert x.dim() == 2, f"Expected 2D input, got {x.dim()}D"
+    M, K = x.shape
+    N = weight.shape[0]
+    assert weight.shape[1] == K, f"Shape mismatch: x {x.shape}, weight {weight.shape}"
+    assert bias.shape == (N,), f"Bias shape mismatch: expected ({N},), got {bias.shape}"
+    
+    # Prepare output
+    c = torch.empty((M, N), device=x.device, dtype=x.dtype)
+    
+    # Ensure tensors are contiguous
+    x = x.contiguous()
+    weight_t = weight.t().contiguous()
+    bias = bias.contiguous()
+    
+    # Optimized configs for Ada Lovelace (4090)
+    if configs is None:
+        configs = [
+            # Primary: Best for large matrices, maximizes tensor core utilization
+            triton.Config({
+                'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 32,
+                'GROUP_M': 8, 'num_warps': 8, 'num_stages': 2
+            }, num_stages=2, num_warps=8),
+            # Secondary: Good balance for medium matrices
+            triton.Config({
+                'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32,
+                'GROUP_M': 8, 'num_warps': 8, 'num_stages': 3
+            }, num_stages=3, num_warps=8),
+            # Tertiary: Good for small matrices or irregular shapes
+            triton.Config({
+                'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32,
+                'GROUP_M': 8, 'num_warps': 4, 'num_stages': 4
+            }, num_stages=4, num_warps=4),
+        ]
+    
+    # Grid function with swizzling
+    def grid(meta):
+        M, N = x.shape[0], weight.shape[0]
+        grid_m = triton.cdiv(M, meta['BLOCK_M'])
+        grid_n = triton.cdiv(N, meta['BLOCK_N'])
+        
+        # Use GROUP_M for swizzling
+        GROUP_SIZE = min(meta['GROUP_M'], grid_m)
+        num_groups = triton.cdiv(grid_m, GROUP_SIZE)
+        total_blocks = num_groups * GROUP_SIZE * grid_n
+        
+        return (total_blocks,)
+    
+    # Launch kernel with first config
+    config = configs[0]
+    fused_gemm_mul_leaky_relu_kernel[grid](
+        x, weight_t, bias, c,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        weight_t.stride(0), weight_t.stride(1),
+        c.stride(0), c.stride(1),
+        multiplier,
+        negative_slope,
+        **config.kwargs
+    )
+    
+    return c
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model with fused GEMM + Bias Add + Multiply + LeakyReLU operation.
+    """
+    def __init__(self, in_features, out_features, multiplier, negative_slope):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.bias = nn.Parameter(torch.randn(out_features))
+        self.multiplier = multiplier
+        self.negative_slope = negative_slope
+        
+        # Initialize parameters properly
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+        bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+        nn.init.uniform_(self.bias, -bound, bound)
+        
+    def forward(self, x):
+        # Ensure input is contiguous
+        x = x.contiguous()
+        
+        # Use fused kernel
+        return fused_gemm_mul_leaky_relu(
+            x, self.weight, self.bias, self.multiplier, self.negative_slope
+        )
+```

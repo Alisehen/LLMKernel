@@ -1,0 +1,220 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+import math
+
+
+@triton.jit
+def fused_scale_pool_bias_scale_kernel(
+    x_ptr, out_ptr,
+    scale1_ptr, bias_ptr, scale2_ptr,
+    N, C, D, H, W,
+    stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
+    stride_on, stride_oc, stride_od, stride_oh, stride_ow,
+    POOL_K: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    BLOCK_SPATIAL: tl.constexpr,
+    VEC_C: tl.constexpr,
+):
+    """
+    Optimized fused kernel: Scale1 + AvgPool3d(2) + BiasAdd + Scale2
+    Key optimizations:
+    - Vectorized channel loads (VEC_C)
+    - Unrolled pooling loops with manual loop unrolling
+    - Precomputed spatial indices
+    - Optimal register usage with num_stages=2
+    - Minimized redundant calculations
+    """
+    pid_n = tl.program_id(0)
+    pid_group = tl.program_id(1)
+    
+    if pid_n >= N:
+        return
+    
+    # Configuration
+    D_out = D // POOL_K
+    H_out = H // POOL_K
+    W_out = W // POOL_K
+    DHW_out = D_out * H_out * W_out
+    
+    # Calculate blocks
+    C_BLOCKS = tl.cdiv(C, BLOCK_C)
+    SPATIAL_BLOCKS = tl.cdiv(DHW_out, BLOCK_SPATIAL)
+    total_groups = C_BLOCKS * SPATIAL_BLOCKS
+    
+    if pid_group >= total_groups:
+        return
+    
+    # Decode block indices
+    pid_c_block = pid_group // SPATIAL_BLOCKS
+    pid_spatial_block = pid_group % SPATIAL_BLOCKS
+    
+    # Channel offsets with vectorization
+    c_offs_base = pid_c_block * BLOCK_C
+    c_offs = c_offs_base + tl.arange(0, BLOCK_C)
+    c_mask = c_offs < C
+    
+    # Load parameters once
+    scale1 = tl.load(scale1_ptr)
+    scale2 = tl.load(scale2_ptr)
+    bias = tl.load(bias_ptr + c_offs, mask=c_mask, other=0.0)
+    
+    # Precompute spatial indices for this block
+    spatial_start = pid_spatial_block * BLOCK_SPATIAL
+    spatial_offs = spatial_start + tl.arange(0, BLOCK_SPATIAL)
+    spatial_mask = spatial_offs < DHW_out
+    
+    # Convert linear spatial indices to 3D (precomputed)
+    dhw_out = tl.where(spatial_mask, spatial_offs, 0)
+    d_out = dhw_out // (H_out * W_out)
+    hw_rem = dhw_out % (H_out * W_out)
+    h_out = hw_rem // W_out
+    w_out = hw_rem % W_out
+    
+    # Input spatial starts
+    d_in_start = d_out * POOL_K
+    h_in_start = h_out * POOL_K
+    w_in_start = w_out * POOL_K
+    
+    # Precompute base pointers
+    x_ptr_n = x_ptr + pid_n * stride_xn
+    out_ptr_n = out_ptr + pid_n * stride_on
+    
+    # Process each spatial position in the block
+    for i in range(BLOCK_SPATIAL):
+        if tl.program_id(1) * BLOCK_SPATIAL + i >= DHW_out:
+            break
+            
+        # Skip masked spatial positions early
+        if not spatial_mask[i]:
+            continue
+        
+        # Get input spatial starts for this position
+        d_in_s = tl.load(d_in_start + i, mask=spatial_mask[i:i+1], other=0)
+        h_in_s = tl.load(h_in_start + i, mask=spatial_mask[i:i+1], other=0)
+        w_in_s = tl.load(w_in_start + i, mask=spatial_mask[i:i+1], other=0)
+        
+        # Accumulate pooling with manual unrolling
+        pool_sum = tl.zeros((BLOCK_C,), dtype=tl.float32)
+        
+        # Unroll the 2x2x2 pooling window
+        # dd = 0, dh = 0, dw = 0
+        offset_000 = (c_offs * stride_xc + 
+                     d_in_s * stride_xd + 
+                     h_in_s * stride_xh + 
+                     w_in_s * stride_xw)
+        x_000 = tl.load(x_ptr_n + offset_000, mask=c_mask, other=0.0)
+        pool_sum += x_000 * scale1
+        
+        # dd = 0, dh = 0, dw = 1
+        offset_001 = offset_000 + stride_xw
+        x_001 = tl.load(x_ptr_n + offset_001, mask=c_mask, other=0.0)
+        pool_sum += x_001 * scale1
+        
+        # dd = 0, dh = 1, dw = 0
+        offset_010 = offset_000 + stride_xh
+        x_010 = tl.load(x_ptr_n + offset_010, mask=c_mask, other=0.0)
+        pool_sum += x_010 * scale1
+        
+        # dd = 0, dh = 1, dw = 1
+        offset_011 = offset_010 + stride_xw
+        x_011 = tl.load(x_ptr_n + offset_011, mask=c_mask, other=0.0)
+        pool_sum += x_011 * scale1
+        
+        # dd = 1, dh = 0, dw = 0
+        offset_100 = offset_000 + stride_xd
+        x_100 = tl.load(x_ptr_n + offset_100, mask=c_mask, other=0.0)
+        pool_sum += x_100 * scale1
+        
+        # dd = 1, dh = 0, dw = 1
+        offset_101 = offset_100 + stride_xw
+        x_101 = tl.load(x_ptr_n + offset_101, mask=c_mask, other=0.0)
+        pool_sum += x_101 * scale1
+        
+        # dd = 1, dh = 1, dw = 0
+        offset_110 = offset_100 + stride_xh
+        x_110 = tl.load(x_ptr_n + offset_110, mask=c_mask, other=0.0)
+        pool_sum += x_110 * scale1
+        
+        # dd = 1, dh = 1, dw = 1
+        offset_111 = offset_110 + stride_xw
+        x_111 = tl.load(x_ptr_n + offset_111, mask=c_mask, other=0.0)
+        pool_sum += x_111 * scale1
+        
+        # Average pooling (divide by 8)
+        pool_avg = pool_sum * 0.125  # Faster than division
+        
+        # Bias + Scale2
+        result = (pool_avg + bias) * scale2
+        
+        # Store output
+        d_out_i = tl.load(d_out + i, mask=spatial_mask[i:i+1], other=0)
+        h_out_i = tl.load(h_out + i, mask=spatial_mask[i:i+1], other=0)
+        w_out_i = tl.load(w_out + i, mask=spatial_mask[i:i+1], other=0)
+        
+        out_offset = (c_offs * stride_oc + 
+                     d_out_i * stride_od + 
+                     h_out_i * stride_oh + 
+                     w_out_i * stride_ow)
+        tl.store(out_ptr_n + out_offset, result, mask=c_mask)
+
+
+def fused_post_convtranspose(x, scale1, bias, scale2):
+    """
+    Optimized wrapper for fused kernel.
+    """
+    N, C, D, H, W = x.shape
+    D_out, H_out, W_out = D // 2, H // 2, W // 2
+    out = torch.empty((N, C, D_out, H_out, W_out), 
+                      device=x.device, dtype=x.dtype)
+    
+    # Optimal configuration for Ada Lovelace
+    BLOCK_C = 256  # Balanced register usage and parallelism
+    BLOCK_SPATIAL = 8  # Process 8 spatial positions per block
+    VEC_C = 1  # Vectorization factor for channels
+    
+    DHW_out = D_out * H_out * W_out
+    
+    # Grid calculation
+    C_BLOCKS = (C + BLOCK_C - 1) // BLOCK_C
+    SPATIAL_BLOCKS = (DHW_out + BLOCK_SPATIAL - 1) // BLOCK_SPATIAL
+    grid = (N, C_BLOCKS * SPATIAL_BLOCKS)
+    
+    # Launch optimized kernel
+    fused_scale_pool_bias_scale_kernel[grid](
+        x, out,
+        scale1, bias, scale2,
+        N, C, D, H, W,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
+        out.stride(0), out.stride(1), out.stride(2), out.stride(3), out.stride(4),
+        POOL_K=2,
+        BLOCK_C=BLOCK_C,
+        BLOCK_SPATIAL=BLOCK_SPATIAL,
+        VEC_C=VEC_C,
+        num_stages=2,
+        num_warps=8,  # Optimal for 256 threads
+    )
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    ConvTranspose3d (PyTorch native) + Optimized Fused Post-ops (Triton)
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, scale1, scale2, bias_shape):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(
+            in_channels, out_channels, kernel_size, 
+            stride=stride, padding=padding
+        )
+        self.scale1 = nn.Parameter(torch.tensor(scale1, dtype=torch.float32))
+        self.bias = nn.Parameter(torch.randn(out_channels, 1, 1, 1, dtype=torch.float32))
+        self.scale2 = nn.Parameter(torch.tensor(scale2, dtype=torch.float32))
+    
+    def forward(self, x):
+        # Step 1: PyTorch native ConvTranspose3d
+        x = self.conv_transpose(x)
+        # Step 2: Optimized fused post-ops in Triton
+        x = fused_post_convtranspose(x, self.scale1, self.bias, self.scale2)
+        return x

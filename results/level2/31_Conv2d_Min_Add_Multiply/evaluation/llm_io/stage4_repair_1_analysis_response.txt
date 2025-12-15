@@ -1,0 +1,5 @@
+{
+  "critical_issue": "PyTorch Conv2d runs with TF32/low-precision accumulations while Triton kernel uses full FP32, so convolution sums are computed with different rounding.",
+  "why_it_matters": "Different accumulation precision produces per-element differences around 1e-3; when true outputs are small these exceed atol/rtol thresholds, triggering the 'Outputs are not close' assertion.",
+  "minimal_fix_hint": "Use consistent precision: disable TF32 for the PyTorch Conv2d or approximate TF32 behavior in the Triton kernel to match reference numerics."
+}

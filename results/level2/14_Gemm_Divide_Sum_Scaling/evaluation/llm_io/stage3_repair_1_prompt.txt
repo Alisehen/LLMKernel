@@ -1,0 +1,221 @@
+Fix the Triton kernel errors. Generate correct, high-performance code.
+
+Current Error Log:
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 626, in compare_and_bench
+    raise ValueError(
+ValueError: Outputs are not close (atol=0.001, rtol=0.01). max_abs_err=1.699e+07, mean_abs_err=4.403e+06
+
+Main Critical Problem Analysis:
+Problem Analysis (from expert diagnosis):
+critical_issue: The Triton path computes (scaling_factor/2) * x @ weight.sum(dim=0) instead of (x @ weight.T / 2).sum(dim=1, keepdim=True) * scaling_factor.
+why_it_matters: This algebraic rewrite is not equivalent for arbitrary inputs, so the fused kernel implements a different mathematical operation, causing large numerical discrepancies versus the PyTorch reference.
+minimal_fix_hint: Make the Triton implementation directly mirror the original matmul/divide/sum/scale sequence without collapsing weight to weight.sum(dim=0).
+
+Focus your fix on addressing the identified critical issue.
+
+
+Broken Code:
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 16,  'BLOCK_K': 128}, num_warps=2, num_stages=2),
+        triton.Config({'BLOCK_M': 32,  'BLOCK_K': 128}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_K': 128}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_K': 128}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_K': 256}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_K': 256}, num_warps=8, num_stages=2),
+    ],
+    key=['M', 'K'],
+)
+@triton.jit
+def gemv_scaled_kernel_1d(
+    x_ptr,          # *fp32, [M, K]
+    wsum_ptr,       # *fp32, [K]
+    y_ptr,          # *fp32, [M]
+    M, K,           # int32
+    stride_xm, stride_xk,
+    stride_ym,
+    alpha,          # fp32 scalar
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offs_m < M
+
+    acc = tl.zeros((BLOCK_M,), dtype=tl.float32)
+
+    offs_k = tl.arange(0, BLOCK_K)
+    tl.multiple_of(offs_k, BLOCK_K)
+    tl.multiple_of(offs_m, BLOCK_M)
+
+    for k in range(0, K, BLOCK_K):
+        k_offsets = k + offs_k
+        mask_k = k_offsets < K
+
+        x_ptrs = x_ptr + offs_m[:, None] * stride_xm + k_offsets[None, :] * stride_xk
+        wsum_ptrs = wsum_ptr + k_offsets
+
+        x = tl.load(x_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0)
+        wsum = tl.load(wsum_ptrs, mask=mask_k, other=0.0)
+
+        prod = x * wsum[None, :]
+        acc += tl.sum(prod, axis=1)
+
+    acc = acc * alpha
+
+    y_ptrs = y_ptr + offs_m * stride_ym
+    tl.store(y_ptrs, acc, mask=mask_m)
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 16,  'BLOCK_K': 128}, num_warps=2, num_stages=2),
+        triton.Config({'BLOCK_M': 32,  'BLOCK_K': 128}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_K': 128}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_K': 128}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_K': 256}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_K': 256}, num_warps=8, num_stages=2),
+    ],
+    key=['M', 'K'],
+)
+@triton.jit
+def gemv_scaled_kernel_2d(
+    x_ptr,          # *fp32, [M, K]
+    wsum_ptr,       # *fp32, [K]
+    y_ptr,          # *fp32, [M]
+    M, K,           # int32
+    stride_xm, stride_xk,
+    stride_ym,
+    alpha,          # fp32 scalar
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_k = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+
+    mask_m = offs_m < M
+    mask_k = offs_k < K
+
+    tl.multiple_of(offs_m, BLOCK_M)
+    tl.multiple_of(offs_k, BLOCK_K)
+
+    x_ptrs = x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk
+    wsum_ptrs = wsum_ptr + offs_k
+
+    x = tl.load(x_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0)
+    wsum = tl.load(wsum_ptrs, mask=mask_k, other=0.0)
+
+    acc = tl.sum(x * wsum[None, :], axis=1) * alpha
+
+    y_ptrs = y_ptr + offs_m * stride_ym
+    tl.atomic_add(y_ptrs, acc, mask=mask_m)
+
+
+def fused_matmul_div_sum_scale(x: torch.Tensor, weight: torch.Tensor, scaling_factor: float) -> torch.Tensor:
+    """
+    Computes:
+        y = scaling_factor * sum_{h} ( (x @ weight.T)[..., h] / 2 )
+      which is algebraically equal to:
+        y = (scaling_factor / 2) * x @ weight.sum(dim=0)
+    Returns y with shape (batch_size, 1).
+    """
+    assert x.is_cuda and weight.is_cuda, "Inputs must be on CUDA device"
+    assert x.dtype == weight.dtype, "x and weight must have the same dtype"
+
+    M, K = x.shape
+    H, K_w = weight.shape
+    assert K_w == K, "Incompatible shapes between x and weight"
+
+    # Precompute column-wise sum over hidden dimension
+    weight_sum = weight.sum(dim=0).contiguous()
+
+    alpha = float(scaling_factor) * 0.5
+
+    y = torch.zeros((M, 1), device=x.device, dtype=x.dtype)
+
+    device_index = x.device.index if x.device.index is not None else torch.cuda.current_device()
+    sm_count = torch.cuda.get_device_properties(device_index).multi_processor_count
+
+    # Heuristic: if 1D grid would underutilize SMs, use 2D kernel with K-splitting + atomics
+    approx_block_m = 64
+    grid_1d_est = (M + approx_block_m - 1) // approx_block_m
+    use_2d = grid_1d_est < 4 * sm_count
+
+    if use_2d:
+        grid = lambda META: (
+            triton.cdiv(M, META['BLOCK_M']),
+            triton.cdiv(K, META['BLOCK_K']),
+        )
+        gemv_scaled_kernel_2d[grid](
+            x,
+            weight_sum,
+            y.view(-1),
+            M,
+            K,
+            x.stride(0),
+            x.stride(1),
+            y.stride(0),
+            alpha,
+        )
+    else:
+        grid = lambda META: (triton.cdiv(M, META['BLOCK_M']),)
+        gemv_scaled_kernel_1d[grid](
+            x,
+            weight_sum,
+            y.view(-1),
+            M,
+            K,
+            x.stride(0),
+            x.stride(1),
+            y.stride(0),
+            alpha,
+        )
+
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-accelerated version of the original Model.
+
+    It uses the algebraic identity:
+        sum_h ( (x @ W^T)[b, h] / 2 ) * s
+      = (s / 2) * x[b] · (sum_h W[h])
+    to reduce the computation to a matrix-vector product,
+    and dispatches to highly optimized Triton kernels.
+    """
+
+    def __init__(self, input_size, hidden_size, scaling_factor):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.randn(hidden_size, input_size))
+        self.scaling_factor = scaling_factor
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return fused_matmul_div_sum_scale(x, self.weight, self.scaling_factor)
+```
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl, AND any other modules used (e.g., import math if using math.sqrt)
+   2. @triton.jit decorated kernel function(s) — NO continue/break/return inside loops (use masking)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels — THIS CLASS IS REQUIRED
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+3. Learn from previous repair attempts to avoid repeating the same mistakes
+4. Ensure ALL imports are included at the top (common mistake: forgetting `import math`)
+
+```python
+# <corrected code>
+```

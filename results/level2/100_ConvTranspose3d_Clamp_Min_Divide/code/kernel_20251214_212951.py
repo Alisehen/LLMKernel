@@ -1,0 +1,143 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+import math
+
+
+@triton.jit
+def clamp_div_kernel(
+    x_ptr,
+    out_ptr,
+    N, C, D, H, W,
+    stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
+    min_value,
+    divisor,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Fused kernel: clamp(min=min_value) + division by divisor
+    Input/Output: [N, C, D, H, W]
+    """
+    # 1D grid covering all elements
+    pid = tl.program_id(0)
+    
+    # Calculate total elements and block offset
+    total_elements = N * C * D * H * W
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < total_elements
+    
+    # Compute 5D indices from 1D offset
+    # Using integer arithmetic to avoid expensive modulo operations
+    HW = H * W
+    DHW = D * HW
+    CDHW = C * DHW
+    
+    # Efficiently compute indices using integer division
+    # Note: Triton doesn't have integer division, so we use floating point with truncation
+    # This is OK since all values are positive integers
+    idx = offsets
+    n_idx = tl.math.trunc(idx / CDHW).to(tl.int64)
+    remainder = idx - n_idx * CDHW
+    c_idx = tl.math.trunc(remainder / DHW).to(tl.int64)
+    remainder = remainder - c_idx * DHW
+    d_idx = tl.math.trunc(remainder / HW).to(tl.int64)
+    remainder = remainder - d_idx * HW
+    h_idx = tl.math.trunc(remainder / W).to(tl.int64)
+    w_idx = remainder - h_idx * W
+    
+    # Compute memory offsets using strides
+    ptr_offsets = (n_idx * stride_xn + 
+                   c_idx * stride_xc + 
+                   d_idx * stride_xd + 
+                   h_idx * stride_xh + 
+                   w_idx * stride_xw)
+    
+    # Load data
+    x = tl.load(x_ptr + ptr_offsets, mask=mask)
+    
+    # Apply operations: clamp(min=min_value) + division
+    # Use tl.maximum for clamp(min=...)
+    x = tl.maximum(x, min_value)
+    x = x / divisor
+    
+    # Store result
+    tl.store(out_ptr + ptr_offsets, x, mask=mask)
+
+
+def fused_clamp_div(x, min_value, divisor):
+    """
+    Fused clamp(min=min_value) + division by divisor
+    """
+    N, C, D, H, W = x.shape
+    
+    # Create output tensor
+    out = torch.empty_like(x)
+    
+    # Calculate total elements
+    total_elements = N * C * D * H * W
+    
+    # Choose block size (power of 2)
+    # Use next power of 2, but cap at 1024 (max threads per block)
+    max_block_size = min(1024, triton.next_power_of_2(total_elements))
+    
+    # Configuration for autotune
+    configs = [
+        triton.Config({'BLOCK_SIZE': 256}, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 512}, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=8),
+    ]
+    
+    @triton.autotune(configs=configs, key=['total_elements'])
+    def tuned_kernel(
+        x_ptr, out_ptr,
+        N, C, D, H, W,
+        stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
+        min_value, divisor,
+        total_elements,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        clamp_div_kernel[(
+            triton.cdiv(total_elements, BLOCK_SIZE),
+        )](
+            x_ptr, out_ptr,
+            N, C, D, H, W,
+            stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
+            min_value, divisor,
+            BLOCK_SIZE,
+        )
+    
+    # Launch kernel
+    tuned_kernel(
+        x, out,
+        N, C, D, H, W,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
+        float(min_value), float(divisor),
+        total_elements,
+        BLOCK_SIZE=max_block_size,
+    )
+    
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    ConvTranspose3d (PyTorch native) + Fused clamp + division (Triton)
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, min_value, divisor):
+        super(ModelNew, self).__init__()
+        # Keep ConvTranspose3d as PyTorch native - DO NOT reimplement in Triton
+        self.conv_transpose = nn.ConvTranspose3d(
+            in_channels, out_channels, kernel_size,
+            stride=stride, padding=padding
+        )
+        self.min_value = min_value
+        self.divisor = divisor
+
+    def forward(self, x):
+        # Step 1: PyTorch native ConvTranspose3d
+        x = self.conv_transpose(x)
+        # Step 2: Fused clamp + division in Triton
+        x = fused_clamp_div(x, self.min_value, self.divisor)
+        return x

@@ -1,0 +1,5 @@
+{
+  "critical_issue": "GroupNorm variance is computed with divisor group_size (biased), while PyTorch’s GroupNorm uses unbiased variance (dividing by group_size - 1).",
+  "why_it_matters": "This systematic variance mismatch changes normalization scale per group, so post-activation outputs differ by several 1e-3, exceeding the atol/rtol thresholds.",
+  "minimal_fix_hint": "Match PyTorch by using unbiased variance: scale E[(x-mean)^2] by group_size / (group_size - 1) or divide by (group_size - 1) directly."
+}

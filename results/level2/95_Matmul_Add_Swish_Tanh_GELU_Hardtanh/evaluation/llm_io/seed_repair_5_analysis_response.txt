@@ -1,0 +1,5 @@
+{
+  "critical_issue": "The Triton matmul uses full fp32 precision, while PyTorch nn.Linear uses TF32 by default; tl.dot is called without allow_tf32=True, causing mismatched Linear outputs.",
+  "why_it_matters": "Small Linear-output differences from FP32 vs TF32 accumulate through Swish, Tanh, GELU, and Hardtanh, producing output deviations around 1e-2 that exceed the atol/rtol comparison thresholds.",
+  "minimal_fix_hint": "Align matmul precision with PyTorch by enabling TF32 in tl.dot (allow_tf32=True) or disabling TF32 in PyTorch to match FP32 behavior."
+}

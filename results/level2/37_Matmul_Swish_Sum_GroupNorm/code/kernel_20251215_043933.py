@@ -1,0 +1,194 @@
+# <complete ModelNew code with optimized Triton kernels>
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        # High-throughput tile for large, square-ish problems
+        triton.Config(
+            {'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+        # Tall / skinny tile
+        triton.Config(
+            {'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+        # Conservative baseline
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+    ],
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def matmul_swish_add_two_biases_kernel(
+    a_ptr,            # [M, K]
+    b_ptr,            # [K, N]
+    linear_bias_ptr,  # [N]
+    extra_bias_ptr,   # [N]
+    c_ptr,            # [M, N]
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """
+    Compute C = Swish(A @ B + linear_bias) + extra_bias,
+    where Swish(x) = x * sigmoid(x), sigmoid(x) = 1 / (1 + exp(-x)).
+    """
+
+    # 2D launch grid: (pid_m, pid_n)
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    tl.multiple_of(offs_m, BLOCK_M)
+    tl.multiple_of(offs_n, BLOCK_N)
+    tl.multiple_of(offs_k, BLOCK_K)
+
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+    out_mask = mask_m[:, None] & mask_n[None, :]
+
+    # Base pointers for this tile
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+
+    # Accumulator in FP32 to leverage tensor cores / TF32 on Ada
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    a_mask_m = mask_m[:, None]
+    b_mask_n = mask_n[None, :]
+
+    # K-loop
+    for k in range(0, K, BLOCK_K):
+        k_mask = (k + offs_k) < K
+
+        a = tl.load(
+            a_ptrs,
+            mask=a_mask_m & k_mask[None, :],
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptrs,
+            mask=k_mask[:, None] & b_mask_n,
+            other=0.0,
+        )
+
+        acc += tl.dot(a, b, allow_tf32=True)
+
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Load biases once per output-column tile
+    linear_bias = tl.load(
+        linear_bias_ptr + offs_n,
+        mask=mask_n,
+        other=0.0,
+    )
+    extra_bias = tl.load(
+        extra_bias_ptr + offs_n,
+        mask=mask_n,
+        other=0.0,
+    )
+
+    # Fused bias + Swish + extra bias
+    x = acc + linear_bias[None, :]
+    sig = 1.0 / (1.0 + tl.exp(-x))
+    x = x * sig
+    x = x + extra_bias[None, :]
+
+    tl.store(c_ptrs, x, mask=out_mask)
+
+
+def matmul_swish_add_bias(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    linear_bias: torch.Tensor,
+    extra_bias: torch.Tensor,
+) -> torch.Tensor:
+    """
+    x:           [M, K]
+    weight:      [N, K]  (nn.Linear weight: [out_features, in_features])
+    linear_bias: [N]
+    extra_bias:  [N]
+    returns:     [M, N]
+
+    Computes: Swish(x @ weight.T + linear_bias) + extra_bias
+    """
+    assert x.dim() == 2
+    assert weight.dim() == 2
+    assert linear_bias.dim() == 1
+    assert extra_bias.dim() == 1
+
+    M, K = x.shape
+    out_features, in_features = weight.shape
+    assert K == in_features
+    N = out_features
+    assert linear_bias.shape[0] == N
+    assert extra_bias.shape[0] == N
+
+    # Layout: A [M, K] row-major, B [K, N] row-major
+    x_contig = x.contiguous()
+    b_t = weight.t().contiguous()  # [K, N]
+
+    c = torch.empty((M, N), device=x.device, dtype=x.dtype)
+
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta['BLOCK_M']),
+            triton.cdiv(N, meta['BLOCK_N']),
+        )
+
+    matmul_swish_add_two_biases_kernel[grid](
+        x_contig, b_t,
+        linear_bias, extra_bias,
+        c,
+        M, N, K,
+        x_contig.stride(0), x_contig.stride(1),
+        b_t.stride(0), b_t.stride(1),
+        c.stride(0), c.stride(1),
+    )
+    return c
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-accelerated version of the original model.
+
+    Pipeline:
+      1) Linear: x @ W^T + linear_bias
+      2) Swish activation: x * sigmoid(x)
+      3) Add extra bias term
+      4) GroupNorm over features
+    """
+    def __init__(self, in_features, out_features, num_groups, bias_shape):
+        super(ModelNew, self).__init__()
+        self.linear = nn.Linear(in_features, out_features, bias=True)
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.group_norm = nn.GroupNorm(num_groups, out_features)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = matmul_swish_add_bias(
+            x,
+            self.linear.weight,
+            self.linear.bias,
+            self.bias,
+        )
+        x = self.group_norm(x)
+        return x

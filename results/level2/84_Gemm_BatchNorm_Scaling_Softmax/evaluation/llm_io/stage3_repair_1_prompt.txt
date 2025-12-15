@@ -1,0 +1,405 @@
+Fix the Triton kernel errors. Generate correct, high-performance code.
+
+Current Error Log:
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 538, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251214_114800_batch_range81to100_deepseek_deepseek/84_Gemm_BatchNorm_Scaling_Softmax/code/kernel_20251214_125110.py", line 321, in forward
+    x = gemm_wrapper_v2(x, self.weight)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251214_114800_batch_range81to100_deepseek_deepseek/84_Gemm_BatchNorm_Scaling_Softmax/code/kernel_20251214_125110.py", line 222, in gemm_wrapper_v2
+    gemm_kernel_v2[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 347, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 569, in run
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 278, in compile
+    module = src.make_ir(options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 81, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 18:19:
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr, 
+    BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+    USE_TF32: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    grid_m = tl.cdiv(M, BLOCK_M)
+    grid_n = tl.cdiv(N, BLOCK_N)
+
+    # Swizzling for better L2 cache locality
+    pid_m, pid_n = tl.swizzle2d(pid, grid_m, grid_n, GROUP_M)
+                   ^
+TypeError("swizzle2d() missing 1 required positional argument: 'size_g'")
+
+Main Critical Problem Analysis:
+Problem Analysis (from expert diagnosis):
+critical_issue: tl.swizzle2d signature mismatch: missing required argument 'size_g' (group size).
+why_it_matters: Triton compiler error occurs because swizzle2d API changed; current call has wrong number of arguments.
+minimal_fix_hint: Change tl.swizzle2d(pid, grid_m, grid_n, GROUP_M) to tl.swizzle2d(pid, grid_m, grid_n, GROUP_M, GROUP_SIZE).
+
+Focus your fix on addressing the identified critical issue.
+
+
+Broken Code:
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+import math
+
+# -----------------------------------------------------------------------------
+# Optimized Gemm kernel - V2: Improved blocking for Ada Lovelace
+# -----------------------------------------------------------------------------
+@triton.jit
+def gemm_kernel_v2(
+    a_ptr, b_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr, 
+    BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+    USE_TF32: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    grid_m = tl.cdiv(M, BLOCK_M)
+    grid_n = tl.cdiv(N, BLOCK_N)
+    
+    # Swizzling for better L2 cache locality
+    pid_m, pid_n = tl.swizzle2d(pid, grid_m, grid_n, GROUP_M)
+    
+    # Offsets
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    rk = tl.arange(0, BLOCK_K)
+    
+    # Precompute masks
+    mask_m = rm < M
+    mask_n = rn < N
+    
+    # Initialize pointers
+    a_ptrs = a_ptr + (rm[:, None] * stride_am + rk[None, :] * stride_ak)
+    b_ptrs = b_ptr + (rk[:, None] * stride_bk + rn[None, :] * stride_bn)
+    
+    # Prefetch first tiles
+    k_remaining = K
+    a = tl.load(a_ptrs, mask=mask_m[:, None] & (rk[None, :] < k_remaining), other=0.0)
+    b = tl.load(b_ptrs, mask=(rk[:, None] < k_remaining) & mask_n[None, :], other=0.0)
+    
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    # Main loop with software pipelining
+    for k in range(0, K, BLOCK_K):
+        # Prefetch next tiles
+        if k + BLOCK_K < K:
+            a_next_ptrs = a_ptrs + BLOCK_K * stride_ak
+            b_next_ptrs = b_ptrs + BLOCK_K * stride_bk
+            a_next = tl.load(a_next_ptrs, 
+                           mask=mask_m[:, None] & (rk[None, :] < K - (k + BLOCK_K)), 
+                           other=0.0)
+            b_next = tl.load(b_next_ptrs,
+                           mask=(rk[:, None] < K - (k + BLOCK_K)) & mask_n[None, :],
+                           other=0.0)
+        
+        # Current tile computation
+        acc += tl.dot(a, b, allow_tf32=USE_TF32)
+        
+        # Update for next iteration
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+        
+        if k + BLOCK_K < K:
+            a = a_next
+            b = b_next
+        else:
+            # Last iteration - load with boundary check
+            a = tl.load(a_ptrs, mask=mask_m[:, None] & (rk[None, :] < K - (k + BLOCK_K)), other=0.0)
+            b = tl.load(b_ptrs, mask=(rk[:, None] < K - (k + BLOCK_K)) & mask_n[None, :], other=0.0)
+    
+    # Store with vectorization
+    c_ptrs = c_ptr + (rm[:, None] * stride_cm + rn[None, :] * stride_cn)
+    tl.store(c_ptrs, acc, mask=mask_m[:, None] & mask_n[None, :])
+
+# -----------------------------------------------------------------------------
+# Fused BatchNorm + Scale + Softmax kernel - V2: Single-pass online softmax
+# -----------------------------------------------------------------------------
+@triton.jit
+def fused_bn_scale_softmax_kernel_v2(
+    x_ptr, gamma_ptr, beta_ptr, running_mean_ptr, running_var_ptr,
+    scale_ptr, output_ptr,
+    M, N,
+    stride_xm, stride_xn,
+    stride_om, stride_on,
+    eps,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    num_blocks_n = tl.cdiv(N, BLOCK_N)
+    
+    # Row block
+    row_start = pid_m * BLOCK_M
+    row_offs = row_start + tl.arange(0, BLOCK_M)
+    row_mask = row_offs < M
+    
+    # Thread-local storage for online softmax
+    row_max = tl.full((BLOCK_M,), float('-inf'), dtype=tl.float32)
+    row_sum = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    
+    # Process columns in chunks - online softmax algorithm
+    for pid_n in range(num_blocks_n):
+        col_start = pid_n * BLOCK_N
+        col_offs = col_start + tl.arange(0, BLOCK_N)
+        col_mask = col_offs < N
+        
+        # Load input tile
+        x_ptrs = x_ptr + row_offs[:, None] * stride_xm + col_offs[None, :] * stride_xn
+        x_tile = tl.load(x_ptrs,
+                        mask=row_mask[:, None] & col_mask[None, :],
+                        other=0.0)
+        
+        # Load parameters (vectorized)
+        gamma = tl.load(gamma_ptr + col_offs, mask=col_mask, other=1.0)
+        beta = tl.load(beta_ptr + col_offs, mask=col_mask, other=0.0)
+        r_mean = tl.load(running_mean_ptr + col_offs, mask=col_mask, other=0.0)
+        r_var = tl.load(running_var_ptr + col_offs, mask=col_mask, other=1.0)
+        scale = tl.load(scale_ptr)
+        
+        # Apply fused BatchNorm + Scale
+        inv_std = 1.0 / tl.sqrt(r_var + eps)
+        normalized = (x_tile - r_mean[None, :]) * inv_std[None, :] * gamma[None, :] + beta[None, :]
+        scaled = normalized * scale
+        
+        # Online softmax: update max and sum for each row
+        # For numerical stability, we use the online algorithm:
+        # new_sum = old_sum * exp(old_max - new_max) + sum(exp(scaled - new_max))
+        # This avoids overflow and allows single-pass processing
+        
+        # Compute local max for this tile
+        tile_max = tl.max(scaled, axis=1)
+        new_max = tl.maximum(row_max, tile_max)
+        
+        # Adjust previous sum
+        if pid_n > 0:
+            row_sum = row_sum * tl.exp(row_max - new_max)
+        
+        # Compute exponentials and add to sum
+        exp_vals = tl.exp(scaled - new_max[:, None])
+        tile_sum = tl.sum(exp_vals, axis=1)
+        row_sum = row_sum + tile_sum
+        
+        # Update max
+        row_max = new_max
+        
+        # Store scaled values temporarily in registers for second pass
+        # We'll recompute them in the second pass - better than global memory
+        
+        # Process next column block
+    
+    # Reset column pointer for second pass
+    for pid_n in range(num_blocks_n):
+        col_start = pid_n * BLOCK_N
+        col_offs = col_start + tl.arange(0, BLOCK_N)
+        col_mask = col_offs < N
+        
+        # Reload input tile and recompute scaled values
+        x_ptrs = x_ptr + row_offs[:, None] * stride_xm + col_offs[None, :] * stride_xn
+        x_tile = tl.load(x_ptrs,
+                        mask=row_mask[:, None] & col_mask[None, :],
+                        other=0.0)
+        
+        # Reload parameters
+        gamma = tl.load(gamma_ptr + col_offs, mask=col_mask, other=1.0)
+        beta = tl.load(beta_ptr + col_offs, mask=col_mask, other=0.0)
+        r_mean = tl.load(running_mean_ptr + col_offs, mask=col_mask, other=0.0)
+        r_var = tl.load(running_var_ptr + col_offs, mask=col_mask, other=1.0)
+        scale = tl.load(scale_ptr)
+        
+        # Recompute scaled values
+        inv_std = 1.0 / tl.sqrt(r_var + eps)
+        normalized = (x_tile - r_mean[None, :]) * inv_std[None, :] * gamma[None, :] + beta[None, :]
+        scaled = normalized * scale
+        
+        # Final softmax
+        exp_vals = tl.exp(scaled - row_max[:, None])
+        softmax_out = exp_vals / row_sum[:, None]
+        
+        # Store final result
+        out_ptrs = output_ptr + row_offs[:, None] * stride_om + col_offs[None, :] * stride_on
+        tl.store(out_ptrs, softmax_out,
+                mask=row_mask[:, None] & col_mask[None, :])
+
+# -----------------------------------------------------------------------------
+# Wrapper functions
+# -----------------------------------------------------------------------------
+def gemm_wrapper_v2(x, weight):
+    """Optimized matrix multiplication with autotuning."""
+    M, K = x.shape
+    N = weight.shape[0]
+    
+    # Prepare output tensor
+    output = torch.empty((M, N), device=x.device, dtype=x.dtype)
+    
+    # Transpose weight for efficient access
+    weight_t = weight.t().contiguous()
+    
+    # Grid configuration
+    grid = lambda META: (
+        triton.cdiv(M, META['BLOCK_M']) * triton.cdiv(N, META['BLOCK_N']),
+    )
+    
+    # Optimized configurations for Ada Lovelace
+    configs = [
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_M': 8}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_M': 8}, num_warps=4, num_stages=3),
+    ]
+    
+    # Best config for Ada 4090: 128x128x32 with 8 warps
+    best_config = configs[1]
+    
+    gemm_kernel_v2[grid](
+        x, weight_t, output,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        weight_t.stride(0), weight_t.stride(1),
+        output.stride(0), output.stride(1),
+        BLOCK_M=best_config.kwargs['BLOCK_M'],
+        BLOCK_N=best_config.kwargs['BLOCK_N'],
+        BLOCK_K=best_config.kwargs['BLOCK_K'],
+        GROUP_M=best_config.kwargs['GROUP_M'],
+        USE_TF32=True,
+        num_warps=best_config.num_warps,
+        num_stages=best_config.num_stages,
+    )
+    
+    return output
+
+def fused_bn_scale_softmax_wrapper_v2(x, gamma, beta, running_mean, running_var, scale, eps=1e-5):
+    """Fused BatchNorm + Scale + Softmax wrapper with optimized memory access."""
+    M, N = x.shape
+    
+    # Prepare output tensor
+    output = torch.empty_like(x)
+    
+    # Grid configuration
+    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']),)
+    
+    # Optimized configurations for softmax
+    configs = [
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 512}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64}, num_warps=8, num_stages=2),
+    ]
+    
+    # Best config: process more rows at once for better occupancy
+    best_config = configs[2]  # 128x128
+    
+    fused_bn_scale_softmax_kernel_v2[grid](
+        x, gamma, beta, running_mean, running_var,
+        scale, output,
+        M, N,
+        x.stride(0), x.stride(1),
+        output.stride(0), output.stride(1),
+        eps,
+        BLOCK_M=best_config.kwargs['BLOCK_M'],
+        BLOCK_N=best_config.kwargs['BLOCK_N'],
+        num_warps=best_config.num_warps,
+        num_stages=best_config.num_stages,
+    )
+    
+    return output
+
+# -----------------------------------------------------------------------------
+# Main Model Class
+# -----------------------------------------------------------------------------
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs matrix multiplication (Gemm), 
+    Batch Normalization, scaling, and Softmax in fused kernels.
+    """
+    def __init__(self, in_features, out_features, bn_eps=1e-5, bn_momentum=0.1, scale_shape=(1,)):
+        super(ModelNew, self).__init__()
+        
+        # Store parameters
+        self.in_features = in_features
+        self.out_features = out_features
+        self.bn_eps = bn_eps
+        self.bn_momentum = bn_momentum
+        
+        # Learnable parameters
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.gamma = nn.Parameter(torch.ones(out_features))
+        self.beta = nn.Parameter(torch.zeros(out_features))
+        self.scale = nn.Parameter(torch.ones(scale_shape))
+        
+        # BatchNorm buffers (running statistics)
+        self.register_buffer('running_mean', torch.zeros(out_features))
+        self.register_buffer('running_var', torch.ones(out_features))
+        
+        # Initialize parameters
+        self._initialize_parameters()
+    
+    def _initialize_parameters(self):
+        """Initialize weights using Kaiming initialization."""
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        
+        # Initialize gamma and beta
+        nn.init.ones_(self.gamma)
+        nn.init.zeros_(self.beta)
+    
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_features).
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_features).
+        """
+        # Step 1: Matrix multiplication with optimized kernel
+        x = gemm_wrapper_v2(x, self.weight)
+        
+        # Step 2: Fused BatchNorm + Scale + Softmax (inference only)
+        x = fused_bn_scale_softmax_wrapper_v2(
+            x, self.gamma, self.beta,
+            self.running_mean, self.running_var,
+            self.scale, self.bn_eps
+        )
+        
+        return x
+```
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl, AND any other modules used (e.g., import math if using math.sqrt)
+   2. @triton.jit decorated kernel function(s) — NO continue/break/return inside loops (use masking)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels — THIS CLASS IS REQUIRED
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+3. Learn from previous repair attempts to avoid repeating the same mistakes
+4. Ensure ALL imports are included at the top (common mistake: forgetting `import math`)
+
+```python
+# <corrected code>
+```

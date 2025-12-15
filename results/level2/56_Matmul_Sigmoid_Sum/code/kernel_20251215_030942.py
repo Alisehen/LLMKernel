@@ -1,0 +1,170 @@
+# <corrected code>
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64},
+            num_warps=4,
+            num_stages=2,
+        ),
+        triton.Config(
+            {'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32},
+            num_warps=8,
+            num_stages=2,
+        ),
+    ],
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def linear_sigmoid_row_sum_kernel(
+    a_ptr,         # [M, K] input
+    wt_ptr,        # [K, N] = nn.Linear weight.T (in_features x out_features)
+    bias_ptr,      # [N] bias
+    out_ptr,       # [M] output row sums
+    M, N, K,
+    stride_am, stride_ak,    # strides for a_ptr[m, k]
+    stride_wtk, stride_wtn,  # strides for wt_ptr[k, n]  (weight.T)
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # Program IDs.
+    pid_m = tl.program_id(0)  # along batch dimension (M)
+    pid_n = tl.program_id(1)  # along hidden/output dimension (N)
+
+    # Offsets for this program's block.
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Masks for valid rows / columns.
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+
+    # Accumulator for this [BLOCK_M, BLOCK_N] tile.
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Loop over K dimension.
+    for k0 in range(0, K, BLOCK_K):
+        k_ids = k0 + offs_k
+
+        # A[m, k] tile: [BLOCK_M, BLOCK_K]
+        a_ptrs = (
+            a_ptr
+            + offs_m[:, None] * stride_am
+            + k_ids[None, :] * stride_ak
+        )
+        a_mask = (offs_m[:, None] < M) & (k_ids[None, :] < K)
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)  # [BM, BK]
+
+        # Wt[k, n] tile: [BLOCK_K, BLOCK_N]
+        wt_ptrs = (
+            wt_ptr
+            + k_ids[:, None] * stride_wtk
+            + offs_n[None, :] * stride_wtn
+        )
+        wt_mask = (k_ids[:, None] < K) & (offs_n[None, :] < N)
+        wt = tl.load(wt_ptrs, mask=wt_mask, other=0.0)  # [BK, BN]
+
+        # Matmul in fp32: (BM, BK) x (BK, BN) -> (BM, BN)
+        acc += tl.dot(a, wt)
+
+    # Add bias: bias[n] broadcast along M.
+    bias = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0)
+    acc += bias[None, :]
+
+    # Sigmoid activation.
+    acc = 1.0 / (1.0 + tl.exp(-acc))
+
+    # Zero out contributions from columns outside N.
+    acc = tl.where(mask_n[None, :], acc, 0.0)
+
+    # Sum over N dimension -> per-row partial sums (for this N-tile).
+    row_sum = tl.sum(acc, axis=1)
+
+    # Accumulate into output via atomic add (across N-tiles).
+    tl.atomic_add(out_ptr + offs_m, row_sum, mask=mask_m)
+
+
+def fused_linear_sigmoid_sum(x: torch.Tensor,
+                             weight: torch.Tensor,
+                             bias: torch.Tensor) -> torch.Tensor:
+    """
+    Fused implementation of:
+        y = x @ weight.T + bias
+        y = sigmoid(y)
+        out = y.sum(dim=1, keepdim=True)
+
+    Args:
+        x:      [M, K]
+        weight: [N, K] (nn.Linear weight: out_features x in_features)
+        bias:   [N]
+
+    Returns:
+        out: [M, 1]
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda, "All tensors must be on CUDA device"
+    assert x.dtype == weight.dtype == bias.dtype == torch.float32, "Use float32 for this kernel"
+
+    M, K = x.shape
+    N, K_w = weight.shape
+    assert K == K_w, "Input feature dimension mismatch"
+
+    # Materialize weight.T once so the kernel computes x @ weight.T correctly.
+    wt = weight.t().contiguous()  # [K, N]
+
+    # Output is the row-wise sum -> [M]
+    out = torch.zeros((M,), device=x.device, dtype=x.dtype)
+
+    # Strides for A[M, K]
+    stride_am, stride_ak = x.stride()
+
+    # Strides for Wt[K, N]
+    stride_wtk, stride_wtn = wt.stride()
+
+    # Grid: 2D over (M, N) tiles.
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta['BLOCK_M']),
+            triton.cdiv(N, meta['BLOCK_N']),
+        )
+
+    linear_sigmoid_row_sum_kernel[grid](
+        x, wt, bias, out,
+        M, N, K,
+        stride_am, stride_ak,
+        stride_wtk, stride_wtn,
+    )
+
+    return out.view(M, 1)
+
+
+class ModelNew(nn.Module):
+    """
+    Model equivalent to the reference PyTorch model, but using a fused Triton kernel
+    for linear + sigmoid + row-wise sum.
+    """
+    def __init__(self, input_size, hidden_size):
+        super(ModelNew, self).__init__()
+        self.linear = nn.Linear(input_size, hidden_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Ensure x is on the same device as the parameters.
+        x = x.to(self.linear.weight.device)
+        return fused_linear_sigmoid_sum(x, self.linear.weight, self.linear.bias)

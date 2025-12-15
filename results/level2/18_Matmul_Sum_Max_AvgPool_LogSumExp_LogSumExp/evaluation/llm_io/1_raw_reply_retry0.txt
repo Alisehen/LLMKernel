@@ -1,0 +1,284 @@
+```python
+# <optimized Triton code>
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+import torch.nn.functional as F
+
+
+@triton.autotune(
+    configs=[
+        # Well-suited for large, square-ish problems
+        triton.Config(
+            {
+                "BLOCK_M": 128,
+                "BLOCK_N": 128,
+                "BLOCK_K": 32,
+                "num_warps": 8,
+            },
+            num_stages=4,
+        ),
+        # Tall-skinny / skinny-tall
+        triton.Config(
+            {
+                "BLOCK_M": 128,
+                "BLOCK_N": 64,
+                "BLOCK_K": 32,
+                "num_warps": 4,
+            },
+            num_stages=4,
+        ),
+        triton.Config(
+            {
+                "BLOCK_M": 64,
+                "BLOCK_N": 128,
+                "BLOCK_K": 32,
+                "num_warps": 4,
+            },
+            num_stages=4,
+        ),
+        # Smaller tiles for smaller M/N or very skinny K
+        triton.Config(
+            {
+                "BLOCK_M": 64,
+                "BLOCK_N": 64,
+                "BLOCK_K": 64,
+                "num_warps": 4,
+            },
+            num_stages=3,
+        ),
+        triton.Config(
+            {
+                "BLOCK_M": 32,
+                "BLOCK_N": 128,
+                "BLOCK_K": 64,
+                "num_warps": 4,
+            },
+            num_stages=3,
+        ),
+    ],
+    key=["M", "N", "K"],
+)
+@triton.jit
+def linear_kernel(
+    a_ptr,       # [M, K]          (input)
+    wt_ptr,      # [K, N] = W^T    (nn.Linear.weight.T)
+    bias_ptr,    # [N]
+    out_ptr,     # [M, N]
+    M, N, K,
+    stride_am, stride_ak,
+    stride_wk, stride_wn,
+    stride_om, stride_on,
+    OUT_DTYPE: tl.constexpr,      # 0: fp16, 1: bf16, 2: fp32
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """
+    Compute:
+        out = x @ W^T + b
+    where:
+        x:  [M, K]
+        W:  [N, K]  (nn.Linear.weight)
+        W^T: [K, N] (passed as wt_ptr)
+        out: [M, N]
+
+    Accumulation is in fp32 for stability; final cast controlled by OUT_DTYPE.
+
+    Grid:
+        pid_m in [0, ceil_div(M, BLOCK_M))
+        pid_n in [0, ceil_div(N, BLOCK_N))
+
+    All fused ops (matmul + bias add + store) use identical
+    (offs_m, offs_n) and the same boundary mask.
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    # Compute row/column offsets for this block
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    # Shared boundary mask for all elementwise ops
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+    block_mask = mask_m[:, None] & mask_n[None, :]
+
+    # K-dimension offsets for block-wise reduction
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Pointers to first K-tile of A and W^T for this (m, n) block
+    # A: [M, K] strides (stride_am, stride_ak)
+    a_ptrs = a_ptr + (
+        offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    )
+    # W^T: [K, N] strides (stride_wk, stride_wn)
+    wt_ptrs = wt_ptr + (
+        offs_k[:, None] * stride_wk + offs_n[None, :] * stride_wn
+    )
+
+    # Accumulator in fp32
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Iterate over K dimension in BLOCK_K chunks
+    k = 0
+    while k < K:
+        k_mask = offs_k + k < K
+
+        a = tl.load(
+            a_ptrs,
+            mask=mask_m[:, None] & k_mask[None, :],
+            other=0.0,
+        )
+        wt = tl.load(
+            wt_ptrs,
+            mask=k_mask[:, None] & mask_n[None, :],
+            other=0.0,
+        )
+
+        # TensorCore-friendly matmul: fp16/bf16 inputs, fp32 accumulation
+        acc += tl.dot(a, wt, out_dtype=tl.float32)
+
+        a_ptrs += BLOCK_K * stride_ak
+        wt_ptrs += BLOCK_K * stride_wk
+        k += BLOCK_K
+
+    # Bias add (broadcast over rows), using the same offs_n / mask_n
+    bias = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0)
+    bias_fp32 = bias.to(tl.float32)
+    acc += bias_fp32[None, :]
+
+    # Cast accumulator to desired output dtype (single, shared conversion)
+    if OUT_DTYPE == 0:
+        acc_out = acc.to(tl.float16)
+    elif OUT_DTYPE == 1:
+        acc_out = acc.to(tl.bfloat16)
+    elif OUT_DTYPE == 2:
+        acc_out = acc.to(tl.float32)
+    else:
+        # Fallback: default to fp16
+        acc_out = acc.to(tl.float16)
+
+    # Store with the same (offs_m, offs_n) offsets and shared mask
+    out_ptrs = out_ptr + (
+        offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
+    )
+    tl.store(out_ptrs, acc_out, mask=block_mask)
+
+
+def _launch_triton_linear(x: torch.Tensor,
+                          weight: torch.Tensor,
+                          bias: torch.Tensor) -> torch.Tensor:
+    """
+    Fast Triton implementation of:
+        y = F.linear(x, weight, bias)
+    for low-precision dtypes (fp16 / bf16).
+
+    x:      [M, K]
+    weight: [N, K]   (nn.Linear.weight)
+    bias:   [N]
+    """
+    assert x.dim() == 2
+    M, K = x.shape
+    N, K_w = weight.shape
+    assert K == K_w
+    assert bias.shape == (N,)
+
+    # Weight as W^T = [K, N], view only to avoid extra copies.
+    # This preserves strict, shared indexing for all fused ops.
+    weight_t = weight.t()
+    y = torch.empty((M, N), device=x.device, dtype=x.dtype)
+
+    # Dtype code for OUT_DTYPE constexpr
+    if x.dtype == torch.float16:
+        out_dtype_code = 0
+    elif x.dtype == torch.bfloat16:
+        out_dtype_code = 1
+    elif x.dtype == torch.float32:
+        out_dtype_code = 2
+    else:
+        # Fallback: treat as fp16-safe
+        out_dtype_code = 0
+
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_M"]),
+        triton.cdiv(N, META["BLOCK_N"]),
+    )
+
+    linear_kernel[grid](
+        x,
+        weight_t,
+        bias,
+        y,
+        M,
+        N,
+        K,
+        x.stride(0),
+        x.stride(1),
+        weight_t.stride(0),
+        weight_t.stride(1),
+        y.stride(0),
+        y.stride(1),
+        out_dtype_code,
+    )
+
+    return y
+
+
+def fused_linear_with_reductions(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Replacement for:
+
+        y = F.linear(x, weight, bias)          # (M, N)
+        y = torch.sum(y, dim=1, keepdim=True)  # (M, 1)
+        y = torch.max(y, dim=1, keepdim=True)[0]
+        y = torch.mean(y, dim=1, keepdim=True)
+        y = torch.logsumexp(y, dim=1, keepdim=True)
+        y = torch.logsumexp(y, dim=1, keepdim=True)
+
+    Grid layout & indexing rules:
+    - The Triton kernel covers the output [M, N] of the linear op.
+    - All fused ops *inside the kernel* (matmul + bias add + store)
+      share the same (offs_m, offs_n) and the same boundary mask.
+    - Reduction ops are NOT fused into the kernel, per constraints.
+    """
+    assert x.dim() == 2, "x must be 2D (batch_size, in_features)"
+    M, K = x.shape
+    N, K_w = weight.shape
+    assert K == K_w, "in_features mismatch between x and weight"
+    assert bias.shape == (N,), "bias must be 1D of shape (out_features,)"
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda, "All tensors must be on CUDA device"
+
+    # To preserve strict fp32 numerical behavior, route fp32 to cuBLAS
+    if x.dtype == torch.float32:
+        y = F.linear(x, weight, bias)
+    else:
+        # High-performance Triton kernel for low-precision dtypes
+        y = _launch_triton_linear(x, weight, bias)
+
+    # Reduction chain (explicitly kept outside Triton for correctness
+    # and because reductions are excluded from fusion at this stage)
+    y = torch.sum(y, dim=1, keepdim=True)
+    y, _ = torch.max(y, dim=1, keepdim=True)
+    y = torch.mean(y, dim=1, keepdim=True)
+    y = torch.logsumexp(y, dim=1, keepdim=True)
+    y = torch.logsumexp(y, dim=1, keepdim=True)
+
+    return y
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features):
+        super(ModelNew, self).__init__()
+        # Match reference model structure
+        self.linear = nn.Linear(in_features, out_features, bias=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return fused_linear_with_reductions(x, self.linear.weight, self.linear.bias)
+```

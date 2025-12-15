@@ -1,0 +1,5 @@
+{
+  "critical_issue": "Using tl.float32(group_elems) as a callable to cast an int scalar inside the Triton kernel.",
+  "why_it_matters": "tl.float32 is a dtype, not a function; calling it raises TypeError, preventing kernel compilation and causing the shown CompilationError.",
+  "minimal_fix_hint": "Cast group_elems via Triton casting, e.g., group_elems.to(tl.float32) or tl.astype(group_elems, tl.float32), instead of tl.float32(group_elems)."
+}

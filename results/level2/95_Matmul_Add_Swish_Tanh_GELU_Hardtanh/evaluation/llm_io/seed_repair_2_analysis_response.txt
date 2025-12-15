@@ -1,0 +1,5 @@
+{
+  "critical_issue": "Matmul uses tl.dot with allow_tf32=True, introducing TF32 rounding error not present in the PyTorch fp32 reference.",
+  "why_it_matters": "TF32 reduces mantissa precision, so accumulated GEMM errors exceed the strict atol/rtol thresholds, causing max_abs_err around 1e-2 despite otherwise correct algorithm.",
+  "minimal_fix_hint": "Use full fp32 in tl.dot (disable TF32 or mirror torch.backends.cuda.matmul.allow_tf32) to match PyTorch numerical behavior."
+}

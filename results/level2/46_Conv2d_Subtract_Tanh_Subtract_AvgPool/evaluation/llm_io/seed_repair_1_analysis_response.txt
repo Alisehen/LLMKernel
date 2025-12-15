@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Inside avgpool2d_sub2_kernel, Python float() is applied to Triton tensor pool_k when computing denom.",
+  "why_it_matters": "Triton JIT treats pool_k as a tensor, so Python’s float() cannot convert it, causing a TypeError during compilation.",
+  "minimal_fix_hint": "Compute denom using Triton types, e.g., cast with tl.float32 or use a constexpr, avoiding Python float() inside the kernel."
+}
+```

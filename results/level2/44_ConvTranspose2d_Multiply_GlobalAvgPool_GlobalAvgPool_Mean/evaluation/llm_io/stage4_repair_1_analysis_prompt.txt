@@ -1,0 +1,353 @@
+You are a Triton kernel debugging expert. Analyze the error and identify the root cause.
+
+## ERROR LOG
+```
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 538, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251214_114657_batch_range25to55_deepseek_deepseek/44_ConvTranspose2d_Multiply_GlobalAvgPool_GlobalAvgPool_Mean/code/kernel_20251214_211711.py", line 225, in forward
+    x = fused_multiply_gap(x, self.multiplier)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251214_114657_batch_range25to55_deepseek_deepseek/44_ConvTranspose2d_Multiply_GlobalAvgPool_GlobalAvgPool_Mean/code/kernel_20251214_211711.py", line 197, in fused_multiply_gap
+    fused_multiply_gap_kernel_ultra_opt[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 347, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 569, in run
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 278, in compile
+    module = src.make_ir(options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 81, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 34:4:
+    channel_sum = tl.zeros((BLOCK_C,), dtype=tl.float32)
+
+    # Optimized memory access pattern with reduced register pressure
+    hw_size = spatial_size
+    num_tiles = tl.cdiv(hw_size, BLOCK_HW)
+
+    # Precompute constants for better compiler optimization
+    stride_xc_local = stride_xc
+    stride_xn_local = stride_xn
+    W_local = W
+
+    for tile_idx in range(num_tiles):
+    ^
+AssertionError("Loop-carried variable channel_sum has initial type <['32'], fp32> but is re-assigned to <['32', '32'], fp32> in loop! Please make sure that the type stays consistent.")
+```
+
+## Expected Behavior (PyTorch Reference)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs a transposed convolution, multiplies by a scalar, applies global average pooling, 
+    another global average pooling
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, multiplier):
+        super(Model, self).__init__()
+        self.conv_transpose = nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, output_padding=output_padding)
+        self.multiplier = multiplier
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = x * self.multiplier
+        x = torch.mean(x, dim=[2, 3], keepdim=True)  # First global average pooling
+        x = torch.mean(x, dim=[2, 3], keepdim=True)  # Second global average pooling
+        return x
+
+batch_size = 16
+in_channels = 64
+out_channels = 128
+height, width = 128, 128
+kernel_size = 3
+stride = 2
+padding = 1
+output_padding = 1
+multiplier = 0.5
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, stride, padding, output_padding, multiplier]
+```
+
+## Current Implementation (Broken Triton Kernel)
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def fused_multiply_gap_kernel_small(
+    x_ptr,
+    out_ptr,
+    multiplier,
+    N, C, H, W,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_on, stride_oc, stride_oh, stride_ow,
+    BLOCK_C: tl.constexpr,
+):
+    pid_n = tl.program_id(0)
+    pid_c = tl.program_id(1)
+    
+    if pid_n >= N or pid_c >= C:
+        return
+    
+    spatial_size = H * W
+    inv_spatial_size = 1.0 / spatial_size
+    
+    hw_idx = tl.arange(0, spatial_size)
+    h = hw_idx // W
+    w = hw_idx % W
+    
+    ptr_offset = pid_n * stride_xn + pid_c * stride_xc + h * stride_xh + w * stride_xw
+    mask = hw_idx < spatial_size
+    spatial_data = tl.load(x_ptr + ptr_offset, mask=mask, other=0.0)
+    
+    channel_sum = tl.sum(spatial_data)
+    result = channel_sum * multiplier * inv_spatial_size
+    
+    out_offset = pid_n * stride_on + pid_c * stride_oc
+    tl.store(out_ptr + out_offset, result)
+
+
+@triton.jit
+def fused_multiply_gap_kernel_large(
+    x_ptr,
+    out_ptr,
+    multiplier,
+    N, C, H, W,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_on, stride_oc, stride_oh, stride_ow,
+    BLOCK_C: tl.constexpr,
+    BLOCK_HW: tl.constexpr,
+    VEC_SIZE: tl.constexpr,
+):
+    pid_n = tl.program_id(0)
+    pid_c_block = tl.program_id(1)
+    
+    if pid_n >= N:
+        return
+    
+    c_offsets = pid_c_block * BLOCK_C + tl.arange(0, BLOCK_C)
+    c_mask = c_offsets < C
+    
+    spatial_size = H * W
+    inv_spatial_size = 1.0 / spatial_size
+    channel_sum = tl.zeros((BLOCK_C,), dtype=tl.float32)
+    
+    # Optimized vectorized loop with proper memory coalescing
+    hw_size = spatial_size
+    vec_tile_size = BLOCK_HW // VEC_SIZE
+    num_tiles = tl.cdiv(hw_size, BLOCK_HW)
+    
+    for tile_idx in range(num_tiles):
+        hw_start = tile_idx * BLOCK_HW
+        hw_offsets = hw_start + tl.arange(0, BLOCK_HW)
+        hw_mask = hw_offsets < hw_size
+        
+        h = hw_offsets // W
+        w = hw_offsets % W
+        
+        # Vectorized load pattern for better coalescing
+        x_base = pid_n * stride_xn + c_offsets[:, None] * stride_xc
+        h_offsets = h[None, :] * stride_xh
+        w_offsets = w[None, :] * stride_xw
+        
+        ptr_offsets = x_base + h_offsets + w_offsets
+        mask_2d = c_mask[:, None] & hw_mask[None, :]
+        
+        # Load with vectorization hint
+        data = tl.load(x_ptr + ptr_offsets, mask=mask_2d, other=0.0)
+        channel_sum += tl.sum(data, axis=1)
+    
+    result = channel_sum * (multiplier * inv_spatial_size)
+    out_base = pid_n * stride_on + c_offsets * stride_oc
+    tl.store(out_ptr + out_base, result, mask=c_mask)
+
+
+@triton.jit
+def fused_multiply_gap_kernel_ultra_opt(
+    x_ptr,
+    out_ptr,
+    multiplier,
+    N, C, H, W,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_on, stride_oc, stride_oh, stride_ow,
+    BLOCK_C: tl.constexpr,
+    BLOCK_HW: tl.constexpr,
+    VEC_SIZE: tl.constexpr,
+):
+    pid_n = tl.program_id(0)
+    pid_c_block = tl.program_id(1)
+    
+    if pid_n >= N:
+        return
+    
+    c_offsets = pid_c_block * BLOCK_C + tl.arange(0, BLOCK_C)
+    c_mask = c_offsets < C
+    
+    spatial_size = H * W
+    inv_spatial_size = 1.0 / spatial_size
+    channel_sum = tl.zeros((BLOCK_C,), dtype=tl.float32)
+    
+    # Optimized memory access pattern with reduced register pressure
+    hw_size = spatial_size
+    num_tiles = tl.cdiv(hw_size, BLOCK_HW)
+    
+    # Precompute constants for better compiler optimization
+    stride_xc_local = stride_xc
+    stride_xn_local = stride_xn
+    W_local = W
+    
+    for tile_idx in range(num_tiles):
+        hw_start = tile_idx * BLOCK_HW
+        hw_offsets = hw_start + tl.arange(0, BLOCK_HW)
+        hw_mask = hw_offsets < hw_size
+        
+        # Efficient h/w computation
+        h = hw_offsets // W_local
+        w = hw_offsets % W_local
+        
+        # Optimized pointer computation with less register usage
+        base_ptr = pid_n * stride_xn_local + c_offsets[:, None] * stride_xc_local
+        spatial_offset = h * stride_xh + w * stride_xw
+        ptr_offsets = base_ptr + spatial_offset[None, :]
+        
+        mask_2d = c_mask[:, None] & hw_mask[None, :]
+        data = tl.load(x_ptr + ptr_offsets, mask=mask_2d, other=0.0)
+        
+        # Efficient reduction with minimal intermediate storage
+        channel_sum += tl.where(c_mask[:, None], tl.sum(data, axis=1), 0.0)
+    
+    result = channel_sum * (multiplier * inv_spatial_size)
+    out_base = pid_n * stride_on + c_offsets * stride_oc
+    tl.store(out_ptr + out_base, result, mask=c_mask)
+
+
+def fused_multiply_gap(x, multiplier):
+    N, C, H, W = x.shape
+    spatial_size = H * W
+    out = torch.empty((N, C, 1, 1), device=x.device, dtype=x.dtype)
+    
+    if spatial_size <= 256:
+        BLOCK_C = 1
+        grid = (N, C)
+        fused_multiply_gap_kernel_small[grid](
+            x, out, multiplier,
+            N, C, H, W,
+            x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+            out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+            BLOCK_C=BLOCK_C,
+        )
+    elif spatial_size <= 4096:
+        BLOCK_C = min(64, triton.next_power_of_2(C))
+        BLOCK_HW = 256
+        VEC_SIZE = 4 if x.element_size() == 4 else 8
+        
+        grid = (N, triton.cdiv(C, BLOCK_C))
+        
+        # Conservative configuration for medium sizes
+        fused_multiply_gap_kernel_large[grid](
+            x, out, multiplier,
+            N, C, H, W,
+            x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+            out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+            BLOCK_C=BLOCK_C,
+            BLOCK_HW=BLOCK_HW,
+            VEC_SIZE=VEC_SIZE,
+            num_stages=2,
+            num_warps=4,
+        )
+    else:
+        BLOCK_C = min(32, triton.next_power_of_2(C))
+        BLOCK_HW = 256  # Reduced from 512 for better occupancy
+        VEC_SIZE = 4 if x.element_size() == 4 else 8
+        
+        grid = (N, triton.cdiv(C, BLOCK_C))
+        
+        # Optimized configuration based on NCU metrics analysis
+        fused_multiply_gap_kernel_ultra_opt[grid](
+            x, out, multiplier,
+            N, C, H, W,
+            x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+            out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+            BLOCK_C=BLOCK_C,
+            BLOCK_HW=BLOCK_HW,
+            VEC_SIZE=VEC_SIZE,
+            num_stages=2,    # Reduced from 4 to lower register pressure
+            num_warps=4,     # Reduced from 8 for better occupancy
+        )
+    
+    return out
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, 
+                 output_padding, multiplier):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose2d(
+            in_channels, out_channels, kernel_size, 
+            stride=stride, padding=padding, 
+            output_padding=output_padding
+        )
+        self.multiplier = multiplier
+    
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = fused_multiply_gap(x, self.multiplier)
+        return x
+```
+
+---
+
+## Your Task
+
+Identify the **single most critical issue** that causes the error above.
+
+### Analysis Guidelines
+
+1. **Focus on root cause**, not symptoms
+   - Bad: "Output is wrong"
+   - Good: "BLOCK_K loop missing, only processes first 32 elements of K dimension"
+
+2. **Be specific about WHAT and WHERE**
+   - Bad: "Memory access issue"
+   - Good: "Line 45: tl.atomic_add(c_block_ptr, acc) - atomic_add requires scalar pointer, not block_ptr"
+
+3. **Prioritize by impact**
+   - Correctness bugs > Performance issues > Style problems
+   - Algorithm errors > Implementation details
+
+### Output Format
+
+**CRITICAL: You MUST output ONLY valid JSON. No other text allowed.**
+
+```json
+{
+  "critical_issue": "<Concise description of THE root cause, max 30 words>",
+  "why_it_matters": "<Why this causes the observed error, max 35 words>",
+  "minimal_fix_hint": "<What needs to change (not how), max 30 words>"
+}
+```
+
+**Remember**: Output ONLY the JSON block. No explanations, no commentary, no additional text.

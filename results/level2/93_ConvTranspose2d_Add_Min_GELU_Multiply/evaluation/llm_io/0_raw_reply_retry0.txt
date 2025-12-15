@@ -1,0 +1,99 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def fused_add_min_gelu_mul_kernel(
+    x_ptr, out_ptr,
+    numel: tl.int32,
+    add_value: tl.float32,
+    multiply_value: tl.float32,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Fused elementwise kernel:
+      y = x + add_value
+      y = min(y, 0.0)
+      y = GELU(y)
+      y = y * multiply_value
+
+    Operates on a 1D flattened view of the tensor.
+    """
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < numel
+
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+
+    # Add scalar
+    x = x + add_value
+
+    # Elementwise min with 0.0 (clamp_max at 0)
+    x = tl.minimum(x, 0.0)
+
+    # GELU using erf-based formulation: 0.5 * x * (1 + erf(x / sqrt(2)))
+    inv_sqrt2 = 0.7071067811865475  # 1 / sqrt(2)
+    x_erf = tl.math.erf(x * inv_sqrt2)
+    x = 0.5 * x * (1.0 + x_erf)
+
+    # Multiply scalar
+    x = x * multiply_value
+
+    tl.store(out_ptr + offsets, x, mask=mask)
+
+
+def fused_post_convtranspose(x: torch.Tensor, add_value: float, multiply_value: float) -> torch.Tensor:
+    """
+    Fused post-processing after ConvTranspose2d:
+      y = x + add_value
+      y = min(y, 0.0)
+      y = GELU(y)
+      y = y * multiply_value
+
+    Implemented as a single Triton kernel over the flattened tensor.
+    """
+    assert x.is_cuda, "Input must be a CUDA tensor for Triton kernels."
+
+    out = torch.empty_like(x)
+    numel = x.numel()
+
+    BLOCK_SIZE = 1024  # power of 2 per requirements
+    grid = (triton.cdiv(numel, BLOCK_SIZE),)
+
+    fused_add_min_gelu_mul_kernel[grid](
+        x, out,
+        numel,
+        float(add_value),
+        float(multiply_value),
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    ConvTranspose2d (PyTorch native) +
+    Fused: AddValue + Min(., 0) + GELU + MultiplyValue (Triton)
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, add_value, multiply_value):
+        super(ModelNew, self).__init__()
+        # Keep ConvTranspose2d in PyTorch (indexing is complex)
+        self.conv_transpose = nn.ConvTranspose2d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+        )
+        # Store scalar parameters for Triton kernel
+        self.add_value = float(add_value)
+        self.multiply_value = float(multiply_value)
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = fused_post_convtranspose(x, self.add_value, self.multiply_value)
+        return x
+```

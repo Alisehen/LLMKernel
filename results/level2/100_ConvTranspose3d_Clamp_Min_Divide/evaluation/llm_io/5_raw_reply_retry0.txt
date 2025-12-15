@@ -1,0 +1,182 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 256, 'VEC_SIZE': 8}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 512, 'VEC_SIZE': 8}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 1024, 'VEC_SIZE': 4}, num_warps=4, num_stages=3),
+    ],
+    key=['total_elements']
+)
+@triton.jit
+def clamp_div_kernel_contiguous(
+    x_ptr,
+    out_ptr,
+    min_value,
+    divisor,
+    total_elements,
+    BLOCK_SIZE: tl.constexpr,
+    VEC_SIZE: tl.constexpr,
+):
+    """
+    Optimized kernel for contiguous tensors ONLY
+    Maximizes memory throughput with aggressive vectorization
+    """
+    pid = tl.program_id(0)
+    base_offset = pid * BLOCK_SIZE * VEC_SIZE
+    
+    # Use 1D indexing with vectorization - FIXED: avoid problematic reshape
+    offsets = base_offset + tl.arange(0, BLOCK_SIZE * VEC_SIZE)
+    mask = offsets < total_elements
+    
+    # Load vectorized
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    
+    # Fused operations (use maximum for clamp)
+    # Precompute reciprocal once
+    inv_divisor = 1.0 / divisor
+    x = tl.maximum(x, min_value) * inv_divisor
+    
+    # Store vectorized
+    tl.store(out_ptr + offsets, x, mask=mask)
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 128, 'VEC_SIZE': 4}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 256, 'VEC_SIZE': 4}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 256, 'VEC_SIZE': 2}, num_warps=4, num_stages=3),
+    ],
+    key=['total_elements']
+)
+@triton.jit
+def clamp_div_kernel_strided(
+    x_ptr,
+    out_ptr,
+    N, C, D, H, W,
+    stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
+    min_value,
+    divisor,
+    total_elements,
+    BLOCK_SIZE: tl.constexpr,
+    VEC_SIZE: tl.constexpr,
+):
+    """
+    Optimized kernel for strided tensors
+    Reduces register pressure with simplified indexing
+    """
+    pid = tl.program_id(0)
+    base_offset = pid * BLOCK_SIZE
+    
+    # Process elements sequentially within each block
+    offsets = base_offset + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < total_elements
+    
+    # Fast 5D index calculation using integer arithmetic
+    idx = tl.where(mask, offsets, 0)  # Use 0 for masked elements to avoid out-of-bounds
+    
+    DHW = D * H * W
+    CDHW = C * DHW
+    HW = H * W
+    
+    # Compute indices without expensive divisions
+    n_idx = idx // CDHW
+    remainder = idx - n_idx * CDHW
+    c_idx = remainder // DHW
+    remainder = remainder - c_idx * DHW
+    d_idx = remainder // HW
+    remainder = remainder - d_idx * HW
+    h_idx = remainder // W
+    w_idx = remainder - h_idx * W
+    
+    # Compute memory offsets
+    memory_offsets = (
+        n_idx * stride_xn + 
+        c_idx * stride_xc + 
+        d_idx * stride_xd + 
+        h_idx * stride_xh + 
+        w_idx * stride_xw
+    )
+    
+    # Load with computed offsets
+    x = tl.load(x_ptr + memory_offsets, mask=mask, other=0.0)
+    
+    # Fused operations
+    inv_divisor = 1.0 / divisor
+    x = tl.maximum(x, min_value) * inv_divisor
+    
+    # Store
+    tl.store(out_ptr + memory_offsets, x, mask=mask)
+
+
+def fused_clamp_div(x, min_value, divisor):
+    """
+    Fused clamp(min=min_value) + division by divisor
+    Automatically selects optimal kernel based on memory layout
+    """
+    N, C, D, H, W = x.shape
+    total_elements = N * C * D * H * W
+    
+    # Create output tensor
+    out = torch.empty_like(x)
+    
+    # Check contiguity efficiently
+    if x.is_contiguous():
+        # Use optimized contiguous kernel with high vectorization
+        grid = lambda META: (triton.cdiv(total_elements, META['BLOCK_SIZE'] * META['VEC_SIZE']),)
+        clamp_div_kernel_contiguous[grid](
+            x, out,
+            float(min_value), float(divisor),
+            total_elements,
+        )
+    else:
+        # Use strided kernel with conservative settings
+        grid = lambda META: (triton.cdiv(total_elements, META['BLOCK_SIZE']),)
+        clamp_div_kernel_strided[grid](
+            x, out,
+            N, C, D, H, W,
+            x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
+            float(min_value), float(divisor),
+            total_elements,
+        )
+    
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    ConvTranspose3d (PyTorch native) + Fused clamp + division (Triton)
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, min_value, divisor):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(
+            in_channels, out_channels, kernel_size,
+            stride=stride, padding=padding
+        )
+        self.min_value = min_value
+        self.divisor = divisor
+
+    def forward(self, x):
+        # Step 1: PyTorch native ConvTranspose3d
+        x = self.conv_transpose(x)
+        # Step 2: Fused clamp + division in Triton
+        x = fused_clamp_div(x, self.min_value, self.divisor)
+        return x
+```
+
+The key fixes:
+
+1. **Removed problematic reshape operation**: The original code used `tl.reshape(offsets, -1)` which requires dimensions to be powers of 2. Triton has restrictions on reshape dimensions, so I replaced it with 1D indexing.
+
+2. **Simplified contiguous kernel**: Used simple 1D indexing `tl.arange(0, BLOCK_SIZE * VEC_SIZE)` instead of creating 2D offsets and reshaping.
+
+3. **Fixed grid calculation for strided kernel**: Changed from `META['BLOCK_SIZE'] * META['VEC_SIZE']` to just `META['BLOCK_SIZE']` since the strided kernel now processes elements sequentially.
+
+4. **Added safe index calculation**: Used `tl.where(mask, offsets, 0)` to ensure out-of-bounds indices are handled properly in the strided kernel.
+
+The kernels maintain high performance while being correct and avoiding Triton's reshape restrictions. The contiguous kernel still achieves high memory throughput with vectorization, while the strided kernel uses simpler indexing for correctness with complex memory layouts.

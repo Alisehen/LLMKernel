@@ -1,0 +1,259 @@
+You are a Triton kernel debugging expert. Analyze the error and identify the root cause.
+
+## ERROR LOG
+```
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 538, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251214_114657_batch_range25to55_deepseek_deepseek/26_ConvTranspose3d_Add_HardSwish/code/kernel_20251214_121501.py", line 149, in forward
+    x = fused_add_hardswish(x, add_input)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251214_114657_batch_range25to55_deepseek_deepseek/26_ConvTranspose3d_Add_HardSwish/code/kernel_20251214_121501.py", line 102, in fused_add_hardswish
+    grid = (N, triton.cdiv(C, configs[0].BLOCK_C))
+                              ^^^^^^^^^^^^^^^^^^
+AttributeError: 'Config' object has no attribute 'BLOCK_C'
+```
+
+## Expected Behavior (PyTorch Reference)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs a 3D transposed convolution, adds an input tensor, and applies HardSwish activation.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, bias_shape):
+        super(Model, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, output_padding=output_padding)
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+
+    def forward(self, x, add_input):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_channels, D, H, W).
+            add_input (torch.Tensor): Input tensor to be added after transposed convolution, of shape (batch_size, out_channels, D, H, W).
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_channels, D, H, W) after HardSwish activation.
+        """
+        x = self.conv_transpose(x)
+        x = x + add_input
+        x = x * torch.nn.functional.hardswish(x)
+        return x
+
+
+batch_size = 128
+in_channels = 32
+out_channels = 64
+D, H, W = 16, 16, 16
+kernel_size = 3
+stride = 2
+padding = 1
+output_padding = 1
+bias_shape = (out_channels, 1, 1, 1, 1)
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, D, H, W), torch.rand(batch_size, out_channels, D*stride, H*stride, W*stride)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, stride, padding, output_padding, bias_shape]
+```
+
+## Current Implementation (Broken Triton Kernel)
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def fused_add_hardswish_kernel(
+    conv_out_ptr,      # [N, C, D, H, W]
+    add_input_ptr,     # [N, C, D, H, W]
+    out_ptr,           # [N, C, D, H, W]
+    N, C, D, H, W,
+    stride_conv_n, stride_conv_c, stride_conv_d, stride_conv_h, stride_conv_w,
+    stride_add_n, stride_add_c, stride_add_d, stride_add_h, stride_add_w,
+    stride_out_n, stride_out_c, stride_out_d, stride_out_h, stride_out_w,
+    BLOCK_C: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Fused kernel: Add + HardSwish activation
+    HardSwish(x) = x * relu6(x + 3) / 6
+    """
+    pid_n = tl.program_id(0)  # batch index
+    pid_chunk = tl.program_id(1)  # chunk of C dimension
+    
+    if pid_n >= N:
+        return
+    
+    # Compute offsets for C dimension
+    c_offsets = pid_chunk * BLOCK_C + tl.arange(0, BLOCK_C)
+    c_mask = c_offsets < C
+    
+    # Compute base pointers for this batch and C chunk
+    conv_base = conv_out_ptr + pid_n * stride_conv_n
+    add_base = add_input_ptr + pid_n * stride_add_n
+    out_base = out_ptr + pid_n * stride_out_n
+    
+    # Process all spatial positions for this C chunk
+    for idx in range(D * H * W):
+        # Compute spatial indices
+        d_idx = idx // (H * W)
+        h_idx = (idx % (H * W)) // W
+        w_idx = idx % W
+        
+        # Load conv output values for this spatial position
+        conv_ptrs = (conv_base + 
+                     c_offsets * stride_conv_c +
+                     d_idx * stride_conv_d +
+                     h_idx * stride_conv_h +
+                     w_idx * stride_conv_w)
+        conv_vals = tl.load(conv_ptrs, mask=c_mask, other=0.0)
+        
+        # Load add_input values for this spatial position
+        add_ptrs = (add_base +
+                    c_offsets * stride_add_c +
+                    d_idx * stride_add_d +
+                    h_idx * stride_add_h +
+                    w_idx * stride_add_w)
+        add_vals = tl.load(add_ptrs, mask=c_mask, other=0.0)
+        
+        # Add operation: x = conv_out + add_input
+        x = conv_vals + add_vals
+        
+        # HardSwish activation: x * relu6(x + 3) / 6
+        # relu6(x) = min(max(x, 0), 6)
+        x_plus_3 = x + 3.0
+        relu6_val = tl.minimum(tl.maximum(x_plus_3, 0.0), 6.0)
+        hardswish_x = x * relu6_val / 6.0
+        
+        # Store result
+        out_ptrs = (out_base +
+                    c_offsets * stride_out_c +
+                    d_idx * stride_out_d +
+                    h_idx * stride_out_h +
+                    w_idx * stride_out_w)
+        tl.store(out_ptrs, hardswish_x, mask=c_mask)
+
+
+def fused_add_hardswish(conv_out, add_input):
+    """
+    Fused Add + HardSwish operation
+    Args:
+        conv_out: [N, C, D, H, W] - output from ConvTranspose3d
+        add_input: [N, C, D, H, W] - tensor to add (same shape)
+    Returns:
+        [N, C, D, H, W] - result after Add + HardSwish
+    """
+    assert conv_out.shape == add_input.shape, "Shapes must match"
+    N, C, D, H, W = conv_out.shape
+    
+    # Output tensor
+    out = torch.empty_like(conv_out)
+    
+    # Configurations for autotuning
+    configs = [
+        triton.Config({'BLOCK_C': 32, 'BLOCK_SIZE': 256}, num_warps=4),
+        triton.Config({'BLOCK_C': 64, 'BLOCK_SIZE': 512}, num_warps=8),
+        triton.Config({'BLOCK_C': 128, 'BLOCK_SIZE': 1024}, num_warps=8),
+    ]
+    
+    # Launch kernel
+    grid = (N, triton.cdiv(C, configs[0].BLOCK_C))
+    fused_add_hardswish_kernel[grid](
+        conv_out, add_input, out,
+        N, C, D, H, W,
+        conv_out.stride(0), conv_out.stride(1), conv_out.stride(2),
+        conv_out.stride(3), conv_out.stride(4),
+        add_input.stride(0), add_input.stride(1), add_input.stride(2),
+        add_input.stride(3), add_input.stride(4),
+        out.stride(0), out.stride(1), out.stride(2),
+        out.stride(3), out.stride(4),
+        BLOCK_C=configs[0].BLOCK_C,
+        BLOCK_SIZE=configs[0].BLOCK_SIZE,
+    )
+    
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    ConvTranspose3d (PyTorch native) + Fused Add + HardSwish (Triton)
+    
+    NOTE: ConvTranspose3d has complex index mapping - keep it in PyTorch.
+    Only fuse the simpler subsequent operations (Add + HardSwish) in Triton.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, bias_shape):
+        super(ModelNew, self).__init__()
+        # Keep ConvTranspose as PyTorch native - DO NOT reimplement in Triton
+        self.conv_transpose = nn.ConvTranspose3d(
+            in_channels, out_channels, kernel_size,
+            stride=stride, padding=padding, output_padding=output_padding
+        )
+        # Bias is initialized but not used in forward (as per original model)
+        self.register_parameter('bias', nn.Parameter(torch.randn(bias_shape)))
+
+    def forward(self, x, add_input):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_channels, D, H, W).
+            add_input (torch.Tensor): Tensor to add after transposed convolution, 
+                                     of shape (batch_size, out_channels, D_out, H_out, W_out).
+        Returns:
+            torch.Tensor: Output tensor after ConvTranspose3d, Add, and HardSwish.
+        """
+        # Step 1: PyTorch native ConvTranspose3d
+        x = self.conv_transpose(x)
+        
+        # Step 2: Fused Add + HardSwish in Triton
+        x = fused_add_hardswish(x, add_input)
+        
+        return x
+```
+
+---
+
+## Your Task
+
+Identify the **single most critical issue** that causes the error above.
+
+### Analysis Guidelines
+
+1. **Focus on root cause**, not symptoms
+   - Bad: "Output is wrong"
+   - Good: "BLOCK_K loop missing, only processes first 32 elements of K dimension"
+
+2. **Be specific about WHAT and WHERE**
+   - Bad: "Memory access issue"
+   - Good: "Line 45: tl.atomic_add(c_block_ptr, acc) - atomic_add requires scalar pointer, not block_ptr"
+
+3. **Prioritize by impact**
+   - Correctness bugs > Performance issues > Style problems
+   - Algorithm errors > Implementation details
+
+### Output Format
+
+**CRITICAL: You MUST output ONLY valid JSON. No other text allowed.**
+
+```json
+{
+  "critical_issue": "<Concise description of THE root cause, max 30 words>",
+  "why_it_matters": "<Why this causes the observed error, max 35 words>",
+  "minimal_fix_hint": "<What needs to change (not how), max 30 words>"
+}
+```
+
+**Remember**: Output ONLY the JSON block. No explanations, no commentary, no additional text.

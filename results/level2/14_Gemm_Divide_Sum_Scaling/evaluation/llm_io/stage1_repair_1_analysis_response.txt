@@ -1,0 +1,5 @@
+{
+  "critical_issue": "Using tl.multiple_of on offs_m and offs_k, which are not multiples of BLOCK_M/BLOCK_K, violating the assumption and causing undefined behavior in pointer arithmetic.",
+  "why_it_matters": "The compiler assumes these indices are aligned multiples; since they're not, x_ptrs/wsum_ptrs accesses become incorrect, so dot-products accumulate garbage values, producing huge numerical errors.",
+  "minimal_fix_hint": "Remove or correct tl.multiple_of calls; only apply them to indices that are guaranteed multiples of the specified block size."
+}

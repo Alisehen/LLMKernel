@@ -1,0 +1,5 @@
+{
+  "critical_issue": "The matmul uses the wrong weight layout, effectively computing x @ weight instead of x @ weight.T.",
+  "why_it_matters": "Every linear output element is wrong, so the subsequent sigmoid and row-sum differ drastically from the PyTorch reference, yielding huge absolute errors.",
+  "minimal_fix_hint": "Adjust w_ptr layout or the host-side transpose so the kernel truly computes x @ weight.T like nn.Linear."
+}

@@ -1,0 +1,317 @@
+You are a Triton kernel debugging expert. Analyze the error and identify the root cause.
+
+## ERROR LOG
+```
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 538, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251214_114735_batch_range56to80_deepseek_deepseek/58_ConvTranspose3d_LogSumExp_HardSwish_Subtract_Clamp/code/kernel_20251214_132918.py", line 197, in forward
+    x = fused_post_convtranspose(x, self.bias)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251214_114735_batch_range56to80_deepseek_deepseek/58_ConvTranspose3d_LogSumExp_HardSwish_Subtract_Clamp/code/kernel_20251214_132918.py", line 157, in fused_post_convtranspose
+    fused_post_ops_kernel[grid_n, grid_spatial](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 347, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 192, in run
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 192, in <dictcomp>
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 170, in _bench
+    return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/testing.py", line 145, in do_bench
+    fn()
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 156, in kernel_call
+    self.fn.run(
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 537, in run
+    bound_args, specialization, options = binder(*args, **kwargs)
+                                          ^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: dynamic_func() missing 1 required positional argument: 'BLOCK_DHW'
+```
+
+## Expected Behavior (PyTorch Reference)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs a 3D transposed convolution, LogSumExp, HardSwish, subtraction, clamp operations.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, bias_shape):
+        super(Model, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding)
+        self.bias = nn.Parameter(torch.randn(1, 1, 1, 1)) 
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = torch.logsumexp(x, dim=1, keepdim=True)
+        x = x * torch.sigmoid(x + 3) / 6
+        x = x - self.bias
+        x = torch.clamp(x, min=-1, max=1)
+        return x
+
+batch_size = 128
+in_channels = 3
+out_channels = 16
+depth, height, width = 16, 32, 32
+kernel_size = 3
+stride = 2
+padding = 1
+bias_shape = (1, 1, 1, 1)  
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, depth, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, stride, padding, bias_shape]
+```
+
+## Current Implementation (Broken Triton Kernel)
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+import math
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_C': 32, 'BLOCK_DHW': 128}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_C': 64, 'BLOCK_DHW': 128}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_C': 32, 'OCK_DHW': 256}, num_warps=4, num_stages=2),
+    ],
+    key=['N', 'C', 'D', 'H', 'W'],
+)
+@triton.jit
+def fused_post_ops_kernel(
+    # Pointers to tensors
+    x_ptr,
+    bias_ptr,
+    out_ptr,
+    # Tensor dimensions
+    N, C, D, H, W,
+    # Strides for x
+    stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
+    # Strides for output
+    stride_on, stride_oc, stride_od, stride_oh, stride_ow,
+    # Block dimensions
+    BLOCK_C: tl.constexpr,
+    BLOCK_DHW: tl.constexpr,
+):
+    """
+    Fused kernel for: LogSumExp over channels + HardSwish + Bias Subtract + Clamp
+    Optimized for Ada Lovelace (RTX 4090) with tensor cores
+    """
+    # Batch index
+    pid_n = tl.program_id(0)
+    # Spatial block index (flattened D*H*W dimension)
+    pid_spatial = tl.program_id(1)
+    
+    if pid_n >= N:
+        return
+    
+    # Calculate D*H*W
+    DHW = D * H * W
+    if pid_spatial * BLOCK_DHW >= DHW:
+        return
+    
+    # Compute spatial indices with masking
+    spatial_idx = tl.arange(0, BLOCK_DHW)
+    spatial_offsets = pid_spatial * BLOCK_DHW + spatial_idx
+    dhw_mask = spatial_offsets < DHW
+    
+    # Precompute spatial indices
+    HW = H * W
+    d_idx = spatial_offsets // HW
+    hw_rem = spatial_offsets % HW
+    h_idx = hw_rem // W
+    w_idx = hw_rem % W
+    
+    # Channel indices for current block
+    c_idx = tl.arange(0, BLOCK_C)
+    c_mask = c_idx < C
+    
+    # Initialize accumulators in registers (not shared memory)
+    max_vals = tl.full([BLOCK_DHW], -float('inf'), dtype=tl.float32)
+    sum_exp_vals = tl.zeros([BLOCK_DHW], dtype=tl.float32)
+    
+    # Precompute base pointers for better ILP
+    x_batch_ptr = x_ptr + pid_n * stride_xn
+    out_batch_ptr = out_ptr + pid_n * stride_on
+    
+    # Main reduction loop over channels
+    for c_start in range(0, C, BLOCK_C):
+        # Current channel indices
+        cur_c = c_start + c_idx
+        cur_c_mask = c_mask & (cur_c < C)
+        
+        # Compute pointer offsets efficiently
+        c_offset = cur_c[:, None] * stride_xc
+        d_offset = d_idx[None, :] * stride_xd
+        h_offset = h_idx[None, :] * stride_xh
+        w_offset = w_idx[None, :] * stride_xw
+        
+        # Combine offsets
+        offset_2d = c_offset + d_offset + h_offset + w_offset
+        
+        # Load with masking
+        x_vals = tl.load(
+            x_batch_ptr + offset_2d,
+            mask=cur_c_mask[:, None] & dhw_mask[None, :],
+            other=0.0
+        )
+        
+        # Fast reduction with early-exit optimization
+        if BLOCK_C >= 32:
+            # Use tree reduction within warp for large blocks
+            local_max = tl.max(x_vals, axis=0)
+            exp_vals = tl.exp(x_vals - local_max[None, :])
+            local_sum_exp = tl.sum(exp_vals, axis=0)
+        else:
+            # Direct computation for small blocks
+            local_max = tl.max(x_vals, axis=0)
+            exp_vals = tl.exp(x_vals - local_max[None, :])
+            local_sum_exp = tl.sum(exp_vals, axis=0)
+        
+        # Numerical stable LogSumExp update
+        new_max = tl.maximum(max_vals, local_max)
+        scale_prev = tl.exp(max_vals - new_max)
+        scale_curr = tl.exp(local_max - new_max)
+        
+        sum_exp_vals = scale_prev * sum_exp_vals + scale_curr * local_sum_exp
+        max_vals = new_max
+    
+    # Final LogSumExp
+    logsumexp_vals = max_vals + tl.log(sum_exp_vals)
+    
+    # Optimized HardSwish: x * (min(max(0, x+3), 6)) / 6
+    # Avoids expensive sigmoid computation
+    x_shifted = logsumexp_vals + 3.0
+    # Approximate sigmoid with clamped linear function
+    # sigmoid(x) ≈ min(max(0, x), 6) / 6 for HardSwish
+    clamped = tl.minimum(tl.maximum(x_shifted, 0.0), 6.0)
+    hardswish_vals = logsumexp_vals * (clamped / 6.0)
+    
+    # Subtract bias
+    bias = tl.load(bias_ptr)
+    result_vals = hardswish_vals - bias
+    
+    # Fast clamp between -1 and 1
+    result_vals = tl.minimum(tl.maximum(result_vals, -1.0), 1.0)
+    
+    # Store results with coalesced access
+    out_spatial_offset = (
+        d_idx * stride_od +
+        h_idx * stride_oh +
+        w_idx * stride_ow
+    )
+    out_ptrs = out_batch_ptr + out_spatial_offset
+    tl.store(out_ptrs, result_vals, mask=dhw_mask)
+
+
+def fused_post_convtranspose(x, bias):
+    """
+    Fused post-convtranspose operations with autotuning
+    """
+    N, C, D, H, W = x.shape
+    out = torch.empty((N, 1, D, H, W), device=x.device, dtype=x.dtype)
+    
+    # Calculate grid size
+    DHW = D * H * W
+    
+    # Launch kernel with autotuned configuration
+    grid_n = N
+    grid_spatial = triton.cdiv(DHW, 128)  # Use baseline for grid calculation
+    
+    fused_post_ops_kernel[grid_n, grid_spatial](
+        x,
+        bias,
+        out,
+        N, C, D, H, W,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
+        out.stride(0), out.stride(1), out.stride(2), out.stride(3), out.stride(4),
+    )
+    
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    ConvTranspose3d (PyTorch native) + Fused post-ops (Triton)
+    Optimized for RTX 4090 with tensor core utilization
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, bias_shape):
+        super(ModelNew, self).__init__()
+        # Keep ConvTranspose3d as PyTorch native
+        self.conv_transpose = nn.ConvTranspose3d(
+            in_channels, out_channels, kernel_size, 
+            stride=stride, padding=padding
+        )
+        # Initialize bias properly
+        self.bias = nn.Parameter(torch.zeros(1))
+        
+    def forward(self, x):
+        # Use channels_last memory format for better memory access
+        if x.stride()[1] != 1:
+            x = x.contiguous(memory_format=torch.channels_last_3d)
+            
+        # PyTorch native ConvTranspose3d
+        x = self.conv_transpose(x)
+        
+        # Ensure tensor is contiguous for Triton
+        if not x.is_contiguous():
+            x = x.contiguous()
+            
+        # Fused post-ops in Triton
+        x = fused_post_convtranspose(x, self.bias)
+        return x
+```
+
+---
+
+## Your Task
+
+Identify the **single most critical issue** that causes the error above.
+
+### Analysis Guidelines
+
+1. **Focus on root cause**, not symptoms
+   - Bad: "Output is wrong"
+   - Good: "BLOCK_K loop missing, only processes first 32 elements of K dimension"
+
+2. **Be specific about WHAT and WHERE**
+   - Bad: "Memory access issue"
+   - Good: "Line 45: tl.atomic_add(c_block_ptr, acc) - atomic_add requires scalar pointer, not block_ptr"
+
+3. **Prioritize by impact**
+   - Correctness bugs > Performance issues > Style problems
+   - Algorithm errors > Implementation details
+
+### Output Format
+
+**CRITICAL: You MUST output ONLY valid JSON. No other text allowed.**
+
+```json
+{
+  "critical_issue": "<Concise description of THE root cause, max 30 words>",
+  "why_it_matters": "<Why this causes the observed error, max 35 words>",
+  "minimal_fix_hint": "<What needs to change (not how), max 30 words>"
+}
+```
+
+**Remember**: Output ONLY the JSON block. No explanations, no commentary, no additional text.

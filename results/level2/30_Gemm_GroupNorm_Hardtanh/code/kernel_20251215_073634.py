@@ -1,0 +1,360 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+# ------------------------
+# High-performance GEMM (Linear) Kernel
+# ------------------------
+# Computes: C = A @ W^T + bias
+# A: [M, K]
+# W: [N, K]  (same layout as nn.Linear.weight)
+# bias: [N]
+# C: [M, N]
+#
+# Key optimizations:
+# - No explicit transpose of weight on host; we address W with transposed indexing.
+# - Multiple autotuned tilings.
+# - Shared grid offsets (offs_m, offs_n) used consistently for matmul + bias.
+
+@triton.autotune(
+    configs=[
+        # Larger tiles
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 64},
+            num_warps=8,
+            num_stages=4,
+        ),
+        triton.Config(
+            {"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 64},
+            num_warps=8,
+            num_stages=4,
+        ),
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64},
+            num_warps=4,
+            num_stages=4,
+        ),
+        # Medium tiles
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 256, "BLOCK_K": 64},
+            num_warps=4,
+            num_stages=3,
+        ),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64},
+            num_warps=4,
+            num_stages=3,
+        ),
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 64},
+            num_warps=4,
+            num_stages=3,
+        ),
+        # Fallback smaller tiles
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32},
+            num_warps=2,
+            num_stages=2,
+        ),
+    ],
+    key=["M", "N", "K"],
+)
+@triton.jit
+def linear_kernel(
+    a_ptr,        # [M, K]
+    w_ptr,        # [N, K]  (nn.Linear.weight)
+    bias_ptr,     # [N]
+    c_ptr,        # [M, N]
+    M, N, K,
+    stride_am, stride_ak,
+    stride_wn, stride_wk,   # weight strides for [N, K]
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # Program ids for M- and N-tiles
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    # Tile offsets in output-space
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Output pointer for this tile
+    c_ptrs = c_ptr + (offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn)
+    # Output mask (shared by all fused elementwise ops)
+    mask_out = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+
+    # Initialize accumulator
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Base pointers for A and W tiles
+    a_ptrs = a_ptr + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    # We read W with transposed indexing: W[n, k] -> tile [k, n]
+    w_ptrs = w_ptr + (offs_n[None, :] * stride_wn + offs_k[:, None] * stride_wk)
+
+    # Loop over K dimension
+    k_remaining = K
+    while k_remaining > 0:
+        k_mask = offs_k[None, :] < k_remaining
+
+        a = tl.load(
+            a_ptrs,
+            mask=(offs_m[:, None] < M) & k_mask,
+            other=0.0,
+        )
+        w = tl.load(
+            w_ptrs,
+            mask=k_mask.T & (offs_n[None, :] < N),
+            other=0.0,
+        )
+        # Tensor-core friendly matmul (TF32 allowed for fp32 inputs)
+        acc += tl.dot(a, w, allow_tf32=True)
+
+        a_ptrs += BLOCK_K * stride_ak
+        w_ptrs += BLOCK_K * stride_wk
+        k_remaining -= BLOCK_K
+
+    # Fused bias add uses same N-offsets (broadcast along M)
+    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc += bias[None, :]
+
+    # Store result
+    tl.store(c_ptrs, acc, mask=mask_out)
+
+
+def triton_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    x:      [M, K]
+    weight: [N, K] (nn.Linear.weight)
+    bias:   [N]
+    returns: [M, N]
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+    assert x.dim() == 2 and weight.dim() == 2
+    M, K = x.shape
+    N, K_w = weight.shape
+    assert K == K_w
+    assert bias.numel() == N
+
+    out = torch.empty((M, N), device=x.device, dtype=x.dtype)
+
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta["BLOCK_M"]),
+            triton.cdiv(N, meta["BLOCK_N"]),
+        )
+
+    linear_kernel[grid](
+        x,
+        weight,
+        bias,
+        out,
+        M,
+        N,
+        K,
+        x.stride(0),
+        x.stride(1),
+        weight.stride(0),
+        weight.stride(1),
+        out.stride(0),
+        out.stride(1),
+    )
+    return out
+
+
+# ------------------------
+# GroupNorm + HardTanh Kernel
+# ------------------------
+# Fuses:
+#   - GroupNorm over channels
+#   - Affine transform (gamma, beta)
+#   - HardTanh activation
+#
+# Grid & indexing:
+# - Each program handles exactly one (batch, group) pair.
+# - All elementwise fused ops in the second loop use the same
+#   (chan_idx, mask) offsets (with explicit broadcasting via [None, :] when needed).
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_SIZE": 64}, num_warps=2, num_stages=2),
+        triton.Config({"BLOCK_SIZE": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_SIZE": 256}, num_warps=4, num_stages=2),
+    ],
+    key=["group_size"],
+)
+@triton.jit
+def groupnorm_hardtanh_kernel(
+    x_ptr,        # [B, C]
+    weight_ptr,   # [C] (gamma)
+    bias_ptr,     # [C] (beta)
+    y_ptr,        # [B, C]
+    B, C, G, group_size,
+    stride_xb, stride_xc,
+    stride_yb, stride_yc,
+    eps,          # float
+    min_val,      # float
+    max_val,      # float
+    BLOCK_SIZE: tl.constexpr,
+):
+    # Program → (batch, group)
+    pid = tl.program_id(0)
+    b = pid // G
+    g = pid % G
+
+    if b >= B:
+        return
+
+    # Channel offsets within this group
+    offs_c = tl.arange(0, BLOCK_SIZE)
+    group_start = g * group_size
+
+    # Base pointers for this (b, g) pair
+    base_x = x_ptr + b * stride_xb + group_start * stride_xc
+    base_y = y_ptr + b * stride_yb + group_start * stride_yc
+
+    # -------- Reduction: compute mean and variance over the group --------
+    sum_val = tl.zeros((), dtype=tl.float32)
+    sum_sq_val = tl.zeros((), dtype=tl.float32)
+
+    num_chunks = (group_size + BLOCK_SIZE - 1) // BLOCK_SIZE
+    for c_chunk in range(0, num_chunks):
+        c0 = c_chunk * BLOCK_SIZE
+        idx = c0 + offs_c
+        mask = idx < group_size
+
+        chan_idx = idx
+        x_ptrs = base_x + chan_idx * stride_xc
+
+        x = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
+        sum_val += tl.sum(x, axis=0)
+        sum_sq_val += tl.sum(x * x, axis=0)
+
+    group_elems = tl.full((), group_size, dtype=tl.float32)
+    mean = sum_val / group_elems
+    var = sum_sq_val / group_elems - mean * mean
+    inv_std = 1.0 / tl.sqrt(var + eps)
+
+    # -------- Apply normalization, affine, and HardTanh --------
+    for c_chunk in range(0, num_chunks):
+        c0 = c_chunk * BLOCK_SIZE
+        idx = c0 + offs_c
+        mask = idx < group_size
+
+        chan_idx = idx
+
+        x_ptrs = base_x + chan_idx * stride_xc
+        y_ptrs = base_y + chan_idx * stride_yc
+        w_ptrs = weight_ptr + (group_start + chan_idx)
+        b_ptrs = bias_ptr + (group_start + chan_idx)
+
+        # All fused elementwise ops share (chan_idx, mask)
+        x = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
+        gamma = tl.load(w_ptrs, mask=mask, other=1.0).to(tl.float32)
+        beta = tl.load(b_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+        x_hat = (x - mean) * inv_std
+        y = x_hat * gamma + beta
+
+        # HardTanh (clamp)
+        y = tl.minimum(tl.maximum(y, min_val), max_val)
+
+        tl.store(y_ptrs, y, mask=mask)
+
+
+def triton_groupnorm_hardtanh(
+    x: torch.Tensor,
+    num_groups: int,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    eps: float,
+    min_val: float,
+    max_val: float,
+) -> torch.Tensor:
+    """
+    x:      [B, C]
+    weight: [C] (gamma)
+    bias:   [C] (beta)
+    """
+    assert x.is_cuda
+    assert x.dim() == 2
+    B, C = x.shape
+    assert C % num_groups == 0
+    group_size = C // num_groups
+
+    assert weight.numel() == C
+    assert bias.numel() == C
+
+    y = torch.empty_like(x)
+
+    def grid(meta):
+        # One program per (batch, group)
+        return (B * num_groups,)
+
+    groupnorm_hardtanh_kernel[grid](
+        x,
+        weight,
+        bias,
+        y,
+        B,
+        C,
+        num_groups,
+        group_size,
+        x.stride(0),
+        x.stride(1),
+        y.stride(0),
+        y.stride(1),
+        eps,
+        min_val,
+        max_val,
+    )
+    return y
+
+
+# ------------------------
+# PyTorch Module Wrapper
+# ------------------------
+
+class ModelNew(nn.Module):
+    """
+    Triton-accelerated Linear + GroupNorm + HardTanh
+
+    - Linear uses high-performance GEMM with fused bias.
+    - GroupNorm and HardTanh are fused in a single reduction + elementwise kernel.
+    """
+
+    def __init__(self, in_features, out_features, num_groups, hardtanh_min, hardtanh_max):
+        super(ModelNew, self).__init__()
+        self.gemm = nn.Linear(in_features, out_features)
+        self.group_norm = nn.GroupNorm(num_groups, out_features)
+        self.hardtanh = nn.Hardtanh(min_val=hardtanh_min, max_val=hardtanh_max)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: [batch_size, in_features]
+        """
+        if not x.is_cuda:
+            x = self.gemm(x)
+            x = self.group_norm(x)
+            x = self.hardtanh(x)
+            return x
+
+        # 1) Linear via Triton GEMM (no explicit weight transpose)
+        x = triton_linear(x, self.gemm.weight, self.gemm.bias)
+
+        # 2) GroupNorm + HardTanh via Triton
+        x = triton_groupnorm_hardtanh(
+            x,
+            num_groups=self.group_norm.num_groups,
+            weight=self.group_norm.weight,
+            bias=self.group_norm.bias,
+            eps=self.group_norm.eps,
+            min_val=self.hardtanh.min_val,
+            max_val=self.hardtanh.max_val,
+        )
+        return x

@@ -1,0 +1,276 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+# -----------------------------------------------------------------------------
+# Single-kernel fused:
+#   y = x @ W_pooled^T + b_pooled
+#   y = GELU(y) * scale
+#   out[m] = max_n y[m, n]
+#
+# Key optimization for this stage:
+#   - No intermediate stores: only a single tl.store to the final out tensor.
+#   - All intermediates (matmul, bias add, GELU, scaling, per-tile max) stay
+#     in registers.
+# -----------------------------------------------------------------------------
+
+@triton.autotune(
+    configs=[
+        # Default balanced
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_stages=3,
+            num_warps=4,
+        ),
+        # Wider rows
+        triton.Config(
+            {'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_stages=3,
+            num_warps=4,
+        ),
+        # Wider columns
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32},
+            num_stages=3,
+            num_warps=8,
+        ),
+        # Smaller rows (for small M)
+        triton.Config(
+            {'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_stages=2,
+            num_warps=2,
+        ),
+    ],
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def matmul_gelu_scale_rowmax_kernel(
+    a_ptr,          # [M, K],      fp16
+    w_ptr,          # [N, K],      fp16 (pooled weights)
+    b_ptr,          # [N],         fp16 (pooled bias)
+    out_ptr,        # [M],         fp32 (final row-wise max)
+    M, N, K,
+    stride_am, stride_ak,         # strides for A
+    stride_wm, stride_wk,         # strides for W
+    stride_outm,                  # stride for out
+    scale,                        # float32
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # Program id: each program handles a block of rows (BLOCK_M) and
+    # processes the entire N dimension internally, accumulating a
+    # row-wise max in registers.
+    pid_m = tl.program_id(0)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offs_m < M
+
+    # Running row-wise max for these rows (fp32)
+    neg_inf = -float("inf")
+    row_max = tl.full((BLOCK_M,), neg_inf, dtype=tl.float32)
+
+    # Loop over feature dimension in tiles of BLOCK_N, fully inside this program
+    n_start = 0
+    while n_start < N:
+        offs_n = n_start + tl.arange(0, BLOCK_N)
+        mask_n = offs_n < N
+
+        # GEMM accumulator for current [BLOCK_M, BLOCK_N] tile
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+        # K-loop
+        k_start = 0
+        while k_start < K:
+            offs_k = k_start + tl.arange(0, BLOCK_K)
+            mask_k = offs_k < K
+
+            # Load A tile: [BLOCK_M, BLOCK_K]
+            a_ptrs = a_ptr + (
+                offs_m[:, None] * stride_am +
+                offs_k[None, :] * stride_ak
+            )
+            a = tl.load(
+                a_ptrs,
+                mask=mask_m[:, None] & mask_k[None, :],
+                other=0.0,
+            )
+
+            # Load W tile: [BLOCK_K, BLOCK_N], W is [N, K]
+            w_ptrs = w_ptr + (
+                offs_n[None, :] * stride_wm +
+                offs_k[:, None] * stride_wk
+            )
+            w = tl.load(
+                w_ptrs,
+                mask=mask_k[:, None] & mask_n[None, :],
+                other=0.0,
+            )
+
+            # Tensor Core-accelerated dot (fp16 inputs, fp32 accum)
+            acc += tl.dot(a, w)
+
+            k_start += BLOCK_K
+
+        # Fused epilogue on this [BLOCK_M, BLOCK_N] tile:
+        #   + bias, GELU, scale, partial row-wise max
+
+        # Bias add (broadcast over M)
+        bias = tl.load(
+            b_ptr + offs_n,
+            mask=mask_n,
+            other=0.0,
+        ).to(tl.float32)
+        acc = acc + bias[None, :]
+
+        # GELU approximation (tanh-based) in fp32
+        x = acc
+        x2 = x * x
+        x3 = x2 * x
+        # √(2/π) ≈ 0.7978845608
+        t = 0.7978845608028654 * (x + 0.044715 * x3)
+        u = tl.exp(2.0 * t)
+        tanh_t = (u - 1.0) / (u + 1.0)
+        gelu = 0.5 * x * (1.0 + tanh_t)
+
+        # Scale
+        gelu = gelu * scale
+
+        # Mask out-of-range N with -inf so they don't affect the max
+        gelu = tl.where(mask_n[None, :], gelu, neg_inf)
+
+        # Tile-wise row-wise max
+        tile_max = tl.max(gelu, axis=1)  # [BLOCK_M]
+
+        # Update running row-wise max across all N tiles
+        row_max = tl.maximum(row_max, tile_max)
+
+        n_start += BLOCK_N
+
+    # Final store: one per output tensor, no intermediate stores
+    out_ptrs = out_ptr + offs_m * stride_outm
+    tl.store(out_ptrs, row_max, mask=mask_m)
+
+
+# -----------------------------------------------------------------------------
+# Python wrapper: pooling weights, launching Triton kernel
+# -----------------------------------------------------------------------------
+
+def fused_matmul_avgpool_gelu_scale_max(x, weight, bias, pool_kernel_size, scale_factor):
+    """
+    Fused implementation of:
+        y = x @ W^T + b
+        y = AvgPool1d(kernel_size=pool_kernel_size, stride=pool_kernel_size) along features
+        y = GELU(y)
+        y = y * scale_factor
+        out = max(y, dim=1)
+
+    Using:
+        avg_pool(x @ W^T + b) == x @ W_pooled^T + b_pooled
+
+    This wrapper:
+      * Pools weight/bias on the host.
+      * Uses a single high-performance Triton kernel:
+          - fp16 Tensor Core GEMM with fp32 accumulation
+          - Fused bias + GELU + scale in-register
+          - Full row-wise max inside the same kernel
+      * No intermediate global memory buffers for partial results.
+    """
+    assert x.is_cuda, "Input must be on CUDA device"
+    device = x.device
+
+    # fp16 for matmul to exploit Tensor Cores; keep reduction/output in fp32
+    compute_dtype = torch.float16
+
+    # Pool weights/bias in fp32 for numerical stability
+    w_f32 = weight.float()
+    b_f32 = bias.float()
+    x_orig_dtype = x.dtype
+
+    M, K = x.shape
+    N = w_f32.shape[0]
+    k = pool_kernel_size
+
+    # Output length after AvgPool1d(kernel=k, stride=k, padding=0)
+    # L_out = floor((N - k) / k) + 1
+    N_pool = (N - k) // k + 1
+    assert N_pool > 0, "Invalid configuration: out_features < pool_kernel_size"
+
+    N_eff = N_pool * k  # Only first N_eff features participate in pooling
+
+    w_eff = w_f32[:N_eff]   # [N_eff, K]
+    b_eff = b_f32[:N_eff]   # [N_eff]
+
+    # Pool along the output-feature dimension:
+    # w_eff: [N_pool, k, K] -> mean over k -> [N_pool, K]
+    # b_eff: [N_pool, k]    -> mean over k -> [N_pool]
+    w_pooled = w_eff.view(N_pool, k, K).mean(dim=1).contiguous()
+    b_pooled = b_eff.view(N_pool, k).mean(dim=1).contiguous()
+
+    # Cast to compute dtype for GEMM
+    x_mat = x.to(compute_dtype).contiguous()
+    w_pooled_mat = w_pooled.to(compute_dtype).contiguous()
+    b_pooled_mat = b_pooled.to(compute_dtype).contiguous()
+
+    # Allocate final output [M] in fp32
+    out = torch.empty((M,), device=device, dtype=torch.float32)
+
+    # Launch the fused kernel
+    def grid(meta):
+        return (triton.cdiv(M, meta['BLOCK_M']),)
+
+    matmul_gelu_scale_rowmax_kernel[grid](
+        x_mat, w_pooled_mat, b_pooled_mat,
+        out,
+        M, N_pool, K,
+        x_mat.stride(0), x_mat.stride(1),
+        w_pooled_mat.stride(0), w_pooled_mat.stride(1),
+        out.stride(0),
+        float(scale_factor),
+    )
+
+    # Cast back to original dtype if desired
+    if x_orig_dtype != torch.float32:
+        return out.to(x_orig_dtype)
+    return out
+
+
+# -----------------------------------------------------------------------------
+# nn.Module wrapper
+# -----------------------------------------------------------------------------
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized implementation of:
+        Matmul -> AvgPool1d -> GELU -> Scale -> Row-wise Max
+
+    Optimizations:
+      * Weight/bias pooling on host.
+      * Single Triton kernel:
+          - fp16 Tensor Core matmul with fp32 accumulation
+          - In-register fused epilogue (bias + GELU + scale)
+          - In-register row-wise max across all pooled features
+      * No intermediate global-memory stores; only final output store.
+    """
+
+    def __init__(self, in_features, out_features, pool_kernel_size, scale_factor):
+        super(ModelNew, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.pool_kernel_size = pool_kernel_size
+        self.scale_factor = float(scale_factor)
+
+        # Match nn.Linear(in_features, out_features) semantics
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias = nn.Parameter(torch.empty(out_features))
+
+        # Initialization similar to nn.Linear
+        bound = 1 / (in_features ** 0.5)
+        nn.init.uniform_(self.weight, -bound, bound)
+        nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return fused_matmul_avgpool_gelu_scale_max(
+            x, self.weight, self.bias, self.pool_kernel_size, self.scale_factor
+        )

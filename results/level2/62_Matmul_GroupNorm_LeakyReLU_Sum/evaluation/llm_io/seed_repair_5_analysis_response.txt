@@ -1,0 +1,5 @@
+{
+  "critical_issue": "groupnorm_stats_kernel computes unbiased variance (divide by group_size-1) while PyTorch GroupNorm uses biased variance (divide by group_size).",
+  "why_it_matters": "This systematically rescales normalization, causing ~3% deviation in normalized activations, which propagates through LeakyReLU and doubling, exceeding the atol/rtol error thresholds.",
+  "minimal_fix_hint": "Change variance computation to use denominator group_size (unbiased=False), removing the group_size-1 division and related conditional handling."
+}

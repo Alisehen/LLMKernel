@@ -11,7 +11,7 @@ Kernel Benchmark 统计分析脚本
 import numpy as np
 from pathlib import Path
 
-def calculate_statistics(summary_file='summary_table.md'):
+def calculate_statistics(summary_file='summary_table2.md'):
     """从summary_table.md计算统计指标"""
 
     summary_path = Path(__file__).parent / summary_file

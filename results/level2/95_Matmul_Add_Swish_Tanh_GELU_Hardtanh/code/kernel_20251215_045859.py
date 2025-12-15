@@ -1,0 +1,176 @@
+# <corrected code>
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_warps=4,
+        ),
+        triton.Config(
+            {'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_warps=8,
+        ),
+    ],
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def fused_linear_swish_tanh_gelu_hardtanh_kernel(
+    a_ptr,  # [M, K]
+    b_ptr,  # [K, N]
+    add_ptr,  # [N]
+    c_ptr,  # [M, N]
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    min_val, max_val,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    # Program IDs - rows and columns of the output tile
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    # Offsets for this tile
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # [BLOCK_M]
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # [BLOCK_N]
+    offs_k = tl.arange(0, BLOCK_K)  # [BLOCK_K]
+
+    # Pointers to A and B tiles
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    # Accumulator
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Main K-loop
+    for k in range(0, K, BLOCK_K):
+        k_remaining = K - k
+
+        a = tl.load(
+            a_ptrs,
+            mask=(offs_m[:, None] < M) & (offs_k[None, :] < k_remaining),
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptrs,
+            mask=(offs_k[:, None] < k_remaining) & (offs_n[None, :] < N),
+            other=0.0,
+        )
+
+        # Use full fp32 accumulation to match PyTorch reference numerics
+        acc += tl.dot(a, b, allow_tf32=False)
+
+        # Move pointers to next K-block
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Add bias/add_value (1D over N)
+    bias = tl.load(add_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc = acc + bias[None, :]
+
+    # ----- Fused activations -----
+    x = acc
+
+    # Swish: x * sigmoid(x)
+    sig = 1.0 / (1.0 + tl.exp(-x))
+    x = x * sig
+
+    # Tanh: tanh(x) = 2 * sigmoid(2x) - 1
+    sig2 = 1.0 / (1.0 + tl.exp(-2.0 * x))
+    x = 2.0 * sig2 - 1.0
+
+    # GELU (erf-based, matches torch.nn.GELU(approximate='none')):
+    # gelu(x) = 0.5 * x * (1 + erf(x / sqrt(2)))
+    inv_sqrt2 = 0.70710678118654752440084436210485  # 1 / sqrt(2)
+    z = x * inv_sqrt2
+
+    # Use Triton's libdevice-backed erf for high numerical accuracy
+    erf_z = tl.math.erf(z)
+    x = 0.5 * x * (1.0 + erf_z)
+
+    # Hardtanh: clamp between min_val and max_val
+    x = tl.minimum(tl.maximum(x, min_val), max_val)
+
+    # Store result
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    tl.store(
+        c_ptrs,
+        x,
+        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+    )
+
+
+def fused_linear_swish_tanh_gelu_hardtanh(x, weight, add_value, min_val=-1.0, max_val=1.0):
+    """
+    x:         [M, K]
+    weight:    [N, K]  (same layout as nn.Linear.weight)
+    add_value: [N]     (bias-like 1D term added after matmul)
+    """
+    assert x.is_cuda and weight.is_cuda and add_value.is_cuda
+    assert x.dtype == weight.dtype == add_value.dtype
+
+    M, K = x.shape
+    N = weight.shape[0]
+    assert weight.shape[1] == K
+    assert add_value.numel() == N
+
+    # Triton kernel expects B = weight.T (i.e., [K, N])
+    b = weight.t().contiguous()
+
+    out = torch.empty((M, N), device=x.device, dtype=x.dtype)
+
+    grid = lambda META: (
+        triton.cdiv(M, META['BLOCK_M']),
+        triton.cdiv(N, META['BLOCK_N']),
+    )
+
+    fused_linear_swish_tanh_gelu_hardtanh_kernel[grid](
+        x, b, add_value, out,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        b.stride(0), b.stride(1),
+        out.stride(0), out.stride(1),
+        float(min_val), float(max_val),
+    )
+
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized replacement for:
+
+        x = Linear(x)
+        x = x + add_value
+        x = sigmoid(x) * x       # Swish
+        x = tanh(x)
+        x = GELU(x)              # default PyTorch (erf-based)
+        x = hardtanh(x, -1, 1)
+    """
+
+    def __init__(self, in_features, out_features, add_value_shape):
+        super(ModelNew, self).__init__()
+        # Parameters matching nn.Linear(in_features, out_features, bias=True)
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias = nn.Parameter(torch.empty(out_features))
+        # Extra add_value parameter
+        self.add_value = nn.Parameter(torch.randn(add_value_shape))
+
+        # Use the same initialization as nn.Linear by delegating once
+        lin = nn.Linear(in_features, out_features)
+        with torch.no_grad():
+            self.weight.copy_(lin.weight.data)
+            self.bias.copy_(lin.bias.data)
+
+    def forward(self, x):
+        # Combine bias and add_value so the kernel sees a single 1D add term
+        add_total = self.bias + self.add_value
+        return fused_linear_swish_tanh_gelu_hardtanh(
+            x, self.weight, add_total, min_val=-1.0, max_val=1.0
+        )

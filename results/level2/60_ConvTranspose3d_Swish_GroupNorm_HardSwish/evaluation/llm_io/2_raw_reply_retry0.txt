@@ -1,0 +1,247 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+import math
+
+
+@triton.jit
+def swish_activation(x):
+    """Optimized Swish: x * sigmoid(x) with fast sigmoid approximation"""
+    sigmoid = 1.0 / (1.0 + tl.exp(-x))
+    return x * sigmoid
+
+
+@triton.jit
+def hardswish_activation(x):
+    """Optimized HardSwish with minimal branching"""
+    x_plus_3 = x + 3.0
+    lower = tl.maximum(x_plus_3, 0.0)
+    relu6 = tl.minimum(lower, 6.0)
+    return x * relu6 * (1.0 / 6.0)
+
+
+@triton.jit
+def fused_swish_groupnorm_hardswish_kernel_final(
+    x_ptr,
+    weight_ptr,
+    bias_ptr,
+    out_ptr,
+    N, C, D, H, W,
+    groups,
+    eps,
+    stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
+    BLOCK_SIZE: tl.constexpr,
+    TILE_C: tl.constexpr,
+):
+    """
+    Optimized kernel with separate mean/variance computation.
+    Each block processes multiple channels and spatial positions.
+    """
+    
+    # 2D grid: [spatial_blocks, groups * batch]
+    pid_spatial = tl.program_id(0)
+    pid_n_g = tl.program_id(1)
+    
+    pid_n = pid_n_g // groups
+    pid_g = pid_n_g % groups
+    
+    if pid_n >= N or pid_g >= groups:
+        return
+    
+    # Group parameters
+    group_size = C // groups
+    start_c = pid_g * group_size
+    
+    # Spatial tiling
+    DHW = D * H * W
+    spatial_tile_size = BLOCK_SIZE
+    num_spatial_tiles = (DHW + spatial_tile_size - 1) // spatial_tile_size
+    
+    if pid_spatial >= num_spatial_tiles:
+        return
+    
+    # Thread block processing
+    offs_c = tl.arange(0, TILE_C)
+    offs_spatial = tl.arange(0, BLOCK_SIZE)
+    
+    spatial_base = pid_spatial * BLOCK_SIZE
+    spatial_offs = spatial_base + offs_spatial
+    spatial_mask = spatial_offs < DHW
+    
+    # Reconstruct spatial indices
+    d_idx = spatial_offs // (H * W)
+    h_idx = (spatial_offs % (H * W)) // W
+    w_idx = spatial_offs % W
+    
+    # Initialize accumulators
+    sum_val = tl.zeros((TILE_C,), dtype=tl.float32)
+    sum_sq = tl.zeros((TILE_C,), dtype=tl.float32)
+    
+    # First: compute mean and variance across spatial dimension
+    for c in range(0, group_size, TILE_C):
+        c_offs = c + offs_c
+        c_idx = start_c + c_offs
+        c_mask = c_offs < group_size
+        
+        # Check if any valid channels in this tile
+        any_valid = tl.sum(c_mask) > 0
+        if not any_valid:
+            # Skip this tile if no valid channels
+            pass
+        else:
+            # Vectorized load
+            x_ptrs = (x_ptr + 
+                     pid_n * stride_xn + 
+                     c_idx[:, None] * stride_xc +
+                     d_idx[None, :] * stride_xd +
+                     h_idx[None, :] * stride_xh +
+                     w_idx[None, :] * stride_xw)
+            
+            mask = c_mask[:, None] & spatial_mask[None, :]
+            x_vals = tl.load(x_ptrs, mask=mask, other=0.0)
+            
+            # Apply Swish
+            x_swish = swish_activation(x_vals)
+            
+            # Accumulate
+            spatial_sum = tl.sum(x_swish, axis=1)
+            spatial_sum_sq = tl.sum(x_swish * x_swish, axis=1)
+            
+            sum_val += tl.where(c_mask, spatial_sum, 0.0)
+            sum_sq += tl.where(c_mask, spatial_sum_sq, 0.0)
+    
+    # Compute total count
+    spatial_count = tl.sum(spatial_mask)
+    total_count = spatial_count * group_size
+    
+    # Compute mean and variance for this spatial tile
+    group_mean = tl.sum(sum_val) / (total_count + eps)
+    group_var = tl.sum(sum_sq) / (total_count + eps) - group_mean * group_mean
+    inv_std = 1.0 / tl.sqrt(group_var + eps)
+    
+    # Second: apply normalization
+    for c in range(0, group_size, TILE_C):
+        c_offs = c + offs_c
+        c_idx = start_c + c_offs
+        c_mask = c_offs < group_size
+        
+        # Check if any valid channels in this tile
+        any_valid = tl.sum(c_mask) > 0
+        if not any_valid:
+            # Skip this tile if no valid channels
+            continue
+        
+        # Load input
+        x_ptrs = (x_ptr + 
+                 pid_n * stride_xn + 
+                 c_idx[:, None] * stride_xc +
+                 d_idx[None, :] * stride_xd +
+                 h_idx[None, :] * stride_xh +
+                 w_idx[None, :] * stride_xw)
+        
+        mask = c_mask[:, None] & spatial_mask[None, :]
+        x_vals = tl.load(x_ptrs, mask=mask, other=0.0)
+        
+        # Apply Swish
+        x_swish = swish_activation(x_vals)
+        
+        # Normalize
+        x_norm = (x_swish - group_mean) * inv_std
+        
+        # Load weight and bias
+        weight = tl.load(weight_ptr + c_idx, mask=c_mask, other=0.0)
+        bias = tl.load(bias_ptr + c_idx, mask=c_mask, other=0.0)
+        
+        # Affine transform
+        x_gn = x_norm * weight[:, None] + bias[:, None]
+        
+        # Apply HardSwish
+        x_final = hardswish_activation(x_gn)
+        
+        # Store
+        out_ptrs = (out_ptr + 
+                   pid_n * stride_xn + 
+                   c_idx[:, None] * stride_xc +
+                   d_idx[None, :] * stride_xd +
+                   h_idx[None, :] * stride_xh +
+                   w_idx[None, :] * stride_xw)
+        
+        tl.store(out_ptrs, x_final, mask=mask)
+
+
+def fused_post_convtranspose_3d_optimized(x, weight, bias, groups, eps):
+    """
+    Optimized fused kernel launcher with better grid configuration.
+    """
+    N, C, D, H, W = x.shape
+    
+    if C % groups != 0:
+        raise ValueError(f"Number of channels {C} must be divisible by groups {groups}")
+    
+    out = torch.empty_like(x)
+    
+    # Choose optimal tile sizes based on tensor dimensions
+    group_size = C // groups
+    
+    if group_size <= 32:
+        TILE_C = 32
+    elif group_size <= 64:
+        TILE_C = 64
+    else:
+        TILE_C = min(triton.next_power_of_2(group_size), 128)
+    
+    # Spatial block size - tuned for 4090
+    BLOCK_SIZE = 256
+    
+    # Calculate grid size
+    DHW = D * H * W
+    num_spatial_tiles = (DHW + BLOCK_SIZE - 1) // BLOCK_SIZE
+    grid = (num_spatial_tiles, N * groups)
+    
+    # Launch kernel
+    fused_swish_groupnorm_hardswish_kernel_final[grid](
+        x, weight, bias, out,
+        N, C, D, H, W,
+        groups, eps,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
+        BLOCK_SIZE=BLOCK_SIZE,
+        TILE_C=TILE_C,
+    )
+    
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    ConvTranspose3d (PyTorch native) + Optimized fused post-ops (Triton)
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, groups, eps, bias=True):
+        super(ModelNew, self).__init__()
+        # Keep ConvTranspose3d as PyTorch native
+        self.conv_transpose = nn.ConvTranspose3d(
+            in_channels, out_channels, kernel_size, 
+            stride=stride, padding=padding, bias=bias
+        )
+        
+        # GroupNorm parameters
+        self.group_norm = nn.GroupNorm(num_groups=groups, num_channels=out_channels, eps=eps)
+        self.groups = groups
+        self.eps = eps
+
+    def forward(self, x):
+        # Step 1: PyTorch native ConvTranspose3d
+        x = self.conv_transpose(x)
+        
+        # Step 2: Optimized fused post-ops in Triton
+        x = fused_post_convtranspose_3d_optimized(
+            x, 
+            self.group_norm.weight, 
+            self.group_norm.bias,
+            self.groups,
+            self.eps
+        )
+        
+        return x
+```

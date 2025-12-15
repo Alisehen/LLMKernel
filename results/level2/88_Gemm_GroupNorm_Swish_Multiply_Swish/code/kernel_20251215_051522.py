@@ -1,0 +1,230 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def gemm_bias_kernel(
+    a_ptr, b_ptr, bias_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    # Program IDs for tiles along M and N
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    # Offsets for this tile
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # [BLOCK_M]
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # [BLOCK_N]
+    offs_k = tl.arange(0, BLOCK_K)                    # [BLOCK_K]
+
+    # Pointers for A and B tiles
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    # Accumulator
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Loop over K
+    for k in range(0, K, BLOCK_K):
+        k_remaining = K - k
+
+        a_mask = (offs_m[:, None] < M) & (offs_k[None, :] < k_remaining)
+        b_mask = (offs_k[:, None] < k_remaining) & (offs_n[None, :] < N)
+
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+        acc += tl.dot(a, b, allow_tf32=True)
+
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Add bias (per output feature / column)
+    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc += bias[None, :]
+
+    # Write back
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, acc, mask=c_mask)
+
+
+@triton.jit
+def groupnorm_swish2_kernel(
+    x_ptr,          # [B, C], input from linear
+    gamma_ptr,      # [C], group norm weight
+    beta_ptr,       # [C], group norm bias
+    mul_w_ptr,      # [C], multiply_weight
+    y_ptr,          # [B, C], output
+    B, C,
+    GROUP_SIZE,     # C / num_groups
+    num_groups,
+    eps,
+    stride_xb, stride_xc,
+    stride_yb, stride_yc,
+    BLOCK_C: tl.constexpr,
+):
+    # Each program handles one (batch, group)
+    pid_b = tl.program_id(0)
+    pid_g = tl.program_id(1)
+
+    valid_b = pid_b < B
+    valid_g = pid_g < num_groups
+    valid = valid_b & valid_g
+
+    group_offset = pid_g * GROUP_SIZE
+
+    # Reduction over group channels to compute mean and variance
+    total_sum = tl.zeros((), dtype=tl.float32)
+    total_sum2 = tl.zeros((), dtype=tl.float32)
+
+    offs = tl.arange(0, BLOCK_C)
+
+    for c0 in range(0, GROUP_SIZE, BLOCK_C):
+        c_idx = group_offset + c0 + offs  # channel indices in this group
+        c_mask = (offs + c0) < GROUP_SIZE
+        mask = valid & c_mask
+
+        x_ptrs = x_ptr + pid_b * stride_xb + c_idx * stride_xc
+        x = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+        block_sum = tl.sum(x, axis=0)
+        block_sum2 = tl.sum(x * x, axis=0)
+
+        total_sum += block_sum
+        total_sum2 += block_sum2
+
+    group_size_f = GROUP_SIZE * 1.0
+    mean = total_sum / group_size_f
+    var = total_sum2 / group_size_f - mean * mean
+    inv_std = 1.0 / tl.sqrt(var + eps)
+
+    # Second pass: apply GroupNorm affine and two Swish operations
+    for c0 in range(0, GROUP_SIZE, BLOCK_C):
+        c_idx = group_offset + c0 + offs
+        c_mask = (offs + c0) < GROUP_SIZE
+        mask = valid & c_mask
+
+        x_ptrs = x_ptr + pid_b * stride_xb + c_idx * stride_xc
+        x = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+        gamma = tl.load(gamma_ptr + c_idx, mask=c_mask, other=0.0).to(tl.float32)
+        beta = tl.load(beta_ptr + c_idx, mask=c_mask, other=0.0).to(tl.float32)
+        mul_w = tl.load(mul_w_ptr + c_idx, mask=c_mask, other=0.0).to(tl.float32)
+
+        # GroupNorm normalization
+        x_norm = (x - mean) * inv_std
+
+        # Affine
+        x_gn = x_norm * gamma + beta
+
+        # First Swish: x * sigmoid(x)
+        sig1 = 1.0 / (1.0 + tl.exp(-x_gn))
+        x1 = x_gn * sig1
+
+        # Multiply by weight
+        x2 = x1 * mul_w
+
+        # Second Swish
+        sig2 = 1.0 / (1.0 + tl.exp(-x2))
+        y = x2 * sig2
+
+        y_ptrs = y_ptr + pid_b * stride_yb + c_idx * stride_yc
+        tl.store(y_ptrs, y, mask=mask)
+
+
+def fused_linear_groupnorm_swish2(x, weight, bias, gn_weight, gn_bias, multiply_weight, num_groups, eps=1e-5):
+    """
+    x: [B, in_features]
+    weight: [out_features, in_features]
+    bias: [out_features]
+    gn_weight, gn_bias: [out_features]
+    multiply_weight: [out_features]
+    """
+    assert x.is_cuda, "Input must be on CUDA"
+    B, K = x.shape
+    out_features = weight.shape[0]
+    C = out_features
+
+    # GEMM: (B, K) @ (K, C) + bias -> (B, C)
+    w_t = weight.t().contiguous()
+    y_linear = torch.empty((B, C), device=x.device, dtype=x.dtype)
+
+    grid = lambda META: (
+        triton.cdiv(B, META['BLOCK_M']),
+        triton.cdiv(C, META['BLOCK_N']),
+    )
+
+    gemm_bias_kernel[grid](
+        x, w_t, bias, y_linear,
+        B, C, K,
+        x.stride(0), x.stride(1),
+        w_t.stride(0), w_t.stride(1),
+        y_linear.stride(0), y_linear.stride(1),
+        BLOCK_M=64, BLOCK_N=128, BLOCK_K=32,
+    )
+
+    # GroupNorm + Swish * multiply_weight + Swish
+    assert C % num_groups == 0, "out_features must be divisible by num_groups"
+    group_size = C // num_groups
+
+    y = torch.empty_like(y_linear)
+
+    grid2 = (B, num_groups)
+
+    groupnorm_swish2_kernel[grid2](
+        y_linear,
+        gn_weight,
+        gn_bias,
+        multiply_weight,
+        y,
+        B,
+        C,
+        group_size,
+        num_groups,
+        eps,
+        y_linear.stride(0), y_linear.stride(1),
+        y.stride(0), y.stride(1),
+        BLOCK_C=128,
+    )
+
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-accelerated version of the model:
+    Linear -> GroupNorm -> Swish -> Multiply -> Swish
+
+    This version reuses the same Linear and GroupNorm parameters as the
+    reference PyTorch model, so state_dict copying produces identical
+    parameters and numerically comparable outputs.
+    """
+    def __init__(self, in_features, out_features, num_groups, multiply_weight_shape):
+        super(ModelNew, self).__init__()
+
+        # Match reference module structure and parameter names
+        self.linear = nn.Linear(in_features, out_features)
+        self.gn = nn.GroupNorm(num_groups, out_features, eps=1e-5, affine=True)
+        self.num_groups = num_groups
+        self.eps = self.gn.eps
+
+        # Multiply weight (same name as reference)
+        self.multiply_weight = nn.Parameter(torch.randn(multiply_weight_shape))
+
+    def forward(self, x):
+        return fused_linear_groupnorm_swish2(
+            x,
+            self.linear.weight,
+            self.linear.bias,
+            self.gn.weight,
+            self.gn.bias,
+            self.multiply_weight,
+            self.num_groups,
+            self.eps,
+        )

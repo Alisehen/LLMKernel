@@ -7,7 +7,7 @@ import json
 ROOT = Path(__file__).resolve().parents[1]  # project root
 HW_FILE = ROOT / "prompts/hardware/gpu_specs.py"
 
-from prompts.generate_custom_cuda import _load_gpu_spec
+from prompts.generate_custom_cuda import _load_gpu_spec, MODEL_SINGLE, MODEL_FUSION, MODEL_NETWORK
 
 _OPTIMIZATION_PROMPT_TEMPLATE = Template("""\
 You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
@@ -17,7 +17,7 @@ GPU Name: $gpu_name
 Architecture: $gpu_arch
 $gpu_items
 
-[OPTIMIZATION STAGE]
+[OPTIMIZATION STAGE]f
 $STAGE_CONTEXT
 
 [CURRENT CODE]
@@ -29,6 +29,9 @@ $arch_src
 $NCU_METRICS
 
 **Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+TRITON API CONSTRAINTS (CRITICAL):
+- Triton has NO: tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
 
 OUTPUT RULES (STRICT):
 1. Follow this exact order:
@@ -74,6 +77,7 @@ Autotune:
 - Autotune either BLOCK_* OR (num_warps, num_stages)
 - If autotuning BLOCK_*, use grid=lambda META: (...)
 - Never redefine BLOCK_* in both kernel and launch
+- Max 2-3 configs to reduce compilation time
 """,
 
     "block_tiling": """
@@ -90,7 +94,7 @@ Rules:
 - Keep baseline tile if unsure
 
 Autotune:
-- 2–4 configs max
+- Max 2-3 configs to reduce compilation time
 - Autotune ONLY on @triton.jit kernel
 """,
 
@@ -108,7 +112,7 @@ Rules:
 - Larger BLOCK_K improves reuse but increases register pressure
 
 Autotune:
-- If unsure, try num_stages ∈ {1,2,3} on kernel
+- Max 2-3 configs (e.g., num_stages ∈ {2,3})
 """,
 
     "advanced_memory": """
@@ -124,7 +128,7 @@ Rules:
 - Do NOT modify grid or BLOCK sizes
 
 Autotune:
-- 3–6 nearby configs
+- Max 2-3 configs to reduce compilation time
 - Always include original config
 - Revert if gain <1–2% or unstable
 """
@@ -132,77 +136,118 @@ Autotune:
 
 FUSION_STAGE_FOCUS_MAP = {
     "grid_and_parallel": """
-Focus: Grid layout for FUSED operations.
+Focus: Grid layout & indexing for FUSED operations.
+
+⚠️ FUSION EXCLUSIONS (do NOT apply fusion rules to these):
+- Reduction ops (sum, mean, softmax along axis)
+- Atomic operations
+- Irregular/data-dependent access patterns
+- Cross-block dependencies
 
 Key Principle:
-- All fused operations share the SAME grid - do NOT split into multiple kernels
-- Grid should cover the OUTPUT tensor dimensions
+- All fused ops share the SAME grid AND the SAME (offsets, mask) tuple
+- Grid covers OUTPUT tensor dimensions
 
-Rules:
-- Element-wise fusion: Simple 1D grid (cdiv(n_elements, BLOCK_SIZE))
-- Matmul + activation fusion: Same grid as matmul (pid_m, pid_n pattern)
-- Keep all intermediate values in registers between operations
+Hard Rules:
+- Every fused op MUST use identical offset calculation
+- Every fused op MUST use identical boundary mask
+- If broadcast needed: explicit `[None, :]` or `[:, None]`, NOT different offsets
+- Element-wise: 1D grid, single `offs = pid * BLOCK + tl.arange(0, BLOCK)`
+- Matmul fusion: 2D grid, `offs_m/offs_n` shared by bias add & activation
 
-Safety:
-- Verify ALL fused operations use compatible indexing
-- Do NOT change grid if fusion correctness is at risk
-- If metrics are acceptable, skip this stage
+Verification:
+- Check: all tl.load/tl.store use same `offsets` variable
+- Check: all masks derived from same boundary condition
+- If ANY op needs different indexing → do NOT fuse, split kernel
 """,
 
     "block_tiling": """
-Focus: BLOCK_SIZE for fused operations with register pressure awareness.
+Focus: BLOCK_SIZE with register pressure awareness.
 
 Key Principle:
-- Fusion increases register usage (intermediate values stay in registers)
-- Balance between parallelism and register spilling
+- Fusion increases register usage (intermediates stay in registers)
+- Spill to local memory kills fusion benefit
+
+Register Pressure Signals (from NCU):
+- launch__registers_per_thread > 128 → likely spilling
+- launch__occupancy_limit_registers < other limits → register-bound
 
 Rules:
-- Start conservative: BLOCK_SIZE ∈ {256, 512, 1024}
-- If register spilling suspected, reduce BLOCK_SIZE
-- For matmul fusion: smaller BLOCK_M/N may help with register pressure
-- Monitor: high register count → reduce tile size
+- Start conservative: BLOCK_SIZE ∈ {256, 512} for element-wise
+- For matmul fusion: BLOCK_M/N ∈ {32, 64}, BLOCK_K ∈ {32}
+- If registers > 128: reduce BLOCK_* by half
+- Trade-off: recompute cheap ops (e.g., x*0.5) vs store intermediate
+
+When to Recompute vs Keep:
+- Keep: expensive ops (exp, log, div, sqrt)
+- Recompute: cheap ops (add, mul, max) if register pressure high
+- Example: `y = relu(x); z = y * scale` → keep y
+- Example: `y = x * 0.5; z = y + bias` → can recompute y if needed
 
 Autotune:
-- 2-3 BLOCK_SIZE configs
-- Include a smaller fallback option
+- 2-3 BLOCK_SIZE configs, always include smaller fallback
 """,
 
     "memory_access": """
 Focus: Memory pattern for fused operations.
 
 Key Principle:
-- Fusion benefit = eliminated intermediate memory traffic
-- Verify: ONE load at start, ONE store at end, NO intermediate stores
+- Fusion benefit = eliminated INTERMEDIATE stores
+- Multiple input loads are OK; intermediate stores are NOT
 
 Rules:
-- Check for accidental intermediate tl.store() calls - remove them
-- All intermediate values should stay in registers
-- Coalesced access on input load and output store
-- num_stages: start with 2, increase only if memory-bound
+- ✅ Multiple tl.load() for different inputs (x, weight, bias) - OK
+- ❌ tl.store() for intermediate results - NEVER (this is what fusion eliminates)
+- ✅ Single tl.store() for final output - required
 
 Verification:
-- Count tl.load() and tl.store() calls
-- Should have minimal stores (ideally just final output)
+- Count tl.store() calls: should equal number of OUTPUT tensors (usually 1)
+- Intermediate values: must stay in registers between ops
+- If you see store-then-load pattern for same data → BUG, refactor
+
+Multi-input Fusion Pattern:
+```
+x = tl.load(input_ptr + offs, mask=mask)
+w = tl.load(weight_ptr + ..., mask=...)  # OK: different input
+b = tl.load(bias_ptr + ..., mask=...)    # OK: different input
+y = op1(x, w)  # in registers
+z = op2(y, b)  # in registers
+tl.store(out_ptr + offs, z, mask=mask)   # single output store
+```
+
+num_stages: start with 2, only increase if memory stalls high AND registers OK
 """,
 
     "advanced_memory": """
-Focus: Fine-tuning fused kernel.
+Focus: Fine-tuning fused kernel parameters.
 
 Params:
-- num_warps ∈ {4, 8} (fusion often benefits from more warps)
+- num_warps ∈ {4, 8}
 - num_stages ∈ {2, 3}
 
-Rules:
-- Fusion kernels are often compute-bound, not memory-bound
-- Prioritize num_warps over num_stages
-- For activation-heavy fusion: try num_warps=8
+Conditional Rules (NOT one-size-fits-all):
+
+IF register pressure LOW (regs < 96, no spill):
+  - Try num_warps=8 for compute-bound fusion
+  - num_stages=3 may help hide latency
+
+IF register pressure HIGH (regs > 128 or occupancy_limit_registers):
+  - Use num_warps=4 (fewer warps = more registers per warp)
+  - Keep num_stages=2 (higher stages need more registers)
+
+IF multi-input fusion (3+ distinct loads):
+  - num_stages=2 preferred (each stage buffers all inputs)
+  - num_warps=4 often better than 8
 
 Autotune:
-- Focus on num_warps variations
-- 3-4 configs max
-- Keep original as baseline
+- Max 2-3 configs to reduce compilation time
+- Always include conservative baseline (num_warps=4, num_stages=2)
+- Test before/after: revert if gain < 2%
 """
 }
+
+# Network model (level3) - use same stages as fusion
+NETWORK_STAGE_FOCUS_MAP = FUSION_STAGE_FOCUS_MAP
 
 
 def build_optimization_prompt(
@@ -215,6 +260,7 @@ def build_optimization_prompt(
     stage_description: str = "",
     failure_analysis: str = "",
     fusion: bool = False,
+    model: str = MODEL_SINGLE,
 ) -> str:
     """Build single-phase optimization prompt with NCU metrics.
 
@@ -227,6 +273,7 @@ def build_optimization_prompt(
         stage_description: Stage description
         failure_analysis: Analysis of previous failures
         fusion: Whether this is a fusion operator (multi-op kernel)
+        model: Model type - "single" (level1), "fusion" (level2), or "network" (level3)
     """
     gpu_info = _load_gpu_spec()
 
@@ -247,8 +294,18 @@ def build_optimization_prompt(
     arch_src = Path(arch_path).read_text().strip()
     hist = history_block or "(None)\n"
 
-    # Select stage focus map based on fusion mode
-    stage_focus_map = FUSION_STAGE_FOCUS_MAP if fusion else NORMAL_STAGE_FOCUS_MAP
+    # Determine effective model type (fusion param for backward compatibility)
+    effective_model = model
+    if fusion and model == MODEL_SINGLE:
+        effective_model = MODEL_FUSION
+
+    # Select stage focus map based on model type
+    if effective_model == MODEL_NETWORK:
+        stage_focus_map = NETWORK_STAGE_FOCUS_MAP
+    elif effective_model == MODEL_FUSION:
+        stage_focus_map = FUSION_STAGE_FOCUS_MAP
+    else:
+        stage_focus_map = NORMAL_STAGE_FOCUS_MAP
 
     # Build stage context
     stage_context = ""

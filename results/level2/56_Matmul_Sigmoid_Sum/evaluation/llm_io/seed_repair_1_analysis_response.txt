@@ -1,0 +1,5 @@
+{
+  "critical_issue": "The Triton matmul uses the weight matrix with incorrect layout/strides, effectively computing x @ weight instead of x @ weight.T.",
+  "why_it_matters": "This wrong orientation of the weight matrix makes every linear output incorrect before sigmoid and summation, causing large, systematic deviations from the PyTorch reference.",
+  "minimal_fix_hint": "Fix the weight strides/layout so B[k, n] correctly maps to weight[n, k] and the kernel truly computes x @ weight.T."
+}

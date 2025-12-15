@@ -1,0 +1,5 @@
+{
+  "critical_issue": "Mask shapes for tl.load of W are incompatible: k_mask (1, BLOCK_K) & offs_n mask (1, BLOCK_N) broadcast fails when BLOCK_K != BLOCK_N.",
+  "why_it_matters": "Triton cannot broadcast these mismatched mask dimensions, triggering the ValueError during compilation when constructing the mask for loading W tiles.",
+  "minimal_fix_hint": "Use a Kx1-shaped mask for W, e.g., k_mask = offs_k[:, None] < (K - k), before combining with offs_n[None, :]."
+}

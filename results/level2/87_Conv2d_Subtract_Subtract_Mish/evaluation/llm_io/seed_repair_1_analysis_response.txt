@@ -1,0 +1,5 @@
+{
+  "critical_issue": "Inside the kernel, b_ptr (a pointer) is compared to integer 0: `if b_ptr != 0:` causing pointer–int type mismatch.",
+  "why_it_matters": "Triton’s type system forbids direct comparison between pointer<fp32> and int32, so compilation fails before code generation, producing the IncompatibleTypeError.",
+  "minimal_fix_hint": "Remove pointer–int comparison; instead use a constexpr has_bias flag or always pass a valid bias pointer and conditionally add bias via a mask."
+}

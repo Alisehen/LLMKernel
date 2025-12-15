@@ -1,0 +1,237 @@
+You are a Triton kernel debugging expert. Analyze the error and identify the root cause.
+
+## ERROR LOG
+```
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 626, in compare_and_bench
+    raise ValueError(
+ValueError: Outputs are not close (atol=0.001, rtol=0.01). max_abs_err=9.179e+05, mean_abs_err=9.168e+05
+```
+
+## Expected Behavior (PyTorch Reference)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs a matrix multiplication, applies sigmoid, and sums the result.
+    """
+    def __init__(self, input_size, hidden_size):
+        super(Model, self).__init__()
+        self.linear = nn.Linear(input_size, hidden_size)
+
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor of shape (batch_size, input_size).
+
+        Returns:
+            Output tensor of shape (batch_size, 1).
+        """
+        x = self.linear(x)
+        x = torch.sigmoid(x)
+        x = torch.sum(x, dim=1, keepdim=True)
+        return x
+
+batch_size = 128
+input_size = 32768
+hidden_size = 32768
+
+def get_inputs():
+    return [torch.rand(batch_size, input_size)]
+
+def get_init_inputs():
+    return [input_size, hidden_size]
+```
+
+## Current Implementation (Broken Triton Kernel)
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32},
+            num_warps=8,
+            num_stages=2,
+        ),
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+    ],
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def linear_sigmoid_row_sum_kernel(
+    a_ptr,         # [M, K] input
+    w_ptr,         # [N, K] = nn.Linear weight (out_features x in_features)
+    bias_ptr,      # [N] bias
+    out_ptr,       # [M] output row sums
+    M, N, K,
+    stride_am, stride_ak,    # strides for a_ptr[m, k]
+    stride_wn, stride_wk,    # strides for w_ptr[n, k]
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # Program IDs.
+    pid_m = tl.program_id(0)  # along batch dimension (M)
+    pid_n = tl.program_id(1)  # along hidden/output dimension (N)
+
+    # Offsets for this program's block.
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    # Create accumulator.
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Reduction loop over K dimension.
+    for k in range(0, K, BLOCK_K):
+        offs_k = k + tl.arange(0, BLOCK_K)
+
+        # Pointers for A (input): A[m, k]
+        a_ptrs = a_ptr + (
+            offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+        )
+
+        # Conceptual B (for matmul) has shape [K, N] and is weight.T:
+        # B[k, n] = weight[n, k].
+        # w_ptr has shape [N, K], with strides (stride_wn, stride_wk).
+        b_ptrs = w_ptr + (
+            offs_n[None, :] * stride_wn + offs_k[:, None] * stride_wk
+        )
+
+        # Masks for valid loads.
+        a_mask = (offs_m[:, None] < M) & (offs_k[None, :] < K)
+        b_mask = (offs_n[None, :] < N) & (offs_k[:, None] < K)
+
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+        # Accumulate matmul in fp32.
+        acc += tl.dot(a, b)
+
+    # Add bias: bias[n] broadcast along M.
+    mask_n = offs_n < N
+    bias = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0)
+    acc += bias[None, :]
+
+    # Sigmoid: 1 / (1 + exp(-x))
+    acc = 1.0 / (1.0 + tl.exp(-acc))
+
+    # Zero out contributions from columns outside N.
+    acc = tl.where(mask_n[None, :], acc, 0.0)
+
+    # Sum over N dimension -> per-row partial sums (for this N-tile).
+    row_sum = tl.sum(acc, axis=1)
+
+    # Accumulate into output via atomic add (across N-tiles).
+    mask_m = offs_m < M
+    tl.atomic_add(out_ptr + offs_m, row_sum, mask=mask_m)
+
+
+def fused_linear_sigmoid_sum(x: torch.Tensor,
+                             weight: torch.Tensor,
+                             bias: torch.Tensor) -> torch.Tensor:
+    """
+    Fused implementation of:
+        y = x @ weight.T + bias
+        y = sigmoid(y)
+        out = y.sum(dim=1, keepdim=True)
+
+    Args:
+        x:      [M, K]
+        weight: [N, K] (nn.Linear weight: out_features x in_features)
+        bias:   [N]
+
+    Returns:
+        out: [M, 1]
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda, "All tensors must be on CUDA device"
+    assert x.dtype == weight.dtype == bias.dtype == torch.float32, "Use float32 for this kernel"
+
+    M, K = x.shape
+    N, K_w = weight.shape
+    assert K == K_w, "Input feature dimension mismatch"
+
+    # Output is only the row-wise sum -> [M]
+    out = torch.zeros((M,), device=x.device, dtype=x.dtype)
+
+    # Strides for A[M, K]
+    stride_am, stride_ak = x.stride()
+
+    # Strides for weight[N, K]; we will access it as weight[n, k]
+    # and interpret B[k, n] = weight[n, k] inside the kernel.
+    stride_wn, stride_wk = weight.stride()
+
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta['BLOCK_M']),
+            triton.cdiv(N, meta['BLOCK_N']),
+        )
+
+    linear_sigmoid_row_sum_kernel[grid](
+        x, weight, bias, out,
+        M, N, K,
+        stride_am, stride_ak,
+        stride_wn, stride_wk,
+    )
+
+    return out.view(M, 1)
+
+
+class ModelNew(nn.Module):
+    """
+    Model equivalent to the reference PyTorch model, but using a fused Triton kernel
+    for linear + sigmoid + row-wise sum.
+    """
+    def __init__(self, input_size, hidden_size):
+        super(ModelNew, self).__init__()
+        self.linear = nn.Linear(input_size, hidden_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Ensure x is on the same device as the parameters.
+        x = x.to(self.linear.weight.device)
+        return fused_linear_sigmoid_sum(x, self.linear.weight, self.linear.bias)
+```
+
+---
+
+## Your Task
+
+Identify the **single most critical issue** that causes the error above.
+
+### Analysis Guidelines
+
+1. **Focus on root cause**, not symptoms
+   - Bad: "Output is wrong"
+   - Good: "BLOCK_K loop missing, only processes first 32 elements of K dimension"
+
+2. **Be specific about WHAT and WHERE**
+   - Bad: "Memory access issue"
+   - Good: "Line 45: tl.atomic_add(c_block_ptr, acc) - atomic_add requires scalar pointer, not block_ptr"
+
+3. **Prioritize by impact**
+   - Correctness bugs > Performance issues > Style problems
+   - Algorithm errors > Implementation details
+
+### Output Format
+
+**CRITICAL: You MUST output ONLY valid JSON. No other text allowed.**
+
+```json
+{
+  "critical_issue": "<Concise description of THE root cause, max 30 words>",
+  "why_it_matters": "<Why this causes the observed error, max 35 words>",
+  "minimal_fix_hint": "<What needs to change (not how), max 30 words>"
+}
+```
+
+**Remember**: Output ONLY the JSON block. No explanations, no commentary, no additional text.

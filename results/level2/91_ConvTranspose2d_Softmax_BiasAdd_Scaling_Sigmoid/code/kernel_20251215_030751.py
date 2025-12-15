@@ -1,0 +1,158 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def fused_softmax_bias_scale_sigmoid_kernel_2d(
+    x_ptr, bias_ptr, out_ptr,
+    N, C, H, W,
+    stride_n, stride_c, stride_h, stride_w,
+    scaling_factor,
+    BLOCK_HW: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+):
+    """
+    Fused kernel:
+      1. Softmax over channel dimension (dim=1) per (n, h, w)
+      2. Add channel bias (C,)
+      3. Multiply by scaling_factor
+      4. Apply sigmoid
+
+    2D tiling:
+      - program_id(0): batch index n
+      - program_id(1): tile index along flattened (H*W)
+
+    Each program processes:
+      - BLOCK_HW spatial positions (h, w)
+      - All C channels (C <= BLOCK_C, with padding if C < BLOCK_C)
+    """
+    pid_n = tl.program_id(0)
+    pid_hw_block = tl.program_id(1)
+
+    HW = H * W
+
+    # Offsets over spatial positions (flattened h*w)
+    offs_hw = pid_hw_block * BLOCK_HW + tl.arange(0, BLOCK_HW)  # [BLOCK_HW]
+    mask_hw = offs_hw < HW
+
+    # Decode flattened hw into (h, w)
+    w_idx = offs_hw % W
+    h_idx = offs_hw // W
+
+    # Offsets over channels
+    offs_c = tl.arange(0, BLOCK_C)  # [BLOCK_C]
+    mask_c = offs_c < C
+
+    # 2D mask for valid (hw, c) pairs
+    mask = mask_hw[:, None] & mask_c[None, :]
+
+    # Base pointer offsets for each spatial position
+    base_n = pid_n * stride_n
+    base_hw = base_n + h_idx * stride_h + w_idx * stride_w  # [BLOCK_HW]
+
+    # Pointers to input x for [BLOCK_HW, BLOCK_C] tile
+    x_ptrs = x_ptr + base_hw[:, None] + offs_c[None, :] * stride_c
+
+    # Load input; pad invalid lanes with -inf so they don't affect softmax
+    x_vals = tl.load(x_ptrs, mask=mask, other=-float('inf'))
+    x_dtype = x_vals.dtype
+    x_fp32 = tl.cast(x_vals, tl.float32)
+
+    # Softmax over channels (axis=1) for each spatial position
+    max_val = tl.max(x_fp32, axis=1)              # [BLOCK_HW]
+    x_shifted = x_fp32 - max_val[:, None]         # [BLOCK_HW, BLOCK_C]
+    exp_x = tl.exp(x_shifted)                     # [BLOCK_HW, BLOCK_C]
+    sum_exp = tl.sum(exp_x, axis=1)               # [BLOCK_HW]
+    softmax = exp_x / sum_exp[:, None]           # [BLOCK_HW, BLOCK_C]
+
+    # Load bias [C] and broadcast over BLOCK_HW positions
+    bias_vals = tl.load(bias_ptr + offs_c, mask=mask_c, other=0.0)
+    bias_fp32 = tl.cast(bias_vals, tl.float32)[None, :]  # [1, BLOCK_C] -> broadcast
+
+    # Fused: +bias, *scale, sigmoid
+    y = softmax + bias_fp32
+    y = y * scaling_factor
+
+    neg_y = -y
+    exp_neg_y = tl.exp(neg_y)
+    sigmoid = 1.0 / (1.0 + exp_neg_y)
+
+    # Store result, cast back to original dtype
+    out_vals = tl.cast(sigmoid, x_dtype)
+    out_ptrs = out_ptr + base_hw[:, None] + offs_c[None, :] * stride_c
+    tl.store(out_ptrs, out_vals, mask=mask)
+
+
+def fused_post_convtranspose(x: torch.Tensor, bias: torch.Tensor, scaling_factor: float):
+    """
+    x: [N, C, H, W] - result of ConvTranspose2d
+    bias: [C, 1, 1] or [C] - channel-wise bias
+    Returns: [N, C, H, W] with fused operations:
+        softmax(dim=1) -> +bias -> *scaling_factor -> sigmoid
+    """
+    assert x.is_cuda, "Input must be on CUDA device"
+    N, C, H, W = x.shape
+    assert C <= 1024, "Kernel currently supports C <= 1024 for best performance."
+
+    # Ensure bias is [C]
+    bias_flat = bias.view(C).contiguous()
+
+    out = torch.empty_like(x)
+
+    # Choose BLOCK_C as next power of 2 >= C, capped at 1024
+    BLOCK_C = 1
+    while BLOCK_C < C:
+        BLOCK_C <<= 1
+    if BLOCK_C > 1024:
+        BLOCK_C = 1024
+
+    # Tile multiple spatial positions per program to amortize overhead and reuse bias
+    BLOCK_HW = 8  # good trade-off for typical CNN shapes on Ada GPUs
+
+    HW = H * W
+    grid_n = N
+    grid_hw = triton.cdiv(HW, BLOCK_HW)
+    grid = (grid_n, grid_hw)
+
+    # Heuristic for num_warps based on C
+    num_warps = 4 if C <= 256 else 8
+
+    fused_softmax_bias_scale_sigmoid_kernel_2d[grid](
+        x, bias_flat, out,
+        N, C, H, W,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        float(scaling_factor),
+        BLOCK_HW=BLOCK_HW,
+        BLOCK_C=BLOCK_C,
+        num_warps=num_warps,
+        num_stages=1,
+    )
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    ConvTranspose2d (PyTorch native) +
+    fused softmax(dim=1) + bias add + scaling + sigmoid (Triton).
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding,
+                 output_padding, bias_shape, scaling_factor):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose2d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            output_padding=output_padding,
+        )
+        # Match original bias shape (C, 1, 1)
+        self.bias = nn.Parameter(torch.randn(out_channels, 1, 1))
+        self.scaling_factor = scaling_factor
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = fused_post_convtranspose(x, self.bias, self.scaling_factor)
+        return x

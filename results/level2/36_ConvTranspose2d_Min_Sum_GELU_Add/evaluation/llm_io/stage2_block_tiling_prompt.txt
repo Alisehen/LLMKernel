@@ -1,0 +1,220 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU
+GPU Name: 4090
+Architecture: Ada Lovelace
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+[OPTIMIZATION STAGE]
+
+## Current Optimization Stage
+
+Focus: BLOCK_SIZE with register pressure awareness.
+
+Key Principle:
+- Fusion increases register usage (intermediates stay in registers)
+- Spill to local memory kills fusion benefit
+
+Register Pressure Signals (from NCU):
+- launch__registers_per_thread > 128 → likely spilling
+- launch__occupancy_limit_registers < other limits → register-bound
+
+Rules:
+- Start conservative: BLOCK_SIZE ∈ {256, 512} for element-wise
+- For matmul fusion: BLOCK_M/N ∈ {32, 64}, BLOCK_K ∈ {32}
+- If registers > 128: reduce BLOCK_* by half
+- Trade-off: recompute cheap ops (e.g., x*0.5) vs store intermediate
+
+When to Recompute vs Keep:
+- Keep: expensive ops (exp, log, div, sqrt)
+- Recompute: cheap ops (add, mul, max) if register pressure high
+- Example: `y = relu(x); z = y * scale` → keep y
+- Example: `y = x * 0.5; z = y + bias` → can recompute y if needed
+
+Autotune:
+- 2-3 BLOCK_SIZE configs, always include smaller fallback
+
+
+
+[CURRENT CODE]
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+import math
+
+
+@triton.jit
+def fused_min_sum_gelu_bias_kernel(
+    x_ptr,
+    bias_ptr,
+    out_ptr,
+    N, C, H, W,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_on, stride_o1, stride_o2, stride_ow,
+    BLOCK_H: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+):
+    """
+    Fused kernel for: min(dim=1) + sum(dim=2) + GELU + bias
+    Input: [N, C, H, W] -> Output: [N, 1, 1, W]
+    """
+    pid_n = tl.program_id(0)
+    pid_w = tl.program_id(1)
+    
+    if pid_n >= N or pid_w >= W:
+        return
+    
+    # Initialize accumulation array for H dimension
+    h_offsets = tl.arange(0, BLOCK_H)
+    h_mask = h_offsets < H
+    
+    # Initialize min accumulator for each H position
+    # Start with large values (for min reduction)
+    min_vals = tl.full((BLOCK_H,), float('inf'), dtype=tl.float32)
+    
+    # Process channels in blocks
+    for c_block in range(0, C, BLOCK_C):
+        c_offsets = tl.arange(0, BLOCK_C)
+        c_mask = c_offsets < C
+        
+        # Load a block of channels for all H positions
+        x_ptrs = (
+            x_ptr +
+            pid_n * stride_xn +
+            c_offsets[:, None] * stride_xc +
+            h_offsets[None, :] * stride_xh +
+            pid_w * stride_xw
+        )
+        
+        # Load [BLOCK_C, BLOCK_H] values
+        x_block = tl.load(x_ptrs, mask=c_mask[:, None] & h_mask[None, :], other=float('inf'))
+        
+        # Update min across channels (dim=0)
+        block_min = tl.min(x_block, axis=0)
+        min_vals = tl.minimum(min_vals, block_min)
+    
+    # Sum across H dimension
+    # Mask out invalid H positions
+    valid_min_vals = tl.where(h_mask, min_vals, 0.0)
+    sum_val = tl.sum(valid_min_vals, axis=0)
+    
+    # GELU approximation: 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x^3)))
+    sqrt_2_over_pi = 0.7978845608028654
+    gelu_coef = 0.044715
+    
+    x_cubed = sum_val * sum_val * sum_val
+    inner = sqrt_2_over_pi * (sum_val + gelu_coef * x_cubed)
+    
+    # tanh approximation using sigmoid: tanh(x) = 2 * sigmoid(2x) - 1
+    # but we need to compute 1 + tanh(inner), so: 1 + tanh(inner) = 2 / (1 + exp(-2*inner))
+    exp_neg_2inner = tl.exp(-2.0 * inner)
+    one_plus_tanh = 2.0 / (1.0 + exp_neg_2inner)
+    
+    gelu_result = 0.5 * sum_val * one_plus_tanh
+    
+    # Add bias (scalar)
+    bias_val = tl.load(bias_ptr)
+    result = gelu_result + bias_val
+    
+    # Store result [N, 1, 1, W]
+    out_ptr_base = pid_n * stride_on + pid_w * stride_ow
+    tl.store(out_ptr + out_ptr_base, result)
+
+
+def fused_post_convtranspose(x, bias):
+    """
+    Fused: min(dim=1) + sum(dim=2) + GELU + bias
+    Input shape: [N, C, H, W]
+    Output shape: [N, 1, 1, W]
+    """
+    N, C, H, W = x.shape
+    
+    # Output tensor
+    out = torch.empty((N, 1, 1, W), device=x.device, dtype=x.dtype)
+    
+    # Choose block sizes (powers of 2)
+    BLOCK_H = triton.next_power_of_2(H)
+    BLOCK_C = 128  # Fixed block size for channels (reasonable for up to 128 channels)
+    
+    # Ensure BLOCK_H is not too large (32 max for reasonable register usage)
+    BLOCK_H = min(BLOCK_H, 32)
+    
+    # Grid: N x W
+    grid = (N, W)
+    
+    fused_min_sum_gelu_bias_kernel[grid](
+        x, bias, out,
+        N, C, H, W,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+        BLOCK_H=BLOCK_H,
+        BLOCK_C=BLOCK_C,
+    )
+    
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    ConvTranspose2d (PyTorch native) + Fused min + sum + GELU + bias (Triton)
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, bias_shape):
+        super(ModelNew, self).__init__()
+        # Keep ConvTranspose as PyTorch native
+        self.conv_transpose = nn.ConvTranspose2d(
+            in_channels, out_channels, kernel_size, 
+            stride, padding, output_padding
+        )
+        # Bias is scalar (1, 1, 1) -> store as 1-element tensor
+        self.bias = nn.Parameter(torch.randn(1))
+        
+    def forward(self, x):
+        # Step 1: PyTorch native ConvTranspose2d
+        x = self.conv_transpose(x)
+        # Step 2: Fused post-ops in Triton
+        x = fused_post_convtranspose(x, self.bias)
+        return x
+```
+
+[NCU PROFILING METRICS]
+{
+  "fused_min_sum_gelu_bias_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 9.18,
+    "launch__grid_size": 4096,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 32.46,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 21.3,
+    "lts__t_sector_hit_rate.pct": 87.51
+  }
+}
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+TRITON API CONSTRAINTS (CRITICAL):
+- Triton has NO: tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

@@ -1,0 +1,147 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        # Baseline, conservative: good occupancy, low register use
+        triton.Config({"BLOCK_W": 128}, num_warps=4, num_stages=2),
+        # More warps to hide memory latency
+        triton.Config({"BLOCK_W": 128}, num_warps=8, num_stages=2),
+        # Extra stages to better pipeline memory
+        triton.Config({"BLOCK_W": 128}, num_warps=8, num_stages=3),
+    ],
+    key=["N", "C", "H", "W"],
+)
+@triton.jit
+def bias_sub_tanh_kernel(
+    x_ptr, bias_ptr, out_ptr,
+    N, C, H, W,
+    stride_x_n, stride_x_c, stride_x_h, stride_x_w,
+    stride_o_n, stride_o_c, stride_o_h, stride_o_w,
+    num_w_blocks,
+    BLOCK_W: tl.constexpr,
+):
+    """
+    Fused kernel: (x - bias) followed by tanh activation.
+
+    x:     [N, C, H, W]
+    bias:  [C]          (broadcast over H, W, N)
+    out:   [N, C, H, W]
+    """
+    pid_nc = tl.program_id(0)  # over N * C * num_w_blocks
+    pid_h = tl.program_id(1)   # over H
+
+    # Decode (n, c, w_block) from pid_nc
+    nc = pid_nc // num_w_blocks
+    w_block = pid_nc % num_w_blocks
+    n = nc // C
+    c = nc % C
+
+    # Early exit for out-of-range N (safety when grid over-allocates)
+    if n >= N:
+        return
+
+    # Offsets along W for this block
+    offs_w = w_block * BLOCK_W + tl.arange(0, BLOCK_W)
+    mask_w = offs_w < W
+
+    # Base pointers for this (n, c, h)
+    x_base = (
+        n * stride_x_n +
+        c * stride_x_c +
+        pid_h * stride_x_h
+    )
+    o_base = (
+        n * stride_o_n +
+        c * stride_o_c +
+        pid_h * stride_o_h
+    )
+
+    x_offsets = x_base + offs_w * stride_x_w
+    o_offsets = o_base + offs_w * stride_o_w
+
+    # Load input and bias
+    x_vals = tl.load(x_ptr + x_offsets, mask=mask_w, other=0.0)
+    bias_val = tl.load(bias_ptr + c)  # scalar bias per channel
+
+    # Subtract bias
+    x_vals = x_vals - bias_val
+
+    # Compute tanh in float32 for numerical stability:
+    # tanh(x) = (e^{2x} - 1) / (e^{2x} + 1)
+    x_fp32 = x_vals.to(tl.float32)
+    exp_2x = tl.exp(2.0 * x_fp32)
+    tanh_fp32 = (exp_2x - 1.0) / (exp_2x + 1.0)
+    tanh_vals = tanh_fp32.to(x_vals.dtype)
+
+    # Store result
+    tl.store(out_ptr + o_offsets, tanh_vals, mask=mask_w)
+
+
+def fused_bias_sub_tanh(x: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    Fused operation:
+      y = tanh(x - bias)
+
+    x:    [N, C, H, W] (CUDA tensor)
+    bias: [C, 1, 1] or [C] (CUDA tensor)
+    Returns: y with same shape as x.
+    """
+    assert x.is_cuda, "Input must be on CUDA device"
+    assert bias.is_cuda, "Bias must be on CUDA device"
+    assert x.ndim == 4, "x must be 4D [N, C, H, W]"
+
+    N, C, H, W = x.shape
+
+    # Ensure bias is [C]
+    bias_1d = bias.reshape(C).contiguous()
+
+    # BLOCK_W is autotuned inside the kernel; all configs use 128.
+    # We must use the same value here to compute num_w_blocks and grid dims.
+    BLOCK_W = 128
+    num_w_blocks = (W + BLOCK_W - 1) // BLOCK_W
+
+    # In-place write to avoid extra allocation
+    out = x
+
+    grid = (N * C * num_w_blocks, H)
+
+    bias_sub_tanh_kernel[grid](
+        x, bias_1d, out,
+        N, C, H, W,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+        num_w_blocks,
+        # BLOCK_W is provided by the autotuner configs; do NOT pass it here
+    )
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    ConvTranspose2d (PyTorch native) + fused (x - bias) + tanh (Triton)
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, bias_shape,
+                 stride=2, padding=1, output_padding=1):
+        super(ModelNew, self).__init__()
+        # PyTorch ConvTranspose2d
+        self.conv_transpose = nn.ConvTranspose2d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            output_padding=output_padding,
+        )
+        # Bias parameter with the same shape as the original model
+        self.bias = nn.Parameter(torch.randn(*bias_shape))
+
+    def forward(self, x):
+        # PyTorch ConvTranspose2d
+        x = self.conv_transpose(x)
+        # Fused bias subtraction + tanh in Triton
+        x = fused_bias_sub_tanh(x, self.bias)
+        return x

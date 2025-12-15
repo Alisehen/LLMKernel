@@ -1,0 +1,5 @@
+{
+  "critical_issue": "Kernel uses tl.ones_like, which does not exist in triton.language.",
+  "why_it_matters": "During JIT parsing Triton inspects tl.* attributes; referencing nonexistent tl.ones_like raises AttributeError before compilation, causing the autotuner and kernel launch to fail.",
+  "minimal_fix_hint": "Replace tl.ones_like with a supported Triton op, e.g., tl.full(x0.shape, 1.0, dtype=tl.float32) or equivalent."
+}

@@ -1,0 +1,462 @@
+You are a Triton kernel debugging expert. Analyze the error and identify the root cause.
+
+## ERROR LOG
+```
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 527, in compare_and_bench
+    test_model = ModelNew(*init_args, **init_kwargs)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251215_024837_batch_range56to88_openai_deepseek/66_Matmul_Dropout_Softmax/code/kernel_20251215_040121.py", line 357, in __init__
+    self.reset_parameters()
+  File "/home/hyc/LLMKernel/run/20251215_024837_batch_range56to88_openai_deepseek/66_Matmul_Dropout_Softmax/code/kernel_20251215_040121.py", line 360, in reset_parameters
+    bound = 1.0 / math.sqrt(self.in_features)
+                  ^^^^
+NameError: name 'math' is not defined
+```
+
+## Expected Behavior (PyTorch Reference)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    A model that performs matrix multiplication, applies dropout, and then applies softmax.
+    """
+    def __init__(self, in_features, out_features, dropout_p):
+        super(Model, self).__init__()
+        self.matmul = nn.Linear(in_features, out_features)
+        self.dropout = nn.Dropout(dropout_p)
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_features).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_features).
+        """
+        x = self.matmul(x)
+        x = self.dropout(x)
+        x = torch.softmax(x, dim=1)  # Softmax over features
+        return x
+
+batch_size = 128
+in_features = 16384
+out_features = 16384
+dropout_p = 0.2
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features)]
+
+def get_init_inputs():
+    return [in_features, out_features, dropout_p]
+```
+
+## Current Implementation (Broken Triton Kernel)
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+# ---------------------------
+# GEMM + Bias (Linear layer)
+# ---------------------------
+
+@triton.autotune(
+    configs=[
+        # Large tiles for big GEMMs
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_M": 8},
+            num_warps=8,
+            num_stages=3,
+        ),
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 32, "GROUP_M": 4},
+            num_warps=8,
+            num_stages=4,
+        ),
+        triton.Config(
+            {"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_M": 4},
+            num_warps=8,
+            num_stages=4,
+        ),
+        # Medium tiles
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_M": 8},
+            num_warps=4,
+            num_stages=3,
+        ),
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_M": 8},
+            num_warps=4,
+            num_stages=3,
+        ),
+        # Small tiles for skinny / small shapes
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32, "GROUP_M": 8},
+            num_warps=4,
+            num_stages=2,
+        ),
+    ],
+    key=["M", "N", "K"],
+)
+@triton.jit
+def linear_gemm_bias_kernel(
+    a_ptr,  # [M, K]
+    w_ptr,  # [N, K] (row-major as in nn.Linear: out_features x in_features)
+    b_ptr,  # [N]
+    c_ptr,  # [M, N]
+    M, N, K,
+    stride_am, stride_ak,   # a[m, k] = a_ptr + m*stride_am + k*stride_ak
+    stride_wn, stride_wk,   # w[n, k] = w_ptr + n*stride_wn + k*stride_wk
+    stride_cm, stride_cn,   # c[m, n] = c_ptr + m*stride_cm + n*stride_cn
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    # -------------
+    # 2D grid (flattened) with GROUP_M swizzling for better L2 reuse
+    # -------------
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+
+    num_pid_in_group = GROUP_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_M
+    group_size_m = tl.minimum(num_pid_m - first_pid_m, GROUP_M)
+
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    # Offsets in output space (shared by GEMM + bias + store)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    # Common mask for fused bias+store
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+
+    # -------------
+    # Initialize accumulators
+    # -------------
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Initial K offsets and pointers
+    offs_k = tl.arange(0, BLOCK_K)
+    a_ptrs = (
+        a_ptr
+        + offs_m[:, None] * stride_am
+        + offs_k[None, :] * stride_ak
+    )
+    # w is [N, K] row-major -> treat as [K, N] logically:
+    w_ptrs = (
+        w_ptr
+        + offs_n[None, :] * stride_wn
+        + offs_k[:, None] * stride_wk
+    )
+
+    # -------------
+    # K loop
+    # -------------
+    for k0 in range(0, K, BLOCK_K):
+        k_mask = offs_k[None, :] + k0 < K
+
+        a = tl.load(
+            a_ptrs,
+            mask=(offs_m[:, None] < M) & k_mask,
+            other=0.0,
+        )
+        w = tl.load(
+            w_ptrs,
+            mask=(offs_n[None, :] < N) & k_mask.T,
+            other=0.0,
+        )
+
+        # Tensor-core friendly dot (TF32 allowed for fp32 inputs)
+        acc += tl.dot(a, w, allow_tf32=True)
+
+        # Advance pointers along K
+        a_ptrs += BLOCK_K * stride_ak
+        w_ptrs += BLOCK_K * stride_wk
+
+    # -------------
+    # Fused bias add (uses same offs_n / mask as output)
+    # -------------
+    bias = tl.load(b_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc += bias[None, :]
+
+    # -------------
+    # Store output
+    # -------------
+    c_ptrs = (
+        c_ptr
+        + offs_m[:, None] * stride_cm
+        + offs_n[None, :] * stride_cn
+    )
+    tl.store(c_ptrs, acc, mask=c_mask)
+
+
+def triton_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    x:      [M, K]
+    weight: [N, K]  (out_features x in_features, as in nn.Linear)
+    bias:   [N]
+    returns: [M, N]
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+    M, K = x.shape
+    N = weight.shape[0]
+    y = torch.empty((M, N), device=x.device, dtype=torch.float32)
+
+    stride_am, stride_ak = x.stride()
+    stride_wn, stride_wk = weight.stride()
+    stride_cm, stride_cn = y.stride()
+
+    def grid(meta):
+        BLOCK_M = meta["BLOCK_M"]
+        BLOCK_N = meta["BLOCK_N"]
+        num_pid_m = triton.cdiv(M, BLOCK_M)
+        num_pid_n = triton.cdiv(N, BLOCK_N)
+        return (num_pid_m * num_pid_n,)
+
+    linear_gemm_bias_kernel[grid](
+        x,
+        weight,
+        bias,
+        y,
+        M,
+        N,
+        K,
+        stride_am,
+        stride_ak,
+        stride_wn,
+        stride_wk,
+        stride_cm,
+        stride_cn,
+    )
+    return y
+
+
+# ---------------------------
+# Dropout + Softmax (row-wise over features)
+# ---------------------------
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_N": 1024}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_N": 512}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_N": 256}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_N": 128}, num_warps=2, num_stages=2),
+    ],
+    key=["N"],
+)
+@triton.jit
+def dropout_softmax_kernel(
+    x_ptr,  # [M, N]
+    y_ptr,  # [M, N]
+    M, N,
+    stride_xm, stride_xn,
+    stride_ym, stride_yn,
+    p,          # dropout probability (float32)
+    seed,       # rng seed (int32)
+    training,   # 1 if training (dropout active), 0 if eval
+    BLOCK_N: tl.constexpr,
+):
+    # -------------
+    # 1D grid over rows, each program handles one full row
+    # -------------
+    row = tl.program_id(0)
+    if row >= M:
+        return
+
+    # Base pointers for this row (shared across fused ops)
+    x_row_ptr = x_ptr + row * stride_xm
+    y_row_ptr = y_ptr + row * stride_ym
+
+    # -------------
+    # Pass 1: compute row-wise max for numerical stability
+    # -------------
+    row_max = -float("inf")
+
+    for start_n in range(0, N, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        mask = offs_n < N  # shared mask for all fused ops in this tile
+
+        x_vals = tl.load(
+            x_row_ptr + offs_n * stride_xn,
+            mask=mask,
+            other=-float("inf"),
+        )
+        block_max = tl.max(x_vals, axis=0)
+        row_max = tl.maximum(row_max, block_max)
+
+    # -------------
+    # Pass 2: compute exp(x - max), apply dropout (if training), accumulate sum,
+    #         and store numerators (before final normalization)
+    # -------------
+    row_sum = 0.0
+    keep_prob = 1.0 - p
+    is_training = training > 0
+
+    for start_n in range(0, N, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        mask = offs_n < N  # same offsets/mask used by load, dropout, store
+
+        x_vals = tl.load(
+            x_row_ptr + offs_n * stride_xn,
+            mask=mask,
+            other=-float("inf"),
+        )
+
+        shifted = x_vals - row_max
+        exp_vals = tl.exp(shifted)
+
+        if is_training:
+            # Unique RNG offset per element in row-major order
+            offsets = row * N + offs_n
+            rnd = tl.rand(seed, offsets)
+            drop_mask = rnd > p
+            factor = drop_mask.to(exp_vals.dtype) / keep_prob
+        else:
+            factor = 1.0
+
+        numerators = exp_vals * factor
+
+        block_sum = tl.sum(numerators, axis=0)
+        row_sum += block_sum
+
+        tl.store(
+            y_row_ptr + offs_n * stride_yn,
+            numerators,
+            mask=mask,
+        )
+
+    # -------------
+    # Pass 3: normalize to get softmax probabilities
+    # -------------
+    inv_row_sum = 1.0 / row_sum
+
+    for start_n in range(0, N, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        mask = offs_n < N  # same offsets/mask for load + store
+
+        numerators = tl.load(
+            y_row_ptr + offs_n * stride_yn,
+            mask=mask,
+            other=0.0,
+        )
+        probs = numerators * inv_row_sum
+
+        tl.store(
+            y_row_ptr + offs_n * stride_yn,
+            probs,
+            mask=mask,
+        )
+
+
+def triton_dropout_softmax(
+    x: torch.Tensor,
+    p: float,
+    training: bool,
+    seed: int | None = None,
+) -> torch.Tensor:
+    """
+    x: [M, N]
+    Applies dropout (with probability p) then softmax over dim=1.
+    """
+    assert x.is_cuda
+    M, N = x.shape
+    y = torch.empty_like(x, dtype=torch.float32)
+
+    if seed is None:
+        # NOTE: Python-side RNG; Triton uses its own counter-based RNG inside the kernel
+        seed = torch.randint(0, 2**31 - 1, ()).item()
+
+    grid = (M,)
+
+    dropout_softmax_kernel[grid](
+        x,
+        y,
+        M,
+        N,
+        x.stride(0),
+        x.stride(1),
+        y.stride(0),
+        y.stride(1),
+        float(p),
+        int(seed),
+        int(training),
+    )
+    return y
+
+
+# ---------------------------
+# Combined Module
+# ---------------------------
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized replacement for:
+
+        Linear(in_features, out_features) + Dropout(p) + Softmax(dim=1)
+    """
+
+    def __init__(self, in_features: int, out_features: int, dropout_p: float):
+        super(ModelNew, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias = nn.Parameter(torch.empty(out_features))
+        self.dropout_p = float(dropout_p)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        bound = 1.0 / math.sqrt(self.in_features)
+        with torch.no_grad():
+            self.weight.uniform_(-bound, bound)
+            self.bias.uniform_(-bound, bound)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Expect x on CUDA; compute in float32
+        x = x.to(dtype=torch.float32, device=self.weight.device)
+        y = triton_linear(x, self.weight, self.bias)
+        y = triton_dropout_softmax(y, self.dropout_p, self.training)
+        return y
+```
+
+---
+
+## Your Task
+
+Identify the **single most critical issue** that causes the error above.
+
+### Analysis Guidelines
+
+1. **Focus on root cause**, not symptoms
+   - Bad: "Output is wrong"
+   - Good: "BLOCK_K loop missing, only processes first 32 elements of K dimension"
+
+2. **Be specific about WHAT and WHERE**
+   - Bad: "Memory access issue"
+   - Good: "Line 45: tl.atomic_add(c_block_ptr, acc) - atomic_add requires scalar pointer, not block_ptr"
+
+3. **Prioritize by impact**
+   - Correctness bugs > Performance issues > Style problems
+   - Algorithm errors > Implementation details
+
+### Output Format
+
+**CRITICAL: You MUST output ONLY valid JSON. No other text allowed.**
+
+```json
+{
+  "critical_issue": "<Concise description of THE root cause, max 30 words>",
+  "why_it_matters": "<Why this causes the observed error, max 35 words>",
+  "minimal_fix_hint": "<What needs to change (not how), max 30 words>"
+}
+```
+
+**Remember**: Output ONLY the JSON block. No explanations, no commentary, no additional text.

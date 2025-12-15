@@ -1,0 +1,5 @@
+{
+  "critical_issue": "Kernel compares a pointer argument (b_ptr) with integer 0: `if b_ptr != 0:` causing invalid pointer-int comparison in Triton.",
+  "why_it_matters": "Triton’s type system forbids direct comparisons between pointer<fp32> and int32, so the conditional on b_ptr triggers a compile-time IncompatibleTypeError and prevents kernel compilation.",
+  "minimal_fix_hint": "Replace pointer comparison with a boolean/constexpr flag (e.g., has_bias) or always assume bias present; do not compare b_ptr to 0 inside the kernel."
+}

@@ -1,226 +1,271 @@
 ```python
+# <complete ModelNew code with optimized Triton kernels>
 import torch
 import torch.nn as nn
 import triton
 import triton.language as tl
 
-@triton.jit
-def conv_pointwise_kernel(
-    x_ptr,
-    weight_ptr,
-    bias_ptr,
-    scaling_factor_ptr,
-    bias2_ptr,
-    output_ptr,
-    stride_d, stride_h, stride_w,
-    padding_d, padding_h, padding_w,
-    dilation_d, dilation_h, dilation_w,
-    groups,
-    B, C_in, C_out, D, H, W, K_d, K_h, K_w,
-    out_d, out_h, out_w,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
-):
-    """
-    Fused 3D convolution with pointwise operations (scaling, tanh, bias, sigmoid).
-    """
-    # Program ID mapping
-    pid_b = tl.program_id(0)
-    pid_c = tl.program_id(1)
-    pid_d = tl.program_id(2)
-    pid_h = tl.program_id(3)
-    
-    # Calculate output height block start
-    start_h = pid_h * BLOCK_SIZE_N
-    # Create mask for height dimension
-    oh = start_h + tl.arange(0, BLOCK_SIZE_N)
-    mask_h = oh < out_h
-    
-    # We'll compute one width element per program
-    pid_w = tl.program_id(4)
-    ow = pid_w
-    mask_w = ow < out_w
-    
-    # Combined spatial mask
-    spatial_mask = mask_h
-    
-    # Calculate input starting positions
-    in_d_start = pid_d * stride_d - padding_d
-    in_h_start = oh * stride_h - padding_h
-    in_w_start = ow * stride_w - padding_w
-    
-    # Initialize accumulator
-    acc = tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32)
-    
-    # Loop over kernel depth dimension
-    for kd in range(K_d):
-        in_d = in_d_start + kd * dilation_d
-        in_d_mask = (in_d >= 0) & (in_d < D)
-        
-        # Loop over kernel height dimension
-        for kh in range(K_h):
-            in_h = in_h_start + kh * dilation_h
-            in_h_mask = (in_h >= 0) & (in_h < H)
-            
-            # Loop over kernel width dimension
-            for kw in range(K_w):
-                in_w = in_w_start + kw * dilation_w
-                in_w_mask = (in_w >= 0) & (in_w < W)
-                
-                # Combined spatial mask for this kernel position
-                spatial_valid = in_d_mask & in_h_mask & in_w_mask
-                
-                # Loop over input channels in blocks
-                for c_block in range(0, C_in, BLOCK_SIZE_M):
-                    c_offsets = c_block + tl.arange(0, BLOCK_SIZE_M)
-                    c_mask = c_offsets < C_in
-                    
-                    # Load input with broadcasting mask
-                    input_mask = c_mask[:, None] & spatial_valid & spatial_mask[None, :]
-                    
-                    # Calculate input indices - flatten 5D tensor
-                    input_idx = (
-                        pid_b * C_in * D * H * W +
-                        c_offsets[:, None] * D * H * W +
-                        in_d * H * W +
-                        in_h * W +
-                        in_w
-                    )
-                    x = tl.load(x_ptr + input_idx, mask=input_mask, other=0.0)
-                    
-                    # Load weight
-                    weight_idx = (
-                        pid_c * C_in * K_d * K_h * K_w +
-                        c_offsets[:, None] * K_d * K_h * K_w +
-                        kd * K_h * K_w +
-                        kh * K_w +
-                        kw
-                    )
-                    weight = tl.load(weight_ptr + weight_idx, 
-                                   mask=c_mask[:, None], other=0.0)
-                    
-                    # Accumulate
-                    acc += tl.sum(x * weight, axis=0)
-    
-    # Load parameters for pointwise operations
-    bias_val = tl.load(bias_ptr + pid_c)
-    scaling = tl.load(scaling_factor_ptr + pid_c)
-    bias2_val = tl.load(bias2_ptr + pid_c)
-    
-    # Apply pointwise operations
-    acc = acc + bias_val
-    acc = acc * scaling
-    # tanh(x) = 2*sigmoid(2*x) - 1
-    acc = 2.0 * tl.sigmoid(2.0 * acc) - 1.0
-    acc = acc * bias2_val
-    acc = tl.sigmoid(acc)
-    
-    # Calculate output index
-    output_idx = (
-        pid_b * C_out * out_d * out_h * out_w +
-        pid_c * out_d * out_h * out_w +
-        pid_d * out_h * out_w +
-        oh * out_w +
-        ow
-    )
-    
-    # Store output
-    tl.store(output_ptr + output_idx, acc, mask=spatial_mask & mask_w)
 
-def triton_conv_pointwise(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor,
-    scaling_factor: torch.Tensor,
-    bias2: torch.Tensor,
-    stride: int = 1,
-    padding: int = 0,
-    dilation: int = 1,
-    groups: int = 1
-) -> torch.Tensor:
-    """
-    Wrapper function for the fused convolution-pointwise Triton kernel.
-    """
-    B, C_in, D, H, W = x.shape
-    C_out, C_in_groups, K_d, K_h, K_w = weight.shape
-    
-    # Calculate output dimensions
-    out_d = (D + 2 * padding - dilation * (K_d - 1) - 1) // stride + 1
-    out_h = (H + 2 * padding - dilation * (K_h - 1) - 1) // stride + 1
-    out_w = (W + 2 * padding - dilation * (K_w - 1) - 1) // stride + 1
-    
-    output = torch.empty((B, C_out, out_d, out_h, out_w), 
-                        device=x.device, dtype=x.dtype)
-    
-    # Grid configuration - 5D grid to handle all dimensions
-    BLOCK_SIZE_N = 32
-    BLOCK_SIZE_M = 16
-    
-    # Calculate grid dimensions
-    grid_h = (out_h + BLOCK_SIZE_N - 1) // BLOCK_SIZE_N
-    
-    grid = (
-        B,  # batch dimension
-        C_out,  # output channel dimension
-        out_d,  # depth dimension
-        grid_h,  # height blocks
-        out_w,  # width dimension
+@triton.autotune(
+    configs=[
+        # Smaller tiles → lower register pressure, higher occupancy
+        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 32}, num_warps=2, num_stages=2),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32}, num_warps=4, num_stages=2),
+        # A couple of larger tiles in case shapes favor them
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32}, num_warps=8, num_stages=2),
+    ],
+    key=['P', 'OC'],
+)
+@triton.jit
+def conv3d_fused_tanh_sigmoid_kernel(
+    x_ptr,            # float32[N, C_in, D_in, H_in, W_in]
+    w_ptr,            # float32[OC, C_in, KD, KH, KW]
+    conv_bias_ptr,    # float32[OC]
+    scale_ptr,        # float32[OC, 1, 1, 1]
+    bias2_ptr,        # float32[OC, 1, 1, 1]
+    y_ptr,            # float32[N, OC, D_out, H_out, W_out]
+
+    N,
+    D_in, H_in, W_in,
+    OC,
+    D_out, H_out, W_out,
+    P,                # N * D_out * H_out * W_out
+
+    stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
+    stride_wn, stride_wc, stride_wd, stride_wh, stride_ww,
+    stride_yn, stride_yc, stride_yd, stride_yh, stride_yw,
+    scale_stride_c, bias2_stride_c,
+
+    C_in,             # runtime number of input channels
+
+    KD: tl.constexpr,
+    KH: tl.constexpr,
+    KW: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    # -------------------------------------------------------------------------
+    # 2D tiling over:
+    #   M = P  (flattened [N, D_out, H_out, W_out])
+    #   N = OC (output channels)
+    # -------------------------------------------------------------------------
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    mask_m = offs_m < P
+    mask_n = offs_n < OC
+    mask = mask_m[:, None] & mask_n[None, :]
+
+    # Decode flattened M-index -> (n_idx, od_idx, oh_idx, ow_idx)
+    DHW_out = D_out * H_out * W_out
+    HW_out = H_out * W_out
+
+    n_idx = offs_m // DHW_out
+    rem = offs_m % DHW_out
+    od_idx = rem // HW_out
+    rem2 = rem % HW_out
+    oh_idx = rem2 // W_out
+    ow_idx = rem2 % W_out
+
+    # Base pointer offsets for input corresponding to (n, od, oh, ow)
+    x_base = (
+        n_idx * stride_xn
+        + od_idx * stride_xd
+        + oh_idx * stride_xh
+        + ow_idx * stride_xw
     )
-    
-    # Launch kernel
-    conv_pointwise_kernel[grid](
-        x, weight, bias, scaling_factor, bias2, output,
-        stride, stride, stride,
-        padding, padding, padding,
-        dilation, dilation, dilation,
-        groups,
-        B, C_in, C_out, D, H, W, K_d, K_h, K_w,
-        out_d, out_h, out_w,
-        BLOCK_SIZE_M=BLOCK_SIZE_M,
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        BLOCK_SIZE_K=1,  # We handle width sequentially
+
+    # Base pointer for weights for this OC tile
+    w_oc_base = w_ptr + offs_n * stride_wn
+
+    # Accumulator for convolution result
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # -------------------------------------------------------------------------
+    # Convolution reduction over C_in * KD * KH * KW
+    #
+    #   - KD, KH, KW loops are fully unrolled via tl.static_range
+    #   - C_in loop is kept as a runtime while loop to limit unrolling and
+    #     reduce register pressure → higher occupancy on 4090.
+    # -------------------------------------------------------------------------
+    for kd in tl.static_range(0, KD):
+        kd_offset_x = kd * stride_xd
+        kd_offset_w = kd * stride_wd
+
+        for kh in tl.static_range(0, KH):
+            kh_offset_x = kh * stride_xh
+            kh_offset_w = kh * stride_wh
+
+            for kw in tl.static_range(0, KW):
+                kw_offset_x = kw * stride_xw
+                kw_offset_w = kw * stride_ww
+
+                ic = 0
+                while ic < C_in:
+                    ic_offset_x = ic * stride_xc
+                    ic_offset_w = ic * stride_wc
+
+                    # X values: [BLOCK_M]
+                    x_ptrs = (
+                        x_ptr
+                        + x_base
+                        + ic_offset_x
+                        + kd_offset_x
+                        + kh_offset_x
+                        + kw_offset_x
+                    )
+                    x_vals = tl.load(x_ptrs, mask=mask_m, other=0.0)
+
+                    # W values: [BLOCK_N] for current (ic, kd, kh, kw, offs_n)
+                    w_ptrs = (
+                        w_oc_base
+                        + ic_offset_w
+                        + kd_offset_w
+                        + kh_offset_w
+                        + kw_offset_w
+                    )
+                    w_vals = tl.load(w_ptrs, mask=mask_n, other=0.0)
+
+                    # Outer-product accumulate in registers
+                    acc += x_vals[:, None] * w_vals[None, :]
+
+                    ic += 1
+
+    # -------------------------------------------------------------------------
+    # Fused post-convolution ops in-register:
+    #   + conv bias (per-channel)
+    #   * scaling_factor (per-channel)
+    #   tanh
+    #   * bias2 (per-channel)
+    #   sigmoid
+    # -------------------------------------------------------------------------
+
+    # Per-channel bias and scale (no intermediate stores)
+    conv_b = tl.load(conv_bias_ptr + offs_n, mask=mask_n, other=0.0)
+    scale = tl.load(scale_ptr + offs_n * scale_stride_c, mask=mask_n, other=0.0)
+    bias2 = tl.load(bias2_ptr + offs_n * bias2_stride_c, mask=mask_n, other=0.0)
+
+    # y = conv + bias
+    acc = acc + conv_b[None, :]
+    # y = y * scale
+    acc = acc * scale[None, :]
+
+    # tanh(x) via exp: tanh(x) = (e^{2x} - 1) / (e^{2x} + 1)
+    acc = acc * 2.0
+    e2x = tl.exp(acc)
+    acc = (e2x - 1.0) / (e2x + 1.0)
+
+    # y = tanh(x) * bias2
+    acc = acc * bias2[None, :]
+
+    # sigmoid(z) = 1 / (1 + e^{-z})
+    acc = -acc
+    exp_neg = tl.exp(acc)
+    acc = 1.0 / (1.0 + exp_neg)
+
+    # -------------------------------------------------------------------------
+    # Store final result, single tl.store (no intermediate stores)
+    # -------------------------------------------------------------------------
+    y_base = (
+        n_idx * stride_yn
+        + od_idx * stride_yd
+        + oh_idx * stride_yh
+        + ow_idx * stride_yw
     )
-    
-    return output
+    y_ptrs = y_ptr + y_base[:, None] + offs_n[None, :] * stride_yc
+    tl.store(y_ptrs, acc, mask=mask)
+
+
+def fused_conv3d_scaled_tanh_sigmoid(x, weight, conv_bias, scale, bias2):
+    """
+    x:        [N, C_in, D_in, H_in, W_in]       (float32, CUDA)
+    weight:   [OC, C_in, KD, KH, KW]           (float32, contiguous, CUDA)
+    conv_bias:[OC]                             (float32, CUDA)
+    scale:    [OC, 1, 1, 1]                    (float32, CUDA)
+    bias2:    [OC, 1, 1, 1]                    (float32, CUDA)
+    """
+    assert x.is_cuda, "Input must be on CUDA device for Triton kernel."
+    assert weight.is_cuda and conv_bias.is_cuda and scale.is_cuda and bias2.is_cuda
+
+    N, C_in, D_in, H_in, W_in = x.shape
+    OC, C_in_w, KD, KH, KW = weight.shape
+    assert C_in == C_in_w, "Input channels mismatch between x and weight."
+
+    # Stride=1, padding=0, dilation=1
+    D_out = D_in - KD + 1
+    H_out = H_in - KH + 1
+    W_out = W_in - KW + 1
+    assert D_out > 0 and H_out > 0 and W_out > 0
+
+    y = torch.empty((N, OC, D_out, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    P = N * D_out * H_out * W_out
+
+    # Use meta-dependent grid to avoid over-launching blocks
+    def grid(meta):
+        return (
+            triton.cdiv(P, meta['BLOCK_M']),
+            triton.cdiv(OC, meta['BLOCK_N']),
+        )
+
+    conv3d_fused_tanh_sigmoid_kernel[grid](
+        x,
+        weight,
+        conv_bias,
+        scale,
+        bias2,
+        y,
+        N,
+        D_in, H_in, W_in,
+        OC,
+        D_out, H_out, W_out,
+        P,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
+        weight.stride(0), weight.stride(1), weight.stride(2), weight.stride(3), weight.stride(4),
+        y.stride(0), y.stride(1), y.stride(2), y.stride(3), y.stride(4),
+        scale.stride(0), bias2.stride(0),
+        C_in,
+        KD=KD,
+        KH=KH,
+        KW=KW,
+    )
+
+    return y
+
 
 class ModelNew(nn.Module):
     """
-    Optimized model using fused Triton kernel for 3D convolution and pointwise operations.
+    Triton-based implementation of:
+        Conv3d -> * scaling_factor -> tanh -> * bias -> sigmoid
     """
     def __init__(self, in_channels, out_channels, kernel_size, scaling_factor, bias_shape):
-        super().__init__()
-        self.conv_weight = nn.Parameter(
-            torch.randn(out_channels, in_channels, kernel_size, kernel_size, kernel_size)
-        )
-        self.conv_bias = nn.Parameter(torch.randn(out_channels))
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size)
+
+        # Per-channel scaling_factor and bias (same shape as original model)
         self.scaling_factor = nn.Parameter(torch.randn(bias_shape))
         self.bias = nn.Parameter(torch.randn(bias_shape))
-        
-        # Store convolution parameters
-        self.kernel_size = kernel_size
-        self.stride = 1
-        self.padding = kernel_size // 2
-        self.dilation = 1
-        self.groups = 1
 
     def forward(self, x):
-        # Ensure tensors are contiguous
-        x = x.contiguous()
-        
-        # Reshape parameters if needed
-        scaling_factor = self.scaling_factor.view(-1, 1, 1, 1).squeeze()  # Shape: (out_channels,)
-        bias = self.bias.view(-1, 1, 1, 1).squeeze()  # Shape: (out_channels,)
-        
-        return triton_conv_pointwise(
-            x, 
-            self.conv_weight.contiguous(), 
-            self.conv_bias, 
-            scaling_factor, 
-            bias,
-            stride=self.stride,
-            padding=self.padding,
-            dilation=self.dilation,
-            groups=self.groups
+        # Ensure parameters are on same device as x (no shape changes)
+        if self.conv.weight.device != x.device:
+            self.conv.to(x.device)
+        if self.scaling_factor.device != x.device:
+            self.scaling_factor.data = self.scaling_factor.data.to(x.device)
+        if self.bias.device != x.device:
+            self.bias.data = self.bias.data.to(x.device)
+
+        return fused_conv3d_scaled_tanh_sigmoid(
+            x,
+            self.conv.weight,
+            self.conv.bias,
+            self.scaling_factor,
+            self.bias,
         )
 ```

@@ -1,0 +1,220 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU
+GPU Name: 4090
+Architecture: Ada Lovelace
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+[OPTIMIZATION STAGE]
+
+## Current Optimization Stage
+
+Focus: BLOCK_SIZE with register pressure awareness.
+
+Key Principle:
+- Fusion increases register usage (intermediates stay in registers)
+- Spill to local memory kills fusion benefit
+
+Register Pressure Signals (from NCU):
+- launch__registers_per_thread > 128 → likely spilling
+- launch__occupancy_limit_registers < other limits → register-bound
+
+Rules:
+- Start conservative: BLOCK_SIZE ∈ {256, 512} for element-wise
+- For matmul fusion: BLOCK_M/N ∈ {32, 64}, BLOCK_K ∈ {32}
+- If registers > 128: reduce BLOCK_* by half
+- Trade-off: recompute cheap ops (e.g., x*0.5) vs store intermediate
+
+When to Recompute vs Keep:
+- Keep: expensive ops (exp, log, div, sqrt)
+- Recompute: cheap ops (add, mul, max) if register pressure high
+- Example: `y = relu(x); z = y * scale` → keep y
+- Example: `y = x * 0.5; z = y + bias` → can recompute y if needed
+
+Autotune:
+- 2-3 BLOCK_SIZE configs, always include smaller fallback
+
+
+
+[CURRENT CODE]
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def fused_gemm_scale_kernel(
+    a_ptr,  # [M, K]
+    b_ptr,  # [K, N]
+    bias_ptr,  # [N]
+    scale_ptr,  # [N]
+    c_ptr,  # [M, N]
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # Program ids for 2D tiling of the output matrix
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    # Tile offsets
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Pointers for the first K-tile
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    # Accumulator in fp32 for better precision
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Loop over K dimension
+    for k in range(0, K, BLOCK_K):
+        k_remaining = K - k
+
+        a_mask = (offs_m[:, None] < M) & (offs_k[None, :] < k_remaining)
+        b_mask = (offs_k[:, None] < k_remaining) & (offs_n[None, :] < N)
+
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+        acc += tl.dot(a, b, allow_tf32=True)
+
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Load bias and scale (per output feature) and apply: (acc + bias) * scale
+    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    scale = tl.load(scale_ptr + offs_n, mask=offs_n < N, other=1.0)
+    acc = acc + bias[None, :]
+    acc = acc * scale[None, :]
+
+    # Store result
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, acc, mask=c_mask)
+
+
+def fused_gemm_scale(x: torch.Tensor,
+                     weight: torch.Tensor,
+                     bias: torch.Tensor,
+                     scale: torch.Tensor) -> torch.Tensor:
+    """
+    Fused operation:
+        y = (x @ weight.T + bias) * scale
+
+    x:      [M, K]
+    weight: [N, K]  (same layout as nn.Linear.weight)
+    bias:   [N]
+    scale:  [N]
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda and scale.is_cuda, \
+        "All tensors must be on CUDA for Triton kernels."
+
+    M, K = x.shape
+    N = weight.shape[0]
+    assert weight.shape[1] == K, "weight shape must be [N, K]"
+    assert bias.shape[0] == N and scale.shape[0] == N, "bias/scale must have shape [N]"
+
+    # Prepare output tensor
+    out = torch.empty((M, N), device=x.device, dtype=x.dtype)
+
+    # We use weight.T as B in GEMM, so that B is [K, N]
+    b = weight.t().contiguous()
+
+    # Strides
+    stride_am, stride_ak = x.stride()
+    stride_bk, stride_bn = b.stride()
+    stride_cm, stride_cn = out.stride()
+
+    # Define kernel launch grid
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta["BLOCK_M"]),
+            triton.cdiv(N, meta["BLOCK_N"]),
+        )
+
+    fused_gemm_scale_kernel[grid](
+        x, b, bias, scale, out,
+        M, N, K,
+        stride_am, stride_ak,
+        stride_bk, stride_bn,
+        stride_cm, stride_cn,
+        BLOCK_M=64,
+        BLOCK_N=64,
+        BLOCK_K=32,
+    )
+
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-accelerated version of the original model:
+
+        x -> Linear -> elementwise scale -> BatchNorm1d
+
+    The GEMM + bias + scale are fused into a single Triton kernel.
+    BatchNorm is kept as PyTorch for correctness (training/eval behavior).
+    """
+    def __init__(self, in_features, out_features, scale_shape, eps=1e-5, momentum=0.1):
+        super(ModelNew, self).__init__()
+        self.gemm = nn.Linear(in_features, out_features)
+        self.scale = nn.Parameter(torch.randn(scale_shape))
+        self.bn = nn.BatchNorm1d(out_features, eps=eps, momentum=momentum)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Fused GEMM + bias + scale
+        y = fused_gemm_scale(x, self.gemm.weight, self.gemm.bias, self.scale)
+        # BatchNorm remains in PyTorch
+        y = self.bn(y)
+        return y
+```
+
+[NCU PROFILING METRICS]
+{
+  "fused_gemm_scale_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 44.41,
+    "launch__grid_size": 2048,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 24.03,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 16.58,
+    "lts__t_sector_hit_rate.pct": 96.31
+  }
+}
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+TRITON API CONSTRAINTS (CRITICAL):
+- Triton has NO: tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

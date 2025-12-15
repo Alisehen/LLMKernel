@@ -1,0 +1,185 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def ln_gelu_scale_kernel(
+    x_ptr,          # *f32
+    gamma_ptr,      # *f32, shape [C]
+    beta_ptr,       # *f32, shape [C]
+    out_ptr,        # *f32
+    C, N, D, H, W,  # int32
+    stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,  # int32
+    eps,            # f32
+    scaling_factor, # f32
+    BLOCK_C: tl.constexpr,
+):
+    """
+    Fused LayerNorm (over channel dim C) + GELU + scaling.
+    Input / Output: x, out in shape [N, C, D, H, W], arbitrary strides.
+    Each program instance handles one (n, d, h, w) position and the full C vector.
+    """
+
+    pid = tl.program_id(axis=0)  # ranges over N*D*H*W
+
+    # Decode (n, d, h, w) from flattened pid
+    tmp = pid
+    w_idx = tmp % W
+    tmp = tmp // W
+    h_idx = tmp % H
+    tmp = tmp // H
+    d_idx = tmp % D
+    n_idx = tmp // D
+
+    # Compute base offset for c = 0
+    base_offset = (
+        n_idx * stride_xn
+        + d_idx * stride_xd
+        + h_idx * stride_xh
+        + w_idx * stride_xw
+    )
+
+    # Channel offsets
+    offs_c = tl.arange(0, BLOCK_C)
+    mask = offs_c < C
+
+    x_offsets = base_offset + offs_c * stride_xc
+
+    # Load input values
+    x = tl.load(x_ptr + x_offsets, mask=mask, other=0.0)
+
+    # LayerNorm over channel dimension C
+    # mean
+    mean = tl.sum(x, axis=0) / C
+    x_centered = x - mean
+    # variance
+    var = tl.sum(x_centered * x_centered, axis=0) / C
+    inv_std = 1.0 / tl.sqrt(var + eps)
+    y = x_centered * inv_std
+
+    # Apply per-channel affine: y = y * gamma + beta
+    gamma = tl.load(gamma_ptr + offs_c, mask=mask, other=1.0)
+    beta = tl.load(beta_ptr + offs_c, mask=mask, other=0.0)
+    y = y * gamma + beta
+
+    # GELU activation (tanh approximation implemented via exp, since tl.tanh is not available)
+    # gelu(y) = 0.5 * y * (1 + tanh(√(2/π) * (y + 0.044715*y^3)))
+    # tanh(t) = (1 - exp(-2t)) / (1 + exp(-2t))
+    c0 = 0.7978845608028654  # sqrt(2/pi)
+    y_cubed = y * y * y
+    t = c0 * (y + 0.044715 * y_cubed)
+    exp_neg2t = tl.exp(-2.0 * t)
+    tanh_t = (1.0 - exp_neg2t) / (1.0 + exp_neg2t)
+    gelu = 0.5 * y * (1.0 + tanh_t)
+
+    # Scaling
+    out_val = gelu * scaling_factor
+
+    # Store result
+    tl.store(out_ptr + x_offsets, out_val, mask=mask)
+
+
+def fused_ln_gelu_scale(x: torch.Tensor,
+                        gamma: torch.Tensor,
+                        beta: torch.Tensor,
+                        eps: float,
+                        scaling_factor: float) -> torch.Tensor:
+    """
+    Fused LayerNorm (over channel dim) + GELU + scaling for 5D tensors.
+
+    Args:
+        x:      [N, C, D, H, W] tensor (expected contiguous, float32/float16/bfloat16).
+        gamma:  [C] LayerNorm weight.
+        beta:   [C] LayerNorm bias.
+        eps:    epsilon for numerical stability in LayerNorm.
+        scaling_factor: scalar multiplier applied after GELU.
+
+    Returns:
+        out: same shape as x.
+    """
+    assert x.dim() == 5, "Input must be 5D [N, C, D, H, W]."
+    N, C, D, H, W = x.shape
+
+    # For simplicity and correctness, require reasonably small C so that one block covers all channels.
+    # This matches typical settings (e.g., C <= 1024). You can relax this with a more complex reduction scheme.
+    # BLOCK_C must be a power-of-two and >= C.
+    BLOCK_C = 1 << (C - 1).bit_length()
+    # Triton / hardware constraint: keep block size reasonable.
+    if BLOCK_C > 1024:
+        raise NotImplementedError(
+            f"Channel dimension C={C} is too large for this simple fused kernel (BLOCK_C={BLOCK_C} > 1024)."
+        )
+
+    x_contig = x.contiguous()
+    out = torch.empty_like(x_contig)
+
+    # Ensure gamma/beta are on the same device and dtype as x
+    gamma = gamma.to(device=x_contig.device, dtype=x_contig.dtype)
+    beta = beta.to(device=x_contig.device, dtype=x_contig.dtype)
+
+    # Strides for input (and output; out is contiguous with same layout)
+    stride_xn, stride_xc, stride_xd, stride_xh, stride_xw = x_contig.stride()
+
+    # Grid: one program per (n, d, h, w) position
+    grid = (N * D * H * W,)
+
+    ln_gelu_scale_kernel[grid](
+        x_contig,
+        gamma,
+        beta,
+        out,
+        C, N, D, H, W,
+        stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
+        eps,
+        scaling_factor,
+        BLOCK_C=BLOCK_C,
+        num_warps=4,    # reasonable default for vector-sized kernels
+        num_stages=2,
+    )
+
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    ConvTranspose3d (PyTorch native) + fused LayerNorm (over channels) + GELU + scaling in Triton.
+    """
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 kernel_size,
+                 stride,
+                 padding,
+                 bias=True,
+                 eps=1e-5,
+                 scaling_factor=1.0):
+        super(ModelNew, self).__init__()
+        # Keep ConvTranspose3d in PyTorch as required.
+        self.conv_transpose = nn.ConvTranspose3d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            bias=bias,
+        )
+
+        # LayerNorm-style per-channel affine parameters (over channel dimension C).
+        self.eps = eps
+        self.scaling_factor = scaling_factor
+        self.ln_weight = nn.Parameter(torch.ones(out_channels))
+        self.ln_bias = nn.Parameter(torch.zeros(out_channels))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [N, in_channels, D, H, W]
+        x = self.conv_transpose(x)  # -> [N, out_channels, D', H', W']
+        x = fused_ln_gelu_scale(
+            x,
+            self.ln_weight,
+            self.ln_bias,
+            self.eps,
+            self.scaling_factor,
+        )
+        return x

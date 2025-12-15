@@ -1,0 +1,5 @@
+{
+  "critical_issue": "The weight matrix is indexed with the wrong layout in b_ptrs, effectively treating weight as already transposed and breaking the intended x @ weight.T computation.",
+  "why_it_matters": "Misinterpreting weight layout corrupts every matmul result, so sigmoid and row-sum operate on wrong values, producing very large numerical mismatches versus the PyTorch reference.",
+  "minimal_fix_hint": "Correct the b_ptrs indexing so B is formed as the true transpose of the nn.Linear weight used in PyTorch."
+}

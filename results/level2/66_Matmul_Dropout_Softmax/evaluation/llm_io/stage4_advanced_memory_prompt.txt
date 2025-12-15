@@ -1,0 +1,384 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU
+GPU Name: 4090
+Architecture: Ada Lovelace
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+[OPTIMIZATION STAGE]
+
+## Current Optimization Stage
+
+Focus: Fine-tuning fused kernel parameters.
+
+Params:
+- num_warps ∈ {4, 8}
+- num_stages ∈ {2, 3}
+
+Conditional Rules (NOT one-size-fits-all):
+
+IF register pressure LOW (regs < 96, no spill):
+  - Try num_warps=8 for compute-bound fusion
+  - num_stages=3 may help hide latency
+
+IF register pressure HIGH (regs > 128 or occupancy_limit_registers):
+  - Use num_warps=4 (fewer warps = more registers per warp)
+  - Keep num_stages=2 (higher stages need more registers)
+
+IF multi-input fusion (3+ distinct loads):
+  - num_stages=2 preferred (each stage buffers all inputs)
+  - num_warps=4 often better than 8
+
+Autotune:
+- Max 2-3 configs to reduce compilation time
+- Always include conservative baseline (num_warps=4, num_stages=2)
+- Test before/after: revert if gain < 2%
+
+
+
+[CURRENT CODE]
+```python
+import math
+import random
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+# ---------------------------
+# GEMM + Bias (Linear layer)
+# ---------------------------
+
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32},
+            num_warps=8,
+            num_stages=2,
+        ),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+    ],
+    key=["M", "N", "K"],
+)
+@triton.jit
+def linear_gemm_bias_kernel(
+    a_ptr,  # [M, K]
+    w_ptr,  # [N, K] (note: this is weight, used as transposed KxN in kernel via strides)
+    b_ptr,  # [N]
+    c_ptr,  # [M, N]
+    M, N, K,
+    stride_am, stride_ak,
+    stride_wk, stride_wn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    # Create a block of accumulator
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Loop over K dimension
+    for k0 in range(0, K, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+
+        a_ptrs = (
+            a_ptr
+            + offs_m[:, None] * stride_am
+            + offs_k[None, :] * stride_ak
+        )
+        w_ptrs = (
+            w_ptr
+            + offs_k[:, None] * stride_wk
+            + offs_n[None, :] * stride_wn
+        )
+
+        a_mask = (offs_m[:, None] < M) & (offs_k[None, :] < K)
+        w_mask = (offs_k[:, None] < K) & (offs_n[None, :] < N)
+
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        w = tl.load(w_ptrs, mask=w_mask, other=0.0)
+
+        acc += tl.dot(a, w, allow_tf32=True)
+
+    # Add bias: bias is length-N
+    bias = tl.load(b_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc += bias[None, :]
+
+    # Store result
+    c_ptrs = (
+        c_ptr
+        + offs_m[:, None] * stride_cm
+        + offs_n[None, :] * stride_cn
+    )
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, acc, mask=c_mask)
+
+
+def triton_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    x:      [M, K]
+    weight: [N, K]  (as in nn.Linear: out_features x in_features)
+    bias:   [N]
+    returns: [M, N]
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+    M, K = x.shape
+    N = weight.shape[0]
+    y = torch.empty((M, N), device=x.device, dtype=torch.float32)
+
+    # Treat weight as (K, N) via strides:
+    # logical B[k, n] = weight[n, k]
+    stride_am, stride_ak = x.stride()
+    stride_wn, stride_wk = weight.stride()  # (row, col) = (N, K)
+    # For logical (k, n): addr = base + k * stride_wk + n * stride_wn
+    # So in kernel: stride_bk = stride_wk, stride_bn = stride_wn
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_M"]),
+        triton.cdiv(N, META["BLOCK_N"]),
+    )
+    linear_gemm_bias_kernel[grid](
+        x,
+        weight,
+        bias,
+        y,
+        M,
+        N,
+        K,
+        stride_am,
+        stride_ak,
+        stride_wk,
+        stride_wn,
+        y.stride(0),
+        y.stride(1),
+    )
+    return y
+
+
+# ---------------------------
+# Dropout + Softmax (row-wise over features)
+# ---------------------------
+
+@triton.jit
+def dropout_softmax_kernel(
+    x_ptr,  # [M, N]
+    y_ptr,  # [M, N]
+    M, N,
+    stride_xm, stride_xn,
+    stride_ym, stride_yn,
+    p,          # dropout probability (float32)
+    seed,       # rng seed (int32)
+    training,   # 1 if training (dropout active), 0 if eval
+    BLOCK_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    row = pid_m
+
+    # Mask for valid row
+    row_mask = row < M
+
+    # Pointers to the start of the row
+    x_row_ptr = x_ptr + row * stride_xm
+    y_row_ptr = y_ptr + row * stride_ym
+
+    # 1) Compute row-wise max for numerical stability
+    row_max = tl.full((1,), -float("inf"), dtype=tl.float32)
+
+    for start_n in range(0, N, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        mask = row_mask & (offs_n < N)
+
+        x_vals = tl.load(
+            x_row_ptr + offs_n * stride_xn,
+            mask=mask,
+            other=-float("inf"),
+        )
+        block_max = tl.max(x_vals, axis=0)
+        row_max = tl.maximum(row_max, block_max)
+
+    # 2) Compute exp(x - max), apply dropout (if training), accumulate sum, and store numerators
+    row_sum = tl.zeros((1,), dtype=tl.float32)
+    keep_prob = 1.0 - p
+    is_training = training > 0  # scalar bool
+
+    for start_n in range(0, N, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        mask = row_mask & (offs_n < N)
+
+        x_vals = tl.load(
+            x_row_ptr + offs_n * stride_xn,
+            mask=mask,
+            other=-float("inf"),
+        )
+
+        shifted = x_vals - row_max
+        exp_vals = tl.exp(shifted)
+
+        # RNG offset: unique id per element
+        offsets = row * N + offs_n
+        rnd = tl.rand(seed, offsets)
+        drop_mask = rnd > p  # boolean
+
+        # Factor: if training -> drop_mask / keep_prob, else 1.0
+        drop_scale = drop_mask.to(exp_vals.dtype) / keep_prob
+        factor = tl.where(is_training, drop_scale, 1.0)
+
+        numerators = exp_vals * factor
+
+        block_sum = tl.sum(numerators, axis=0)
+        row_sum += block_sum
+
+        tl.store(
+            y_row_ptr + offs_n * stride_yn,
+            numerators,
+            mask=mask,
+        )
+
+    # 3) Normalize to get softmax probabilities
+    for start_n in range(0, N, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        mask = row_mask & (offs_n < N)
+
+        numerators = tl.load(
+            y_row_ptr + offs_n * stride_yn,
+            mask=mask,
+            other=0.0,
+        )
+        probs = numerators / row_sum
+        tl.store(
+            y_row_ptr + offs_n * stride_yn,
+            probs,
+            mask=mask,
+        )
+
+
+def triton_dropout_softmax(
+    x: torch.Tensor,
+    p: float,
+    training: bool,
+    seed: int | None = None,
+) -> torch.Tensor:
+    """
+    x: [M, N]
+    Applies dropout (with probability p) then softmax over dim=1.
+    """
+    assert x.is_cuda
+    M, N = x.shape
+    y = torch.empty_like(x, dtype=torch.float32)
+
+    if seed is None:
+        seed = random.randint(0, 2**31 - 1)
+
+    grid = (M,)
+
+    dropout_softmax_kernel[grid](
+        x,
+        y,
+        M,
+        N,
+        x.stride(0),
+        x.stride(1),
+        y.stride(0),
+        y.stride(1),
+        float(p),
+        int(seed),
+        int(training),
+        BLOCK_N=1024,
+        num_warps=4,
+    )
+    return y
+
+
+# ---------------------------
+# Combined Module
+# ---------------------------
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized replacement for:
+
+        Linear(in_features, out_features) + Dropout(p) + Softmax(dim=1)
+    """
+
+    def __init__(self, in_features: int, out_features: int, dropout_p: float):
+        super(ModelNew, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias = nn.Parameter(torch.empty(out_features))
+        self.dropout_p = float(dropout_p)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        # Roughly match nn.Linear initialization
+        bound = 1.0 / math.sqrt(self.in_features)
+        with torch.no_grad():
+            self.weight.uniform_(-bound, bound)
+            self.bias.uniform_(-bound, bound)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Expect x on CUDA; move to float32 for compute
+        x = x.to(dtype=torch.float32, device=self.weight.device)
+        y = triton_linear(x, self.weight, self.bias)
+        y = triton_dropout_softmax(y, self.dropout_p, self.training)
+        return y
+```
+
+[NCU PROFILING METRICS]
+{
+  "linear_gemm_bias_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 35.32,
+    "launch__grid_size": 256,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 15.99,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 83.28,
+    "lts__t_sector_hit_rate.pct": 66.47
+  },
+  "dropout_softmax_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 18.84,
+    "launch__grid_size": 128,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 8.29,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 28.22,
+    "lts__t_sector_hit_rate.pct": 77.35
+  }
+}
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+TRITON API CONSTRAINTS (CRITICAL):
+- Triton has NO: tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

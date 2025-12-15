@@ -1,0 +1,293 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def fused_bn_avgpool_kernel_optimized(
+    # Pointers to tensors
+    x_ptr, gamma_ptr, beta_ptr, mean_ptr, var_ptr, out_ptr,
+    # Tensor dimensions
+    N, C, D, H, W,
+    D_out, H_out, W_out,
+    # Strides for input tensor
+    stride_n, stride_c, stride_d, stride_h, stride_w,
+    # Strides for output tensor
+    out_stride_n, out_stride_c, out_stride_d, out_stride_h, out_stride_w,
+    # BatchNorm parameters
+    eps: tl.constexpr,
+    # Block sizes
+    BLOCK_SPATIAL: tl.constexpr,
+    # Memory tiling
+    TILE_D: tl.constexpr,
+    TILE_H: tl.constexpr,
+    TILE_W: tl.constexpr,
+):
+    """
+    Optimized fused BatchNorm3d + 4x4x4 AvgPool3d kernel for Ada Lovelace.
+    Key optimizations:
+    1. Tiled memory access for better L1/L2 cache utilization
+    2. Reduced register pressure with loop unrolling
+    3. Minimized conditional operations
+    4. Optimized for tensor core occupancy
+    """
+    # Parallelize over channels and spatial dimensions
+    pid = tl.program_id(0)
+    pid_nc = tl.program_id(1)
+    
+    # Decode batch and channel indices
+    num_channels = C
+    batch_idx = pid_nc // num_channels
+    channel_idx = pid_nc % num_channels
+    
+    # Early exit for out-of-bounds
+    if batch_idx >= N or channel_idx >= C:
+        return
+    
+    # Load BatchNorm parameters - scalar load once per thread block
+    gamma = tl.load(gamma_ptr + channel_idx)
+    beta = tl.load(beta_ptr + channel_idx)
+    mean = tl.load(mean_ptr + channel_idx)
+    var = tl.load(var_ptr + channel_idx)
+    
+    # Compute normalization factor
+    inv_std = 1.0 / tl.sqrt(var + eps)
+    norm_factor = gamma * inv_std
+    bias_term = beta - mean * norm_factor
+    
+    # Compute spatial indices
+    spatial_size = D_out * H_out * W_out
+    num_spatial_blocks = tl.cdiv(spatial_size, BLOCK_SPATIAL)
+    
+    # Process multiple spatial outputs per thread with tiling
+    for spatial_block in range(0, num_spatial_blocks):
+        spatial_start = spatial_block * BLOCK_SPATIAL
+        spatial_offsets = spatial_start + tl.arange(0, BLOCK_SPATIAL)
+        spatial_mask = spatial_offsets < spatial_size
+        
+        if tl.reduce_or(spatial_mask) == 0:
+            continue
+            
+        # Decode 3D spatial indices efficiently
+        D_stride = H_out * W_out
+        H_stride = W_out
+        
+        d_out_idx = tl.where(spatial_mask, spatial_offsets // D_stride, 0)
+        hw_rem = tl.where(spatial_mask, spatial_offsets % D_stride, 0)
+        h_out_idx = tl.where(spatial_mask, hw_rem // H_stride, 0)
+        w_out_idx = tl.where(spatial_mask, hw_rem % H_stride, 0)
+        
+        # Initialize accumulators
+        accum = tl.zeros([BLOCK_SPATIAL], dtype=tl.float32)
+        count = tl.zeros([BLOCK_SPATIAL], dtype=tl.float32)
+        
+        # Base offset for this batch/channel
+        base_offset = batch_idx * stride_n + channel_idx * stride_c
+        
+        # Process input 4x4x4 blocks with tiling
+        for tile_d in range(0, 4, TILE_D):
+            for tile_h in range(0, 4, TILE_H):
+                for tile_w in range(0, 4, TILE_W):
+                    # Precompute d/h/w indices for this tile
+                    d_in_start = (d_out_idx * 4 + tile_d) * stride_d
+                    h_in_start = (h_out_idx * 4 + tile_h) * stride_h
+                    
+                    # Process elements in tile
+                    for d_off in range(TILE_D):
+                        d_in = d_out_idx * 4 + tile_d + d_off
+                        d_valid = d_in < D
+                        d_offset = d_in_start + d_off * stride_d
+                        
+                        for h_off in range(TILE_H):
+                            h_in = h_out_idx * 4 + tile_h + h_off
+                            h_valid = h_in < H
+                            h_offset = h_in_start + h_off * stride_h
+                            
+                            for w_off in range(TILE_W):
+                                w_in = w_out_idx * 4 + tile_w + w_off
+                                w_valid = w_in < W
+                                
+                                # Combined mask
+                                elem_valid = spatial_mask & d_valid & h_valid & w_valid
+                                
+                                if tl.reduce_or(elem_valid) > 0:
+                                    # Compute offset once
+                                    w_offset = w_in * stride_w
+                                    offset = base_offset + d_offset + h_offset + w_offset
+                                    
+                                    # Load and apply BN
+                                    x_val = tl.load(x_ptr + offset, mask=elem_valid, other=0.0)
+                                    scaled = x_val * norm_factor + bias_term
+                                    
+                                    # Accumulate
+                                    accum = tl.where(elem_valid, accum + scaled, accum)
+                                    count = tl.where(elem_valid, count + 1.0, count)
+        
+        # Compute average and store
+        result = tl.where(spatial_mask, accum / tl.maximum(count, 1.0), 0.0)
+        
+        # Compute output offsets
+        out_offsets = (
+            batch_idx * out_stride_n + 
+            channel_idx * out_stride_c + 
+            d_out_idx * out_stride_d + 
+            h_out_idx * out_stride_h + 
+            w_out_idx * out_stride_w
+        )
+        
+        # Store with masking
+        tl.store(out_ptr + out_offsets, result, mask=spatial_mask)
+
+
+@triton.autotune(
+    configs=[
+        # Conservative baseline (register pressure high)
+        triton.Config({
+            'BLOCK_SPATIAL': 64,
+            'TILE_D': 2,
+            'TILE_H': 2,
+            'TILE_W': 2,
+        }, num_warps=4, num_stages=2),
+        # Balanced config (medium register pressure)
+        triton.Config({
+            'BLOCK_SPATIAL': 96,
+            'TILE_D': 2,
+            'TILE_H': 2,
+            'TILE_W': 2,
+        }, num_warps=4, num_stages=2),
+        # Aggressive config (low register pressure)
+        triton.Config({
+            'BLOCK_SPATIAL': 128,
+            'TILE_D': 2,
+            'TILE_H': 2,
+            'TILE_W': 2,
+        }, num_warps=8, num_stages=3),
+    ],
+    key=['N', 'C', 'D', 'H', 'W'],
+)
+@triton.jit
+def fused_bn_avgpool_kernel_autotune(
+    x_ptr, gamma_ptr, beta_ptr, mean_ptr, var_ptr, out_ptr,
+    N, C, D, H, W,
+    D_out, H_out, W_out,
+    stride_n, stride_c, stride_d, stride_h, stride_w,
+    out_stride_n, out_stride_c, out_stride_d, out_stride_h, out_stride_w,
+    eps: tl.constexpr,
+    BLOCK_SPATIAL: tl.constexpr,
+    TILE_D: tl.constexpr,
+    TILE_H: tl.constexpr,
+    TILE_W: tl.constexpr,
+):
+    # Call the main kernel
+    fused_bn_avgpool_kernel_optimized(
+        x_ptr, gamma_ptr, beta_ptr, mean_ptr, var_ptr, out_ptr,
+        N, C, D, H, W,
+        D_out, H_out, W_out,
+        stride_n, stride_c, stride_d, stride_h, stride_w,
+        out_stride_n, out_stride_c, out_stride_d, out_stride_h, out_stride_w,
+        eps,
+        BLOCK_SPATIAL,
+        TILE_D,
+        TILE_H,
+        TILE_W,
+    )
+
+
+def fused_batch_norm_avgpool_optimized(x, gamma, beta, running_mean, running_var, 
+                                      training=False, eps=1e-5, momentum=0.1):
+    """
+    Optimized fused BatchNorm3d + 4x4x4 AvgPool3d with autotune
+    
+    Args:
+        x: Input tensor of shape [N, C, D, H, W]
+        gamma: Weight parameter of shape [C]
+        beta: Bias parameter of shape [C]
+        running_mean: Running mean of shape [C]
+        running_var: Running variance of shape [C]
+        training: Whether in training mode
+        eps: Added to denominator for numerical stability
+        momentum: Momentum for updating running statistics
+    
+    Returns:
+        Output tensor of shape [N, C, D//4, H//4, W//4]
+    """
+    N, C, D, H, W = x.shape
+    
+    # Output dimensions
+    D_out, H_out, W_out = D // 4, H // 4, W // 4
+    out_shape = (N, C, D_out, H_out, W_out)
+    out = torch.empty(out_shape, device=x.device, dtype=x.dtype)
+    
+    # Compute statistics based on training mode
+    if training:
+        # Compute batch statistics
+        mean = x.mean(dim=(0, 2, 3, 4))
+        var = x.var(dim=(0, 2, 3, 4), unbiased=False)
+        
+        # Update running statistics
+        running_mean.mul_(1 - momentum).add_(mean, alpha=momentum)
+        running_var.mul_(1 - momentum).add_(var, alpha=momentum)
+    else:
+        # Use stored statistics
+        mean = running_mean
+        var = running_var
+    
+    # Grid configuration optimized for Ada Lovelace
+    total_spatial = D_out * H_out * W_out
+    
+    # Use dynamic grid sizing based on autotune
+    grid_spatial = triton.cdiv(total_spatial, 64)  # Conservative baseline
+    num_batch_channel = N * C
+    
+    grid = (grid_spatial, num_batch_channel)
+    
+    # Launch autotuned kernel
+    fused_bn_avgpool_kernel_autotune[grid](
+        x, gamma, beta, mean, var, out,
+        N, C, D, H, W,
+        D_out, H_out, W_out,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
+        out.stride(0), out.stride(1), out.stride(2), out.stride(3), out.stride(4),
+        eps,
+    )
+    
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized version with fused BatchNorm3d + 2x AvgPool3d (4x4x4 reduction)
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, bias_shape):
+        super(ModelNew, self).__init__()
+        # Keep ConvTranspose3d as PyTorch native
+        self.conv_transpose = nn.ConvTranspose3d(
+            in_channels, out_channels, kernel_size, 
+            stride=stride, padding=padding
+        )
+        
+        # Initialize BatchNorm parameters
+        self.gamma = nn.Parameter(torch.ones(out_channels))
+        self.beta = nn.Parameter(torch.zeros(out_channels))
+        self.register_buffer('running_mean', torch.zeros(out_channels))
+        self.register_buffer('running_var', torch.ones(out_channels))
+        
+        # Set default BatchNorm parameters
+        self.eps = 1e-5
+        self.momentum = 0.1
+    
+    def forward(self, x):
+        # Step 1: PyTorch native ConvTranspose3d
+        x = self.conv_transpose(x)
+        
+        # Step 2: Optimized fused BatchNorm3d + AvgPool3d in Triton
+        x = fused_batch_norm_avgpool_optimized(
+            x, self.gamma, self.beta, 
+            self.running_mean, self.running_var,
+            training=self.training,
+            eps=self.eps,
+            momentum=self.momentum
+        )
+        
+        return x

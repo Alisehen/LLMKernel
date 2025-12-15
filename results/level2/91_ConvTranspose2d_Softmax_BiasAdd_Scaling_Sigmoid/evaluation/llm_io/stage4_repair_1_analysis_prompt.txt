@@ -1,0 +1,290 @@
+You are a Triton kernel debugging expert. Analyze the error and identify the root cause.
+
+## ERROR LOG
+```
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 538, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251215_024929_batch_range89to100_openai_deepseek/91_ConvTranspose2d_Softmax_BiasAdd_Scaling_Sigmoid/code/kernel_20251215_034900.py", line 175, in forward
+    x = fused_post_convtranspose(x, self.bias, self.scaling_factor)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251215_024929_batch_range89to100_openai_deepseek/91_ConvTranspose2d_Softmax_BiasAdd_Scaling_Sigmoid/code/kernel_20251215_034900.py", line 142, in fused_post_convtranspose
+    fused_softmax_bias_scale_sigmoid_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 347, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 192, in run
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 192, in <dictcomp>
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 145, in _bench
+    raise ValueError(f"Conflicting meta-parameters: {', '.join(conflicts)}."
+ValueError: Conflicting meta-parameters: BLOCK_W. Make sure that you don't re-define auto-tuned symbols.
+```
+
+## Expected Behavior (PyTorch Reference)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs a transposed convolution, applies softmax, adds a bias term, scales the result, and applies sigmoid.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, bias_shape, scaling_factor):
+        super(Model, self).__init__()
+        self.conv_transpose = nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, output_padding=output_padding)
+        self.bias = nn.Parameter(torch.randn(bias_shape)) 
+        self.scaling_factor = scaling_factor
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = torch.softmax(x, dim=1)
+        x = x + self.bias
+        x = x * self.scaling_factor
+        x = torch.sigmoid(x)
+        return x
+
+batch_size = 128
+in_channels = 64
+out_channels = 128
+height, width = 64, 64
+kernel_size = 4
+stride = 2
+padding = 1
+output_padding = 1
+bias_shape = (out_channels, 1, 1)
+scaling_factor = 2.0
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, stride, padding, output_padding, bias_shape, scaling_factor]
+```
+
+## Current Implementation (Broken Triton Kernel)
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        # Conservative baseline
+        triton.Config(
+            {'BLOCK_W': 64},
+            num_warps=4,
+            num_stages=2,
+        ),
+        # More aggressive: more warps and stages if register pressure allows
+        triton.Config(
+            {'BLOCK_W': 64},
+            num_warps=8,
+            num_stages=3,
+        ),
+    ],
+    key=['C', 'W'],
+)
+@triton.jit
+def fused_softmax_bias_scale_sigmoid_kernel(
+    x_ptr, bias_ptr, out_ptr,
+    N, C, H, W,
+    stride_n, stride_c, stride_h, stride_w,
+    scaling_factor,
+    BLOCK_W: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+):
+    """
+    Fused kernel:
+      1. Softmax over channel dimension (dim=1) per (n, h, w)
+      2. Add channel bias (C,)
+      3. Multiply by scaling_factor
+      4. Apply sigmoid
+
+    Tiling and memory layout:
+      - x is [N, C, H, W] (NCHW)
+      - We tile as [BLOCK_C, BLOCK_W] so that the *width* (stride_w=1) is
+        the innermost dimension for coalesced global memory accesses.
+      - program_id(0): batch index n
+      - program_id(1): height index h
+      - program_id(2): tile index along width (w)
+
+    Each program processes:
+      - One fixed (n, h)
+      - BLOCK_W spatial positions along width
+      - All C channels (C <= BLOCK_C, padded with -inf if C < BLOCK_C)
+    """
+    pid_n = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    pid_w_block = tl.program_id(2)
+
+    # Offsets over width
+    offs_w = pid_w_block * BLOCK_W + tl.arange(0, BLOCK_W)
+    mask_w = offs_w < W
+
+    # Offsets over channels
+    offs_c = tl.arange(0, BLOCK_C)
+    mask_c = offs_c < C
+
+    # 2D mask for valid (c, w) pairs; shape [BLOCK_C, BLOCK_W]
+    mask = mask_c[:, None] & mask_w[None, :]
+
+    # Base pointer for (n, h)
+    base_nh = pid_n * stride_n + pid_h * stride_h
+
+    # Pointers to input x for [BLOCK_C, BLOCK_W] tile
+    # Layout: channels as rows, width as columns
+    x_ptrs = (
+        x_ptr
+        + base_nh
+        + offs_c[:, None] * stride_c
+        + offs_w[None, :] * stride_w
+    )
+
+    # Load input; pad invalid lanes with -inf so they don't affect softmax
+    x_vals = tl.load(x_ptrs, mask=mask, other=-float('inf'))
+    x_dtype = x_vals.dtype
+    x_fp32 = tl.cast(x_vals, tl.float32)
+
+    # Softmax over channels (axis=0) for each spatial position (n, h, w)
+    # x_fp32: [BLOCK_C, BLOCK_W]
+    max_val = tl.max(x_fp32, axis=0)               # [BLOCK_W]
+    x_shifted = x_fp32 - max_val[None, :]          # [BLOCK_C, BLOCK_W]
+    exp_x = tl.exp(x_shifted)                      # [BLOCK_C, BLOCK_W]
+    sum_exp = tl.sum(exp_x, axis=0)                # [BLOCK_W]
+    softmax = exp_x / sum_exp[None, :]             # [BLOCK_C, BLOCK_W]
+
+    # Load bias [C] and broadcast over BLOCK_W positions
+    bias_vals = tl.load(bias_ptr + offs_c, mask=mask_c, other=0.0)
+    bias_fp32 = tl.cast(bias_vals, tl.float32)[:, None]  # [BLOCK_C, 1] -> broadcast
+
+    # Fused: +bias, *scale, sigmoid
+    y = (softmax + bias_fp32) * scaling_factor
+
+    # Sigmoid: 1 / (1 + exp(-y))
+    neg_y = -y
+    exp_neg_y = tl.exp(neg_y)
+    sigmoid = 1.0 / (1.0 + exp_neg_y)
+
+    # Store result, cast back to original dtype
+    out_vals = tl.cast(sigmoid, x_dtype)
+    out_ptrs = (
+        out_ptr
+        + base_nh
+        + offs_c[:, None] * stride_c
+        + offs_w[None, :] * stride_w
+    )
+    tl.store(out_ptrs, out_vals, mask=mask)
+
+
+def fused_post_convtranspose(x: torch.Tensor, bias: torch.Tensor, scaling_factor: float):
+    """
+    x: [N, C, H, W] - result of ConvTranspose2d (NCHW)
+    bias: [C, 1, 1] or [C] - channel-wise bias
+    Returns: [N, C, H, W] with fused operations:
+        softmax(dim=1) -> +bias -> *scaling_factor -> sigmoid
+    """
+    assert x.is_cuda, "Input must be on CUDA device"
+    N, C, H, W = x.shape
+    assert C <= 1024, "Kernel currently supports C <= 1024 for best performance."
+
+    # Ensure bias is [C]
+    bias_flat = bias.view(C).contiguous()
+
+    out = torch.empty_like(x, memory_format=torch.contiguous_format)
+
+    # Channel tile size: round up to nearest multiple of 64, capped at 1024
+    BLOCK_C = min(((C + 63) // 64) * 64, 1024)
+    BLOCK_W = 64
+
+    grid = (
+        N,                        # batch
+        H,                        # height
+        triton.cdiv(W, BLOCK_W),  # width tiles
+    )
+
+    fused_softmax_bias_scale_sigmoid_kernel[grid](
+        x, bias_flat, out,
+        N, C, H, W,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        float(scaling_factor),
+        BLOCK_W=BLOCK_W,
+        BLOCK_C=BLOCK_C,
+    )
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    ConvTranspose2d (PyTorch native) +
+    fused softmax(dim=1) + bias add + scaling + sigmoid (Triton).
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding,
+                 output_padding, bias_shape, scaling_factor):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose2d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            output_padding=output_padding,
+        )
+        # Match original bias shape (C, 1, 1)
+        self.bias = nn.Parameter(torch.randn(out_channels, 1, 1))
+        self.scaling_factor = scaling_factor
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = fused_post_convtranspose(x, self.bias, self.scaling_factor)
+        return x
+```
+
+---
+
+## Your Task
+
+Identify the **single most critical issue** that causes the error above.
+
+### Analysis Guidelines
+
+1. **Focus on root cause**, not symptoms
+   - Bad: "Output is wrong"
+   - Good: "BLOCK_K loop missing, only processes first 32 elements of K dimension"
+
+2. **Be specific about WHAT and WHERE**
+   - Bad: "Memory access issue"
+   - Good: "Line 45: tl.atomic_add(c_block_ptr, acc) - atomic_add requires scalar pointer, not block_ptr"
+
+3. **Prioritize by impact**
+   - Correctness bugs > Performance issues > Style problems
+   - Algorithm errors > Implementation details
+
+### Output Format
+
+**CRITICAL: You MUST output ONLY valid JSON. No other text allowed.**
+
+```json
+{
+  "critical_issue": "<Concise description of THE root cause, max 30 words>",
+  "why_it_matters": "<Why this causes the observed error, max 35 words>",
+  "minimal_fix_hint": "<What needs to change (not how), max 30 words>"
+}
+```
+
+**Remember**: Output ONLY the JSON block. No explanations, no commentary, no additional text.

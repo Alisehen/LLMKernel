@@ -1,0 +1,261 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        # Baseline, conservative (required)
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_stages=2,
+            num_warps=4,
+        ),
+        # Higher parallelism when register pressure allows
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_stages=2,
+            num_warps=8,
+        ),
+        # Smaller block to reduce per-CTA register usage / improve occupancy
+        triton.Config(
+            {'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_stages=2,
+            num_warps=4,
+        ),
+    ],
+    key=['P', 'C_out', 'K_total'],
+)
+@triton.jit
+def conv2d_min_bias_scale_kernel(
+    x_ptr,            # [N, C_in, H_in, W_in]
+    w_ptr,            # [C_out, C_in, K_H, K_W]
+    conv_bias_ptr,    # [C_out]
+    extra_bias_ptr,   # [C_out, 1, 1]
+    out_ptr,          # [N, C_out, H_out, W_out]
+    N, C_in, H_in, W_in,
+    C_out, K_H, K_W,
+    H_out, W_out,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_wo, stride_wc, stride_wkh, stride_wkw,
+    stride_cb0,
+    stride_eb0,
+    stride_on, stride_oc, stride_oh, stride_ow,
+    const_val,        # scalar (float32)
+    scaling,          # scalar (float32)
+    P,                # N * H_out * W_out
+    K_total,          # C_in * K_H * K_W
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # Program IDs for tiling over output positions (M) and output channels (N)
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    # Offsets in M (flattened N*H_out*W_out) and N (C_out) dimensions
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    valid_m = offs_m < P
+    valid_n = offs_n < C_out
+
+    # Decode offs_m -> (n_idx, oh_idx, ow_idx)
+    DHW = H_out * W_out
+    n_idx = offs_m // DHW
+    rem = offs_m % DHW
+    oh_idx = rem // W_out
+    ow_idx = rem % W_out
+
+    # Base pointer offsets for input and output (per M-tile row, independent of K)
+    x_base = (
+        n_idx[:, None] * stride_xn
+        + oh_idx[:, None] * stride_xh
+        + ow_idx[:, None] * stride_xw
+    )
+
+    # Base offsets for each output channel
+    w_base = offs_n[None, :] * stride_wo
+
+    # Accumulator in fp32
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # GEMM-style K loop over C_in * K_H * K_W
+    for k_start in range(0, K_total, BLOCK_K):
+        k_ids = k_start + tl.arange(0, BLOCK_K)
+        valid_k = k_ids < K_total
+
+        # Decode k_ids -> (ic, kh, kw)
+        tmp = k_ids // K_W
+        kw = k_ids % K_W
+        kh = tmp % K_H
+        ic = tmp // K_H
+
+        # Offsets for K-dimension within input and weight
+        x_k_offsets = (
+            ic * stride_xc
+            + kh * stride_xh
+            + kw * stride_xw
+        )  # [BLOCK_K]
+
+        w_k_offsets = (
+            ic * stride_wc
+            + kh * stride_wkh
+            + kw * stride_wkw
+        )  # [BLOCK_K]
+
+        # Input pointers: [BLOCK_M, BLOCK_K]
+        x_ptrs = x_ptr + x_base + x_k_offsets[None, :]
+        x_mask = valid_m[:, None] & valid_k[None, :]
+
+        # Weight pointers: [BLOCK_K, BLOCK_N]
+        w_ptrs = w_ptr + w_k_offsets[:, None] + w_base
+        w_mask = valid_k[:, None] & valid_n[None, :]
+
+        # Loads in source dtype; dot accumulates in fp32 (uses tensor cores for fp16/bf16)
+        x_vals = tl.load(x_ptrs, mask=x_mask, other=0.0)
+        w_vals = tl.load(w_ptrs, mask=w_mask, other=0.0)
+
+        acc += tl.dot(x_vals, w_vals, out_dtype=tl.float32)
+
+    # Load and add convolution bias (pre-activation bias)
+    cb_ptrs = conv_bias_ptr + offs_n * stride_cb0
+    cb = tl.load(cb_ptrs, mask=valid_n, other=0.0).to(tl.float32)
+    acc += cb[None, :]
+
+    # Min with constant value (elementwise)
+    acc = tl.where(acc < const_val, acc, const_val)
+
+    # Add extra bias (post-activation)
+    eb_ptrs = extra_bias_ptr + offs_n * stride_eb0
+    eb = tl.load(eb_ptrs, mask=valid_n, other=0.0).to(tl.float32)
+    acc += eb[None, :]
+
+    # Scale
+    acc = acc * scaling
+
+    # Store result
+    out_ptrs = (
+        out_ptr
+        + n_idx[:, None] * stride_on
+        + oh_idx[:, None] * stride_oh
+        + ow_idx[:, None] * stride_ow
+        + offs_n[None, :] * stride_oc
+    )
+    store_mask = valid_m[:, None] & valid_n[None, :]
+    tl.store(out_ptrs, acc, mask=store_mask)
+
+
+def conv2d_min_bias_scale_triton(
+    x,
+    weight,
+    conv_bias,
+    extra_bias,
+    constant_value,
+    scaling_factor,
+):
+    """
+    x          : [N, C_in, H_in, W_in]
+    weight     : [C_out, C_in, K_H, K_W]
+    conv_bias  : [C_out]
+    extra_bias : [C_out, 1, 1]
+    """
+    assert x.is_cuda, "Input must be on CUDA device for Triton kernel"
+    assert x.ndim == 4 and weight.ndim == 4
+    assert conv_bias.ndim == 1
+    assert extra_bias.ndim == 3
+
+    N, C_in, H_in, W_in = x.shape
+    C_out, C_in_w, K_H, K_W = weight.shape
+    assert C_in_w == C_in, "Weight C_in mismatch with input"
+
+    # Assume stride=1, padding=0, dilation=1, groups=1
+    H_out = H_in - K_H + 1
+    W_out = W_in - K_W + 1
+    assert H_out > 0 and W_out > 0
+
+    out = torch.empty((N, C_out, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    # Use original strides to support non-contiguous tensors if needed
+    sx0, sx1, sx2, sx3 = x.stride()
+    sw0, sw1, sw2, sw3 = weight.stride()
+    scb0 = conv_bias.stride(0)
+    seb0 = extra_bias.stride(0)
+    so0, so1, so2, so3 = out.stride()
+
+    P = N * H_out * W_out
+    K_total = C_in * K_H * K_W
+
+    def grid(meta):
+        return (
+            triton.cdiv(P, meta['BLOCK_M']),
+            triton.cdiv(C_out, meta['BLOCK_N']),
+        )
+
+    conv2d_min_bias_scale_kernel[grid](
+        x, weight, conv_bias, extra_bias, out,
+        N, C_in, H_in, W_in,
+        C_out, K_H, K_W,
+        H_out, W_out,
+        sx0, sx1, sx2, sx3,
+        sw0, sw1, sw2, sw3,
+        scb0,
+        seb0,
+        so0, so1, so2, so3,
+        float(constant_value),
+        float(scaling_factor),
+        P,
+        K_total,
+    )
+
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-accelerated version of:
+
+        x = conv2d(x)
+        x = min(x, constant_value)
+        x = x + bias
+        x = x * scaling_factor
+
+    where conv2d has its own bias term.
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size, constant_value, bias_shape, scaling_factor):
+        super(ModelNew, self).__init__()
+        if isinstance(kernel_size, int):
+            k_h = k_w = kernel_size
+        else:
+            k_h, k_w = kernel_size
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = (k_h, k_w)
+
+        # Conv2d-like parameters (weight + conv bias)
+        self.weight = nn.Parameter(
+            torch.randn(out_channels, in_channels, k_h, k_w)
+        )
+        self.conv_bias = nn.Parameter(
+            torch.randn(out_channels)
+        )
+
+        # Extra bias added after min, broadcast over spatial
+        self.bias = nn.Parameter(torch.randn(*bias_shape))
+
+        # Scalars
+        self.constant_value = float(constant_value)
+        self.scaling_factor = float(scaling_factor)
+
+    def forward(self, x):
+        # x is assumed to be [N, C_in, H, W], typically on CUDA
+        return conv2d_min_bias_scale_triton(
+            x,
+            self.weight,
+            self.conv_bias,
+            self.bias,
+            self.constant_value,
+            self.scaling_factor,
+        )

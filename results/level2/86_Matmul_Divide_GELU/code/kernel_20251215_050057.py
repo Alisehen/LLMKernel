@@ -1,0 +1,234 @@
+# <complete ModelNew code with optimized Triton kernels>
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        # Smaller tiles -> lower register pressure, higher occupancy
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32, "GROUP_M": 8},
+            num_warps=4,
+            num_stages=2,
+        ),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_M": 8},
+            num_warps=4,
+            num_stages=2,
+        ),
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 32, "GROUP_M": 8},
+            num_warps=4,
+            num_stages=2,
+        ),
+        # Larger tiles when problem size is big enough and registers allow it
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_M": 8},
+            num_warps=8,
+            num_stages=2,
+        ),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 256, "BLOCK_K": 32, "GROUP_M": 4},
+            num_warps=8,
+            num_stages=2,
+        ),
+        triton.Config(
+            {"BLOCK_M": 256, "BLOCK_N": 64, "BLOCK_K": 32, "GROUP_M": 4},
+            num_warps=8,
+            num_stages=2,
+        ),
+    ],
+    key=["M", "N", "K"],
+)
+@triton.jit
+def linear_div_gelu_kernel(
+    a_ptr, w_ptr, bias_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_wk, stride_wn,
+    stride_cm, stride_cn,
+    inv_divisor,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr, GROUP_M: tl.constexpr,
+):
+    """
+    Fused kernel computing:
+        C = GELU( (A @ W^T + bias) / divisor )
+
+    A: [M, K], row-major
+    W: [N, K], row-major  (we use W^T logically: [K, N])
+    bias: [N]
+    C: [M, N]
+
+    Memory fusion rule:
+    - Multiple tl.load() from inputs: OK
+    - No tl.store() of intermediates: OK
+    - Single tl.store() for final output C: enforced
+    """
+
+    # -------------------------
+    # Program id + grouping over M for better L2 locality on W
+    # -------------------------
+    pid = tl.program_id(0)
+
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    num_pid_in_group = GROUP_M * num_pid_n
+
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_M
+
+    # Handle last group which may be smaller than GROUP_M
+    group_size_m = tl.minimum(num_pid_m - first_pid_m, GROUP_M)
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    # -------------------------
+    # Offsets for this tile
+    # -------------------------
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    m_mask = offs_m < M
+    n_mask = offs_n < N
+    mn_mask = m_mask[:, None] & n_mask[None, :]
+
+    # Pointers for A: [M, K], row-major
+    a_ptrs = a_ptr + (
+        offs_m[:, None] * stride_am +
+        offs_k[None, :] * stride_ak
+    )
+
+    # Pointers for W viewed as B = W^T: [K, N]
+    # B(k, n) = W(n, k)
+    # weight is [N, K] row-major -> stride over k is stride_wk, over n is stride_wn
+    w_ptrs = w_ptr + (
+        offs_k[:, None] * stride_wk +
+        offs_n[None, :] * stride_wn
+    )
+
+    # -------------------------
+    # Matmul accumulation (fp32) using tensor cores (allow_tf32=True)
+    # -------------------------
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k_start in range(0, K, BLOCK_K):
+        k_mask = (k_start + offs_k) < K
+
+        a = tl.load(
+            a_ptrs,
+            mask=m_mask[:, None] & k_mask[None, :],
+            other=0.0,
+        )
+        w = tl.load(
+            w_ptrs,
+            mask=k_mask[:, None] & n_mask[None, :],
+            other=0.0,
+        )
+
+        # Tensor-core friendly dot; accumulator in fp32
+        acc += tl.dot(a, w, allow_tf32=True)
+
+        a_ptrs += BLOCK_K * stride_ak
+        w_ptrs += BLOCK_K * stride_wk
+
+    # -------------------------
+    # Fused epilogue (bias + div + GELU) – all in registers
+    # -------------------------
+
+    # Bias add: bias [N] broadcast across M
+    bias = tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0)
+    acc += bias[None, :]
+
+    # Division by scalar via multiply by reciprocal
+    acc *= inv_divisor
+
+    # GELU(x) = 0.5 * x * (1 + erf(x / sqrt(2)))
+    x = acc
+    x_scaled = x * 0.7071067811865476  # 1 / sqrt(2)
+    erf_x = tl.math.erf(x_scaled)
+    acc = 0.5 * x * (1.0 + erf_x)
+
+    # -------------------------
+    # Single final store to output C
+    # -------------------------
+    c_ptrs = c_ptr + (
+        offs_m[:, None] * stride_cm +
+        offs_n[None, :] * stride_cn
+    )
+    tl.store(c_ptrs, acc, mask=mn_mask)
+
+
+def fused_linear_div_gelu(x: torch.Tensor,
+                          weight: torch.Tensor,
+                          bias: torch.Tensor,
+                          divisor: float) -> torch.Tensor:
+    """
+    Fused implementation of:
+        y = x @ weight.T + bias
+        y = y / divisor
+        y = GELU(y)
+
+    Shapes:
+        x:      [M, K]
+        weight: [N, K]  (same as nn.Linear.weight)
+        bias:   [N]
+        out:    [M, N]
+    """
+    assert x.is_cuda, "Input must be on CUDA device"
+    assert weight.is_cuda and bias.is_cuda, "Parameters must be on CUDA device"
+    assert x.dtype == weight.dtype == bias.dtype, "dtypes of x, weight, bias must match"
+
+    M, K = x.shape
+    N = weight.shape[0]
+    assert weight.shape[1] == K, "weight shape must be [N, K]"
+    assert bias.shape[0] == N, "bias shape must match output features"
+
+    y = torch.empty((M, N), device=x.device, dtype=x.dtype)
+
+    def grid(meta):
+        # 1D launch grid with M-grouped tiling for better L2 reuse of W
+        return (
+            triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]),
+        )
+
+    inv_divisor = 1.0 / float(divisor)
+
+    linear_div_gelu_kernel[grid](
+        x, weight, bias, y,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        # Map W [N, K] as B [K, N]:
+        # B(k, n) = W(n, k) -> stride_wk = stride over K, stride_wn = stride over N
+        weight.stride(1), weight.stride(0),
+        y.stride(0), y.stride(1),
+        inv_divisor,
+    )
+
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized version of:
+        y = Linear(x)
+        y = y / divisor
+        y = GELU(y)
+    """
+
+    def __init__(self, input_size, output_size, divisor):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.randn(output_size, input_size))
+        self.bias = nn.Parameter(torch.randn(output_size))
+        self.divisor = float(divisor)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not x.is_cuda:
+            x = x.cuda()
+            self.weight.data = self.weight.data.cuda()
+            self.bias.data = self.bias.data.cuda()
+        return fused_linear_div_gelu(x, self.weight, self.bias, self.divisor)

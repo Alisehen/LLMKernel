@@ -1,0 +1,204 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        # Balanced default tiles
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=8, num_stages=2),
+        # Wider N tiles – good for large output features
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=8, num_stages=2),
+        # Deeper K blocking – better arithmetic intensity for large K
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_warps=8, num_stages=2),
+    ],
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def _linear_bias_kernel(
+    a_ptr,        # [M, K]
+    w_ptr,        # [N, K] (PyTorch Linear.weight, used as B[k, n] = w[n, k])
+    b_ptr,        # [N]
+    c_ptr,        # [M, N]
+    M, N, K,
+    stride_am, stride_ak,
+    stride_wk, stride_wn,  # w[k, n] -> w_ptr + k*stride_wk + n*stride_wn
+    stride_cm, stride_cn,
+    DO_RELU: tl.constexpr,  # fuse ReLU when True, pure linear when False
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # Program IDs for 2D tiling of [M, N]
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    # Offsets along M and N for this tile
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Pointer to the first K-tile
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    w_ptrs = w_ptr + offs_k[:, None] * stride_wk + offs_n[None, :] * stride_wn
+
+    # Accumulator in FP32 (kept entirely in registers)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Precompute masks that are K-independent
+    m_mask = offs_m[:, None] < M
+    n_mask = offs_n[None, :] < N
+
+    # Loop over K dimension in BLOCK_K chunks (software pipelined via num_stages)
+    k = 0
+    while k < K:
+        k_mask = offs_k[None, :] + k < K
+
+        a = tl.load(
+            a_ptrs,
+            mask=m_mask & k_mask,
+            other=0.0,
+        )
+        w = tl.load(
+            w_ptrs,
+            mask=k_mask.T & n_mask,
+            other=0.0,
+        )
+        # Tensor-core friendly dot with TF32 enabled when input is fp32
+        acc += tl.dot(a, w, allow_tf32=True)
+
+        a_ptrs += BLOCK_K * stride_ak
+        w_ptrs += BLOCK_K * stride_wk
+        k += BLOCK_K
+
+    # Bias add (broadcast over M tile); bias kept in registers
+    bias = tl.load(b_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc = acc + bias[None, :]
+
+    # Optional ReLU in-register, no extra global stores
+    if DO_RELU:
+        acc = tl.maximum(acc, 0.0)
+
+    # Single global store of the final result
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    tl.store(
+        c_ptrs,
+        acc,
+        mask=m_mask & n_mask,
+    )
+
+
+def fused_linear_relu_triton(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    x:      [M, K]
+    weight: [N, K] (PyTorch Linear.weight)
+    bias:   [N]
+    returns: [M, N] with fused bias + ReLU
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+    M, K = x.shape
+    N = weight.shape[0]
+
+    # Output in FP32, accumulate in FP32 inside the kernel
+    out = torch.empty((M, N), device=x.device, dtype=torch.float32)
+
+    # Strides: x is [M, K]
+    stride_am, stride_ak = x.stride()
+    # weight is [N, K], interpreted as [K, N] inside the kernel
+    stride_wn = weight.stride(0)  # n
+    stride_wk = weight.stride(1)  # k
+    # Output [M, N]
+    stride_cm, stride_cn = out.stride()
+
+    grid = lambda META: (
+        triton.cdiv(M, META['BLOCK_M']),
+        triton.cdiv(N, META['BLOCK_N']),
+    )
+
+    _linear_bias_kernel[grid](
+        x, weight, bias, out,
+        M, N, K,
+        stride_am, stride_ak,
+        stride_wk, stride_wn,
+        stride_cm, stride_cn,
+        True,  # DO_RELU
+    )
+    return out
+
+
+def linear_triton(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    x:      [M, K]
+    weight: [N, K] (PyTorch Linear.weight)
+    bias:   [N]
+    returns: [M, N] with fused bias (no ReLU)
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+    M, K = x.shape
+    N = weight.shape[0]
+
+    out = torch.empty((M, N), device=x.device, dtype=torch.float32)
+
+    stride_am, stride_ak = x.stride()
+    stride_wn = weight.stride(0)
+    stride_wk = weight.stride(1)
+    stride_cm, stride_cn = out.stride()
+
+    grid = lambda META: (
+        triton.cdiv(M, META['BLOCK_M']),
+        triton.cdiv(N, META['BLOCK_N']),
+    )
+
+    _linear_bias_kernel[grid](
+        x, weight, bias, out,
+        M, N, K,
+        stride_am, stride_ak,
+        stride_wk, stride_wn,
+        stride_cm, stride_cn,
+        False,  # DO_RELU
+    )
+    return out
+
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, layer_sizes, output_size):
+        """
+        :param input_size: The number of input features
+        :param layer_sizes: A list of ints containing the sizes of each hidden layer
+        :param output_size: The number of output features
+        """
+        super(ModelNew, self).__init__()
+
+        # Build [Linear, ReLU, Linear, ReLU, ..., Linear]
+        layers = []
+        current_input_size = input_size
+        for layer_size in layer_sizes:
+            layers.append(nn.Linear(current_input_size, layer_size))
+            layers.append(nn.ReLU())
+            current_input_size = layer_size
+        layers.append(nn.Linear(current_input_size, output_size))
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        :param x: The input tensor, shape (batch_size, input_size)
+        :return: The output tensor, shape (batch_size, output_size)
+        """
+        # CPU fallback: standard PyTorch modules
+        if not x.is_cuda:
+            return self.network(x)
+
+        # Hidden layers: fuse Linear + ReLU
+        num_layers = len(self.network)
+        for idx in range(0, num_layers - 1, 2):
+            linear = self.network[idx]
+            x = fused_linear_relu_triton(x, linear.weight, linear.bias)
+
+        # Final Linear layer: fuse only bias, no ReLU
+        final_linear = self.network[-1]
+        x = linear_triton(x, final_linear.weight, final_linear.bias)
+        return x

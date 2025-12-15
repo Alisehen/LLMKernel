@@ -1,0 +1,5 @@
+{
+  "critical_issue": "Bias is added before ReLU in the Triton kernel (ReLU(conv + bias)) instead of after ReLU (ReLU(conv) + bias) as in the PyTorch reference.",
+  "why_it_matters": "Changing the order of bias and ReLU alters the non-linear transformation, producing systematically different outputs and causing large absolute errors compared to the reference implementation.",
+  "minimal_fix_hint": "Compute conv output, apply ReLU first, then add the broadcast bias term, matching the PyTorch model’s operation order."
+}

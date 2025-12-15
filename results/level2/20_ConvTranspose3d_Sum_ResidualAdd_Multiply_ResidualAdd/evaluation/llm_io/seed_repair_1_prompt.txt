@@ -1,0 +1,204 @@
+Fix the Triton kernel errors. Generate correct, high-performance code.
+
+Current Error Log:
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 626, in compare_and_bench
+    raise ValueError(
+ValueError: Outputs are not close (atol=0.001, rtol=0.01). max_abs_err=inf, mean_abs_err=inf
+
+Main Critical Problem Analysis:
+Problem Analysis (from expert diagnosis):
+critical_issue: Kernel performs in-place modification but reads the same memory after overwriting it, breaking mathematical correctness.
+why_it_matters: The algorithm expects original_x to remain unchanged throughout operations, but kernel overwrites x then uses corrupted values in subsequent calculations.
+minimal_fix_hint: Load original_x once, compute using only original_x values, store final result to separate output buffer.
+
+Focus your fix on addressing the identified critical issue.
+
+
+Broken Code:
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+import math
+
+
+@triton.jit
+def fused_residual_kernel(
+    x_ptr, bias_ptr, out_ptr,
+    N, C, D, H, W,
+    stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
+    BLOCK_C: tl.constexpr,
+    BLOCK_DHW: tl.constexpr,
+):
+    """
+    Fused kernel for: BiasAdd + ResidualAdd + Multiply + ResidualAdd
+    Input: [N, C, D, H, W], Output: [N, C, D, H, W]
+    Performs: out = ((x + bias) + x) * x + x = 2*x^2 + bias*x + x
+    """
+    pid_n = tl.program_id(0)  # batch index
+    pid_c = tl.program_id(1)  # channel index
+    
+    if pid_n >= N or pid_c >= C:
+        return
+    
+    DHW = D * H * W
+    num_dhw_blocks = tl.cdiv(DHW, BLOCK_DHW)
+    
+    # Load bias for this channel (broadcast over spatial dimensions)
+    bias_val = tl.load(bias_ptr + pid_c)
+    
+    # Process spatial blocks
+    for block_idx in range(0, num_dhw_blocks):
+        dhw_start = block_idx * BLOCK_DHW
+        dhw_offsets = dhw_start + tl.arange(0, BLOCK_DHW)
+        mask = dhw_offsets < DHW
+        
+        # Compute spatial indices
+        d_offsets = dhw_offsets // (H * W)
+        hw_offsets = dhw_offsets % (H * W)
+        h_offsets = hw_offsets // W
+        w_offsets = hw_offsets % W
+        
+        # Load input x
+        x_ptrs = (
+            x_ptr + 
+            pid_n * stride_xn + 
+            pid_c * stride_xc + 
+            d_offsets * stride_xd + 
+            h_offsets * stride_xh + 
+            w_offsets * stride_xw
+        )
+        x_vals = tl.load(x_ptrs, mask=mask, other=0.0)
+        
+        # Compute fused operations: ((x + bias) + x) * x + x
+        # Optimized as: 2*x^2 + bias*x + x
+        x_squared = x_vals * x_vals
+        result = x_squared * 2.0 + x_vals * bias_val + x_vals
+        
+        # Store result
+        tl.store(x_ptrs, result, mask=mask)
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_C': 128, 'BLOCK_DHW': 512}, num_warps=8),
+        triton.Config({'BLOCK_C': 64, 'BLOCK_DHW': 1024}, num_warps=8),
+        triton.Config({'BLOCK_C': 32, 'BLOCK_DHW': 2048}, num_warps=8),
+    ],
+    key=['C', 'D', 'H', 'W']
+)
+@triton.jit
+def fused_residual_kernel_autotune(
+    x_ptr, bias_ptr, out_ptr,
+    N, C, D, H, W,
+    stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
+    BLOCK_C: tl.constexpr,
+    BLOCK_DHW: tl.constexpr,
+):
+    """Same kernel with autotune configurations"""
+    pid_n = tl.program_id(0)
+    pid_c = tl.program_id(1)
+    
+    if pid_n >= N or pid_c >= C:
+        return
+    
+    DHW = D * H * W
+    num_dhw_blocks = tl.cdiv(DHW, BLOCK_DHW)
+    
+    bias_val = tl.load(bias_ptr + pid_c)
+    
+    for block_idx in range(0, num_dhw_blocks):
+        dhw_start = block_idx * BLOCK_DHW
+        dhw_offsets = dhw_start + tl.arange(0, BLOCK_DHW)
+        mask = dhw_offsets < DHW
+        
+        # Spatial indices
+        d_offsets = dhw_offsets // (H * W)
+        hw_offsets = dhw_offsets % (H * W)
+        h_offsets = hw_offsets // W
+        w_offsets = hw_offsets % W
+        
+        # Load
+        x_ptrs = (
+            x_ptr + 
+            pid_n * stride_xn + 
+            pid_c * stride_xc + 
+            d_offsets * stride_xd + 
+            h_offsets * stride_xh + 
+            w_offsets * stride_xw
+        )
+        x_vals = tl.load(x_ptrs, mask=mask, other=0.0)
+        
+        # Fused computation: 2*x^2 + bias*x + x
+        x_squared = x_vals * x_vals
+        result = tl.fma(x_squared, 2.0, x_vals * bias_val + x_vals)
+        
+        # Store in-place
+        tl.store(x_ptrs, result, mask=mask)
+
+
+def fused_post_convtranspose(x, bias):
+    """
+    Fused operations: BiasAdd + ResidualAdd + Multiply + ResidualAdd
+    Performs in-place modification on x
+    """
+    N, C, D, H, W = x.shape
+    
+    # Ensure bias has correct shape for broadcasting
+    bias = bias.view(-1, 1, 1, 1)  # [C, 1, 1, 1]
+    
+    # Calculate grid
+    grid = (N, C)
+    
+    # Call kernel with autotune
+    fused_residual_kernel_autotune[grid](
+        x, bias, x,  # in-place operation
+        N, C, D, H, W,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
+    )
+    
+    return x
+
+
+class ModelNew(nn.Module):
+    """
+    ConvTranspose3d (PyTorch native) + Fused post-ops (Triton)
+    
+    Note: ConvTranspose3d is kept in PyTorch due to complexity.
+    Only the subsequent operations are fused in Triton.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, bias_shape):
+        super(ModelNew, self).__init__()
+        # Keep ConvTranspose3d as PyTorch native
+        self.conv_transpose = nn.ConvTranspose3d(
+            in_channels, out_channels, kernel_size, 
+            stride=stride, padding=padding, output_padding=output_padding
+        )
+        # Bias parameter (broadcastable to [out_channels, 1, 1, 1])
+        self.bias = nn.Parameter(torch.randn(out_channels, 1, 1, 1))
+    
+    def forward(self, x):
+        # Step 1: PyTorch native ConvTranspose3d
+        x = self.conv_transpose(x)
+        
+        # Step 2: Fused post-ops in Triton (in-place)
+        x = fused_post_convtranspose(x, self.bias)
+        
+        return x
+```
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl, AND any other modules used (e.g., import math if using math.sqrt)
+   2. @triton.jit decorated kernel function(s) — NO continue/break/return inside loops (use masking)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels — THIS CLASS IS REQUIRED
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+3. Learn from previous repair attempts to avoid repeating the same mistakes
+4. Ensure ALL imports are included at the top (common mistake: forgetting `import math`)
+
+```python
+# <corrected code>
+```

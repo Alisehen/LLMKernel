@@ -1,0 +1,269 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def tanh_maxpool2d_kernel(
+    x_ptr, y_ptr,
+    N, C, Hin, Win,
+    Hout, Wout,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    BLOCK_HW: tl.constexpr,
+):
+    """
+    Fused tanh + 2x2 max-pooling (stride=2, padding=0).
+    Input:  [N, C, Hin, Win]
+    Output: [N, C, Hout, Wout]
+    Each program instance handles one (n, c) pair and a block of HW positions.
+    """
+    pid_n = tl.program_id(0)
+    pid_c = tl.program_id(1)
+    pid_hw_block = tl.program_id(2)
+
+    if pid_n >= N or pid_c >= C:
+        return
+
+    HW_out = Hout * Wout
+    offs_hw = pid_hw_block * BLOCK_HW + tl.arange(0, BLOCK_HW)
+    mask_hw = offs_hw < HW_out
+
+    # Map linear output index -> (ho, wo)
+    ho = offs_hw // Wout
+    wo = offs_hw % Wout
+
+    # Corresponding top-left input indices for 2x2 window
+    hin0 = ho * 2
+    win0 = wo * 2
+
+    base_x = x_ptr + pid_n * stride_xn + pid_c * stride_xc
+    base_y = y_ptr + pid_n * stride_yn + pid_c * stride_yc
+
+    # Masks for each of the 4 pooling positions
+    mask00 = mask_hw & (hin0 < Hin) & (win0 < Win)
+    mask01 = mask_hw & (hin0 < Hin) & (win0 + 1 < Win)
+    mask10 = mask_hw & (hin0 + 1 < Hin) & (win0 < Win)
+    mask11 = mask_hw & (hin0 + 1 < Hin) & (win0 + 1 < Win)
+
+    # Compute pointers for 2x2 window
+    ptr00 = base_x + hin0 * stride_xh + win0 * stride_xw
+    ptr01 = base_x + hin0 * stride_xh + (win0 + 1) * stride_xw
+    ptr10 = base_x + (hin0 + 1) * stride_xh + win0 * stride_xw
+    ptr11 = base_x + (hin0 + 1) * stride_xh + (win0 + 1) * stride_xw
+
+    # Large negative for invalid positions (after tanh)
+    neg_large = tl.full((BLOCK_HW,), -1e9, dtype=tl.float32)
+
+    # Load, apply tanh, and mask invalid positions
+    x00 = tl.load(ptr00, mask=mask00, other=0.0).to(tl.float32)
+    e2x00 = tl.exp(2.0 * x00)
+    t00 = (e2x00 - 1.0) / (e2x00 + 1.0)
+    t00 = tl.where(mask00, t00, neg_large)
+
+    x01 = tl.load(ptr01, mask=mask01, other=0.0).to(tl.float32)
+    e2x01 = tl.exp(2.0 * x01)
+    t01 = (e2x01 - 1.0) / (e2x01 + 1.0)
+    t01 = tl.where(mask01, t01, neg_large)
+
+    x10 = tl.load(ptr10, mask=mask10, other=0.0).to(tl.float32)
+    e2x10 = tl.exp(2.0 * x10)
+    t10 = (e2x10 - 1.0) / (e2x10 + 1.0)
+    t10 = tl.where(mask10, t10, neg_large)
+
+    x11 = tl.load(ptr11, mask=mask11, other=0.0).to(tl.float32)
+    e2x11 = tl.exp(2.0 * x11)
+    t11 = (e2x11 - 1.0) / (e2x11 + 1.0)
+    t11 = tl.where(mask11, t11, neg_large)
+
+    # 2x2 max pooling
+    max1 = tl.maximum(t00, t01)
+    max2 = tl.maximum(t10, t11)
+    pooled = tl.maximum(max1, max2)
+
+    # Store results
+    out_ptrs = base_y + ho * stride_yh + wo * stride_yw
+    tl.store(out_ptrs, pooled, mask=mask_hw)
+
+
+@triton.jit
+def group_norm_kernel(
+    x_ptr, y_ptr, gamma_ptr, beta_ptr,
+    N, C, H, W,
+    num_groups, group_size,
+    eps,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    BLOCK: tl.constexpr,
+):
+    """
+    GroupNorm over channels and spatial dims for each (N, group).
+    Input / Output: [N, C, H, W]
+    gamma, beta: [C]
+    """
+    pid_n = tl.program_id(0)
+    pid_g = tl.program_id(1)
+
+    if pid_n >= N or pid_g >= num_groups:
+        return
+
+    HW = H * W
+    M = group_size * HW  # elements per group
+
+    offs = tl.arange(0, BLOCK)
+
+    # First pass: compute mean and variance
+    sum_val = tl.zeros((), dtype=tl.float32)
+    sum_sq_val = tl.zeros((), dtype=tl.float32)
+
+    for base in range(0, M, BLOCK):
+        idx = base + offs
+        mask = idx < M
+
+        c_rel = idx // HW
+        hw = idx % HW
+        h = hw // W
+        w = hw % W
+
+        c = pid_g * group_size + c_rel
+
+        x_ptrs = x_ptr + pid_n * stride_xn + c * stride_xc + h * stride_xh + w * stride_xw
+        x_vals = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+        sum_val += tl.sum(x_vals, axis=0)
+        sum_sq_val += tl.sum(x_vals * x_vals, axis=0)
+
+    m = sum_val / M
+    var = sum_sq_val / M - m * m
+    rstd = 1.0 / tl.sqrt(var + eps)
+
+    # Second pass: normalize and apply affine
+    for base in range(0, M, BLOCK):
+        idx = base + offs
+        mask = idx < M
+
+        c_rel = idx // HW
+        hw = idx % HW
+        h = hw // W
+        w = hw % W
+
+        c = pid_g * group_size + c_rel
+
+        x_ptrs = x_ptr + pid_n * stride_xn + c * stride_xc + h * stride_xh + w * stride_xw
+        x_vals = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+        norm_vals = (x_vals - m) * rstd
+
+        gamma = tl.load(gamma_ptr + c, mask=mask, other=1.0).to(tl.float32)
+        beta = tl.load(beta_ptr + c, mask=mask, other=0.0).to(tl.float32)
+
+        y_vals = norm_vals * gamma + beta
+
+        y_ptrs = y_ptr + pid_n * stride_yn + c * stride_yc + h * stride_yh + w * stride_yw
+        tl.store(y_ptrs, y_vals, mask=mask)
+
+
+def tanh_maxpool2d_triton(x: torch.Tensor) -> torch.Tensor:
+    """
+    Fused tanh + MaxPool2d(kernel_size=2, stride=2) using Triton.
+    Assumes x is float32 on CUDA.
+    """
+    assert x.is_cuda and x.dtype == torch.float32
+    N, C, Hin, Win = x.shape
+
+    # Match PyTorch MaxPool2d(kernel_size=2, stride=2, padding=0)
+    Hout = (Hin - 2) // 2 + 1
+    Wout = (Win - 2) // 2 + 1
+
+    y = torch.empty((N, C, Hout, Wout), device=x.device, dtype=x.dtype)
+
+    BLOCK_HW = 128  # power-of-2 as required
+    grid = (N, C, (Hout * Wout + BLOCK_HW - 1) // BLOCK_HW)
+
+    tanh_maxpool2d_kernel[grid](
+        x, y,
+        N, C, Hin, Win,
+        Hout, Wout,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        y.stride(0), y.stride(1), y.stride(2), y.stride(3),
+        BLOCK_HW=BLOCK_HW,
+    )
+    return y
+
+
+def group_norm_triton(
+    x: torch.Tensor,
+    num_groups: int,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """
+    GroupNorm implemented in Triton.
+    x: [N, C, H, W], float32 CUDA
+    weight, bias: [C]
+    """
+    assert x.is_cuda and x.dtype == torch.float32
+    assert weight.is_cuda and bias.is_cuda
+    N, C, H, W = x.shape
+    assert C % num_groups == 0
+    group_size = C // num_groups
+
+    y = torch.empty_like(x)
+
+    BLOCK = 128  # power-of-2
+    grid = (N, num_groups)
+
+    group_norm_kernel[grid](
+        x, y, weight, bias,
+        N, C, H, W,
+        num_groups, group_size,
+        eps,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        y.stride(0), y.stride(1), y.stride(2), y.stride(3),
+        BLOCK=BLOCK,
+    )
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    ConvTranspose2d (PyTorch native) +
+    BatchNorm2d (PyTorch native) +
+    fused tanh + max-pooling (Triton) +
+    GroupNorm (Triton).
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, groups, num_groups):
+        super(ModelNew, self).__init__()
+        # ConvTranspose2d kept in PyTorch (index mapping is complex)
+        self.conv_transpose = nn.ConvTranspose2d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+        )
+        # BatchNorm stays in PyTorch to preserve training semantics
+        self.batch_norm = nn.BatchNorm2d(out_channels)
+        # GroupNorm parameters used by Triton kernel
+        self.group_norm = nn.GroupNorm(num_groups=num_groups, num_channels=out_channels)
+
+    def forward(self, x):
+        # ConvTranspose2d (PyTorch)
+        x = self.conv_transpose(x)
+        # BatchNorm2d (PyTorch)
+        x = self.batch_norm(x)
+        # Fused tanh + maxpool in Triton
+        x = tanh_maxpool2d_triton(x)
+        # GroupNorm in Triton, using the module's parameters
+        x = group_norm_triton(
+            x,
+            num_groups=self.group_norm.num_groups,
+            weight=self.group_norm.weight,
+            bias=self.group_norm.bias,
+            eps=self.group_norm.eps,
+        )
+        return x
+```

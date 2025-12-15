@@ -1,0 +1,5 @@
+{
+  "critical_issue": "LayerNorm is computed over the channel dimension [C] in Triton, but PyTorch's LayerNorm(out_channels) normalizes over the last dimension (W'), causing mismatched statistics and outputs.",
+  "why_it_matters": "Different normalization axes produce different means/variances for each element so the affine, GELU, and scaling operate on incompatible activations, leading to large absolute and relative output errors in comparison tests.",
+  "minimal_fix_hint": "Change Triton kernel (and parameter indexing) to perform LayerNorm over the same last dimension as PyTorch LayerNorm, not across the channel dimension."
+}

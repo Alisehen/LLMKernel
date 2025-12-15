@@ -1,0 +1,326 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU
+GPU Name: 4090
+Architecture: Ada Lovelace
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+[OPTIMIZATION STAGE]f
+
+## Current Optimization Stage
+
+Focus: BLOCK_SIZE with register pressure awareness.
+
+Key Principle:
+- Fusion increases register usage (intermediates stay in registers)
+- Spill to local memory kills fusion benefit
+
+Register Pressure Signals (from NCU):
+- launch__registers_per_thread > 128 → likely spilling
+- launch__occupancy_limit_registers < other limits → register-bound
+
+Rules:
+- Start conservative: BLOCK_SIZE ∈ {256, 512} for element-wise
+- For matmul fusion: BLOCK_M/N ∈ {32, 64}, BLOCK_K ∈ {32}
+- If registers > 128: reduce BLOCK_* by half
+- Trade-off: recompute cheap ops (e.g., x*0.5) vs store intermediate
+
+When to Recompute vs Keep:
+- Keep: expensive ops (exp, log, div, sqrt)
+- Recompute: cheap ops (add, mul, max) if register pressure high
+- Example: `y = relu(x); z = y * scale` → keep y
+- Example: `y = x * 0.5; z = y + bias` → can recompute y if needed
+
+Autotune:
+- 2-3 BLOCK_SIZE configs, always include smaller fallback
+
+
+
+[CURRENT CODE]
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=8),
+    ],
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def _linear_bias_relu_kernel(
+    a_ptr,        # [M, K]
+    w_ptr,        # [N, K] (PyTorch Linear.weight, used as B[k, n] = w[n, k])
+    b_ptr,        # [N]
+    c_ptr,        # [M, N]
+    M, N, K,
+    stride_am, stride_ak,
+    stride_wk, stride_wn,  # note: w[k, n] -> w_ptr + k*stride_wk + n*stride_wn
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    w_ptrs = w_ptr + offs_k[:, None] * stride_wk + offs_n[None, :] * stride_wn
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k in range(0, K, BLOCK_K):
+        k_remaining = K - k
+        a = tl.load(
+            a_ptrs,
+            mask=(offs_m[:, None] < M) & (offs_k[None, :] < k_remaining),
+            other=0.0,
+        )
+        w = tl.load(
+            w_ptrs,
+            mask=(offs_k[:, None] < k_remaining) & (offs_n[None, :] < N),
+            other=0.0,
+        )
+        acc += tl.dot(a, w, allow_tf32=True)
+        a_ptrs += BLOCK_K * stride_ak
+        w_ptrs += BLOCK_K * stride_wk
+
+    # Add bias
+    bias = tl.load(b_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc = acc + bias[None, :]
+
+    # ReLU
+    acc = tl.maximum(acc, 0.0)
+
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    tl.store(
+        c_ptrs,
+        acc,
+        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+    )
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=8),
+    ],
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def _linear_bias_kernel(
+    a_ptr,        # [M, K]
+    w_ptr,        # [N, K] (PyTorch Linear.weight, used as B[k, n] = w[n, k])
+    b_ptr,        # [N]
+    c_ptr,        # [M, N]
+    M, N, K,
+    stride_am, stride_ak,
+    stride_wk, stride_wn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    w_ptrs = w_ptr + offs_k[:, None] * stride_wk + offs_n[None, :] * stride_wn
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k in range(0, K, BLOCK_K):
+        k_remaining = K - k
+        a = tl.load(
+            a_ptrs,
+            mask=(offs_m[:, None] < M) & (offs_k[None, :] < k_remaining),
+            other=0.0,
+        )
+        w = tl.load(
+            w_ptrs,
+            mask=(offs_k[:, None] < k_remaining) & (offs_n[None, :] < N),
+            other=0.0,
+        )
+        acc += tl.dot(a, w, allow_tf32=True)
+        a_ptrs += BLOCK_K * stride_ak
+        w_ptrs += BLOCK_K * stride_wk
+
+    # Add bias
+    bias = tl.load(b_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc = acc + bias[None, :]
+
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    tl.store(
+        c_ptrs,
+        acc,
+        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+    )
+
+
+def fused_linear_relu_triton(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    x:      [M, K]
+    weight: [N, K] (PyTorch Linear.weight)
+    bias:   [N]
+    returns: [M, N] with ReLU
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+    M, K = x.shape
+    N = weight.shape[0]
+    out = torch.empty((M, N), device=x.device, dtype=torch.float32)
+
+    stride_am, stride_ak = x.stride()
+    # Interpret weight as B[k, n] = weight[n, k]
+    stride_wn = weight.stride(0)
+    stride_wk = weight.stride(1)
+
+    stride_cm, stride_cn = out.stride()
+
+    grid = lambda META: (
+        triton.cdiv(M, META['BLOCK_M']),
+        triton.cdiv(N, META['BLOCK_N']),
+    )
+
+    _linear_bias_relu_kernel[grid](
+        x, weight, bias, out,
+        M, N, K,
+        stride_am, stride_ak,
+        stride_wk, stride_wn,
+        stride_cm, stride_cn,
+    )
+    return out
+
+
+def linear_triton(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    x:      [M, K]
+    weight: [N, K] (PyTorch Linear.weight)
+    bias:   [N]
+    returns: [M, N]
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+    M, K = x.shape
+    N = weight.shape[0]
+    out = torch.empty((M, N), device=x.device, dtype=torch.float32)
+
+    stride_am, stride_ak = x.stride()
+    stride_wn = weight.stride(0)
+    stride_wk = weight.stride(1)
+    stride_cm, stride_cn = out.stride()
+
+    grid = lambda META: (
+        triton.cdiv(M, META['BLOCK_M']),
+        triton.cdiv(N, META['BLOCK_N']),
+    )
+
+    _linear_bias_kernel[grid](
+        x, weight, bias, out,
+        M, N, K,
+        stride_am, stride_ak,
+        stride_wk, stride_wn,
+        stride_cm, stride_cn,
+    )
+    return out
+
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, layer_sizes, output_size):
+        """
+        :param input_size: The number of input features
+        :param layer_sizes: A list of ints containing the sizes of each hidden layer
+        :param output_size: The number of output features
+        """
+        super(ModelNew, self).__init__()
+
+        # Build the same structure as the original Model for state_dict compatibility:
+        # [Linear, ReLU, Linear, ReLU, ..., Linear]
+        layers = []
+        current_input_size = input_size
+        for layer_size in layer_sizes:
+            layers.append(nn.Linear(current_input_size, layer_size))
+            layers.append(nn.ReLU())
+            current_input_size = layer_size
+        layers.append(nn.Linear(current_input_size, output_size))
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        :param x: The input tensor, shape (batch_size, input_size)
+        :return: The output tensor, shape (batch_size, output_size)
+        """
+        # Fallback to original PyTorch behavior on CPU (Triton requires CUDA)
+        if not x.is_cuda:
+            return self.network(x)
+
+        # Hidden layers: fuse Linear + ReLU using Triton
+        num_layers = len(self.network)
+        # Pattern: even indices (0, 2, ..., num_layers-3) are Linear with ReLU after them
+        for idx in range(0, num_layers - 1, 2):
+            linear = self.network[idx]
+            x = fused_linear_relu_triton(x, linear.weight, linear.bias)
+
+        # Final Linear layer (no ReLU)
+        final_linear = self.network[-1]
+        x = linear_triton(x, final_linear.weight, final_linear.bias)
+        return x
+```
+
+[NCU PROFILING METRICS]
+{
+  "_linear_bias_relu_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 37.7,
+    "launch__grid_size": 256,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 31.79,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 88.7,
+    "lts__t_sector_hit_rate.pct": 66.48
+  },
+  "_linear_bias_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 36.97,
+    "launch__grid_size": 256,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 16.06,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 87.25,
+    "lts__t_sector_hit_rate.pct": 74.66
+  }
+}
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+TRITON API CONSTRAINTS (CRITICAL):
+- Triton has NO: tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

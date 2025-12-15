@@ -1,0 +1,5 @@
+{
+  "critical_issue": "ModelNew uses standalone `weight` and `conv_bias` parameters instead of `conv.weight` and `conv.bias`, so its state_dict doesn’t align with the reference Conv2d module.",
+  "why_it_matters": "The harness can’t copy Conv2d weights/bias from the reference model into ModelNew, leaving different random convolution parameters and causing large output mismatches despite correct kernel math.",
+  "minimal_fix_hint": "Make ModelNew expose a `conv` module (nn.Conv2d) or parameters named `conv.weight` and `conv.bias` so state_dict loading matches the reference model."
+}

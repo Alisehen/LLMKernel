@@ -1,0 +1,251 @@
+You are a Triton kernel debugging expert. Analyze the error and identify the root cause.
+
+## ERROR LOG
+```
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 626, in compare_and_bench
+    raise ValueError(
+ValueError: Outputs are not close (atol=0.001, rtol=0.01). max_abs_err=1.496e+00, mean_abs_err=1.990e-01
+```
+
+## Expected Behavior (PyTorch Reference)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs a 3D transposed convolution, followed by a sum, layer normalization, average pooling, and GELU activation.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, sum_weight, norm_shape, pool_kernel_size):
+        super(Model, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, output_padding=output_padding)
+        self.sum_weight = nn.Parameter(torch.tensor(sum_weight))
+        self.norm = nn.LayerNorm(norm_shape)
+        self.avg_pool = nn.AvgPool3d(kernel_size=pool_kernel_size)
+        self.gelu = nn.GELU()
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = x + self.sum_weight
+        x = self.norm(x)
+        x = self.avg_pool(x)
+        x = self.gelu(x)
+        return x
+
+batch_size = 32
+in_channels = 32
+out_channels = 64
+depth, height, width = 16, 32, 32
+kernel_size = (3, 3, 3)
+stride = (2, 2, 2)
+padding = (1, 1, 1)
+output_padding = (1, 1, 1)
+sum_weight = 1.0
+norm_shape = (out_channels,)
+pool_kernel_size = (2, 2, 2)
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, depth, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, stride, padding, output_padding, sum_weight, norm_shape, pool_kernel_size]
+```
+
+## Current Implementation (Broken Triton Kernel)
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def add_layernorm_lastdim_kernel(
+    x_ptr,            # [rows * width]
+    ln_weight_ptr,    # [width]
+    ln_bias_ptr,      # [width]
+    sum_weight_ptr,   # scalar parameter
+    out_ptr,          # [rows * width]
+    rows,             # number of rows = N * C * D * H
+    width,            # normalization dimension (last dim size)
+    inv_width,        # 1.0 / width (float)
+    eps,              # layernorm epsilon (float)
+    BLOCK_W: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs_w = tl.arange(0, BLOCK_W)
+
+    # Compute base index for this row
+    row_start = pid * width
+    ptrs = x_ptr + row_start + offs_w
+
+    # Masks
+    row_mask = pid < rows
+    col_mask = offs_w < width
+    mask = row_mask & col_mask
+
+    # Load input row
+    x = tl.load(ptrs, mask=mask, other=0.0)
+
+    # Load scalar sum_weight
+    sum_weight = tl.load(sum_weight_ptr)
+    x = x + sum_weight
+
+    # Compute mean/var in fp32 for stability
+    x_f32 = x.to(tl.float32)
+    mean = tl.sum(x_f32, axis=0) * inv_width
+    diff = x_f32 - mean
+    var = tl.sum(diff * diff, axis=0) * inv_width
+    inv_std = tl.rsqrt(var + eps)
+
+    # Load LayerNorm affine parameters
+    gamma = tl.load(ln_weight_ptr + offs_w, mask=col_mask, other=1.0)
+    beta = tl.load(ln_bias_ptr + offs_w, mask=col_mask, other=0.0)
+    gamma = gamma.to(tl.float32)
+    beta = beta.to(tl.float32)
+
+    # Normalize and apply affine
+    y = diff * inv_std
+    y = y * gamma + beta
+
+    # Cast back to input dtype (assume fp32 here, but this keeps API generic)
+    y = y.to(x.dtype)
+
+    # Store result
+    tl.store(out_ptr + row_start + offs_w, y, mask=mask)
+
+
+def fused_add_layernorm_lastdim(x: torch.Tensor,
+                                sum_weight: torch.Tensor,
+                                ln_module: nn.LayerNorm) -> torch.Tensor:
+    """
+    x: [N, C, D, H, W] (contiguous or not; will be made contiguous)
+    LayerNorm is applied over the last dimension (W), matching nn.LayerNorm(normalized_shape=(W,))
+    and fused with adding scalar sum_weight.
+    """
+    assert x.dim() == 5, "Expected 5D input [N, C, D, H, W]"
+    N, C, D, H, W = x.shape
+
+    # LayerNorm as defined in the original model uses normalized_shape=(out_channels,)
+    # which, for this model, matches the last dimension size (W_out).
+    assert ln_module.normalized_shape == (W,), (
+        f"LayerNorm normalized_shape {ln_module.normalized_shape} must match last dim {W}"
+    )
+
+    # Ensure memory is contiguous and flatten first 4 dims
+    x_contig = x.contiguous()
+    rows = N * C * D * H
+    x_2d = x_contig.view(rows, W)
+
+    out_2d = torch.empty_like(x_2d)
+
+    ln_weight = ln_module.weight
+    ln_bias = ln_module.bias
+    eps = ln_module.eps
+
+    # Kernel configuration
+    BLOCK_W = 128  # power-of-2, >= typical W (e.g., 64 in the given configuration)
+    if W > BLOCK_W:
+        raise ValueError(
+            f"Normalized dimension W={W} exceeds BLOCK_W={BLOCK_W}; "
+            "increase BLOCK_W in the kernel for larger widths."
+        )
+
+    inv_width = 1.0 / float(W)
+
+    grid = lambda META: (rows,)
+
+    add_layernorm_lastdim_kernel[grid](
+        x_2d,
+        ln_weight,
+        ln_bias,
+        sum_weight,
+        out_2d,
+        rows,
+        W,
+        inv_width,
+        eps,
+        BLOCK_W=BLOCK_W,
+    )
+
+    return out_2d.view(N, C, D, H, W)
+
+
+class ModelNew(nn.Module):
+    """
+    Model that performs a 3D transposed convolution, followed by a fused
+    (add scalar + LayerNorm over last dim), then average pooling and GELU.
+
+    The fused Triton kernel replaces:
+        x = x + self.sum_weight
+        x = self.norm(x)
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size, stride,
+                 padding, output_padding, sum_weight, norm_shape, pool_kernel_size):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            output_padding=output_padding,
+        )
+
+        # Scalar parameter for the sum
+        self.sum_weight = nn.Parameter(torch.tensor(sum_weight))
+
+        # LayerNorm as in the original model
+        self.norm = nn.LayerNorm(norm_shape)
+
+        # Remaining PyTorch ops
+        self.avg_pool = nn.AvgPool3d(kernel_size=pool_kernel_size)
+        self.gelu = nn.GELU()
+
+    def forward(self, x):
+        # x: [N, C_in, D, H, W]
+        x = self.conv_transpose(x)  # [N, C_out, D_out, H_out, W_out]
+
+        # Fused: add scalar + LayerNorm over last dim (matching original LayerNorm behavior)
+        x = fused_add_layernorm_lastdim(x, self.sum_weight, self.norm)
+
+        x = self.avg_pool(x)
+        x = self.gelu(x)
+        return x
+```
+
+---
+
+## Your Task
+
+Identify the **single most critical issue** that causes the error above.
+
+### Analysis Guidelines
+
+1. **Focus on root cause**, not symptoms
+   - Bad: "Output is wrong"
+   - Good: "BLOCK_K loop missing, only processes first 32 elements of K dimension"
+
+2. **Be specific about WHAT and WHERE**
+   - Bad: "Memory access issue"
+   - Good: "Line 45: tl.atomic_add(c_block_ptr, acc) - atomic_add requires scalar pointer, not block_ptr"
+
+3. **Prioritize by impact**
+   - Correctness bugs > Performance issues > Style problems
+   - Algorithm errors > Implementation details
+
+### Output Format
+
+**CRITICAL: You MUST output ONLY valid JSON. No other text allowed.**
+
+```json
+{
+  "critical_issue": "<Concise description of THE root cause, max 30 words>",
+  "why_it_matters": "<Why this causes the observed error, max 35 words>",
+  "minimal_fix_hint": "<What needs to change (not how), max 30 words>"
+}
+```
+
+**Remember**: Output ONLY the JSON block. No explanations, no commentary, no additional text.

@@ -1,0 +1,234 @@
+Fix the Triton kernel errors. Generate correct, high-performance code.
+
+Current Error Log:
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 538, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251214_114735_batch_range56to80_deepseek_deepseek/63_Gemm_ReLU_Divide/code/kernel_20251214_170550.py", line 152, in forward
+    return fused_linear_relu_div(x, self.weight, self.bias, self.divisor)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251214_114735_batch_range56to80_deepseek_deepseek/63_Gemm_ReLU_Divide/code/kernel_20251214_170550.py", line 132, in fused_linear_relu_div
+    fused_linear_relu_div_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 347, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 192, in run
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 192, in <dictcomp>
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 170, in _bench
+    return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/testing.py", line 145, in do_bench
+    fn()
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 156, in kernel_call
+    self.fn.run(
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 569, in run
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 278, in compile
+    module = src.make_ir(options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 81, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 61:17:
+
+    # Pre-compute masks for boundary conditions
+    k_tile_mask = (offs_k_base + offs_k[None, :]) < K
+    m_mask = offs_m[:, None] < M
+    n_mask = offs_n[None, :] < N
+
+    # Loop over K dimension with split-K optimization
+    k_iters = tl.cdiv(K, BLOCK_K * SPLIT_K)
+    for k in range(k_iters):
+        # Load blocks with pre-computed masks
+        a_mask = m_mask & k_tile_mask
+        b_mask = k_tile_mask[:, None] & n_mask
+                 ^
+ValueError('Cannot make_shape_compatible: incompatible dimensions at index 2: 64 and 256')
+
+Main Critical Problem Analysis:
+
+
+Broken Code:
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=8),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=5, num_warps=8),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=8),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=5, num_warps=8),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 512, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=16),
+    ],
+    key=['M', 'N', 'K']
+)
+@triton.jit
+def fused_linear_relu_div_kernel(
+    # Pointers to matrices
+    a_ptr, b_ptr, bias_ptr, c_ptr,
+    # Matrix dimensions
+    M, N, K,
+    # Strides
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    # Operation parameters
+    reciprocal,
+    use_bias: tl.constexpr,
+    # Block sizes
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+    # New parameters for optimization
+    SPLIT_K: tl.constexpr = 1,
+):
+    # Program IDs
+    pid = tl.program_id(axis=0)
+    pid_k = tl.program_id(axis=1) if SPLIT_K > 1 else 0
+    
+    # Number of program ids in M dimension
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    
+    # Grouped ordering for better L2 cache hit rate
+    num_pid_in_group = GROUP_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
+    
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+    
+    # Create offset pointers with padding handling
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k_base = pid_k * (K // SPLIT_K)
+    offs_k = tl.arange(0, BLOCK_K)
+    
+    # Create block pointers for A and B with pre-computed strides
+    a_ptrs = a_ptr + (offs_m[:, None] * stride_am + (offs_k_base + offs_k[None, :]) * stride_ak)
+    b_ptrs = b_ptr + ((offs_k_base + offs_k[:, None]) * stride_bk + offs_n[None, :] * stride_bn)
+    
+    # Initialize accumulator - use float32 for TF32 accumulation
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    # Pre-compute masks for boundary conditions
+    k_tile_mask = (offs_k_base + offs_k[None, :]) < K
+    m_mask = offs_m[:, None] < M
+    n_mask = offs_n[None, :] < N
+    
+    # Loop over K dimension with split-K optimization
+    k_iters = tl.cdiv(K, BLOCK_K * SPLIT_K)
+    for k in range(k_iters):
+        # Load blocks with pre-computed masks
+        a_mask = m_mask & k_tile_mask
+        b_mask = k_tile_mask[:, None] & n_mask
+        
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+        
+        # Accumulate using dot product with TF32 precision
+        acc += tl.dot(a, b, allow_tf32=True)
+        
+        # Move pointers to next K block
+        a_ptrs += BLOCK_K * stride_ak * SPLIT_K
+        b_ptrs += BLOCK_K * stride_bk * SPLIT_K
+        k_tile_mask = (offs_k_base + offs_k[None, :] + (k + 1) * BLOCK_K * SPLIT_K) < K
+    
+    # Apply bias if needed (broadcast across M dimension)
+    if use_bias:
+        bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+        acc += bias[None, :]
+    
+    # Apply ReLU: max(0, x) - fused with multiplication
+    acc = tl.maximum(acc, 0.0) * reciprocal
+    
+    # Store output with pre-computed mask
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    mask = m_mask & n_mask
+    tl.store(c_ptrs, acc, mask=mask)
+
+def fused_linear_relu_div(x, weight, bias, divisor):
+    # Check input dimensions
+    M, K = x.shape
+    N = weight.shape[0]
+    
+    # Ensure inputs are contiguous with optimal memory layout
+    x = x.contiguous()
+    weight_t = weight.t().contiguous()
+    
+    # Prepare output tensor
+    c = torch.empty((M, N), device=x.device, dtype=x.dtype)
+    
+    # Compute reciprocal to replace division with multiplication
+    reciprocal = 1.0 / divisor
+    
+    # Determine USE_BIAS flag
+    use_bias = bias is not None
+    
+    # Handle bias pointer - pass None if not using bias
+    bias_ptr = bias if bias is not None else torch.empty(0, device=x.device, dtype=x.dtype)
+    
+    # Grid calculation with split-K dimension
+    def grid(META):
+        total_blocks = triton.cdiv(M, META['BLOCK_M']) * triton.cdiv(N, META['BLOCK_N'])
+        split_k = min(4, triton.cdiv(K, META['BLOCK_K'] * 4)) if K >= 4096 else 1
+        return (total_blocks, split_k)
+    
+    # Launch kernel with autotuner
+    fused_linear_relu_div_kernel[grid](
+        x, weight_t, bias_ptr, c,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        weight_t.stride(0), weight_t.stride(1),
+        c.stride(0), c.stride(1),
+        reciprocal,
+        use_bias=use_bias,
+    )
+    
+    return c
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, divisor):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.randn(out_features, in_features) * 0.02)
+        self.bias = nn.Parameter(torch.zeros(out_features))
+        self.divisor = divisor
+    
+    def forward(self, x):
+        return fused_linear_relu_div(x, self.weight, self.bias, self.divisor)
+```
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl, AND any other modules used (e.g., import math if using math.sqrt)
+   2. @triton.jit decorated kernel function(s) — NO continue/break/return inside loops (use masking)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels — THIS CLASS IS REQUIRED
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+3. Learn from previous repair attempts to avoid repeating the same mistakes
+4. Ensure ALL imports are included at the top (common mistake: forgetting `import math`)
+
+```python
+# <corrected code>
+```

@@ -1,0 +1,5 @@
+{
+  "critical_issue": "Kernel normalizes along last dimension W, but reference LayerNorm uses norm_shape=(out_channels,) and should normalize along channel dimension C_out instead.",
+  "why_it_matters": "This mismatched normalization axis changes computed means, variances, and affine transforms for each element, so outputs after LayerNorm, pooling, and GELU diverge significantly from the PyTorch reference.",
+  "minimal_fix_hint": "Rework flattening and indexing so the Triton kernel computes mean/variance and applies gamma/beta across channel dimension C_out, matching nn.LayerNorm(norm_shape=(out_channels,))."
+}

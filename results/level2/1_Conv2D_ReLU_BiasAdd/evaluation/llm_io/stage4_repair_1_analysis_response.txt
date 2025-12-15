@@ -1,0 +1,5 @@
+{
+  "critical_issue": "tl.multiple_of is called with a non-constexpr alignment (BLOCK_N * stride_w_oc), which isn’t allowed inside the Triton kernel.",
+  "why_it_matters": "This misuse forces multiple_of to execute outside JIT builder context, so _builder is None and Triton raises the misleading @triton.jit error.",
+  "minimal_fix_hint": "Remove these tl.multiple_of calls or pass a compile-time constant alignment (e.g., BLOCK_N), not expressions involving runtime strides."
+}

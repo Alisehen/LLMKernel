@@ -1,0 +1,312 @@
+Fix the Triton kernel errors. Generate correct, high-performance code.
+
+Current Error Log:
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 538, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251215_024803_batch_range31to55_openai_deepseek/55_Matmul_MaxPool_Sum_Scale/code/kernel_20251215_061717.py", line 222, in forward
+    return fused_linear_maxpool_sum_scale(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251215_024803_batch_range31to55_openai_deepseek/55_Matmul_MaxPool_Sum_Scale/code/kernel_20251215_061717.py", line 177, in fused_linear_maxpool_sum_scale
+    linear_maxpool_sum_scale_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 347, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 192, in run
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 192, in <dictcomp>
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 170, in _bench
+    return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/testing.py", line 145, in do_bench
+    fn()
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 156, in kernel_call
+    self.fn.run(
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 569, in run
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 278, in compile
+    module = src.make_ir(options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 81, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 78:21:
+    # Fused bias add
+    bias = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0)
+    acc += bias[None, :]
+
+    # Row-wise accumulation of MaxPool1d(kernel=2,stride=2) over N, then sum.
+    # We keep the entire reduction in registers and only write the final result.
+    row_partial = tl.zeros((BLOCK_M,), dtype=tl.float32)
+
+    # BLOCK_N is even in all configs; process local pairs (0,1), (2,3), ...
+    for j in range(0, BLOCK_N, 2):
+        # Valid pair only if both global columns are in range
+        pair_valid = mask_n[j] & mask_n[j + 1]
+                     ^
+ValueError('Did you forget to add @triton.jit ? (`_builder` argument must be provided outside of JIT functions.)')
+
+Main Critical Problem Analysis:
+Problem Analysis (from expert diagnosis):
+critical_issue: The Python loop `for j in range(0, BLOCK_N, 2)` causes `mask_n[j]` to execute outside Triton’s JIT, so tensor indexing runs without a builder.
+why_it_matters: When the loop is executed by Python, Triton tensors are indexed in normal Python code, which lacks an active IR builder and triggers the `_builder` / `@triton.jit` ValueError during compilation.
+minimal_fix_hint: Avoid Python scalar loops over BLOCK_N; use Triton-vectorized indexing (tl.arange-based pair indices) so all tensor operations remain inside the JIT-compiled Triton IR.
+
+Focus your fix on addressing the identified critical issue.
+
+
+Broken Code:
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        # High-throughput configs; BLOCK_N is even to respect pair structure
+        triton.Config(
+            {
+                "BLOCK_M": 64,
+                "BLOCK_N": 128,
+                "BLOCK_K": 32,
+                "GROUP_M": 8,
+            },
+            num_warps=4,
+            num_stages=3,
+        ),
+        triton.Config(
+            {
+                "BLOCK_M": 128,
+                "BLOCK_N": 64,
+                "BLOCK_K": 32,
+                "GROUP_M": 8,
+            },
+            num_warps=4,
+            num_stages=3,
+        ),
+        triton.Config(
+            {
+                "BLOCK_M": 128,
+                "BLOCK_N": 128,
+                "BLOCK_K": 32,
+                "GROUP_M": 4,
+            },
+            num_warps=8,
+            num_stages=3,
+        ),
+        # Safe fallback with lower register pressure
+        triton.Config(
+            {
+                "BLOCK_M": 64,
+                "BLOCK_N": 64,
+                "BLOCK_K": 32,
+                "GROUP_M": 8,
+            },
+            num_warps=4,
+            num_stages=2,
+        ),
+    ],
+    key=["M", "N", "K"],
+)
+@triton.jit
+def linear_maxpool_sum_scale_kernel(
+    a_ptr,        # [M, K] input
+    w_ptr,        # [N, K] weight (same layout as nn.Linear.weight)
+    bias_ptr,     # [N]    bias
+    out_ptr,      # [M]    output (row-wise pooled + summed + scaled)
+    M, N, K,
+    stride_am, stride_ak,
+    stride_wn, stride_wk,
+    stride_outm,
+    scale,        # float32
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,  # must be even
+    BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+
+    # 2D tiling over M and N, grouped by M to improve L2 locality
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+
+    num_pid_in_group = GROUP_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_M
+
+    group_size_m = tl.minimum(num_pid_m - first_pid_m, GROUP_M)
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    # Row and column indices for this tile
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+
+    # Accumulator for GEMM tile in fp32
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Pointers for current K-slice
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    # w_ptr is [N, K]: index as w[n, k]
+    w_ptrs = w_ptr + offs_n[None, :] * stride_wn + offs_k[:, None] * stride_wk
+
+    # GEMM K-loop
+    for k in range(0, K, BLOCK_K):
+        k_rem = K - k
+        k_mask = offs_k < k_rem
+
+        a = tl.load(
+            a_ptrs,
+            mask=mask_m[:, None] & k_mask[None, :],
+            other=0.0,
+        )
+        b = tl.load(
+            w_ptrs,
+            mask=k_mask[:, None] & mask_n[None, :],
+            other=0.0,
+        )
+
+        acc += tl.dot(a, b, allow_tf32=True)
+
+        a_ptrs += BLOCK_K * stride_ak
+        w_ptrs += BLOCK_K * stride_wk
+
+    # Fused bias add
+    bias = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0)
+    acc += bias[None, :]
+
+    # Row-wise accumulation of MaxPool1d(kernel=2,stride=2) over N, then sum.
+    # We keep the entire reduction in registers and only write the final result.
+    row_partial = tl.zeros((BLOCK_M,), dtype=tl.float32)
+
+    # BLOCK_N is even in all configs; process local pairs (0,1), (2,3), ...
+    for j in range(0, BLOCK_N, 2):
+        # Valid pair only if both global columns are in range
+        pair_valid = mask_n[j] & mask_n[j + 1]
+        # Broadcast pair_valid across rows and apply row mask
+        mask_vec = mask_m & pair_valid
+
+        col0 = acc[:, j]
+        col1 = acc[:, j + 1]
+        vmax = tl.maximum(col0, col1)
+        vmax = tl.where(mask_vec, vmax, 0.0)
+        row_partial += vmax
+
+    # Scale and atomically accumulate into global output buffer.
+    # Multiple CTAs contribute different N-tiles for the same rows.
+    row_partial *= scale
+    out_ptrs = out_ptr + offs_m * stride_outm
+    tl.atomic_add(out_ptrs, row_partial, mask=mask_m)
+
+
+def fused_linear_maxpool_sum_scale(x: torch.Tensor,
+                                   weight: torch.Tensor,
+                                   bias: torch.Tensor,
+                                   scale: float) -> torch.Tensor:
+    """
+    Fused operation:
+      y = x @ weight.T + bias                  # [M, N]
+      z = MaxPool1d(kernel_size=2, stride=2)   # along last dim of y
+      out = scale * z.sum(dim=-1)              # [M]
+
+    x:      [M, K]
+    weight: [N, K] (same as nn.Linear.weight)
+    bias:   [N]
+    scale:  float
+    returns: [M]
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+    M, K = x.shape
+    N, Kw = weight.shape
+    assert Kw == K, "in_features mismatch"
+    assert bias.shape[0] == N, "bias/out_features mismatch"
+
+    # Output is accumulated in fp32 for stability and atomic support
+    out_fp32 = torch.zeros((M,), device=x.device, dtype=torch.float32)
+
+    def grid(meta):
+        return (triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]),)
+
+    linear_maxpool_sum_scale_kernel[grid](
+        x,
+        weight,
+        bias,
+        out_fp32,
+        M,
+        N,
+        K,
+        x.stride(0),
+        x.stride(1),
+        weight.stride(0),
+        weight.stride(1),
+        out_fp32.stride(0),
+        float(scale),
+    )
+
+    # Match input dtype on return
+    return out_fp32.to(x.dtype)
+
+
+class ModelNew(nn.Module):
+    """
+    Fused model:
+      - Linear: x @ W^T + b
+      - MaxPool1d(kernel_size=2, stride=2) over features
+      - Sum over pooled positions
+      - Scale by a factor
+
+    Implemented as a single high-performance Triton kernel to
+    eliminate intermediate global-memory stores.
+    """
+    def __init__(self, in_features, out_features, kernel_size, scale_factor):
+        super(ModelNew, self).__init__()
+        assert kernel_size == 2, "This implementation assumes kernel_size=2"
+        self.in_features = in_features
+        self.out_features = out_features
+        self.scale_factor = float(scale_factor)
+
+        # Same layout as nn.Linear
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.bias = nn.Parameter(torch.randn(out_features))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        assert x.is_cuda, "Input must be a CUDA tensor for Triton kernels"
+        # x: [B, in_features] => output: [B]
+        return fused_linear_maxpool_sum_scale(
+            x, self.weight, self.bias, self.scale_factor
+        )
+```
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl, AND any other modules used (e.g., import math if using math.sqrt)
+   2. @triton.jit decorated kernel function(s) — NO continue/break/return inside loops (use masking)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels — THIS CLASS IS REQUIRED
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+3. Learn from previous repair attempts to avoid repeating the same mistakes
+4. Ensure ALL imports are included at the top (common mistake: forgetting `import math`)
+
+```python
+# <corrected code>
+```

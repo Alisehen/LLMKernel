@@ -1,0 +1,327 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+# ----------------------------- CONV2D KERNEL -----------------------------
+
+
+@triton.autotune(
+    configs=[
+        # Baseline (conservative)
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+        # More warps for better latency hiding on compute-bound conv
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 32},
+            num_warps=8,
+            num_stages=2,
+        ),
+        # Aggressive: more warps + more stages if registers allow
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 32},
+            num_warps=8,
+            num_stages=3,
+        ),
+    ],
+    key=['N', 'C_out', 'H_out', 'W_out'],
+)
+@triton.jit
+def conv2d_forward_kernel(
+    x_ptr, w_ptr, b_ptr, y_ptr,
+    N, H, W, H_out, W_out, C_out,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_wn, stride_wc, stride_wh, stride_ww,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    C_IN: tl.constexpr, K: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    # pid_m: flattened output positions (n, oh, ow)
+    # pid_n: output channels
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    P = N * H_out * W_out
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    mask_m = offs_m < P
+    mask_n = offs_n < C_out
+
+    # Decode flattened index -> (n, oh, ow)
+    HW_out = H_out * W_out
+    n_idx = offs_m // HW_out
+    rem = offs_m % HW_out
+    oh_idx = rem // W_out
+    ow_idx = rem % W_out
+
+    # Accumulator in fp32
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Convolution: sum over input channels and kernel window
+    for ic in tl.static_range(0, C_IN):
+        for kh in tl.static_range(0, K):
+            ih = oh_idx + kh  # [BLOCK_M]
+            for kw in tl.static_range(0, K):
+                iw = ow_idx + kw  # [BLOCK_M]
+
+                # Input pointers: shape [BLOCK_M]
+                x_offsets = (
+                    n_idx * stride_xn
+                    + ic * stride_xc
+                    + ih * stride_xh
+                    + iw * stride_xw
+                )
+                x_ptrs = x_ptr + x_offsets
+                x_vals = tl.load(x_ptrs, mask=mask_m, other=0.0).to(tl.float32)
+
+                # Weight pointers: shape [BLOCK_N]
+                w_offsets = (
+                    offs_n * stride_wn
+                    + ic * stride_wc
+                    + kh * stride_wh
+                    + kw * stride_ww
+                )
+                w_ptrs = w_ptr + w_offsets
+                w_vals = tl.load(w_ptrs, mask=mask_n, other=0.0).to(tl.float32)
+
+                # Outer product update
+                acc += x_vals[:, None] * w_vals[None, :]
+
+    # Add bias (fused)
+    bias_vals = tl.load(b_ptr + offs_n, mask=mask_n, other=0.0).to(tl.float32)
+    acc += bias_vals[None, :]
+
+    # Store result
+    y_ptrs = (
+        y_ptr
+        + n_idx[:, None] * stride_yn
+        + offs_n[None, :] * stride_yc
+        + oh_idx[:, None] * stride_yh
+        + ow_idx[:, None] * stride_yw
+    )
+    out_mask = mask_m[:, None] & mask_n[None, :]
+    tl.store(y_ptrs, acc, mask=out_mask)
+
+
+# ---------------------- AVGPOOL + SIGMOID + SUM KERNEL ----------------------
+
+
+@triton.autotune(
+    configs=[
+        # Baseline (conservative)
+        triton.Config(
+            {'BLOCK_HW': 64, 'BLOCK_C': 4},
+            num_warps=4,
+            num_stages=2,
+        ),
+        # Extra pipeline stage to help hide global mem latency
+        triton.Config(
+            {'BLOCK_HW': 64, 'BLOCK_C': 4},
+            num_warps=4,
+            num_stages=3,
+        ),
+    ],
+    key=['N', 'H_out', 'W_out'],
+)
+@triton.jit
+def avgpool_sigmoid_sum_kernel(
+    x_ptr, out_ptr,
+    N, H_out, W_out, Hp, Wp,
+    total_hw,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    C_OUT: tl.constexpr, POOL_K: tl.constexpr,
+    BLOCK_HW: tl.constexpr, BLOCK_C: tl.constexpr,
+):
+    """
+    3D grid:
+      - pid_hw: tiles pooled H*W
+      - pid_c: tiles channels
+      - pid_n: batch index
+    """
+    pid_hw = tl.program_id(0)  # tile over pooled H*W
+    pid_c = tl.program_id(1)   # tile over channels
+    pid_n = tl.program_id(2)   # batch index
+
+    # Tiled pooled spatial indices
+    offs_hw = pid_hw * BLOCK_HW + tl.arange(0, BLOCK_HW)
+    hw_mask = offs_hw < total_hw
+
+    # Decode flattened pooled index -> (ohp, owp)
+    ohp = offs_hw // Wp
+    owp = offs_hw % Wp
+
+    # Base spatial indices in conv output
+    oh_base = ohp * POOL_K
+    ow_base = owp * POOL_K
+
+    # Tiled channels
+    offs_c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
+    c_mask = offs_c < C_OUT
+
+    # Mask shared by all ops
+    full_mask = hw_mask[:, None] & c_mask[None, :]
+
+    # Accumulate pooled values for this (n, tile_hw, tile_c)
+    acc = tl.zeros((BLOCK_HW, BLOCK_C), dtype=tl.float32)
+
+    for ph in tl.static_range(0, POOL_K):
+        ih = oh_base + ph  # [BLOCK_HW]
+        for pw in tl.static_range(0, POOL_K):
+            iw = ow_base + pw  # [BLOCK_HW]
+
+            x_offsets = (
+                pid_n * stride_xn
+                + offs_c[None, :] * stride_xc
+                + ih[:, None] * stride_xh
+                + iw[:, None] * stride_xw
+            )
+            x_vals = tl.load(
+                x_ptr + x_offsets,
+                mask=full_mask,
+                other=0.0,
+            ).to(tl.float32)
+            acc += x_vals
+
+    # Average pooling
+    pool_area = float(POOL_K * POOL_K)
+    acc = acc / pool_area
+
+    # Sigmoid: 1 / (1 + exp(-x))
+    neg = -acc
+    exp_neg = tl.exp(neg)
+    sig = 1.0 / (1.0 + exp_neg)
+
+    # Zero out inactive lanes (keeps atomics correct)
+    sig = sig * full_mask.to(sig.dtype)
+
+    # Reduce over tile (HW, C) -> scalar contribution for this (n)
+    tile_sum = tl.sum(sig, axis=0)
+    tile_sum = tl.sum(tile_sum, axis=0)
+
+    # Atomic add into output[n]
+    tl.atomic_add(out_ptr + pid_n, tile_sum)
+
+
+# ------------------------------- WRAPPERS -------------------------------
+
+
+def conv2d_triton(x, weight, bias, kernel_size: int):
+    """
+    x:      [N, C_in, H, W]
+    weight: [C_out, C_in, K, K]
+    bias:   [C_out]
+    """
+    assert x.ndim == 4
+    assert weight.ndim == 4
+    assert bias.ndim == 1
+    N, C_in, H, W = x.shape
+    C_out, C_in_w, K, K_w = weight.shape
+    assert C_in_w == C_in and K_w == kernel_size and K == kernel_size
+    assert bias.shape[0] == C_out
+
+    # Valid conv2d (stride=1, padding=0)
+    H_out = H - kernel_size + 1
+    W_out = W - kernel_size + 1
+    assert H_out > 0 and W_out > 0
+
+    x_contig = x.contiguous()
+    w_contig = weight.contiguous()
+    b_contig = bias.contiguous()
+
+    y = torch.empty((N, C_out, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    P = N * H_out * W_out
+
+    def grid(meta):
+        return (
+            triton.cdiv(P, meta['BLOCK_M']),
+            triton.cdiv(C_out, meta['BLOCK_N']),
+        )
+
+    conv2d_forward_kernel[grid](
+        x_contig, w_contig, b_contig, y,
+        N, H, W, H_out, W_out, C_out,
+        x_contig.stride(0), x_contig.stride(1),
+        x_contig.stride(2), x_contig.stride(3),
+        w_contig.stride(0), w_contig.stride(1),
+        w_contig.stride(2), w_contig.stride(3),
+        y.stride(0), y.stride(1), y.stride(2), y.stride(3),
+        C_IN=C_in, K=kernel_size,
+    )
+
+    return y
+
+
+def avgpool_sigmoid_sum_triton(conv_out, pool_kernel_size: int):
+    """
+    conv_out: [N, C_out, H_out, W_out]
+    Returns:  [N] (sum over channels and spatial dims of sigmoid(avg_pool(conv_out)))
+    """
+    assert conv_out.ndim == 4
+    N, C_out, H_out, W_out = conv_out.shape
+
+    stride = pool_kernel_size
+    Hp = (H_out - pool_kernel_size) // stride + 1
+    Wp = (W_out - pool_kernel_size) // stride + 1
+    assert Hp > 0 and Wp > 0
+
+    x_contig = conv_out.contiguous()
+
+    out = torch.zeros((N,), device=conv_out.device, dtype=conv_out.dtype)
+
+    total_hw = Hp * Wp
+
+    def grid(meta):
+        return (
+            triton.cdiv(total_hw, meta['BLOCK_HW']),  # pooled H*W tiles
+            triton.cdiv(C_out, meta['BLOCK_C']),      # channel tiles
+            N,                                        # batch
+        )
+
+    avgpool_sigmoid_sum_kernel[grid](
+        x_contig,
+        out,
+        N, H_out, W_out, Hp, Wp,
+        total_hw,
+        x_contig.stride(0), x_contig.stride(1),
+        x_contig.stride(2), x_contig.stride(3),
+        C_OUT=C_out,
+        POOL_K=pool_kernel_size,
+    )
+
+    return out
+
+
+# ------------------------------ MODEL CLASS ------------------------------
+
+
+class ModelNew(nn.Module):
+    """
+    Triton implementation of:
+      Conv2d -> AvgPool2d -> Sigmoid -> Sum over [C, H, W]
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size, pool_kernel_size):
+        super(ModelNew, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.pool_kernel_size = pool_kernel_size
+
+        # Match PyTorch Conv2d parameter shapes (bias enabled)
+        self.weight = nn.Parameter(
+            torch.randn(out_channels, in_channels, kernel_size, kernel_size)
+        )
+        self.bias = nn.Parameter(torch.randn(out_channels))
+
+    def forward(self, x):
+        # x: [N, C_in, H, W]
+        y_conv = conv2d_triton(x, self.weight, self.bias, self.kernel_size)
+        out = avgpool_sigmoid_sum_triton(y_conv, self.pool_kernel_size)
+        return out

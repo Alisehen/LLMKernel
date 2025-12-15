@@ -1,0 +1,5 @@
+{
+  "critical_issue": "GroupNorm variance in groupnorm_stats_kernel uses biased division by group_size instead of the unbiased division used by torch.nn.GroupNorm.",
+  "why_it_matters": "This systematically misestimates per-group variance, changing the normalization scale and causing consistent output deviations above the configured atol/rtol thresholds.",
+  "minimal_fix_hint": "Change the variance computation to use an unbiased estimator, i.e., divide by (group_size - 1) instead of group_size in groupnorm_stats_kernel."
+}

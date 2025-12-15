@@ -1,0 +1,312 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+import math
+
+
+@triton.jit
+def fused_post_ops_kernel_optimized(
+    # Pointers to tensors
+    x_ptr,
+    bias_ptr,
+    out_ptr,
+    # Tensor dimensions
+    N, C, D, H, W,
+    # Strides for x
+    stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
+    # Strides for output
+    stride_on, stride_oc, stride_od, stride_oh, stride_ow,
+    # Block dimensions
+    BLOCK_C: tl.constexpr,
+    BLOCK_DHW: tl.constexpr,
+    # Optimization parameters
+    REDUCE_VECTOR_WIDTH: tl.constexpr,
+    num_stages: tl.constexpr = 2,
+):
+    """
+    Optimized fused kernel for: LogSumExp over channels + HardSwish + Bias Subtract + Clamp
+    Input: [N, C, D, H, W]
+    Output: [N, 1, D, H, W]
+    Each program processes BLOCK_DHW spatial positions for one batch
+    
+    Key optimizations:
+    1. Vectorized reduction for better memory throughput
+    2. Optimized HardSwish using fast sigmoid approximation
+    3. Better occupancy with tuned block sizes
+    4. Minimized register pressure with smaller temporary arrays
+    """
+    # Batch index
+    pid_n = tl.program_id(0)
+    # Spatial block index (flattened D*H*W dimension)
+    pid_spatial = tl.program_id(1)
+    
+    if pid_n >= N:
+        return
+    
+    # Spatial indices within block
+    spatial_offsets = pid_spatial * BLOCK_DHW + tl.arange(0, BLOCK_DHW)
+    
+    # Calculate D, H, W indices from flattened spatial index
+    DHW = D * H * W
+    dhw_mask = spatial_offsets < DHW
+    
+    # Precompute spatial indices with fused divmod operations
+    hw = H * W
+    d_indices = spatial_offsets // hw
+    hw_remainder = spatial_offsets - d_indices * hw
+    h_indices = hw_remainder // W
+    w_indices = hw_remainder - h_indices * W
+    
+    # Channel indices - split into vectorized groups for better memory access
+    c_vec_offsets = tl.arange(0, REDUCE_VECTOR_WIDTH)
+    c_vec_mask = c_vec_offsets < REDUCE_VECTOR_WIDTH
+    
+    # Initialize accumulators - smaller arrays reduce register pressure
+    max_vals = tl.full([BLOCK_DHW], -float('inf'), dtype=tl.float32)
+    sum_exp_vals = tl.zeros([BLOCK_DHW], dtype=tl.float32)
+    
+    # Loop over channel blocks with vectorized loads
+    for c_block_start in range(0, C, BLOCK_C):
+        # Current channel block
+        c_base = c_block_start
+        
+        # Process multiple channels at once using vectorization
+        for c_vec_start in range(0, BLOCK_C, REDUCE_VECTOR_WIDTH):
+            c_vec_idx = c_base + c_vec_start + c_vec_offsets
+            c_vec_active = c_vec_mask & (c_vec_idx < C) & (c_vec_idx < c_block_start + BLOCK_C)
+            
+            # Load input values with vectorized access pattern
+            x_ptrs = (
+                x_ptr + 
+                pid_n * stride_xn + 
+                c_vec_idx[:, None] * stride_xc +
+                d_indices[None, :] * stride_xd +
+                h_indices[None, :] * stride_xh +
+                w_indices[None, :] * stride_xw
+            )
+            
+            # Vectorized load
+            x_vals = tl.load(
+                x_ptrs,
+                mask=c_vec_active[:, None] & dhw_mask[None, :],
+                other=-float('inf')  # Use -inf for masked values in max reduction
+            )
+            
+            # Update LogSumExp accumulators with vectorized operations
+            # Find max along channel dimension
+            local_max = tl.max(x_vals, axis=0)
+            
+            # Compute exponentials with numerical stability
+            exp_vals = tl.exp(x_vals - local_max[None, :])
+            
+            # Sum exponentials along channel dimension
+            local_sum_exp = tl.sum(exp_vals, axis=0)
+            
+            # Update global accumulators
+            new_max = tl.maximum(max_vals, local_max)
+            
+            # Scale previous accumulators
+            scale_prev = tl.exp(max_vals - new_max)
+            scale_curr = tl.exp(local_max - new_max)
+            
+            sum_exp_vals = scale_prev * sum_exp_vals + scale_curr * local_sum_exp
+            max_vals = new_max
+    
+    # Final LogSumExp computation
+    logsumexp_vals = max_vals + tl.log(sum_exp_vals)
+    
+    # Optimized HardSwish using fast sigmoid approximation
+    # Fast sigmoid: x * sigmoid(x) ≈ x / (1 + exp(-x))
+    x_shifted = logsumexp_vals + 3.0
+    # Use exp(-x) = 1 / exp(x) for better numerical stability
+    exp_neg_x_shifted = tl.exp(-x_shifted)
+    sigmoid_vals = 1.0 / (1.0 + exp_neg_x_shifted)
+    hardswish_vals = logsumexp_vals * sigmoid_vals / 6.0
+    
+    # Subtract bias (scalar) and clamp in fused operation
+    bias = tl.load(bias_ptr)
+    result_vals = hardswish_vals - bias
+    
+    # Fused clamp: min(max(x, -1), 1) using tl.minimum and tl.maximum
+    result_vals = tl.minimum(tl.maximum(result_vals, -1.0), 1.0)
+    
+    # Store results with coalesced access pattern
+    out_ptrs = (
+        out_ptr +
+        pid_n * stride_on +
+        d_indices * stride_od +
+        h_indices * stride_oh +
+        w_indices * stride_ow
+    )
+    
+    tl.store(out_ptrs, result_vals, mask=dhw_mask)
+
+
+@triton.jit
+def fused_post_ops_kernel_small_c(
+    # Pointers to tensors
+    x_ptr,
+    bias_ptr,
+    out_ptr,
+    # Tensor dimensions
+    N, C, D, H, W,
+    # Strides for x
+    stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
+    # Strides for output
+    stride_on, stride_oc, stride_od, stride_oh, stride_ow,
+    # Block dimensions
+    BLOCK_DHW: tl.constexpr,
+    num_stages: tl.constexpr = 2,
+):
+    """
+    Optimized kernel for small channel dimensions (C <= 32)
+    Uses full channel reduction in registers without blocking
+    """
+    # Batch index
+    pid_n = tl.program_id(0)
+    # Spatial block index
+    pid_spatial = tl.program_id(1)
+    
+    if pid_n >= N:
+        return
+    
+    # Spatial indices within block
+    spatial_offsets = pid_spatial * BLOCK_DHW + tl.arange(0, BLOCK_DHW)
+    
+    # Calculate spatial indices
+    DHW = D * H * W
+    dhw_mask = spatial_offsets < DHW
+    
+    hw = H * W
+    d_indices = spatial_offsets // hw
+    hw_remainder = spatial_offsets - d_indices * hw
+    h_indices = hw_remainder // W
+    w_indices = hw_remainder - h_indices * W
+    
+    # Initialize accumulators
+    max_vals = tl.full([BLOCK_DHW], -float('inf'), dtype=tl.float32)
+    sum_exp_vals = tl.zeros([BLOCK_DHW], dtype=tl.float32)
+    
+    # Load all channels at once for small C
+    for c in range(C):
+        # Load channel c for all spatial positions
+        x_ptrs = (
+            x_ptr + 
+            pid_n * stride_xn + 
+            c * stride_xc +
+            d_indices * stride_xd +
+            h_indices * stride_xh +
+            w_indices * stride_xw
+        )
+        
+        x_vals = tl.load(x_ptrs, mask=dhw_mask, other=-float('inf'))
+        
+        # Update accumulators
+        new_max = tl.maximum(max_vals, x_vals)
+        scale_prev = tl.exp(max_vals - new_max)
+        scale_curr = tl.exp(x_vals - new_max)
+        
+        sum_exp_vals = scale_prev * sum_exp_vals + scale_curr
+        max_vals = new_max
+    
+    # Final computations
+    logsumexp_vals = max_vals + tl.log(sum_exp_vals)
+    
+    # HardSwish
+    x_shifted = logsumexp_vals + 3.0
+    exp_neg_x_shifted = tl.exp(-x_shifted)
+    sigmoid_vals = 1.0 / (1.0 + exp_neg_x_shifted)
+    hardswish_vals = logsumexp_vals * sigmoid_vals / 6.0
+    
+    # Bias and clamp
+    bias = tl.load(bias_ptr)
+    result_vals = hardswish_vals - bias
+    result_vals = tl.minimum(tl.maximum(result_vals, -1.0), 1.0)
+    
+    # Store
+    out_ptrs = (
+        out_ptr +
+        pid_n * stride_on +
+        d_indices * stride_od +
+        h_indices * stride_oh +
+        w_indices * stride_ow
+    )
+    
+    tl.store(out_ptrs, result_vals, mask=dhw_mask)
+
+
+def fused_post_convtranspose_optimized(x, bias):
+    """
+    Optimized fused post-convtranspose operations with auto-tuned block sizes
+    """
+    N, C, D, H, W = x.shape
+    out = torch.empty((N, 1, D, H, W), device=x.device, dtype=x.dtype)
+    DHW = D * H * W
+    
+    # Auto-tune block sizes based on problem dimensions
+    if C <= 32:
+        # Use specialized kernel for small channel dimensions
+        BLOCK_DHW = 256  # Larger block for better occupancy
+        grid_n = N
+        grid_spatial = triton.cdiv(DHW, BLOCK_DHW)
+        
+        fused_post_ops_kernel_small_c[grid_n, grid_spatial](
+            x, bias, out,
+            N, C, D, H, W,
+            x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
+            out.stride(0), out.stride(1), out.stride(2), out.stride(3), out.stride(4),
+            BLOCK_DHW=BLOCK_DHW,
+            num_stages=2,
+        )
+    else:
+        # Use general kernel with tuned parameters
+        # Heuristics based on Ada Lovelace architecture
+        if DHW < 8192:  # Small spatial size
+            BLOCK_DHW = 128
+            BLOCK_C = 64
+            REDUCE_VECTOR_WIDTH = 16
+        elif C < 128:   # Medium channel size
+            BLOCK_DHW = 256
+            BLOCK_C = 32
+            REDUCE_VECTOR_WIDTH = 8
+        else:           # Large problem
+            BLOCK_DHW = 128
+            BLOCK_C = 64
+            REDUCE_VECTOR_WIDTH = 16
+        
+        grid_n = N
+        grid_spatial = triton.cdiv(DHW, BLOCK_DHW)
+        
+        fused_post_ops_kernel_optimized[grid_n, grid_spatial](
+            x, bias, out,
+            N, C, D, H, W,
+            x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
+            out.stride(0), out.stride(1), out.stride(2), out.stride(3), out.stride(4),
+            BLOCK_C=BLOCK_C,
+            BLOCK_DHW=BLOCK_DHW,
+            REDUCE_VECTOR_WIDTH=REDUCE_VECTOR_WIDTH,
+            num_stages=2,
+        )
+    
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    ConvTranspose3d (PyTorch native) + Optimized fused post-ops (Triton)
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, bias_shape):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(
+            in_channels, out_channels, kernel_size, 
+            stride=stride, padding=padding
+        )
+        self.bias = nn.Parameter(torch.randn(1))
+        
+    def forward(self, x):
+        # Step 1: PyTorch native ConvTranspose3d
+        x = self.conv_transpose(x)
+        # Step 2: Optimized fused post-ops in Triton
+        x = fused_post_convtranspose_optimized(x, self.bias)
+        return x

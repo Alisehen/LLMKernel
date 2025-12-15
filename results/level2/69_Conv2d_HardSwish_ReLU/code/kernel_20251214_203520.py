@@ -1,0 +1,151 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+# Optimized autotune configurations
+configs = [
+    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32}, num_warps=4, num_stages=2),
+    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32}, num_warps=4, num_stages=2),
+    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_warps=4, num_stages=2),
+]
+
+@triton.autotune(configs=configs, key=['N', 'C_out', 'H', 'W'])
+@triton.jit
+def fused_conv_hardswish_relu_kernel(
+    x_ptr, w_ptr, bias_ptr, out_ptr,
+    N, C_in, H, W,
+    C_out, K_H, K_W,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_woc, stride_wic, stride_wkh, stride_wkw,
+    stride_on, stride_oc, stride_oh, stride_ow,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    
+    H_out = H - K_H + 1
+    W_out = W - K_W + 1
+    DHW = H_out * W_out
+    
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    n_idx = offs_m // DHW
+    spatial_idx = offs_m % DHW
+    oh_idx = spatial_idx // W_out
+    ow_idx = spatial_idx % W_out
+    
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    # Pre-compute x base pointers for better ILP
+    x_base_ptrs = (
+        n_idx * stride_xn + 
+        oh_idx * stride_xh + 
+        ow_idx * stride_xw
+    )[:, None]  # Shape: (BLOCK_M, 1)
+    
+    for ic in range(C_in):
+        x_ic_base = ic * stride_xc
+        w_ic_base = ic * stride_wic
+        
+        for kh in range(K_H):
+            ih = oh_idx + kh
+            ih_mask = (ih >= 0) & (ih < H)
+            w_kh_base = kh * stride_wkh
+            
+            for kw in range(K_W):
+                iw = ow_idx + kw
+                mask_m = (offs_m < N * DHW) & ih_mask & (iw >= 0) & (iw < W)
+                
+                # CRITICAL FIX: Correct x memory offset calculation
+                # Use kh*stride_xh + kw*stride_xw instead of iw*stride_xw
+                x_offset = kh * stride_xh + kw * stride_xw
+                
+                # Load x values with coalesced access pattern
+                x_vals = tl.load(
+                    x_ptr + x_base_ptrs + x_ic_base + x_offset,
+                    mask=mask_m[:, None],
+                    other=0.0
+                )
+                
+                # Load weights with vectorized access
+                w_vals = tl.load(
+                    w_ptr + w_ic_base + w_kh_base + kw * stride_wkw + offs_n * stride_woc,
+                    mask=offs_n < C_out,
+                    other=0.0
+                )
+                
+                acc += x_vals * w_vals[None, :]
+    
+    if bias_ptr is not None:
+        bias = tl.load(bias_ptr + offs_n, mask=offs_n < C_out, other=0.0)
+        acc += bias[None, :]
+    
+    # Fused activation with improved numerical stability
+    shifted = acc + 3.0
+    clipped = tl.where(shifted < 0.0, 0.0, tl.where(shifted > 6.0, 6.0, shifted))
+    hardswish = acc * clipped * 0.16666666666666666  # 1/6
+    out = tl.maximum(hardswish, 0.0)
+    
+    mask_out = (offs_m[:, None] < N * DHW) & (offs_n[None, :] < C_out)
+    out_ptrs = (
+        out_ptr + 
+        n_idx[:, None] * stride_on + 
+        offs_n[None, :] * stride_oc + 
+        oh_idx[:, None] * stride_oh + 
+        ow_idx[:, None] * stride_ow
+    )
+    tl.store(out_ptrs, out, mask=mask_out)
+
+
+def fused_conv_hardswish_relu(x, weight, bias, stride=1, padding=0, dilation=1):
+    N, C_in, H, W = x.shape
+    C_out, _, K_H, K_W = weight.shape
+    
+    H_out = H - K_H + 1
+    W_out = W - K_W + 1
+    out = torch.empty((N, C_out, H_out, W_out), device=x.device, dtype=x.dtype)
+    
+    P = N * H_out * W_out
+    
+    grid = lambda META: (
+        triton.cdiv(P, META['BLOCK_M']),
+        triton.cdiv(C_out, META['BLOCK_N']),
+    )
+    
+    weight_contig = weight.contiguous()
+    bias_contig = bias.contiguous() if bias is not None else None
+    
+    fused_conv_hardswish_relu_kernel[grid](
+        x, weight_contig, bias_contig, out,
+        N, C_in, H, W,
+        C_out, K_H, K_W,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        weight_contig.stride(0), weight_contig.stride(1),
+        weight_contig.stride(2), weight_contig.stride(3),
+        out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+    )
+    
+    return out
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size):
+        super(ModelNew, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        
+        if isinstance(kernel_size, int):
+            kernel_size = (kernel_size, kernel_size)
+        
+        self.kernel_size = kernel_size
+        self.K_H, self.K_W = kernel_size
+        
+        self.weight = nn.Parameter(
+            torch.randn(out_channels, in_channels, self.K_H, self.K_W)
+        )
+        self.bias = nn.Parameter(torch.randn(out_channels))
+    
+    def forward(self, x):
+        return fused_conv_hardswish_relu(x, self.weight, self.bias)

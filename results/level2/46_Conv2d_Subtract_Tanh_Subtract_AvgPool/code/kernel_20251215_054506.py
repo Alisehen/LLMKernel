@@ -1,0 +1,305 @@
+# <optimized Triton code>
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+# ---------------------------------------------------------------------------
+# FUSED KERNEL: Conv2d -> bias -> subtract1 -> tanh -> AvgPool2d -> subtract2
+# Single global store of the final output. No intermediate stores.
+# ---------------------------------------------------------------------------
+
+@triton.autotune(
+    configs=[
+        # Smaller tiles – better for register pressure / occupancy
+        triton.Config({'BLOCK_M': 32,  'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 32, 'BLOCK_K': 32}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 32,  'BLOCK_N': 32, 'BLOCK_K': 32}, num_warps=2, num_stages=2),
+        # Larger tiles – higher math intensity when registers allow
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64, 'BLOCK_K': 64}, num_warps=8, num_stages=2),
+    ],
+    key=['N', 'C_out', 'H_pool', 'W_pool'],
+)
+@triton.jit
+def conv2d_sub1_tanh_avgpool2d_sub2_kernel(
+    x_ptr, w_ptr, b_ptr, y_ptr,
+    N, C_out, H_pool, W_pool,
+    P_pool,
+    subtract1,          # scalar
+    subtract2,          # scalar
+    denom,              # scalar = 1 / (pool_k * pool_k)
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_wo, stride_wi, stride_wk_h, stride_wk_w,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    C_in: tl.constexpr,     # in_channels
+    K_H: tl.constexpr,      # conv kernel height
+    K_W: tl.constexpr,      # conv kernel width
+    pool_k: tl.constexpr,   # pooling kernel / stride (compile-time)
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """
+    Fused implicit-GEMM Conv2d + bias + subtract1 + tanh + AvgPool2d + subtract2.
+
+    Layout:
+        - Input x:    [N, C_in, H_in, W_in]
+        - Weight w:   [C_out, C_in, K_H, K_W]
+        - Bias b:     [C_out]
+        - Conv out:   [N, C_out, H_conv, W_conv]
+        - Pooled out: [N, C_out, H_pool, W_pool] (kernel=pool_k, stride=pool_k, no padding)
+
+    Implicit-GEMM for each *conv* position:
+        M_conv = N * H_conv * W_conv
+        N_conv = C_out
+        K_conv = C_in * K_H * K_W
+
+    This kernel tiles over the *pooled* output positions:
+        M_pool = N * H_pool * W_pool   (flattened pooled positions)
+        N_pool = C_out
+    For each pooled position, it computes the corresponding pool_k x pool_k
+    block of conv outputs on the fly, applies tanh, and accumulates the mean.
+    """
+    pid_m = tl.program_id(0)  # over flattened pooled positions
+    pid_n = tl.program_id(1)  # over output channels
+
+    # Offsets in pooled-output space
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    mask_m = offs_m < P_pool
+    mask_n = offs_n < C_out
+    mn_mask = mask_m[:, None] & mask_n[None, :]
+
+    # Decode flat pooled index -> (n, oh_pool, ow_pool)
+    HW_pool = H_pool * W_pool
+    n_idx = offs_m // HW_pool
+    rem = offs_m % HW_pool
+    oh_pool = rem // W_pool
+    ow_pool = rem % W_pool
+
+    # Top-left conv positions covered by each pooled window
+    oh_conv0 = oh_pool * pool_k
+    ow_conv0 = ow_pool * pool_k
+
+    # Base input pointers for the top-left conv position of each pooled window [BLOCK_M, 1]
+    base_x_pool_ptrs = (
+        x_ptr
+        + n_idx[:, None] * stride_xn
+        + oh_conv0[:, None] * stride_xh
+        + ow_conv0[:, None] * stride_xw
+    )
+
+    # Base weight pointers for each output channel [1, BLOCK_N]
+    base_w_ptrs = w_ptr + offs_n[None, :] * stride_wo
+
+    # Bias, shifted by subtract1 so we do (conv + bias - subtract1) cheaply
+    b_vals = tl.load(b_ptr + offs_n, mask=mask_n, other=0.0)  # [BLOCK_N]
+    b_shift = b_vals - subtract1
+
+    # Accumulator for the pooled output [BLOCK_M, BLOCK_N]
+    acc_pool = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Convolution K-dimension
+    K_HW = K_H * K_W
+    K_total = C_in * K_HW
+
+    # Loop over all positions in the pooling window
+    for ph in range(0, pool_k):
+        for pw in range(0, pool_k):
+            # Base input pointers for this conv position (within the pooling window)
+            base_x_ptrs = base_x_pool_ptrs + ph * stride_xh + pw * stride_xw
+
+            # Conv accumulator for this specific (ph, pw) position
+            acc_conv = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+            # Implicit-GEMM over K dimension
+            for k_start in range(0, K_total, BLOCK_K):
+                offs_k = k_start + tl.arange(0, BLOCK_K)
+                mask_k = offs_k < K_total
+
+                # Decode K index -> (ic, kh, kw)
+                ic = offs_k // K_HW
+                rem_k = offs_k % K_HW
+                kh = rem_k // K_W
+                kw = rem_k % K_W
+
+                # Input tile [BLOCK_M, BLOCK_K]
+                x_offsets_k = (
+                    ic[None, :] * stride_xc
+                    + kh[None, :] * stride_xh
+                    + kw[None, :] * stride_xw
+                )
+                x_ptrs = base_x_ptrs + x_offsets_k
+                x_mask = mask_m[:, None] & mask_k[None, :]
+                x_block = tl.load(x_ptrs, mask=x_mask, other=0.0)
+
+                # Weight tile [BLOCK_K, BLOCK_N]
+                w_offsets_k = (
+                    ic[:, None] * stride_wi
+                    + kh[:, None] * stride_wk_h
+                    + kw[:, None] * stride_wk_w
+                )
+                w_ptrs = base_w_ptrs + w_offsets_k
+                w_mask = mask_k[:, None] & mask_n[None, :]
+                w_block = tl.load(w_ptrs, mask=w_mask, other=0.0)
+
+                # FMA over K
+                acc_conv += tl.dot(x_block, w_block)
+
+            # Epilogue for this conv position: bias -> subtract1 -> tanh
+            acc_conv += b_shift[None, :]
+
+            # tanh(x) = (e^{2x} - 1) / (e^{2x} + 1)
+            tmp = 2.0 * acc_conv
+            tmp = tl.exp(tmp)
+            acc_conv = (tmp - 1.0) / (tmp + 1.0)
+
+            # Accumulate into pooling sum
+            acc_pool += acc_conv
+
+    # Final pooling epilogue: average and subtract2
+    acc_pool = acc_pool * denom - subtract2
+
+    # Store final output [N, C_out, H_pool, W_pool]
+    y_ptrs = (
+        y_ptr
+        + n_idx[:, None] * stride_yn
+        + offs_n[None, :] * stride_yc
+        + oh_pool[:, None] * stride_yh
+        + ow_pool[:, None] * stride_yw
+    )
+    tl.store(y_ptrs, acc_pool, mask=mn_mask)
+
+
+# ---------------------------------------------------------------------------
+# Wrapper: fused Conv2d -> subtract1 -> tanh -> AvgPool2d -> subtract2
+# ---------------------------------------------------------------------------
+
+def conv2d_tanh_avgpool2d_triton(x, weight, bias, subtract1_value, subtract2_value, kernel_size_pool):
+    """
+    x:       [N, C_in, H_in, W_in], float32
+    weight:  [C_out, C_in, K_H, K_W], float32
+    bias:    [C_out], float32
+
+    Pipeline (fused in a single Triton kernel, no intermediate global stores):
+        Conv2d (stride=1, padding=0, dilation=1, groups=1)
+        -> + bias
+        -> - subtract1_value
+        -> tanh
+        -> AvgPool2d(kernel=kernel_size_pool, stride=kernel_size_pool, padding=0)
+        -> - subtract2_value
+
+    Returns:
+        y: [N, C_out, H_pool, W_pool]
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+    assert x.dtype == weight.dtype == bias.dtype == torch.float32
+
+    N, C_in, H_in, W_in = x.shape
+    C_out, C_in_w, K_H, K_W = weight.shape
+    assert C_in_w == C_in, "Inconsistent in_channels"
+    assert K_H == K_W, "Only square conv kernels supported"
+
+    # Valid conv, stride=1, no padding
+    H_conv = H_in - K_H + 1
+    W_conv = W_in - K_W + 1
+    assert H_conv > 0 and W_conv > 0
+
+    pool_k = int(kernel_size_pool)
+    # AvgPool2d (no padding, stride=pool_k, dilation=1),
+    # require non-overlapping, fully covered tiles (no tail handling).
+    assert (H_conv - pool_k) >= 0 and (W_conv - pool_k) >= 0
+    assert (H_conv - pool_k) % pool_k == 0, "H_conv must be compatible with pool_k"
+    assert (W_conv - pool_k) % pool_k == 0, "W_conv must be compatible with pool_k"
+
+    H_pool = (H_conv - pool_k) // pool_k + 1
+    W_pool = (W_conv - pool_k) // pool_k + 1
+    P_pool = N * H_pool * W_pool
+
+    y = torch.empty((N, C_out, H_pool, W_pool), device=x.device, dtype=x.dtype)
+
+    denom = float(1.0 / (pool_k * pool_k))
+
+    def grid(META):
+        return (
+            triton.cdiv(P_pool, META['BLOCK_M']),
+            triton.cdiv(C_out, META['BLOCK_N']),
+        )
+
+    conv2d_sub1_tanh_avgpool2d_sub2_kernel[grid](
+        x, weight, bias, y,
+        N, C_out, H_pool, W_pool,
+        P_pool,
+        float(subtract1_value),
+        float(subtract2_value),
+        denom,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        weight.stride(0), weight.stride(1), weight.stride(2), weight.stride(3),
+        y.stride(0), y.stride(1), y.stride(2), y.stride(3),
+        C_in=C_in,
+        K_H=K_H,
+        K_W=K_W,
+        pool_k=pool_k,
+    )
+
+    return y
+
+
+# ---------------------------------------------------------------------------
+# ModelNew: uses the fused Triton kernel
+# ---------------------------------------------------------------------------
+
+class ModelNew(nn.Module):
+    """
+    Triton implementation of:
+        Conv2d -> subtract(subtract1_value) -> tanh
+        -> AvgPool2d(kernel_size_pool, stride=kernel_size_pool, padding=0)
+        -> subtract(subtract2_value)
+
+    All of the above are fused into a single Triton kernel to:
+        - eliminate intermediate global stores,
+        - maximize data reuse from registers/L2,
+        - minimize memory bandwidth pressure.
+
+    Assumptions:
+        - Conv2d: stride=1, padding=0, dilation=1, groups=1
+        - Conv kernel_size is an integer (square kernel)
+        - AvgPool2d: kernel_size=kernel_size_pool, stride=kernel_size_pool, padding=0
+        - Pooling windows fully tile the conv output (no tail rows/cols)
+        - All tensors are float32
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size,
+                 subtract1_value, subtract2_value, kernel_size_pool):
+        super(ModelNew, self).__init__()
+        if isinstance(kernel_size, tuple):
+            assert kernel_size[0] == kernel_size[1], "Only square kernels supported"
+            kernel_size = kernel_size[0]
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = int(kernel_size)
+        self.kernel_size_pool = int(kernel_size_pool)
+
+        self.weight = nn.Parameter(
+            torch.randn(out_channels, in_channels, self.kernel_size, self.kernel_size)
+        )
+        self.bias = nn.Parameter(torch.randn(out_channels))
+
+        self.subtract1_value = float(subtract1_value)
+        self.subtract2_value = float(subtract2_value)
+
+    def forward(self, x):
+        x = x.contiguous()
+        w = self.weight.contiguous()
+        b = self.bias.contiguous()
+
+        y = conv2d_tanh_avgpool2d_triton(
+            x, w, b,
+            self.subtract1_value,
+            self.subtract2_value,
+            self.kernel_size_pool,
+        )
+        return y

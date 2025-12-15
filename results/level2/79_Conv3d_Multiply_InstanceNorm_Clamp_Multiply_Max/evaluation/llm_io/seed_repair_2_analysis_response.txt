@@ -1,0 +1,5 @@
+{
+  "critical_issue": "ModelNew replaces nn.Conv3d with separate weight/bias Parameters, so its convolution parameters are not shared/aligned with the reference model’s Conv3d weights.",
+  "why_it_matters": "Reference and Triton paths use different random convolution weights, producing completely different activations and large output errors unrelated to the Triton kernels’ numerical accuracy.",
+  "minimal_fix_hint": "Use an nn.Conv3d module (or matching parameter names) in ModelNew so the Triton conv uses the exact same Conv3d weights and bias as the reference model."
+}

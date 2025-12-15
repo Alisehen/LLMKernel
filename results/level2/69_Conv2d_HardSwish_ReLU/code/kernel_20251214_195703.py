@@ -1,0 +1,179 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+import math
+
+# Configurations for autotuning
+configs = [
+    {'BLOCK_M': 64, 'BLOCK_N': 32},
+    {'BLOCK_M': 128, 'BLOCK_N': 32},
+    {'BLOCK_M': 256, 'BLOCK_N': 32},
+]
+
+@triton.autotune(configs=configs, key=['P', 'C_out'])
+@triton.jit
+def fused_conv_hardswish_relu_kernel(
+    x_ptr, w_ptr, bias_ptr, out_ptr,
+    # Tensor dimensions
+    N, C_in, H, W,
+    C_out, K_H, K_W,
+    # Strides for x: [N, C_in, H, W]
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    # Strides for w: [C_out, C_in, K_H, K_W]
+    stride_woc, stride_wic, stride_wkh, stride_wkw,
+    # Strides for out: [N, C_out, H_out, W_out]
+    stride_on, stride_oc, stride_oh, stride_ow,
+    # Kernel parameters
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    # 2D grid: (flattened spatial+batch, output channels)
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    
+    # Output spatial dimensions
+    H_out = H - K_H + 1
+    W_out = W - K_W + 1
+    DHW = H_out * W_out
+    
+    # Decode flat index to get (n, oh, ow)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    
+    # n_idx = offs_m // DHW
+    # oh_idx = (offs_m % DHW) // W_out
+    # ow_idx = offs_m % W_out
+    n_idx = tl.floor_divide(offs_m, DHW)
+    rem = tl.extra.cdivmod(offs_m, DHW)[1]  # offs_m % DHW
+    oh_idx = tl.floor_divide(rem, W_out)
+    ow_idx = tl.extra.cdivmod(rem, W_out)[1]
+    
+    # Output channel block
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    
+    # Accumulator
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    # Loop over input channels and kernel positions
+    for ic in range(C_in):
+        for kh in range(K_H):
+            for kw in range(K_W):
+                # Compute input positions
+                ih = oh_idx + kh
+                iw = ow_idx + kw
+                
+                # Check input bounds
+                mask_m = (n_idx < N) & (ih >= 0) & (ih < H) & (iw >= 0) & (iw < W)
+                
+                # Load input values [BLOCK_M]
+                x_ptrs = x_ptr + (
+                    n_idx * stride_xn + 
+                    ic * stride_xc + 
+                    ih * stride_xh + 
+                    iw * stride_xw
+                )
+                x_vals = tl.load(x_ptrs, mask=mask_m, other=0.0)
+                
+                # Load weight values [BLOCK_N]
+                w_ptrs = w_ptr + (
+                    offs_n * stride_woc + 
+                    ic * stride_wic + 
+                    kh * stride_wkh + 
+                    kw * stride_wkw
+                )
+                w_vals = tl.load(w_ptrs, mask=offs_n < C_out, other=0.0)
+                
+                # Broadcast and accumulate: [BLOCK_M, BLOCK_N]
+                acc += x_vals[:, None] * w_vals[None, :]
+    
+    # Add bias if present
+    if bias_ptr is not None:
+        bias = tl.load(bias_ptr + offs_n, mask=offs_n < C_out, other=0.0)
+        acc += bias[None, :]
+    
+    # Fused HardSwish: x * relu6(x + 3) / 6
+    # relu6(x) = min(max(x, 0), 6)
+    shifted = acc + 3.0
+    relu6 = tl.minimum(tl.maximum(shifted, 0.0), 6.0)
+    hardswish = acc * relu6 / 6.0
+    
+    # Fused ReLU
+    out = tl.maximum(hardswish, 0.0)
+    
+    # Compute output positions and store
+    mask_out = (offs_m[:, None] < N * DHW) & (offs_n[None, :] < C_out)
+    out_ptrs = out_ptr + (
+        n_idx[:, None] * stride_on + 
+        offs_n[None, :] * stride_oc + 
+        oh_idx[:, None] * stride_oh + 
+        ow_idx[:, None] * stride_ow
+    )
+    tl.store(out_ptrs, out, mask=mask_out)
+
+
+def fused_conv_hardswish_relu(x, weight, bias, stride=1, padding=0, dilation=1):
+    # For simplicity, handle only stride=1, padding=0, dilation=1
+    # as specified in the original model
+    N, C_in, H, W = x.shape
+    C_out, _, K_H, K_W = weight.shape
+    
+    # Output dimensions
+    H_out = H - K_H + 1
+    W_out = W - K_W + 1
+    
+    # Allocate output
+    out = torch.empty((N, C_out, H_out, W_out), device=x.device, dtype=x.dtype)
+    
+    # Flatten spatial + batch dimensions
+    P = N * H_out * W_out
+    
+    # Launch kernel
+    grid = lambda META: (
+        triton.cdiv(P, META['BLOCK_M']),
+        triton.cdiv(C_out, META['BLOCK_N']),
+    )
+    
+    # Convert weight to contiguous if needed
+    weight_contig = weight.contiguous()
+    bias_ptr = bias.data_ptr() if bias is not None else None
+    
+    fused_conv_hardswish_relu_kernel[grid](
+        x_ptr=x,
+        w_ptr=weight_contig,
+        bias_ptr=bias_ptr,
+        out_ptr=out,
+        N=N, C_in=C_in, H=H, W=W,
+        C_out=C_out, K_H=K_H, K_W=K_W,
+        stride_xn=x.stride(0), stride_xc=x.stride(1),
+        stride_xh=x.stride(2), stride_xw=x.stride(3),
+        stride_woc=weight_contig.stride(0), stride_wic=weight_contig.stride(1),
+        stride_wkh=weight_contig.stride(2), stride_wkw=weight_contig.stride(3),
+        stride_on=out.stride(0), stride_oc=out.stride(1),
+        stride_oh=out.stride(2), stride_ow=out.stride(3),
+        P=P,
+    )
+    
+    return out
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size):
+        super(ModelNew, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        
+        # Handle both int and tuple kernel_size
+        if isinstance(kernel_size, int):
+            kernel_size = (kernel_size, kernel_size)
+        
+        self.kernel_size = kernel_size
+        self.K_H, self.K_W = kernel_size
+        
+        # Initialize parameters
+        self.weight = nn.Parameter(
+            torch.randn(out_channels, in_channels, self.K_H, self.K_W)
+        )
+        self.bias = nn.Parameter(torch.randn(out_channels))
+    
+    def forward(self, x):
+        # Use fused kernel
+        return fused_conv_hardswish_relu(x, self.weight, self.bias)

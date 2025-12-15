@@ -1,0 +1,290 @@
+You are a Triton kernel debugging expert. Analyze the error and identify the root cause.
+
+## ERROR LOG
+```
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 527, in compare_and_bench
+    test_model = ModelNew(*init_args, **init_kwargs)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251215_024837_batch_range56to88_openai_deepseek/68_Matmul_Min_Subtract/code/kernel_20251215_041458.py", line 200, in __init__
+    nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+                                            ^^^^
+NameError: name 'math' is not defined
+```
+
+## Expected Behavior (PyTorch Reference)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs a matrix multiplication, applies minimum, and subtracts a constant.
+    """
+    def __init__(self, in_features, out_features, constant):
+        super(Model, self).__init__()
+        self.linear = nn.Linear(in_features, out_features)
+        self.constant = nn.Parameter(torch.tensor(constant))
+
+    def forward(self, x):
+        x = self.linear(x)
+        x = torch.min(x, self.constant)
+        x = x - self.constant
+        return x
+
+batch_size = 128
+in_features = 16384
+out_features = 16384
+constant = 2.0
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features)]
+
+def get_init_inputs():
+    return [in_features, out_features, constant]
+```
+
+## Current Implementation (Broken Triton Kernel)
+```python
+# <optimized Triton code>
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        # Conservative baseline per instructions
+        triton.Config(
+            {
+                "BLOCK_M": 128,
+                "BLOCK_N": 128,
+                "BLOCK_K": 32,
+                "GROUP_M": 8,
+            },
+            num_warps=4,
+            num_stages=2,
+        ),
+        # Higher parallelism for larger N, still 2 stages (multi-input fusion)
+        triton.Config(
+            {
+                "BLOCK_M": 64,
+                "BLOCK_N": 256,
+                "BLOCK_K": 32,
+                "GROUP_M": 8,
+            },
+            num_warps=8,
+            num_stages=2,
+        ),
+        # Larger K-tile to improve reuse along K for some shapes
+        triton.Config(
+            {
+                "BLOCK_M": 128,
+                "BLOCK_N": 64,
+                "BLOCK_K": 64,
+                "GROUP_M": 4,
+            },
+            num_warps=4,
+            num_stages=2,
+        ),
+    ],
+    key=["M", "N", "K"],
+)
+@triton.jit
+def fused_linear_min_sub_kernel(
+    a_ptr,  # [M, K] input
+    b_ptr,  # [N, K] weight (same layout as nn.Linear.weight)
+    bias_ptr,  # [N]
+    c_ptr,  # [M, N] output
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,  # stride over K for weight
+    stride_bn,  # stride over N for weight
+    stride_cm,
+    stride_cn,
+    constant,  # scalar
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    # 1D launch grid with swizzled (pid_m, pid_n) for better L2 locality
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    num_pid_in_group = GROUP_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_M
+    group_size_m = tl.minimum(num_pid_m - first_pid_m, GROUP_M)
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    # Offsets for this program's block
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Base pointers for A and B tiles
+    a_ptrs = a_ptr + (
+        offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    )  # (BLOCK_M, BLOCK_K)
+    # b_ptr is [N, K]; we access as B[k, n] = weight[n, k]
+    b_ptrs = b_ptr + (
+        offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+    )  # (BLOCK_K, BLOCK_N)
+
+    # Accumulator in fp32
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Loop over K dimension
+    for k in range(0, K, BLOCK_K):
+        k_remaining = K - k
+        a_mask = (offs_m[:, None] < M) & (offs_k[None, :] < k_remaining)
+        b_mask = (offs_k[:, None] < k_remaining) & (offs_n[None, :] < N)
+
+        # Stream A through cache, keep B tiles around longer (better L2 reuse)
+        a = tl.load(
+            a_ptrs, mask=a_mask, other=0.0, eviction_policy="evict_first"
+        )
+        b = tl.load(
+            b_ptrs, mask=b_mask, other=0.0, eviction_policy="evict_last"
+        )
+
+        acc += tl.dot(a, b, allow_tf32=True)
+
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Add bias: [N] -> broadcast over M
+    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc += bias[None, :]
+
+    # Fused elementwise: y = min(acc, constant) - constant
+    acc = tl.minimum(acc, constant)
+    acc = acc - constant
+
+    # Single final store
+    c_ptrs = c_ptr + (
+        offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    )
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, acc, mask=c_mask)
+
+
+def fused_linear_min_sub(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    constant: torch.Tensor,
+) -> torch.Tensor:
+    """
+    x:        [M, K]
+    weight:   [N, K] (same as nn.Linear.weight, NO transpose)
+    bias:     [N]
+    constant: scalar tensor (0-d)
+    Returns:  [M, N]
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda, "Tensors must be on CUDA"
+
+    M, K = x.shape
+    N = weight.shape[0]
+    assert weight.shape[1] == K, "Weight shape must be [N, K] where K == in_features"
+    assert bias.shape[0] == N, "Bias shape must be [N]"
+
+    # Allocate output in fp32 (matches accumulator)
+    c = torch.empty((M, N), device=x.device, dtype=torch.float32)
+
+    # Extract scalar constant as Python float
+    const_value = float(constant.item())
+
+    # 1D grid over (M, N) tiles; mapping handled in kernel
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]),
+        )
+
+    fused_linear_min_sub_kernel[grid](
+        x,
+        weight,  # pass weight directly, avoid explicit transpose
+        bias,
+        c,
+        M,
+        N,
+        K,
+        x.stride(0),
+        x.stride(1),
+        weight.stride(1),  # stride over K
+        weight.stride(0),  # stride over N
+        c.stride(0),
+        c.stride(1),
+        const_value,
+    )
+    return c
+
+
+class ModelNew(nn.Module):
+    """
+    Triton implementation of:
+        y = linear(x)
+        y = torch.min(y, constant)
+        y = y - constant
+    """
+
+    def __init__(self, in_features, out_features, constant):
+        super(ModelNew, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+
+        # Parameters similar to nn.Linear
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias = nn.Parameter(torch.empty(out_features))
+        self.constant = nn.Parameter(torch.tensor(float(constant)))
+
+        # Initialize like nn.Linear
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+        bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+        nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [batch_size, in_features]
+        return fused_linear_min_sub(x, self.weight, self.bias, self.constant)
+```
+
+---
+
+## Your Task
+
+Identify the **single most critical issue** that causes the error above.
+
+### Analysis Guidelines
+
+1. **Focus on root cause**, not symptoms
+   - Bad: "Output is wrong"
+   - Good: "BLOCK_K loop missing, only processes first 32 elements of K dimension"
+
+2. **Be specific about WHAT and WHERE**
+   - Bad: "Memory access issue"
+   - Good: "Line 45: tl.atomic_add(c_block_ptr, acc) - atomic_add requires scalar pointer, not block_ptr"
+
+3. **Prioritize by impact**
+   - Correctness bugs > Performance issues > Style problems
+   - Algorithm errors > Implementation details
+
+### Output Format
+
+**CRITICAL: You MUST output ONLY valid JSON. No other text allowed.**
+
+```json
+{
+  "critical_issue": "<Concise description of THE root cause, max 30 words>",
+  "why_it_matters": "<Why this causes the observed error, max 35 words>",
+  "minimal_fix_hint": "<What needs to change (not how), max 30 words>"
+}
+```
+
+**Remember**: Output ONLY the JSON block. No explanations, no commentary, no additional text.

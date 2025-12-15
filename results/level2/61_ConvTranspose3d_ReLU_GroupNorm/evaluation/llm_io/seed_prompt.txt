@@ -1,0 +1,222 @@
+
+Write a correct and reasonably fast Triton kernel to replace the given PyTorch operator.
+This is a SEED implementation: prioritize correctness and stable compilation.
+
+Rules:
+- Use `tl.program_id(axis)` (axis=0/1/2 only)
+- Use `tl.arange()` for block indices
+- Operate on blocks (no CUDA thread model)
+- No manual shared memory or synchronization
+
+Hard Constraints:
+- All BLOCK_* are `tl.constexpr` and powers of 2
+- `tl.arange(0, BLOCK)` requires BLOCK to be power-of-2
+- No dynamic `tl.reshape()` or view
+- `tl.load` / `tl.store`: scalar ptr → scalar, block ptr → block
+- No Python control flow on `tl.tensor` or BLOCK_*
+- Triton does NOT support `continue`, `break`, or `return` inside loops — use masking instead
+- Import ALL modules you use (e.g., `import math` if using `math.sqrt`)
+- Do NOT index tensors with loop variables: `tensor[:, i]` or `tensor[i, :]` where i is a loop var is INVALID
+- Shared memory limit ~100KB: for matmul, BLOCK_M*BLOCK_K + BLOCK_K*BLOCK_N < 25000 floats
+- Triton has NO: tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+- @triton.autotune: use at most 2-3 configs to reduce compilation time
+
+## ConvTranspose - Use PyTorch Native (CRITICAL)
+
+**DO NOT** implement ConvTranspose1d/2d/3d in Triton. The index mapping is complex and error-prone.
+Use PyTorch's native `nn.ConvTranspose2d` and only fuse the subsequent simple operations in Triton.
+
+Output Format (STRICT):
+1. Imports (torch, torch.nn, triton, triton.language, and any other needed modules like math)
+2. `@triton.jit` kernel(s)
+3. Wrapper function(s)
+4. `class ModelNew(nn.Module)` — this class is REQUIRED
+
+Do NOT include testing code or `if __name__ == "__main__"`.
+
+Example PyTorch:
+'''
+import torch
+import torch.nn as nn
+
+
+class Model(nn.Module):
+    """
+    ConvTranspose2d + GlobalAvgPool + BiasAdd + LogSumExp + Sum + Multiply
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, bias_shape):
+        super(Model, self).__init__()
+        self.conv_transpose = nn.ConvTranspose2d(in_channels, out_channels, kernel_size)
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = torch.mean(x, dim=(2, 3), keepdim=True)  # Global average pooling
+        x = x + self.bias
+        x = torch.logsumexp(x, dim=1, keepdim=True)
+        x = torch.sum(x, dim=(2, 3))
+        x = x * 10.0
+        return x
+
+
+def get_inputs():
+    return [torch.randn(16, 64, 32, 32).cuda()]
+
+
+def get_init_inputs():
+    return [64, 128, 3, (128, 1, 1)]
+'''
+
+Example Triton:
+'''
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def fused_gap_bias_logsumexp_kernel(
+    x_ptr, bias_ptr, out_ptr,
+    N, C, H, W,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    BLOCK_C: tl.constexpr,
+):
+    """
+    Fused kernel: GlobalAvgPool + BiasAdd + LogSumExp + Sum + Multiply
+    Input: [N, C, H, W] -> Output: [N, 1]
+    """
+    pid_n = tl.program_id(0)  # batch index
+
+    if pid_n >= N:
+        return
+
+    HW = H * W
+    offs_c = tl.arange(0, BLOCK_C)
+
+    # Step 1: Global Average Pooling - compute mean over H, W for each channel
+    gap_acc = tl.zeros((BLOCK_C,), dtype=tl.float32)
+
+    for h in range(H):
+        for w in range(W):
+            x_ptrs = x_ptr + pid_n * stride_xn + offs_c * stride_xc + h * stride_xh + w * stride_xw
+            x_vals = tl.load(x_ptrs, mask=offs_c < C, other=0.0)
+            gap_acc += x_vals
+
+    gap_acc = gap_acc / HW  # [C] - global average pooled values
+
+    # Step 2: Add bias
+    bias_vals = tl.load(bias_ptr + offs_c, mask=offs_c < C, other=0.0)
+    gap_acc = gap_acc + bias_vals  # [C]
+
+    # Step 3: LogSumExp over channels
+    max_val = tl.max(gap_acc, axis=0)
+    exp_vals = tl.exp(gap_acc - max_val)
+    sum_exp = tl.sum(exp_vals, axis=0)
+    logsumexp_val = max_val + tl.log(sum_exp)
+
+    # Step 4: Multiply by 10.0
+    result = logsumexp_val * 10.0
+
+    # Store result [N, 1]
+    tl.store(out_ptr + pid_n, result)
+
+
+def fused_post_convtranspose(x, bias):
+    """
+    Fused: GAP + Bias + LogSumExp + Sum + Multiply
+    """
+    N, C, H, W = x.shape
+    out = torch.empty((N, 1), device=x.device, dtype=x.dtype)
+
+    # BLOCK_C must be power of 2 and >= C
+    BLOCK_C = triton.next_power_of_2(C)
+
+    grid = (N,)
+    fused_gap_bias_logsumexp_kernel[grid](
+        x, bias, out,
+        N, C, H, W,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        BLOCK_C=BLOCK_C,
+    )
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    ConvTranspose2d (PyTorch native) + Fused post-ops (Triton)
+
+    NOTE: ConvTranspose2d has complex index mapping - keep it in PyTorch.
+    Only fuse the simpler subsequent operations in Triton.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, bias_shape):
+        super(ModelNew, self).__init__()
+        # Keep ConvTranspose as PyTorch native - DO NOT reimplement in Triton
+        self.conv_transpose = nn.ConvTranspose2d(in_channels, out_channels, kernel_size)
+        self.bias = nn.Parameter(torch.randn(out_channels))  # Flatten for Triton
+
+    def forward(self, x):
+        # Step 1: PyTorch native ConvTranspose2d
+        x = self.conv_transpose(x)
+        # Step 2: Fused post-ops in Triton
+        x = fused_post_convtranspose(x, self.bias)
+        return x
+'''
+
+Hardware:
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+Target:
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs a transposed 3D convolution, applies ReLU, and then applies group normalization.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, groups, bias=False):
+        super(Model, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size, bias=bias)
+        self.relu = nn.ReLU()
+        self.group_norm = nn.GroupNorm(num_groups=groups, num_channels=out_channels)
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_channels, D, H, W).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_channels, D, H, W).
+        """
+        x = self.conv_transpose(x)
+        x = self.relu(x)
+        x = self.group_norm(x)
+        return x
+
+batch_size = 16
+in_channels = 64
+out_channels = 128
+D, H, W = 32, 32, 32
+kernel_size = 3
+groups = 8
+bias = False
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, D, H, W)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, groups, bias]

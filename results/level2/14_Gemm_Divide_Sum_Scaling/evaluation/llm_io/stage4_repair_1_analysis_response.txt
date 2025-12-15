@@ -1,0 +1,5 @@
+{
+  "critical_issue": "The fused kernel changes the algorithm to use x @ weight.sum(dim=0), which is not algebraically equivalent to matmul → divide → sum over hidden.",
+  "why_it_matters": "This incorrect algebraic rewrite systematically produces different outputs from the reference, causing large absolute errors far beyond numerical roundoff.",
+  "minimal_fix_hint": "Compute x @ weight.T then perform division and summation in the Triton kernel, or derive and use a truly equivalent fused expression."
+}

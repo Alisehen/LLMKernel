@@ -1,0 +1,150 @@
+# <complete ModelNew code with optimized Triton kernels>
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def bias_sub_tanh_kernel(
+    x_ptr, bias_ptr, out_ptr,
+    N, C, H, W,
+    stride_x_n, stride_x_c, stride_x_h, stride_x_w,
+    stride_o_n, stride_o_c, stride_o_h, stride_o_w,
+    hw_size,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Fused kernel: out = tanh(x - bias)
+
+    x, out: [N, C, H, W]
+    bias:   [C] (broadcast over N, H, W)
+
+    Tiling:
+      - program_id(0): over N*C
+      - program_id(1): over flattened H*W tiles of size BLOCK_SIZE
+    """
+    pid_nc = tl.program_id(0)
+    pid_hw = tl.program_id(1)
+
+    # Decode n, c from flattened nc
+    n = pid_nc // C
+    c = pid_nc % C
+
+    # Linear indices over H*W for this program
+    offs_hw = pid_hw * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs_hw < hw_size
+
+    # Recover (h, w) from flattened index
+    h = offs_hw // W
+    w = offs_hw % W
+
+    # Compute memory offsets
+    x_offsets = (
+        n * stride_x_n
+        + c * stride_x_c
+        + h * stride_x_h
+        + w * stride_x_w
+    )
+    o_offsets = (
+        n * stride_o_n
+        + c * stride_o_c
+        + h * stride_o_h
+        + w * stride_o_w
+    )
+
+    # Load bias once per (n, c) tile (scalar)
+    bias_val_f32 = tl.load(bias_ptr + c).to(tl.float32)
+
+    # Load input tile
+    x_vals = tl.load(x_ptr + x_offsets, mask=mask, other=0.0)
+
+    # Compute in float32 for numerical stability
+    x_f32 = x_vals.to(tl.float32)
+    y = x_f32 - bias_val_f32
+
+    # Tanh via exp in float32:
+    # tanh(x) = (e^{2x} - 1) / (e^{2x} + 1)
+    two_y = 2.0 * y
+    exp_2y = tl.exp(two_y)
+    tanh_f32 = (exp_2y - 1.0) / (exp_2y + 1.0)
+
+    # Cast back to original dtype (e.g., fp16, bf16, fp32)
+    tanh_vals = tanh_f32.to(x_vals.dtype)
+
+    # Single final store (no intermediate stores)
+    tl.store(out_ptr + o_offsets, tanh_vals, mask=mask)
+
+
+def fused_bias_sub_tanh(x: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    Fused operation:
+      y = tanh(x - bias)
+
+    x:    [N, C, H, W] (CUDA tensor)
+    bias: [C, 1, 1] or [C] (CUDA tensor)
+    Returns: y with same shape as x, computed in-place.
+    """
+    assert x.is_cuda, "Input must be on CUDA device"
+    assert bias.is_cuda, "Bias must be on CUDA device"
+    assert x.ndim == 4, "x must be 4D [N, C, H, W]"
+
+    N, C, H, W = x.shape
+
+    # Ensure bias is [C]
+    bias_1d = bias.reshape(C)
+
+    # Flatten spatial dimensions for better tiling and fewer programs
+    hw_size = H * W
+
+    # Tile size tuned for Ada (4090): 256 elements / program along H*W
+    BLOCK_SIZE = 256
+    num_hw_blocks = (hw_size + BLOCK_SIZE - 1) // BLOCK_SIZE
+
+    # Use x in-place for output to avoid extra allocation
+    out = x
+
+    # Grid:
+    #   dim0 = N*C        (batch-channel tiles)
+    #   dim1 = H*W tiles  (spatial tiles)
+    grid = (N * C, num_hw_blocks)
+
+    bias_sub_tanh_kernel[grid](
+        x, bias_1d, out,
+        N, C, H, W,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+        hw_size,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=8,    # high warp count for strong memory throughput
+        num_stages=2,   # 2-stage pipelining to hide memory latency
+    )
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    ConvTranspose2d (PyTorch native) + fused (x - bias) + tanh (Triton)
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, bias_shape,
+                 stride=2, padding=1, output_padding=1):
+        super(ModelNew, self).__init__()
+        # Keep ConvTranspose2d as PyTorch native
+        self.conv_transpose = nn.ConvTranspose2d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            output_padding=output_padding,
+        )
+        # Bias parameter with the same shape as the original model
+        self.bias = nn.Parameter(torch.randn(*bias_shape))
+
+    def forward(self, x):
+        # PyTorch ConvTranspose2d
+        x = self.conv_transpose(x)
+        # Fused bias subtraction + tanh in Triton (in-place)
+        x = fused_bias_sub_tanh(x, self.bias)
+        return x

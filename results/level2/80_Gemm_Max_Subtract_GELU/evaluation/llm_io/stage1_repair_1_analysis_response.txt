@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Dimension mismatch in b_mask creation: k_mask[:,None] shape [BLOCK_K,1] incompatible with mask_n[None,:] shape [1,BLOCK_N].",
+  "why_it_matters": "BLOCK_K=64 and BLOCK_N=128 cause incompatible 3D broadcasting, violating Triton's shape compatibility rules during compilation.",
+  "minimal_fix_hint": "Use 1D k_mask_1d = offs_k < (K - k) then broadcast as k_mask_1d[:,None] & mask_n[None,:] for 2D b_mask."
+}
+```

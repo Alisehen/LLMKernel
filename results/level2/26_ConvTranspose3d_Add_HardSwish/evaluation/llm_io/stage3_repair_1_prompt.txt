@@ -1,0 +1,431 @@
+Fix the Triton kernel errors. Generate correct, high-performance code.
+
+Current Error Log:
+Traceback (most recent call last):
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 68, in wrapper
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 34, in wrapper
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 1707, in reshape
+    shape = _shape_check_impl(_unwrap_iterable(shape))
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 1474, in _shape_check_impl
+    validate_block_shape(shape)
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/_utils.py", line 14, in validate_block_shape
+    raise TypeError(f"Shape element {i} must have type `constexpr[int]`, got `constexpr[{type(d)}]")
+TypeError: Shape element 0 must have type `constexpr[int]`, got `constexpr[<class 'triton.language.core.tensor'>]
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 538, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251214_114657_batch_range25to55_deepseek_deepseek/26_ConvTranspose3d_Add_HardSwish/code/kernel_20251214_124907.py", line 325, in forward
+    x = fused_add_hardswish(x, add_input)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251214_114657_batch_range25to55_deepseek_deepseek/26_ConvTranspose3d_Add_HardSwish/code/kernel_20251214_124907.py", line 299, in fused_add_hardswish
+    fused_add_hardswish_kernel_autotune[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 347, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 192, in run
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 192, in <dictcomp>
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 170, in _bench
+    return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/testing.py", line 145, in do_bench
+    fn()
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 156, in kernel_call
+    self.fn.run(
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 569, in run
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 278, in compile
+    module = src.make_ir(options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 81, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 23:19:
+):
+    pid = tl.program_id(0)
+
+    if USE_VECTORIZED_LOADS and BLOCK_SIZE >= 256:
+        # Vectorized loads - only for larger block sizes
+        vec_size = 4
+        vec_elements = BLOCK_SIZE // vec_size
+        pid_vec = pid * vec_elements
+
+        offsets = pid_vec * vec_size + tl.arange(0, BLOCK_SIZE)
+        mask_full = offsets < total_elements
+        mask_vec = mask_full.reshape([vec_elements, vec_size])
+                   ^
+
+Main Critical Problem Analysis:
+Problem Analysis (from expert diagnosis):
+critical_issue: Using Python list instead of tuple for reshape shape parameter in Triton JIT kernel.
+why_it_matters: Triton requires constexpr[int] tuple for reshape, but list creates tensor causing compilation error.
+minimal_fix_hint: Change reshape([vec_elements, vec_size]) to reshape((vec_elements, vec_size)).
+
+Focus your fix on addressing the identified critical issue.
+
+
+Broken Code:
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def fused_add_hardswish_kernel(
+    conv_out_ptr,
+    add_input_ptr,
+    out_ptr,
+    total_elements,
+    N, C, D, H, W,
+    stride_conv_n, stride_conv_c, stride_conv_d, stride_conv_h, stride_conv_w,
+    stride_add_n, stride_add_c, stride_add_d, stride_add_h, stride_add_w,
+    stride_out_n, stride_out_c, stride_out_d, stride_out_h, stride_out_w,
+    BLOCK_SIZE: tl.constexpr,
+    USE_VECTORIZED_LOADS: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    
+    if USE_VECTORIZED_LOADS:
+        # Vectorized loads for better memory throughput
+        vec_size = 4
+        vec_elements = BLOCK_SIZE // vec_size
+        pid_vec = pid * vec_elements
+        
+        # Use vec_size elements per thread for better coalescing
+        offsets = pid_vec * vec_size + tl.arange(0, BLOCK_SIZE)
+        mask_full = offsets < total_elements
+        
+        # Reshape mask for vectorized loads
+        mask_vec = mask_full.reshape([vec_elements, vec_size])
+        
+        # Vectorized index decomposition
+        linear_idx_vec = offsets.reshape([vec_elements, vec_size])
+        
+        # Compute 5D indices for vectorized loads
+        w_idx_vec = linear_idx_vec % W
+        tmp = linear_idx_vec // W
+        
+        h_idx_vec = tmp % H
+        tmp = tmp // H
+        
+        d_idx_vec = tmp % D
+        tmp = tmp // D
+        
+        c_idx_vec = tmp % C
+        n_idx_vec = tmp // C
+        
+        # Vectorized memory offsets
+        conv_offsets_vec = (
+            n_idx_vec * stride_conv_n +
+            c_idx_vec * stride_conv_c +
+            d_idx_vec * stride_conv_d +
+            h_idx_vec * stride_conv_h +
+            w_idx_vec * stride_conv_w
+        )
+        
+        add_offsets_vec = (
+            n_idx_vec * stride_add_n +
+            c_idx_vec * stride_add_c +
+            d_idx_vec * stride_add_d +
+            h_idx_vec * stride_add_h +
+            w_idx_vec * stride_add_w
+        )
+        
+        out_offsets_vec = (
+            n_idx_vec * stride_out_n +
+            c_idx_vec * stride_out_c +
+            d_idx_vec * stride_out_d +
+            h_idx_vec * stride_out_h +
+            w_idx_vec * stride_out_w
+        )
+        
+        # Vectorized loads
+        conv_vals_vec = tl.load(conv_out_ptr + conv_offsets_vec, mask=mask_vec, other=0.0)
+        add_vals_vec = tl.load(add_input_ptr + add_offsets_vec, mask=mask_vec, other=0.0)
+        
+        # Vectorized computation
+        x_vec = conv_vals_vec + add_vals_vec
+        x_plus_3_vec = x_vec + 3.0
+        relu6_val_vec = tl.minimum(tl.maximum(x_plus_3_vec, 0.0), 6.0)
+        
+        # Optimized: x * x * (relu6_val / 6) with FMA-style operations
+        # Precompute reciprocal once
+        inv_6 = 1.0 / 6.0
+        output_val_vec = x_vec * x_vec * (relu6_val_vec * inv_6)
+        
+        # Vectorized store
+        tl.store(out_ptr + out_offsets_vec, output_val_vec, mask=mask_vec)
+    else:
+        # Original non-vectorized path for small sizes
+        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < total_elements
+        
+        linear_idx = offsets
+        
+        w_idx = linear_idx % W
+        tmp = linear_idx // W
+        
+        h_idx = tmp % H
+        tmp = tmp // H
+        
+        d_idx = tmp % D
+        tmp = tmp // D
+        
+        c_idx = tmp % C
+        n_idx = tmp // C
+        
+        conv_offsets = (
+            n_idx * stride_conv_n +
+            c_idx * stride_conv_c +
+            d_idx * stride_conv_d +
+            h_idx * stride_conv_h +
+            w_idx * stride_conv_w
+        )
+        
+        add_offsets = (
+            n_idx * stride_add_n +
+            c_idx * stride_add_c +
+            d_idx * stride_add_d +
+            h_idx * stride_add_h +
+            w_idx * stride_add_w
+        )
+        
+        out_offsets = (
+            n_idx * stride_out_n +
+            c_idx * stride_out_c +
+            d_idx * stride_out_d +
+            h_idx * stride_out_h +
+            w_idx * stride_out_w
+        )
+        
+        conv_vals = tl.load(conv_out_ptr + conv_offsets, mask=mask, other=0.0)
+        add_vals = tl.load(add_input_ptr + add_offsets, mask=mask, other=0.0)
+        
+        x = conv_vals + add_vals
+        x_plus_3 = x + 3.0
+        relu6_val = tl.minimum(tl.maximum(x_plus_3, 0.0), 6.0)
+        
+        inv_6 = 1.0 / 6.0
+        output_val = x * x * (relu6_val * inv_6)
+        
+        tl.store(out_ptr + out_offsets, output_val, mask=mask)
+
+
+@triton.autotune(
+    configs=[
+        # Optimized for Ada Lovelace with 128 SMs
+        # Use 4 warps per block to maximize SM occupancy (48 warps / SM / 4 = 12 blocks/SM)
+        triton.Config({'BLOCK_SIZE': 512, 'USE_VECTORIZED_LOADS': True}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 1024, 'USE_VECTORIZED_LOADS': True}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 256, 'USE_VECTORIZED_LOADS': True}, num_warps=2, num_stages=3),
+        # Non-vectorized fallback for small sizes
+        triton.Config({'BLOCK_SIZE': 128, 'USE_VECTORIZED_LOADS': False}, num_warps=4, num_stages=2),
+    ],
+    key=['total_elements']
+)
+@triton.jit
+def fused_add_hardswish_kernel_autotune(
+    conv_out_ptr,
+    add_input_ptr,
+    out_ptr,
+    total_elements,
+    N, C, D, H, W,
+    stride_conv_n, stride_conv_c, stride_conv_d, stride_conv_h, stride_conv_w,
+    stride_add_n, stride_add_c, stride_add_d, stride_add_h, stride_add_w,
+    stride_out_n, stride_out_c, stride_out_d, stride_out_h, stride_out_w,
+    BLOCK_SIZE: tl.constexpr,
+    USE_VECTORIZED_LOADS: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    
+    if USE_VECTORIZED_LOADS and BLOCK_SIZE >= 256:
+        # Vectorized loads - only for larger block sizes
+        vec_size = 4
+        vec_elements = BLOCK_SIZE // vec_size
+        pid_vec = pid * vec_elements
+        
+        offsets = pid_vec * vec_size + tl.arange(0, BLOCK_SIZE)
+        mask_full = offsets < total_elements
+        mask_vec = mask_full.reshape([vec_elements, vec_size])
+        
+        linear_idx_vec = offsets.reshape([vec_elements, vec_size])
+        
+        w_idx_vec = linear_idx_vec % W
+        tmp = linear_idx_vec // W
+        
+        h_idx_vec = tmp % H
+        tmp = tmp // H
+        
+        d_idx_vec = tmp % D
+        tmp = tmp // D
+        
+        c_idx_vec = tmp % C
+        n_idx_vec = tmp // C
+        
+        conv_offsets_vec = (
+            n_idx_vec * stride_conv_n +
+            c_idx_vec * stride_conv_c +
+            d_idx_vec * stride_conv_d +
+            h_idx_vec * stride_conv_h +
+            w_idx_vec * stride_conv_w
+        )
+        
+        add_offsets_vec = (
+            n_idx_vec * stride_add_n +
+            c_idx_vec * stride_add_c +
+            d_idx_vec * stride_add_d +
+            h_idx_vec * stride_add_h +
+            w_idx_vec * stride_add_w
+        )
+        
+        out_offsets_vec = (
+            n_idx_vec * stride_out_n +
+            c_idx_vec * stride_out_c +
+            d_idx_vec * stride_out_d +
+            h_idx_vec * stride_out_h +
+            w_idx_vec * stride_out_w
+        )
+        
+        conv_vals_vec = tl.load(conv_out_ptr + conv_offsets_vec, mask=mask_vec, other=0.0)
+        add_vals_vec = tl.load(add_input_ptr + add_offsets_vec, mask=mask_vec, other=0.0)
+        
+        x_vec = conv_vals_vec + add_vals_vec
+        x_plus_3_vec = x_vec + 3.0
+        relu6_val_vec = tl.minimum(tl.maximum(x_plus_3_vec, 0.0), 6.0)
+        
+        inv_6 = 1.0 / 6.0
+        output_val_vec = x_vec * x_vec * (relu6_val_vec * inv_6)
+        
+        tl.store(out_ptr + out_offsets_vec, output_val_vec, mask=mask_vec)
+    else:
+        # Standard path
+        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < total_elements
+        
+        linear_idx = offsets
+        
+        w_idx = linear_idx % W
+        tmp = linear_idx // W
+        
+        h_idx = tmp % H
+        tmp = tmp // H
+        
+        d_idx = tmp % D
+        tmp = tmp // D
+        
+        c_idx = tmp % C
+        n_idx = tmp // C
+        
+        conv_offsets = (
+            n_idx * stride_conv_n +
+            c_idx * stride_conv_c +
+            d_idx * stride_conv_d +
+            h_idx * stride_conv_h +
+            w_idx * stride_conv_w
+        )
+        
+        add_offsets = (
+            n_idx * stride_add_n +
+            c_idx * stride_add_c +
+            d_idx * stride_add_d +
+            h_idx * stride_add_h +
+            w_idx * stride_add_w
+        )
+        
+        out_offsets = (
+            n_idx * stride_out_n +
+            c_idx * stride_out_c +
+            d_idx * stride_out_d +
+            h_idx * stride_out_h +
+            w_idx * stride_out_w
+        )
+        
+        conv_vals = tl.load(conv_out_ptr + conv_offsets, mask=mask, other=0.0)
+        add_vals = tl.load(add_input_ptr + add_offsets, mask=mask, other=0.0)
+        
+        x = conv_vals + add_vals
+        x_plus_3 = x + 3.0
+        relu6_val = tl.minimum(tl.maximum(x_plus_3, 0.0), 6.0)
+        
+        inv_6 = 1.0 / 6.0
+        output_val = x * x * (relu6_val * inv_6)
+        
+        tl.store(out_ptr + out_offsets, output_val, mask=mask)
+
+
+def fused_add_hardswish(conv_out, add_input):
+    assert conv_out.shape == add_input.shape, "Shapes must match"
+    N, C, D, H, W = conv_out.shape
+    total_elements = N * C * D * H * W
+    
+    out = torch.empty_like(conv_out)
+    
+    grid = lambda meta: (triton.cdiv(total_elements, meta['BLOCK_SIZE']),)
+    
+    fused_add_hardswish_kernel_autotune[grid](
+        conv_out, add_input, out,
+        total_elements,
+        N, C, D, H, W,
+        conv_out.stride(0), conv_out.stride(1), conv_out.stride(2),
+        conv_out.stride(3), conv_out.stride(4),
+        add_input.stride(0), add_input.stride(1), add_input.stride(2),
+        add_input.stride(3), add_input.stride(4),
+        out.stride(0), out.stride(1), out.stride(2),
+        out.stride(3), out.stride(4),
+    )
+    
+    return out
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, bias_shape):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(
+            in_channels, out_channels, kernel_size,
+            stride=stride, padding=padding, output_padding=output_padding
+        )
+        self.register_parameter('bias', nn.Parameter(torch.randn(bias_shape)))
+
+    def forward(self, x, add_input):
+        x = self.conv_transpose(x)
+        x = fused_add_hardswish(x, add_input)
+        return x
+```
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl, AND any other modules used (e.g., import math if using math.sqrt)
+   2. @triton.jit decorated kernel function(s) — NO continue/break/return inside loops (use masking)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels — THIS CLASS IS REQUIRED
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+3. Learn from previous repair attempts to avoid repeating the same mistakes
+4. Ensure ALL imports are included at the top (common mistake: forgetting `import math`)
+
+```python
+# <corrected code>
+```

@@ -1,0 +1,5 @@
+{
+  "critical_issue": "The program-id to (pid_m, pid_n) mapping with GROUP_M is wrong for grid size = M_tiles*N_tiles, so many N-tiles for last M-tiles are never computed.",
+  "why_it_matters": "Missing N-tiles means each row only accumulates over a subset of output features, so the sigmoid outputs and row sums are systematically too small, causing huge max_abs_err and mean_abs_err.",
+  "minimal_fix_hint": "Change grid or pid_m/pid_n computation so every (m, n) tile in [M_tiles, N_tiles] is covered exactly once, following Triton matmul’s GROUP_M tiling pattern."
+}

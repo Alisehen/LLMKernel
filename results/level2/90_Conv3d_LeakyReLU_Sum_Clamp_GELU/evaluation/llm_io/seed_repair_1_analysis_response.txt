@@ -1,0 +1,5 @@
+{
+  "critical_issue": "ModelNew uses separate weight/bias parameters instead of an nn.Conv3d 'conv', so its convolution weights/bias cannot match or be loaded from the reference Model’s conv.",
+  "why_it_matters": "The harness cannot align Conv3d parameters between reference and Triton models, so both run with unrelated random weights, making outputs effectively uncorrelated and violating the numerical closeness check.",
+  "minimal_fix_hint": "Redefine ModelNew to own an nn.Conv3d named 'conv' and have the kernel read conv.weight/conv.bias so state_dict loading matches the reference model."
+}

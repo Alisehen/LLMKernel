@@ -1,56 +1,6 @@
 {
-  "timestamp": "2025-12-13T08:45:02",
-  "reference_file": "KernelBench/level2/1_Conv2D_ReLU_BiasAdd.py",
-  "candidate_file": "/home/hyc/LLMKernel/run/20251213_080709_batch_range1to40_deepseek_deepseek/1_Conv2D_ReLU_BiasAdd/code/kernel_20251213_084455.py",
-  "tolerance": 0.001,
-  "max_abs_err": 0.0,
-  "mean_abs_err": 0.0,
-  "ref_latency_ms": {
-    "avg": 11.500543975830078,
-    "min": 11.495424270629883,
-    "max": 11.514880180358887,
-    "all": [
-      11.514880180358887,
-      11.499520301818848,
-      11.495424270629883,
-      11.496447563171387,
-      11.496447563171387
-    ]
-  },
-  "test_latency_ms": {
-    "avg": 12.672121620178222,
-    "min": 12.66483211517334,
-    "max": 12.679167747497559,
-    "all": [
-      12.679167747497559,
-      12.67404842376709,
-      12.67574405670166,
-      12.66483211517334,
-      12.666815757751465
-    ]
-  },
-  "num_runs": 5,
-  "model_init_args": [
-    64,
-    128,
-    3,
-    [
-      128,
-      1,
-      1
-    ]
-  ],
-  "model_init_kwargs": {},
-  "seed": 100,
-  "align_stats": {
-    "pair_aligner": 1,
-    "copied_same_shape": 1,
-    "mapped_shape": 0,
-    "skipped": 0,
-    "pair_key": "Model->ModelNew"
-  },
-  "runnable": true,
+  "runnable": false,
   "phase": "stage4_advanced_memory",
-  "pytorch_baseline_ms": 11.498118209838868,
-  "score": 0.9073554180169837
+  "error_type": "RuntimeError",
+  "message": "Traceback (most recent call last):\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py\", line 34, in wrapper\n    return fn(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py\", line 2573, in multiple_of\n    for i, d in enumerate(values):\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py\", line 32, in wrapper\n    raise ValueError(\"Did you forget to add @triton.jit ? \"\nValueError: Did you forget to add @triton.jit ? (`_builder` argument must be provided outside of JIT functions.)\n\nThe above exception was the direct cause of the following exception:\n\nTraceback (most recent call last):\n  File \"/home/hyc/LLMKernel/utils/compile_and_run.py\", line 538, in compare_and_bench\n    test_out, _ = _run_once(test_model, inp, dev)\n                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/LLMKernel/utils/compile_and_run.py\", line 132, in _run_once\n    out = model(*inp)\n          ^^^^^^^^^^^\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py\", line 1751, in _wrapped_call_impl\n    return self._call_impl(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py\", line 1762, in _call_impl\n    return forward_call(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/LLMKernel/run/20251214_091600_batch_range1to5_openai_deepseek/1_Conv2D_ReLU_BiasAdd/code/kernel_20251214_092454.py\", line 284, in forward\n    return fused_conv_relu_double_bias(\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/LLMKernel/run/20251214_091600_batch_range1to5_openai_deepseek/1_Conv2D_ReLU_BiasAdd/code/kernel_20251214_092454.py\", line 241, in fused_conv_relu_double_bias\n    conv2d_relu_double_bias_kernel[grid](\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py\", line 347, in <lambda>\n    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)\n                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py\", line 192, in run\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py\", line 192, in <dictcomp>\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py\", line 170, in _bench\n    return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/testing.py\", line 145, in do_bench\n    fn()\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py\", line 156, in kernel_call\n    self.fn.run(\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py\", line 569, in run\n    kernel = self.compile(src, target=target, options=options.__dict__)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py\", line 278, in compile\n    module = src.make_ir(options, codegen_fns, module_map, context)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py\", line 81, in make_ir\n    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\ntriton.compiler.errors.CompilationError: at 59:4:\n    y_base_m = (\n        n_idx * stride_y_n\n        + oh_idx * stride_y_h\n        + ow_idx * stride_y_w\n    )  # [BLOCK_M]\n\n    # Per-output-channel offsets for weights and output tensor\n    w_oc_offsets = offs_n * stride_w_oc  # [BLOCK_N]\n    y_oc_offsets = offs_n * stride_y_oc  # [BLOCK_N]\n\n    # Help Triton with aliasing/contiguity along OC to maximize vectorization\n    tl.multiple_of(w_oc_offsets, BLOCK_N * stride_w_oc)\n    ^\n"
 }

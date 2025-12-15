@@ -1,0 +1,274 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU
+GPU Name: 4090
+Architecture: Ada Lovelace
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+[OPTIMIZATION STAGE]
+
+## Current Optimization Stage
+
+Focus: Memory pattern for fused operations.
+
+Key Principle:
+- Fusion benefit = eliminated INTERMEDIATE stores
+- Multiple input loads are OK; intermediate stores are NOT
+
+Rules:
+- ✅ Multiple tl.load() for different inputs (x, weight, bias) - OK
+- ❌ tl.store() for intermediate results - NEVER (this is what fusion eliminates)
+- ✅ Single tl.store() for final output - required
+
+Verification:
+- Count tl.store() calls: should equal number of OUTPUT tensors (usually 1)
+- Intermediate values: must stay in registers between ops
+- If you see store-then-load pattern for same data → BUG, refactor
+
+Multi-input Fusion Pattern:
+```
+x = tl.load(input_ptr + offs, mask=mask)
+w = tl.load(weight_ptr + ..., mask=...)  # OK: different input
+b = tl.load(bias_ptr + ..., mask=...)    # OK: different input
+y = op1(x, w)  # in registers
+z = op2(y, b)  # in registers
+tl.store(out_ptr + offs, z, mask=mask)   # single output store
+```
+
+num_stages: start with 2, only increase if memory stalls high AND registers OK
+
+
+
+[CURRENT CODE]
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+import math
+
+
+@triton.jit
+def fused_post_ops_kernel(
+    # Pointers to tensors
+    x_ptr,
+    bias_ptr,
+    out_ptr,
+    # Tensor dimensions
+    N, C, D, H, W,
+    # Strides for x
+    stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
+    # Strides for output
+    stride_on, stride_oc, stride_od, stride_oh, stride_ow,
+    # Block dimensions
+    BLOCK_C: tl.constexpr,
+    BLOCK_DHW: tl.constexpr,
+):
+    """
+    Fused kernel for: LogSumExp over channels + HardSwish + Bias Subtract + Clamp
+    Input: [N, C, D, H, W]
+    Output: [N, 1, D, H, W]
+    Each program processes BLOCK_DHW spatial positions for one batch
+    """
+    # Batch index
+    pid_n = tl.program_id(0)
+    # Spatial block index (flattened D*H*W dimension)
+    pid_spatial = tl.program_id(1)
+    
+    if pid_n >= N:
+        return
+    
+    # Spatial indices within block
+    spatial_offsets = pid_spatial * BLOCK_DHW + tl.arange(0, BLOCK_DHW)
+    
+    # Calculate D, H, W indices from flattened spatial index
+    DHW = D * H * W
+    dhw_mask = spatial_offsets < DHW
+    
+    d_indices = spatial_offsets // (H * W)
+    hw_remainder = spatial_offsets % (H * W)
+    h_indices = hw_remainder // W
+    w_indices = hw_remainder % W
+    
+    # Channel indices
+    c_offsets = tl.arange(0, BLOCK_C)
+    c_mask = c_offsets < C
+    
+    # Initialize accumulators for LogSumExp reduction
+    max_vals = tl.full([BLOCK_DHW], -float('inf'), dtype=tl.float32)
+    sum_exp_vals = tl.zeros([BLOCK_DHW], dtype=tl.float32)
+    
+    # Loop over channel blocks for LogSumExp
+    for c_block_start in range(0, C, BLOCK_C):
+        # Current channel indices
+        current_c = c_block_start + c_offsets
+        current_c_mask = c_mask & (current_c < C)
+        
+        # Load input values for current channel block
+        # Pointers: x[n, c, d, h, w]
+        x_ptrs = (
+            x_ptr + 
+            pid_n * stride_xn + 
+            current_c[:, None] * stride_xc +
+            d_indices[None, :] * stride_xd +
+            h_indices[None, :] * stride_xh +
+            w_indices[None, :] * stride_xw
+        )
+        
+        # Load with masking for both channels and spatial positions
+        x_vals = tl.load(
+            x_ptrs,
+            mask=current_c_mask[:, None] & dhw_mask[None, :],
+            other=0.0
+        )
+        
+        # Update LogSumExp accumulators
+        # Find local max for this channel block
+        local_max = tl.max(x_vals, axis=0)
+        
+        # Compute exponential values with numerical stability
+        # Use broadcasting: x_vals - local_max[None, :]
+        exp_vals = tl.exp(x_vals - local_max[None, :])
+        
+        # Sum exponentials along channel dimension
+        local_sum_exp = tl.sum(exp_vals, axis=0)
+        
+        # Combine with previous accumulators
+        # Update global max
+        new_max = tl.maximum(max_vals, local_max)
+        
+        # Adjust previous sum_exp by exp(max_vals - new_max)
+        scale_prev = tl.exp(max_vals - new_max)
+        # Adjust current sum_exp by exp(local_max - new_max)
+        scale_curr = tl.exp(local_max - new_max)
+        
+        # Update sum_exp
+        sum_exp_vals = scale_prev * sum_exp_vals + scale_curr * local_sum_exp
+        max_vals = new_max
+    
+    # Final LogSumExp computation
+    logsumexp_vals = max_vals + tl.log(sum_exp_vals)
+    
+    # HardSwish: x * sigmoid(x + 3) / 6
+    # sigmoid(x) = 1 / (1 + exp(-x))
+    x_shifted = logsumexp_vals + 3.0
+    sigmoid_vals = 1.0 / (1.0 + tl.exp(-x_shifted))
+    hardswish_vals = logsumexp_vals * sigmoid_vals / 6.0
+    
+    # Subtract bias (scalar)
+    bias = tl.load(bias_ptr)
+    result_vals = hardswish_vals - bias
+    
+    # Clamp between -1 and 1
+    result_vals = tl.minimum(tl.maximum(result_vals, -1.0), 1.0)
+    
+    # Store results
+    # Output shape: [N, 1, D, H, W]
+    out_ptrs = (
+        out_ptr +
+        pid_n * stride_on +
+        d_indices * stride_od +
+        h_indices * stride_oh +
+        w_indices * stride_ow
+    )
+    
+    tl.store(out_ptrs, result_vals, mask=dhw_mask)
+
+
+def fused_post_convtranspose(x, bias):
+    """
+    Fused post-convtranspose operations:
+    - LogSumExp over channels
+    - HardSwish (x * sigmoid(x+3) / 6)
+    - Subtract bias
+    - Clamp to [-1, 1]
+    """
+    N, C, D, H, W = x.shape
+    out = torch.empty((N, 1, D, H, W), device=x.device, dtype=x.dtype)
+    
+    # Choose block sizes (powers of 2)
+    BLOCK_C = triton.next_power_of_2(C)
+    BLOCK_DHW = 128  # Process 128 spatial positions per block
+    
+    # Calculate grid size
+    DHW = D * H * W
+    grid_n = N
+    grid_spatial = triton.cdiv(DHW, BLOCK_DHW)
+    
+    # Launch kernel
+    fused_post_ops_kernel[grid_n, grid_spatial](
+        x,
+        bias,
+        out,
+        N, C, D, H, W,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
+        out.stride(0), out.stride(1), out.stride(2), out.stride(3), out.stride(4),
+        BLOCK_C=BLOCK_C,
+        BLOCK_DHW=BLOCK_DHW,
+    )
+    
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    ConvTranspose3d (PyTorch native) + Fused post-ops (Triton)
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, bias_shape):
+        super(ModelNew, self).__init__()
+        # Keep ConvTranspose3d as PyTorch native - DO NOT reimplement in Triton
+        self.conv_transpose = nn.ConvTranspose3d(
+            in_channels, out_channels, kernel_size, 
+            stride=stride, padding=padding
+        )
+        # Bias is a scalar parameter
+        self.bias = nn.Parameter(torch.randn(1))
+        
+    def forward(self, x):
+        # Step 1: PyTorch native ConvTranspose3d
+        x = self.conv_transpose(x)
+        # Step 2: Fused post-ops in Triton
+        x = fused_post_convtranspose(x, self.bias)
+        return x
+```
+
+[NCU PROFILING METRICS]
+{
+  "fused_post_ops_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 61.57,
+    "launch__grid_size": 123136,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 16.01,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 68.36,
+    "lts__t_sector_hit_rate.pct": 11.24
+  }
+}
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+TRITON API CONSTRAINTS (CRITICAL):
+- Triton has NO: tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

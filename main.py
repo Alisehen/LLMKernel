@@ -15,7 +15,7 @@ matplotlib.use("Agg")  # headless save
 import matplotlib.pyplot as plt
 
 from agents.query_server import query_server
-from prompts.generate_custom_cuda import build_seed_prompt, default_system_prompt
+from prompts.generate_custom_cuda import build_seed_prompt, default_system_prompt, MODEL_SINGLE, MODEL_FUSION, MODEL_NETWORK
 from utils.compile_and_run import compare_and_bench
 from utils.kernel_io import extract_code_block, save_kernel_code, extract_json, extract_cuda_kernel_names
 from scripts.individual import KernelIndividual  # adjust path if needed
@@ -70,6 +70,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
     # Fusion operator flag
     p.add_argument("--fusion", action="store_true", help="Enable fusion operator mode (for level2 multi-op kernels)")
+
+    # Model type (level1/2/3)
+    p.add_argument("--model", default=MODEL_SINGLE,
+                   choices=[MODEL_SINGLE, MODEL_FUSION, MODEL_NETWORK],
+                   help="Model type: single (level1), fusion (level2), network (level3)")
 
     return p
 
@@ -745,7 +750,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
 
     # ====== Step 1: Generate Seed Program (outside loop) ======
     print("[Seed] Generating the initial kernel ...")
-    seed_prompt = build_seed_prompt(arch_path=task_path, gpu_name=args.gpu, fusion=args.fusion)
+    seed_prompt = build_seed_prompt(arch_path=task_path, gpu_name=args.gpu, fusion=args.fusion, model=args.model)
     prompt_file = io_dir / "seed_prompt.txt"
     prompt_file.write_text(seed_prompt, encoding="utf-8")
     current_kernel = _llm_to_kernel(seed_prompt, code_dir, call_llm, io_dir,
@@ -1013,6 +1018,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                 stage_description=stage_description,
                 failure_analysis="",
                 fusion=args.fusion,
+                model=args.model,
             )
             prompt_file = io_dir / f"stage{stage_idx + 1}_{stage_name}_prompt.txt"
             prompt_file.write_text(opt_prompt, encoding="utf-8")

@@ -1,0 +1,224 @@
+
+Write a correct and reasonably fast Triton kernel to replace the given PyTorch operator.
+This is a SEED implementation: prioritize correctness and stable compilation.
+
+Rules:
+- Use `tl.program_id(axis)` (axis=0/1/2 only)
+- Use `tl.arange()` for block indices
+- Operate on blocks (no CUDA thread model)
+- No manual shared memory or synchronization
+
+Hard Constraints:
+- All BLOCK_* are `tl.constexpr` and powers of 2
+- `tl.arange(0, BLOCK)` requires BLOCK to be power-of-2
+- No dynamic `tl.reshape()` or view
+- `tl.load` / `tl.store`: scalar ptr → scalar, block ptr → block
+- No Python control flow on `tl.tensor` or BLOCK_*
+- Triton does NOT support `continue`, `break`, or `return` inside loops — use masking instead
+- Import ALL modules you use (e.g., `import math` if using `math.sqrt`)
+- Do NOT index tensors with loop variables: `tensor[:, i]` or `tensor[i, :]` where i is a loop var is INVALID
+- Shared memory limit ~100KB: for matmul, BLOCK_M*BLOCK_K + BLOCK_K*BLOCK_N < 25000 floats
+- Triton has NO: tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+- @triton.autotune: use at most 2-3 configs to reduce compilation time
+
+## Conv Fusion Pattern (CRITICAL for Conv2d/Conv3d)
+
+Triton grid is limited to 3 dimensions. For Conv with 4D+ output, you MUST flatten:
+
+**Conv2d: Output [N, OC, H_out, W_out] → Flatten to 2D grid**
+```python
+P = N * H_out * W_out  # flatten spatial + batch
+grid = (cdiv(P, BLOCK_M), cdiv(OC, BLOCK_N))
+
+# In kernel: decode flat index back to (n, oh, ow)
+offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+n_idx = offs_m // (H_out * W_out)
+rem = offs_m % (H_out * W_out)
+oh_idx = rem // W_out
+ow_idx = rem % W_out
+
+# Accumulator: simple 2D
+acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+# Conv loop: broadcast 1D vectors to 2D
+for ic in range(C_in):
+    for kh in range(K_H):
+        for kw in range(K_W):
+            x_vals = tl.load(...)  # [BLOCK_M]
+            w_vals = tl.load(...)  # [BLOCK_N]
+            acc += x_vals[:, None] * w_vals[None, :]  # [BLOCK_M, BLOCK_N]
+```
+
+**Conv3d: Output [N, OC, D_out, H_out, W_out] → Same pattern**
+```python
+P = N * D_out * H_out * W_out  # flatten spatial + batch
+grid = (cdiv(P, BLOCK_M), cdiv(OC, BLOCK_N))
+
+# Decode: n, od, oh, ow from flat index
+DHW = D_out * H_out * W_out
+HW = H_out * W_out
+n_idx = offs_m // DHW
+rem = offs_m % DHW
+od_idx = rem // HW
+rem2 = rem % HW
+oh_idx = rem2 // W_out
+ow_idx = rem2 % W_out
+```
+
+**Key Rules:**
+- NEVER use 4D grid (program_id only supports 0,1,2)
+- ALWAYS flatten output positions to 1 dimension
+- Use simple 2D accumulator [BLOCK_M, BLOCK_N]
+- Broadcast: x[:, None] * w[None, :] for clean 2D matmul-like pattern
+
+Output Format (STRICT):
+1. Imports (torch, torch.nn, triton, triton.language, and any other needed modules like math)
+2. `@triton.jit` kernel(s)
+3. Wrapper function(s)
+4. `class ModelNew(nn.Module)` — this class is REQUIRED
+
+Do NOT include testing code or `if __name__ == "__main__"`.
+
+Example PyTorch:
+'''
+import torch
+import torch.nn as nn
+
+
+class Model(nn.Module):
+    """
+    Fusion example: Gemm + Add + ReLU
+    Three operations fused together.
+    """
+    def __init__(self, in_features, out_features, bias_shape):
+        super(Model, self).__init__()
+        self.gemm = nn.Linear(in_features, out_features)
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+
+    def forward(self, x):
+        x = self.gemm(x)
+        x = x + self.bias
+        x = torch.relu(x)
+        return x
+
+
+def get_inputs():
+    return [torch.randn(128, 512).cuda()]
+
+
+def get_init_inputs():
+    return [512, 512, (512,)]
+'''
+
+Example Triton:
+'''
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def fused_gemm_add_relu_kernel(
+    a_ptr, b_ptr, bias_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k in range(0, K, BLOCK_K):
+        a = tl.load(a_ptrs, mask=(offs_m[:, None] < M) & (offs_k[None, :] < K - k), other=0.0)
+        b = tl.load(b_ptrs, mask=(offs_k[:, None] < K - k) & (offs_n[None, :] < N), other=0.0)
+        acc += tl.dot(a, b, allow_tf32=True)
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Fused: add bias
+    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc += bias[None, :]
+
+    # Fused: ReLU
+    acc = tl.maximum(acc, 0.0)
+
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    tl.store(c_ptrs, acc, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+
+
+def fused_gemm_add_relu(x, weight, bias):
+    M, K = x.shape
+    N = weight.shape[0]
+    c = torch.empty((M, N), device=x.device, dtype=x.dtype)
+    b = weight.t().contiguous()
+    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']), triton.cdiv(N, META['BLOCK_N']))
+    fused_gemm_add_relu_kernel[grid](
+        x, b, bias, c, M, N, K,
+        x.stride(0), x.stride(1), b.stride(0), b.stride(1), c.stride(0), c.stride(1),
+    )
+    return c
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, bias_shape):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+
+    def forward(self, x):
+        return fused_gemm_add_relu(x, self.weight, self.bias)
+'''
+
+Hardware:
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+Target:
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs a convolution, applies ReLU, and applies HardSwish activation.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size):
+        super(Model, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = torch.relu(x)
+        x = x * torch.clamp((x + 3) / 6, 0, 1)
+        return x
+
+batch_size = 128
+in_channels = 8
+out_channels = 64
+height, width = 128, 128
+kernel_size = 3
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size]

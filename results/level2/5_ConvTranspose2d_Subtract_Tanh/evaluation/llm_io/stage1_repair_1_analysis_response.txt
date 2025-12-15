@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Custom tanh implementation using (exp(2x)-1)/(exp(2x)+1) instead of tl.tanh introduces significant numerical deviation from torch.tanh.",
+  "why_it_matters": "The naive exp-based tanh is numerically unstable for typical ConvTranspose2d outputs, causing large discrepancies (up to ~0.6) versus PyTorch’s highly optimized tanh implementation.",
+  "minimal_fix_hint": "Replace the manual tanh formula with Triton’s built-in tl.tanh on the bias-subtracted values."
+}
+```

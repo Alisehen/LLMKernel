@@ -6,154 +6,177 @@ import triton.language as tl
 
 
 @triton.jit
-def matmul_relu_kernel(
+def fused_linear_relu_kernel(
     # Pointers to matrices
-    a_ptr, b_ptr, bias_ptr, c_ptr,
+    x_ptr,
+    w_ptr,
+    b_ptr,
+    out_ptr,
     # Matrix dimensions
-    M, N, K,
-    # Stride variables
-    stride_am, stride_ak,
-    stride_bn, stride_bk,
-    stride_cm, stride_cn,
+    M,
+    N,
+    K,
+    # Strides
+    stride_xm,
+    stride_xk,
+    stride_wk,
+    stride_wn,
+    stride_om,
+    stride_on,
     # Meta-parameters
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr,
-    USE_BIAS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    ACC_TYPE: tl.constexpr,
 ):
     """
-    Kernel for computing C = ReLU(A @ B + bias) with:
-    - A: [M, K]
-    - B: [N, K] (transposed in memory, column-major)
-    - bias: [N] or None
-    - C: [M, N]
+    Fused kernel for: out = relu(x @ w.T + bias)
     """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
     
-    # Program ID
-    pid = tl.program_id(axis=0)
-    
-    # Number of program groups along M dimension
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * GROUP_SIZE_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
-    pid_n = (pid % num_pid_in_group) // group_size_m
-    
-    # Offsets for blocks
-    rm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    rn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    rk = tl.arange(0, BLOCK_SIZE_K)
-    
-    # Pointers to blocks
-    A = a_ptr + (rm[:, None] * stride_am + rk[None, :] * stride_ak)
-    B = b_ptr + (rk[:, None] * stride_bk + rn[None, :] * stride_bn)
-    bias = bias_ptr + rn if USE_BIAS else None
+    # Create offsets for M and N dimensions
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
     
     # Initialize accumulator
-    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
     
     # Loop over K dimension
-    for k in range(0, K, BLOCK_SIZE_K):
-        # Create masks
-        mask_a = (rm[:, None] < M) & (rk[None, :] < K - k)
-        mask_b = (rk[:, None] < K - k) & (rn[None, :] < N)
+    for k in range(0, tl.cdiv(K, BLOCK_K)):
+        # Load tile from x (M x K)
+        x_mask = (offs_m[:, None] < M) & (offs_k[None, :] < K - k * BLOCK_K)
+        x_ptrs = x_ptr + offs_m[:, None] * stride_xm + (k * BLOCK_K + offs_k[None, :]) * stride_xk
+        x_tile = tl.load(x_ptrs, mask=x_mask, other=0.0)
         
-        # Load blocks
-        a = tl.load(A, mask=mask_a, other=0.0)
-        b = tl.load(B, mask=mask_b, other=0.0)
+        # Load tile from w (N x K) - note w is transposed in this kernel
+        w_mask = (offs_n[:, None] < N) & (offs_k[None, :] < K - k * BLOCK_K)
+        w_ptrs = w_ptr + offs_n[:, None] * stride_wn + (k * BLOCK_K + offs_k[None, :]) * stride_wk
+        w_tile = tl.load(w_ptrs, mask=w_mask, other=0.0)
         
-        # Compute matrix multiplication
-        acc += tl.dot(a, b)
-        
-        # Move pointers to next K block
-        A += BLOCK_SIZE_K * stride_ak
-        B += BLOCK_SIZE_K * stride_bk
+        # Matrix multiplication
+        acc += tl.dot(x_tile, tl.trans(w_tile), allow_tf32=True)
     
-    # Add bias if needed
-    if USE_BIAS:
-        bias_mask = rn < N
-        b = tl.load(bias, mask=bias_mask, other=0.0)
-        acc += b[None, :]
+    # Add bias
+    if b_ptr is not None:
+        bias = tl.load(b_ptr + offs_n, mask=offs_n < N, other=0.0)
+        acc += bias[None, :]
     
     # Apply ReLU
     acc = tl.where(acc > 0, acc, 0.0)
     
-    # Write back result
-    rm_mask = rm < M
-    rn_mask = rn < N
-    mask = rm_mask[:, None] & rn_mask[None, :]
-    C = c_ptr + (rm[:, None] * stride_cm + rn[None, :] * stride_cn)
-    tl.store(C, acc, mask=mask)
+    # Write output
+    out_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    out_ptrs = out_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
+    tl.store(out_ptrs, acc, mask=out_mask)
 
 
-def triton_matmul_relu(
-    a: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor = None
-) -> torch.Tensor:
+def fused_linear_relu(x, weight, bias):
     """
-    Computes ReLU(a @ weight^T + bias) using Triton kernel.
+    Wrapper function for fused linear + bias + ReLU operation.
+    Computes: output = relu(x @ weight.T + bias)
     
     Args:
-        a: Input tensor of shape [M, K]
-        weight: Weight tensor of shape [N, K]
-        bias: Bias tensor of shape [N] or None
-    
+        x: Input tensor of shape (M, K)
+        weight: Weight tensor of shape (N, K)
+        bias: Bias tensor of shape (N,) or None
+        
     Returns:
-        Output tensor of shape [M, N]
+        Output tensor of shape (M, N)
     """
-    M, K = a.shape
-    N, K2 = weight.shape
-    assert K == K2, f"Dimension mismatch: a.shape={a.shape}, weight.shape={weight.shape}"
+    M, K = x.shape
+    N, K_w = weight.shape
+    assert K == K_w, f"Shape mismatch: x has K={K}, weight has K={K_w}"
+    
+    # Pre-transpose weight for better memory access pattern
+    weight_t = weight.t().contiguous()
     
     # Allocate output
-    c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+    out = torch.empty((M, N), device=x.device, dtype=x.dtype)
     
-    # Convert to column-major for B matrix (transpose weight)
-    b = weight.t().contiguous()
+    # Choose configuration based on data type
+    if x.dtype == torch.float16:
+        acc_dtype = tl.float16
+    elif x.dtype == torch.bfloat16:
+        acc_dtype = tl.bfloat16
+    else:
+        acc_dtype = tl.float32
     
-    # Grid launch configuration
+    # Heuristics for block sizes
+    def get_configs():
+        configs = []
+        # Configuration 1: Balanced for large matrices
+        configs.append({
+            'BLOCK_M': 64,
+            'BLOCK_N': 256,
+            'BLOCK_K': 32,
+            'num_stages': 3,
+            'num_warps': 8,
+        })
+        # Configuration 2: Better for smaller M dimension
+        configs.append({
+            'BLOCK_M': 128,
+            'BLOCK_N': 128,
+            'BLOCK_K': 32,
+            'num_stages': 3,
+            'num_warps': 8,
+        })
+        # Configuration 3: Better register utilization
+        configs.append({
+            'BLOCK_M': 128,
+            'BLOCK_N': 64,
+            'BLOCK_K': 64,
+            'num_stages': 2,
+            'num_warps': 4,
+        })
+        return configs
+    
+    # Set grid and kernel launch parameters
     grid = lambda meta: (
-        triton.cdiv(M, meta['BLOCK_SIZE_M']) * triton.cdiv(N, meta['BLOCK_SIZE_N']),
+        triton.cdiv(M, meta['BLOCK_M']),
+        triton.cdiv(N, meta['BLOCK_N']),
     )
     
-    # Kernel configuration
-    BLOCK_SIZE_M = 64
-    BLOCK_SIZE_N = 64
-    BLOCK_SIZE_K = 32
-    GROUP_SIZE_M = 8
+    # Create autotune config
+    @triton.autotune(
+        configs=get_configs(),
+        key=['M', 'N', 'K'],
+    )
+    def kernel_launcher(grid, **kwargs):
+        return fused_linear_relu_kernel[grid](**kwargs)
     
     # Launch kernel
-    matmul_relu_kernel[grid](
-        a, b, bias if bias is not None else a, c,  # Use a as dummy ptr if no bias
-        M, N, K,
-        a.stride(0), a.stride(1),
-        b.stride(0), b.stride(1),
-        c.stride(0), c.stride(1),
-        BLOCK_SIZE_M=BLOCK_SIZE_M,
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        BLOCK_SIZE_K=BLOCK_SIZE_K,
-        GROUP_SIZE_M=GROUP_SIZE_M,
-        USE_BIAS=bias is not None
+    kernel_launcher[grid](
+        x_ptr=x,
+        w_ptr=weight_t,
+        b_ptr=bias if bias is not None else None,
+        out_ptr=out,
+        M=M,
+        N=N,
+        K=K,
+        stride_xm=x.stride(0),
+        stride_xk=x.stride(1),
+        stride_wk=weight_t.stride(0),
+        stride_wn=weight_t.stride(1),
+        stride_om=out.stride(0),
+        stride_on=out.stride(1),
+        ACC_TYPE=acc_dtype,
     )
     
-    return c
+    return out
 
 
 class ModelNew(nn.Module):
     """
-    Optimized model that performs matrix multiplication, adds bias, and applies ReLU.
+    Fused version of Model with optimized Triton kernel.
+    Performs: out = relu(x @ weight.T + bias)
     """
     def __init__(self, in_features, out_features, bias_shape):
         super(ModelNew, self).__init__()
-        # Use nn.Parameter for weight to ensure it's registered correctly
         self.weight = nn.Parameter(torch.randn(out_features, in_features))
-        self.bias = nn.Parameter(torch.randn(bias_shape)) if bias_shape else None
-        
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+    
     def forward(self, x):
         """
         Args:
@@ -161,5 +184,5 @@ class ModelNew(nn.Module):
         Returns:
             torch.Tensor: Output tensor with shape (batch_size, out_features).
         """
-        return triton_matmul_relu(x, self.weight, self.bias)
+        return fused_linear_relu(x, self.weight, self.bias)
 ```

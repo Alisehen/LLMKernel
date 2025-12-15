@@ -1,0 +1,5 @@
+{
+  "critical_issue": "Triton kernel normalizes across the channel dimension, but PyTorch LayerNorm(normalized_shape=(C,)) on [N,C,D,H,W] normalizes over the last dimension, so the reduction axes differ.",
+  "why_it_matters": "Using different normalization axes changes mean/variance and hence the normalized values, leading to the large output discrepancies reported by the max_abs_err and mean_abs_err.",
+  "minimal_fix_hint": "Change the Triton kernel to normalize over the same last-dimension axes as PyTorch LayerNorm for the given input shape and normalized_shape."
+}

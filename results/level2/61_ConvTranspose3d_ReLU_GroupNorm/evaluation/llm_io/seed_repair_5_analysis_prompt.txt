@@ -1,0 +1,435 @@
+You are a Triton kernel debugging expert. Analyze the error and identify the root cause.
+
+## ERROR LOG
+```
+Traceback (most recent call last):
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 34, in wrapper
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 1427, in program_id
+    return semantic.program_id(axis, _builder)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/semantic.py", line 29, in program_id
+    raise ValueError(f"program_id axis must be 0, 1, or 2 but got {axis}")
+ValueError: program_id axis must be 0, 1, or 2 but got 3
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 538, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251214_114735_batch_range56to80_deepseek_deepseek/61_ConvTranspose3d_ReLU_GroupNorm/code/kernel_20251214_155758.py", line 290, in forward
+    x = fused_relu_group_norm(x, self.weight, self.bias, self.groups)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251214_114735_batch_range56to80_deepseek_deepseek/61_ConvTranspose3d_ReLU_GroupNorm/code/kernel_20251214_155758.py", line 239, in fused_relu_group_norm
+    fused_relu_group_norm_apply_kernel[grid_apply](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 347, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 569, in run
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 278, in compile
+    module = src.make_ir(options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 81, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 24:12:
+    BLOCK_C: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+):
+    """
+    Phase 2: Apply ReLU + GroupNorm using precomputed group statistics
+    """
+    pid_n = tl.program_id(0)
+    pid_g = tl.program_id(1)
+    pid_d = tl.program_id(2)
+    pid_h = tl.program_id(3)
+            ^
+```
+
+## Expected Behavior (PyTorch Reference)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs a transposed 3D convolution, applies ReLU, and then applies group normalization.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, groups, bias=False):
+        super(Model, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size, bias=bias)
+        self.relu = nn.ReLU()
+        self.group_norm = nn.GroupNorm(num_groups=groups, num_channels=out_channels)
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_channels, D, H, W).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_channels, D, H, W).
+        """
+        x = self.conv_transpose(x)
+        x = self.relu(x)
+        x = self.group_norm(x)
+        return x
+
+batch_size = 16
+in_channels = 64
+out_channels = 128
+D, H, W = 32, 32, 32
+kernel_size = 3
+groups = 8
+bias = False
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, D, H, W)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, groups, bias]
+```
+
+## Current Implementation (Broken Triton Kernel)
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def fused_relu_group_norm_stats_kernel(
+    x_ptr,
+    group_sum_ptr,
+    group_sum_sq_ptr,
+    N, C, D, H, W,
+    stride_n, stride_c, stride_d, stride_h, stride_w,
+    groups,
+    eps,
+    BLOCK_C: tl.constexpr,
+    BLOCK_DHW: tl.constexpr,
+):
+    """
+    Phase 1: Compute group statistics (sum and sum_sq) across entire groups
+    """
+    pid_n = tl.program_id(0)  # Batch index
+    pid_g = tl.program_id(1)  # Channel group index
+    
+    if pid_n >= N or pid_g >= groups:
+        return
+    
+    group_channels = C // groups
+    group_start = pid_g * group_channels
+    group_end = group_start + group_channels
+    
+    DHW = D * H * W
+    
+    # Initialize accumulators for this group
+    sum_val = tl.zeros((BLOCK_C,), dtype=tl.float32)
+    sum_sq = tl.zeros((BLOCK_C,), dtype=tl.float32)
+    
+    # Loop over channels in this group
+    for c_offset in range(0, group_channels, BLOCK_C):
+        c_idx = tl.arange(0, BLOCK_C)
+        c = group_start + c_offset + c_idx
+        c_mask = c < group_end
+        
+        # Loop over spatial positions
+        for dhw_offset in range(0, DHW, BLOCK_DHW):
+            dhw_idx = tl.arange(0, BLOCK_DHW)
+            global_dhw = dhw_offset + dhw_idx
+            spatial_mask = global_dhw < DHW
+            
+            # Unpack spatial indices
+            d_idx = global_dhw // (H * W)
+            hw_rem = global_dhw % (H * W)
+            h_idx = hw_rem // W
+            w_idx = hw_rem % W
+            
+            # Broadcast masks
+            valid_mask = c_mask[:, None] & spatial_mask[None, :]
+            
+            # Load input and apply ReLU
+            offsets = (
+                pid_n * stride_n + 
+                c[:, None] * stride_c + 
+                d_idx[None, :] * stride_d + 
+                h_idx[None, :] * stride_h + 
+                w_idx[None, :] * stride_w
+            )
+            
+            x_vals = tl.load(x_ptr + offsets, mask=valid_mask, other=0.0)
+            x_relu = tl.maximum(x_vals, 0.0)
+            
+            # Accumulate statistics
+            sum_val += tl.sum(tl.where(valid_mask, x_relu, 0.0), axis=1)
+            sum_sq += tl.sum(tl.where(valid_mask, x_relu * x_relu, 0.0), axis=1)
+    
+    # Reduce across channel block
+    total_sum = tl.sum(sum_val)
+    total_sum_sq = tl.sum(sum_sq)
+    count = tl.cast(group_channels * DHW, tl.float32)
+    
+    # Write group statistics
+    out_idx = pid_n * groups + pid_g
+    tl.store(group_sum_ptr + out_idx, total_sum)
+    tl.store(group_sum_sq_ptr + out_idx, total_sum_sq)
+
+
+@triton.jit
+def fused_relu_group_norm_apply_kernel(
+    x_ptr,
+    weight_ptr,
+    bias_ptr,
+    group_sum_ptr,
+    group_sum_sq_ptr,
+    out_ptr,
+    N, C, D, H, W,
+    stride_n, stride_c, stride_d, stride_h, stride_w,
+    out_stride_n, out_stride_c, out_stride_d, out_stride_h, out_stride_w,
+    groups,
+    eps,
+    BLOCK_C: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+):
+    """
+    Phase 2: Apply ReLU + GroupNorm using precomputed group statistics
+    """
+    pid_n = tl.program_id(0)
+    pid_g = tl.program_id(1)
+    pid_d = tl.program_id(2)
+    pid_h = tl.program_id(3)
+    pid_w = tl.program_id(4)
+    
+    if pid_n >= N or pid_g >= groups:
+        return
+    
+    group_channels = C // groups
+    group_start = pid_g * group_channels
+    
+    # Read group statistics
+    stats_idx = pid_n * groups + pid_g
+    group_sum = tl.load(group_sum_ptr + stats_idx)
+    group_sum_sq = tl.load(group_sum_sq_ptr + stats_idx)
+    count = tl.cast(group_channels * D * H * W, tl.float32)
+    
+    # Compute group mean and variance
+    safe_count = tl.maximum(count, 1.0)
+    mean = group_sum / safe_count
+    variance = tl.maximum(group_sum_sq / safe_count - mean * mean, 0.0)
+    inv_std = 1.0 / tl.sqrt(variance + eps)
+    
+    # Process spatial block
+    d_offset = pid_d * BLOCK_D
+    h_offset = pid_h * BLOCK_H
+    w_offset = pid_w * BLOCK_W
+    
+    d_idx = d_offset + tl.arange(0, BLOCK_D)
+    h_idx = h_offset + tl.arange(0, BLOCK_H)
+    w_idx = w_offset + tl.arange(0, BLOCK_W)
+    
+    d_mask = d_idx < D
+    h_mask = h_idx < H
+    w_mask = w_idx < W
+    
+    # Process channels in this group
+    for c_offset in range(0, group_channels, BLOCK_C):
+        c_idx = tl.arange(0, BLOCK_C)
+        c = group_start + c_offset + c_idx
+        c_mask = c < (group_start + group_channels)
+        
+        # Broadcast masks
+        d_mask_2d = d_mask[None, :, None, None]
+        h_mask_2d = h_mask[None, None, :, None]
+        w_mask_2d = w_mask[None, None, None, :]
+        c_mask_2d = c_mask[:, None, None, None]
+        valid_mask = c_mask_2d & d_mask_2d & h_mask_2d & w_mask_2d
+        
+        # Compute offsets
+        offsets = (
+            pid_n * stride_n +
+            c[:, None, None, None] * stride_c +
+            d_idx[None, :, None, None] * stride_d +
+            h_idx[None, None, :, None] * stride_h +
+            w_idx[None, None, None, :] * stride_w
+        )
+        
+        # Load and apply ReLU
+        x_vals = tl.load(x_ptr + offsets, mask=valid_mask, other=0.0)
+        x_relu = tl.maximum(x_vals, 0.0)
+        
+        # Normalize
+        normalized = (x_relu - mean) * inv_std
+        
+        # Load weight and bias
+        weight_vals = tl.load(weight_ptr + c, mask=c_mask, other=0.0)
+        bias_vals = tl.load(bias_ptr + c, mask=c_mask, other=0.0)
+        
+        # Apply affine transformation
+        output = normalized * weight_vals[:, None, None, None] + bias_vals[:, None, None, None]
+        
+        # Store output
+        out_offsets = (
+            pid_n * out_stride_n +
+            c[:, None, None, None] * out_stride_c +
+            d_idx[None, :, None, None] * out_stride_d +
+            h_idx[None, None, :, None] * out_stride_h +
+            w_idx[None, None, None, :] * out_stride_w
+        )
+        tl.store(out_ptr + out_offsets, output, mask=valid_mask)
+
+
+def fused_relu_group_norm(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, groups: int) -> torch.Tensor:
+    """
+    Wrapper for fused ReLU + GroupNorm using two-phase kernel
+    """
+    N, C, D, H, W = x.shape
+    
+    # Validate dimensions
+    assert C % groups == 0, f"Channels {C} must be divisible by groups {groups}"
+    
+    # Create output tensor
+    out = torch.empty_like(x)
+    
+    # Group parameters
+    eps = 1e-5
+    group_channels = C // groups
+    
+    # Phase 1: Compute group statistics
+    group_sum = torch.zeros(N * groups, dtype=torch.float32, device=x.device)
+    group_sum_sq = torch.zeros(N * groups, dtype=torch.float32, device=x.device)
+    
+    # Launch statistics kernel
+    BLOCK_C_STATS = min(triton.next_power_of_2(group_channels), 32)
+    BLOCK_DHW_STATS = 128  # Process 128 spatial positions at once
+    
+    grid_stats = (N, groups)
+    fused_relu_group_norm_stats_kernel[grid_stats](
+        x, group_sum, group_sum_sq,
+        N, C, D, H, W,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
+        groups, eps,
+        BLOCK_C=BLOCK_C_STATS,
+        BLOCK_DHW=BLOCK_DHW_STATS,
+    )
+    
+    # Phase 2: Apply normalization
+    BLOCK_C = min(triton.next_power_of_2(group_channels), 32)
+    BLOCK_D = min(triton.next_power_of_2(D), 8)
+    BLOCK_H = min(triton.next_power_of_2(H), 8)
+    BLOCK_W = min(triton.next_power_of_2(W), 8)
+    
+    grid_apply = (
+        N,
+        groups,
+        triton.cdiv(D, BLOCK_D),
+        triton.cdiv(H, BLOCK_H),
+        triton.cdiv(W, BLOCK_W),
+    )
+    
+    fused_relu_group_norm_apply_kernel[grid_apply](
+        x, weight, bias, group_sum, group_sum_sq, out,
+        N, C, D, H, W,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
+        out.stride(0), out.stride(1), out.stride(2), out.stride(3), out.stride(4),
+        groups, eps,
+        BLOCK_C=BLOCK_C,
+        BLOCK_D=BLOCK_D,
+        BLOCK_H=BLOCK_H,
+        BLOCK_W=BLOCK_W,
+    )
+    
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    ConvTranspose3d (PyTorch native) + Fused ReLU + GroupNorm (Triton)
+    
+    Uses PyTorch's native ConvTranspose3d (complex index mapping) and fuses
+    the subsequent ReLU and GroupNorm operations in Triton for better performance.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, groups, bias=False):
+        super(ModelNew, self).__init__()
+        
+        # Keep ConvTranspose3d as PyTorch native - DO NOT reimplement in Triton
+        self.conv_transpose = nn.ConvTranspose3d(
+            in_channels, out_channels, kernel_size, bias=bias
+        )
+        
+        # GroupNorm parameters (learnable)
+        self.weight = nn.Parameter(torch.ones(out_channels))
+        self.bias = nn.Parameter(torch.zeros(out_channels))
+        self.groups = groups
+        
+        # Initialize weights
+        nn.init.ones_(self.weight)
+        nn.init.zeros_(self.bias)
+    
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_channels, D, H, W)
+        
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_channels, D, H, W)
+        """
+        # Step 1: PyTorch native ConvTranspose3d
+        x = self.conv_transpose(x)
+        
+        # Step 2: Fused ReLU + GroupNorm in Triton
+        x = fused_relu_group_norm(x, self.weight, self.bias, self.groups)
+        
+        return x
+```
+
+---
+
+## Your Task
+
+Identify the **single most critical issue** that causes the error above.
+
+### Analysis Guidelines
+
+1. **Focus on root cause**, not symptoms
+   - Bad: "Output is wrong"
+   - Good: "BLOCK_K loop missing, only processes first 32 elements of K dimension"
+
+2. **Be specific about WHAT and WHERE**
+   - Bad: "Memory access issue"
+   - Good: "Line 45: tl.atomic_add(c_block_ptr, acc) - atomic_add requires scalar pointer, not block_ptr"
+
+3. **Prioritize by impact**
+   - Correctness bugs > Performance issues > Style problems
+   - Algorithm errors > Implementation details
+
+### Output Format
+
+**CRITICAL: You MUST output ONLY valid JSON. No other text allowed.**
+
+```json
+{
+  "critical_issue": "<Concise description of THE root cause, max 30 words>",
+  "why_it_matters": "<Why this causes the observed error, max 35 words>",
+  "minimal_fix_hint": "<What needs to change (not how), max 30 words>"
+}
+```
+
+**Remember**: Output ONLY the JSON block. No explanations, no commentary, no additional text.

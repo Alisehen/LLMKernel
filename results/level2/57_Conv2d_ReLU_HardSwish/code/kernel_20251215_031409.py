@@ -1,0 +1,155 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def conv_relu_hswish_kernel(
+    x_ptr, w_ptr, b_ptr, y_ptr,
+    N, C_in, H, W,
+    OC, K_H, K_W,
+    H_out, W_out,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_wo, stride_wi, stride_wkh, stride_wkw,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    BLOCK_M: tl.constexpr,  # number of output positions per block (flattened N*H_out*W_out)
+    BLOCK_N: tl.constexpr,  # number of output channels per block
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    # Offsets in flattened output position dimension and output channel dimension
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    # Total number of output positions
+    DHW = H_out * W_out
+    P = N * DHW
+
+    # Mask for valid positions/channels
+    mask_m = offs_m < P
+    mask_n = offs_n < OC
+
+    # Decode flattened index offs_m -> (n, oh, ow)
+    n_idx = offs_m // DHW
+    rem = offs_m % DHW
+    oh_idx = rem // W_out
+    ow_idx = rem % W_out
+
+    # Accumulator for output tile [BLOCK_M, BLOCK_N]
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Convolution: loop over input channels and kernel positions
+    for ic in range(0, C_in):
+        for kh in range(0, K_H):
+            for kw in range(0, K_W):
+                ih = oh_idx + kh
+                iw = ow_idx + kw
+
+                # Pointers for input x: [BLOCK_M]
+                x_ptrs = (
+                    x_ptr
+                    + n_idx * stride_xn
+                    + ic * stride_xc
+                    + ih * stride_xh
+                    + iw * stride_xw
+                )
+
+                # Pointers for weights w: [BLOCK_N]
+                w_ptrs = (
+                    w_ptr
+                    + offs_n * stride_wo
+                    + ic * stride_wi
+                    + kh * stride_wkh
+                    + kw * stride_wkw
+                )
+
+                x_vals = tl.load(x_ptrs, mask=mask_m, other=0.0)        # [BLOCK_M]
+                w_vals = tl.load(w_ptrs, mask=mask_n, other=0.0)        # [BLOCK_N]
+
+                acc += x_vals[:, None] * w_vals[None, :]
+
+    # Add bias: bias is [OC]
+    bias_vals = tl.load(b_ptr + offs_n, mask=mask_n, other=0.0)  # [BLOCK_N]
+    acc += bias_vals[None, :]
+
+    # ReLU
+    acc = tl.maximum(acc, 0.0)
+
+    # HardSwish: x * clamp((x + 3) / 6, 0, 1)
+    t = (acc + 3.0) / 6.0
+    t = tl.minimum(t, 1.0)
+    t = tl.maximum(t, 0.0)
+    acc = acc * t
+
+    # Store results
+    y_ptrs = (
+        y_ptr
+        + n_idx[:, None] * stride_yn
+        + offs_n[None, :] * stride_yc
+        + oh_idx[:, None] * stride_yh
+        + ow_idx[:, None] * stride_yw
+    )
+    out_mask = mask_m[:, None] & mask_n[None, :]
+    tl.store(y_ptrs, acc, mask=out_mask)
+
+
+def conv_relu_hswish_triton(x, weight, bias):
+    """
+    x:      [N, C_in, H, W]
+    weight: [OC, C_in, K_H, K_W]
+    bias:   [OC]
+    Implements Conv2d (stride=1, padding=0, dilation=1) + ReLU + HardSwish.
+    """
+    x = x.contiguous()
+    weight = weight.contiguous()
+    bias = bias.contiguous()
+
+    N, C_in, H, W = x.shape
+    OC, C_w, K_H, K_W = weight.shape
+    assert C_w == C_in, "Incompatible in_channels between input and weight"
+
+    # Stride=1, padding=0, dilation=1
+    H_out = H - K_H + 1
+    W_out = W - K_W + 1
+    assert H_out > 0 and W_out > 0, "Invalid kernel size for given input dimensions"
+
+    y = torch.empty((N, OC, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    def grid(meta):
+        return (
+            triton.cdiv(N * H_out * W_out, meta["BLOCK_M"]),
+            triton.cdiv(OC, meta["BLOCK_N"]),
+        )
+
+    conv_relu_hswish_kernel[grid](
+        x, weight, bias, y,
+        N, C_in, H, W,
+        OC, K_H, K_W,
+        H_out, W_out,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        weight.stride(0), weight.stride(1), weight.stride(2), weight.stride(3),
+        y.stride(0), y.stride(1), y.stride(2), y.stride(3),
+        BLOCK_M=64,  # must be power of 2
+        BLOCK_N=32,  # must be power of 2
+    )
+
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-accelerated version of:
+        Conv2d -> ReLU -> x * clamp((x + 3) / 6, 0, 1)
+    """
+    def __init__(self, in_channels, out_channels, kernel_size):
+        super(ModelNew, self).__init__()
+        # Assume square kernel as in the original Model
+        self.weight = nn.Parameter(
+            torch.randn(out_channels, in_channels, kernel_size, kernel_size)
+        )
+        self.bias = nn.Parameter(torch.randn(out_channels))
+
+    def forward(self, x):
+        return conv_relu_hswish_triton(x, self.weight, self.bias)

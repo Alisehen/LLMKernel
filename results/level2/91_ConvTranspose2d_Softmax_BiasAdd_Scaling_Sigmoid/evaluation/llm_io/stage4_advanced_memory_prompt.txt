@@ -1,0 +1,237 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU
+GPU Name: 4090
+Architecture: Ada Lovelace
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+[OPTIMIZATION STAGE]
+
+## Current Optimization Stage
+
+Focus: Fine-tuning fused kernel parameters.
+
+Params:
+- num_warps ∈ {4, 8}
+- num_stages ∈ {2, 3}
+
+Conditional Rules (NOT one-size-fits-all):
+
+IF register pressure LOW (regs < 96, no spill):
+  - Try num_warps=8 for compute-bound fusion
+  - num_stages=3 may help hide latency
+
+IF register pressure HIGH (regs > 128 or occupancy_limit_registers):
+  - Use num_warps=4 (fewer warps = more registers per warp)
+  - Keep num_stages=2 (higher stages need more registers)
+
+IF multi-input fusion (3+ distinct loads):
+  - num_stages=2 preferred (each stage buffers all inputs)
+  - num_warps=4 often better than 8
+
+Autotune:
+- Max 2-3 configs to reduce compilation time
+- Always include conservative baseline (num_warps=4, num_stages=2)
+- Test before/after: revert if gain < 2%
+
+
+
+[CURRENT CODE]
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def fused_softmax_bias_scale_sigmoid_kernel(
+    x_ptr, bias_ptr, out_ptr,
+    N, C, H, W,
+    stride_n, stride_c, stride_h, stride_w,
+    scaling_factor,
+    BLOCK_W: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+):
+    """
+    Fused kernel:
+      1. Softmax over channel dimension (dim=1) per (n, h, w)
+      2. Add channel bias (C,)
+      3. Multiply by scaling_factor
+      4. Apply sigmoid
+
+    Tiling:
+      - program_id(0): batch index n
+      - program_id(1): height index h
+      - program_id(2): tile index along width (w)
+
+    Each program processes:
+      - One fixed (n, h)
+      - BLOCK_W spatial positions along width
+      - All C channels (C <= BLOCK_C, padded with -inf if C < BLOCK_C)
+    """
+    pid_n = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    pid_w_block = tl.program_id(2)
+
+    # Offsets over width
+    offs_w = pid_w_block * BLOCK_W + tl.arange(0, BLOCK_W)
+    mask_w = offs_w < W
+
+    # Offsets over channels
+    offs_c = tl.arange(0, BLOCK_C)
+    mask_c = offs_c < C
+
+    # 2D mask for valid (w, c) pairs
+    mask = mask_w[:, None] & mask_c[None, :]
+
+    # Base pointer for (n, h)
+    base_nh = pid_n * stride_n + pid_h * stride_h
+
+    # Pointers to input x for [BLOCK_W, BLOCK_C] tile
+    x_ptrs = x_ptr + base_nh + offs_w[:, None] * stride_w + offs_c[None, :] * stride_c
+
+    # Load input; pad invalid lanes with -inf so they don't affect softmax
+    x_vals = tl.load(x_ptrs, mask=mask, other=-float('inf'))
+    x_dtype = x_vals.dtype
+    x_fp32 = tl.cast(x_vals, tl.float32)
+
+    # Softmax over channels (axis=1) for each spatial position (n, h, w)
+    max_val = tl.max(x_fp32, axis=1)              # [BLOCK_W]
+    x_shifted = x_fp32 - max_val[:, None]         # [BLOCK_W, BLOCK_C]
+    exp_x = tl.exp(x_shifted)                     # [BLOCK_W, BLOCK_C]
+    sum_exp = tl.sum(exp_x, axis=1)               # [BLOCK_W]
+    softmax = exp_x / sum_exp[:, None]            # [BLOCK_W, BLOCK_C]
+
+    # Load bias [C] and broadcast over BLOCK_W positions
+    bias_vals = tl.load(bias_ptr + offs_c, mask=mask_c, other=0.0)
+    bias_fp32 = tl.cast(bias_vals, tl.float32)[None, :]  # [1, BLOCK_C] -> broadcast
+
+    # Fused: +bias, *scale, sigmoid
+    y = (softmax + bias_fp32) * scaling_factor
+
+    neg_y = -y
+    exp_neg_y = tl.exp(neg_y)
+    sigmoid = 1.0 / (1.0 + exp_neg_y)
+
+    # Store result, cast back to original dtype
+    out_vals = tl.cast(sigmoid, x_dtype)
+    out_ptrs = out_ptr + base_nh + offs_w[:, None] * stride_w + offs_c[None, :] * stride_c
+    tl.store(out_ptrs, out_vals, mask=mask)
+
+
+def fused_post_convtranspose(x: torch.Tensor, bias: torch.Tensor, scaling_factor: float):
+    """
+    x: [N, C, H, W] - result of ConvTranspose2d
+    bias: [C, 1, 1] or [C] - channel-wise bias
+    Returns: [N, C, H, W] with fused operations:
+        softmax(dim=1) -> +bias -> *scaling_factor -> sigmoid
+    """
+    assert x.is_cuda, "Input must be on CUDA device"
+    N, C, H, W = x.shape
+    assert C <= 1024, "Kernel currently supports C <= 1024 for best performance."
+
+    # Ensure bias is [C]
+    bias_flat = bias.view(C).contiguous()
+
+    out = torch.empty_like(x)
+
+    # Channel tile size: round up to nearest multiple of 64, capped at 1024
+    BLOCK_C = min(((C + 63) // 64) * 64, 1024)
+
+    # Spatial tiling along width
+    BLOCK_W = 64
+
+    grid = (
+        N,                        # batch
+        H,                        # height
+        triton.cdiv(W, BLOCK_W),  # width tiles
+    )
+
+    # Heuristic for num_warps based on C
+    if C <= 128:
+        num_warps = 4
+    elif C <= 512:
+        num_warps = 8
+    else:
+        num_warps = 8
+
+    fused_softmax_bias_scale_sigmoid_kernel[grid](
+        x, bias_flat, out,
+        N, C, H, W,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        float(scaling_factor),
+        BLOCK_W=BLOCK_W,
+        BLOCK_C=BLOCK_C,
+        num_warps=num_warps,
+        num_stages=2,
+    )
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    ConvTranspose2d (PyTorch native) +
+    fused softmax(dim=1) + bias add + scaling + sigmoid (Triton).
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding,
+                 output_padding, bias_shape, scaling_factor):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose2d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            output_padding=output_padding,
+        )
+        # Match original bias shape (C, 1, 1)
+        self.bias = nn.Parameter(torch.randn(out_channels, 1, 1))
+        self.scaling_factor = scaling_factor
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = fused_post_convtranspose(x, self.bias, self.scaling_factor)
+        return x
+```
+
+[NCU PROFILING METRICS]
+{
+  "fused_softmax_bias_scale_sigmoid_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 9.1,
+    "launch__grid_size": 49536,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 16.43,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 56.95,
+    "lts__t_sector_hit_rate.pct": 51.0
+  }
+}
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+TRITON API CONSTRAINTS (CRITICAL):
+- Triton has NO: tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

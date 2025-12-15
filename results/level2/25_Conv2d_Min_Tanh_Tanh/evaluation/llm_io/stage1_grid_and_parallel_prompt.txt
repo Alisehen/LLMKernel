@@ -1,0 +1,252 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU
+GPU Name: 4090
+Architecture: Ada Lovelace
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+[OPTIMIZATION STAGE]
+
+## Current Optimization Stage
+
+Focus: Grid layout & indexing for FUSED operations.
+
+⚠️ FUSION EXCLUSIONS (do NOT apply fusion rules to these):
+- Reduction ops (sum, mean, softmax along axis)
+- Atomic operations
+- Irregular/data-dependent access patterns
+- Cross-block dependencies
+
+Key Principle:
+- All fused ops share the SAME grid AND the SAME (offsets, mask) tuple
+- Grid covers OUTPUT tensor dimensions
+
+Hard Rules:
+- Every fused op MUST use identical offset calculation
+- Every fused op MUST use identical boundary mask
+- If broadcast needed: explicit `[None, :]` or `[:, None]`, NOT different offsets
+- Element-wise: 1D grid, single `offs = pid * BLOCK + tl.arange(0, BLOCK)`
+- Matmul fusion: 2D grid, `offs_m/offs_n` shared by bias add & activation
+
+Verification:
+- Check: all tl.load/tl.store use same `offsets` variable
+- Check: all masks derived from same boundary condition
+- If ANY op needs different indexing → do NOT fuse, split kernel
+
+
+
+[CURRENT CODE]
+```python
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def conv_min_tanh2_kernel(
+    x_ptr, w_ptr, b_ptr, out_ptr,
+    N, C_in, H, W,
+    C_out, K, H_out, W_out,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_wn, stride_wc, stride_wkh, stride_wkw,
+    stride_on, stride_oc, stride_oh, stride_ow,
+    P,
+    BLOCK_M: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offs_m < P
+
+    HW_out = H_out * W_out
+
+    n_idx = offs_m // HW_out
+    rem = offs_m % HW_out
+    oh_idx = rem // W_out
+    ow_idx = rem % W_out
+
+    # Initialize per-position minimum with a large value
+    min_val = tl.zeros((BLOCK_M,), dtype=tl.float32) + 1e30
+
+    # Loop over output channels, compute conv and track minimum over channels
+    for oc in range(0, C_out):
+        acc = tl.zeros((BLOCK_M,), dtype=tl.float32)
+
+        for ic in range(0, C_in):
+            for kh in range(0, K):
+                for kw in range(0, K):
+                    h_in = oh_idx + kh
+                    w_in = ow_idx + kw
+
+                    x_ptrs = (
+                        x_ptr
+                        + n_idx * stride_xn
+                        + ic * stride_xc
+                        + h_in * stride_xh
+                        + w_in * stride_xw
+                    )
+                    x_vals = tl.load(x_ptrs, mask=mask_m, other=0.0)
+
+                    w_offset = (
+                        oc * stride_wn
+                        + ic * stride_wc
+                        + kh * stride_wkh
+                        + kw * stride_wkw
+                    )
+                    w_val = tl.load(w_ptr + w_offset)
+
+                    acc += x_vals * w_val
+
+        # Add bias
+        bias_val = tl.load(b_ptr + oc)
+        acc += bias_val
+
+        # Update minimum across channels
+        min_val = tl.minimum(min_val, acc)
+
+    # Apply tanh twice: tanh(tanh(x))
+    # Use a numerically safe implementation via exp, with clamping.
+    x1 = tl.maximum(tl.minimum(min_val, 10.0), -10.0)
+    t1 = tl.exp(2.0 * x1)
+    tanh1 = (t1 - 1.0) / (t1 + 1.0)
+
+    x2 = tl.maximum(tl.minimum(tanh1, 10.0), -10.0)
+    t2 = tl.exp(2.0 * x2)
+    tanh2 = (t2 - 1.0) / (t2 + 1.0)
+
+    out_ptrs = (
+        out_ptr
+        + n_idx * stride_on
+        + 0 * stride_oc
+        + oh_idx * stride_oh
+        + ow_idx * stride_ow
+    )
+    tl.store(out_ptrs, tanh2, mask=mask_m)
+
+
+def conv_min_tanh2(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    Fused operation:
+      y = conv2d(x, weight, bias)        # N, C_out, H_out, W_out
+      y_min = min(y, dim=1, keepdim=True)
+      out = tanh(tanh(y_min))
+    Implemented as a single Triton kernel.
+    Assumes stride=1, padding=0, dilation=1, groups=1, square kernel.
+    """
+    assert x.ndim == 4
+    x = x.contiguous()
+    weight = weight.contiguous()
+    bias = bias.contiguous()
+
+    N, C_in, H, W = x.shape
+    C_out, C_in_w, K_h, K_w = weight.shape
+    assert C_in_w == C_in
+    assert K_h == K_w
+    K = K_h
+
+    H_out = H - K + 1
+    W_out = W - K + 1
+    assert H_out > 0 and W_out > 0
+
+    out = torch.empty((N, 1, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    P = N * H_out * W_out
+
+    grid = lambda META: (triton.cdiv(P, META["BLOCK_M"]),)
+
+    conv_min_tanh2_kernel[grid](
+        x, weight, bias, out,
+        N, C_in, H, W,
+        C_out, K, H_out, W_out,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        weight.stride(0), weight.stride(1), weight.stride(2), weight.stride(3),
+        out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+        P,
+        BLOCK_M=32,
+    )
+
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    Triton implementation of:
+        conv2d -> channel-wise min (keepdim) -> tanh -> tanh
+    with stride=1, padding=0, dilation=1, groups=1.
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size):
+        super(ModelNew, self).__init__()
+        if isinstance(kernel_size, int):
+            k_h = k_w = kernel_size
+        else:
+            k_h, k_w = kernel_size
+        assert k_h == k_w, "Only square kernels are supported in this implementation."
+        k = k_h
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = k
+
+        self.weight = nn.Parameter(torch.empty(out_channels, in_channels, k, k))
+        self.bias = nn.Parameter(torch.empty(out_channels))
+
+        # Initialize as nn.Conv2d does (Kaiming uniform)
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        fan_in = in_channels * k * k
+        bound = 1 / math.sqrt(fan_in)
+        nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x):
+        # Fallback to PyTorch for non-CUDA tensors
+        if not x.is_cuda:
+            y = F.conv2d(x, self.weight, self.bias, stride=1, padding=0)
+            y_min = torch.min(y, dim=1, keepdim=True)[0]
+            return torch.tanh(torch.tanh(y_min))
+
+        return conv_min_tanh2(x, self.weight, self.bias)
+```
+
+[NCU PROFILING METRICS]
+{
+  "conv_min_tanh2_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 74.87,
+    "launch__grid_size": 258064,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 99.54,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 0.23,
+    "lts__t_sector_hit_rate.pct": 99.54
+  }
+}
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+TRITON API CONSTRAINTS (CRITICAL):
+- Triton has NO: tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

@@ -1,0 +1,125 @@
+```python
+# <complete ModelNew code with optimized Triton kernels>
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_SIZE": 1024}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_SIZE": 2048}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_SIZE": 4096}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_SIZE": 8192}, num_warps=8, num_stages=2),
+    ],
+    key=["numel"],
+)
+@triton.jit
+def fused_add_min_gelu_mul_kernel(
+    x_ptr,
+    out_ptr,
+    numel: tl.int32,
+    add_value: tl.float32,
+    multiply_value: tl.float32,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Fused elementwise kernel:
+      y = x + add_value
+      y = min(y, 0.0)
+      y = GELU(y)                   # erf-based (exact formulation)
+      y = y * multiply_value
+
+    1D grid over the flattened tensor.
+    All fused ops share the SAME offsets and mask.
+    """
+    pid = tl.program_id(axis=0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < numel
+
+    # Streaming, contiguous load (no unsupported cache_modifier)
+    x = tl.load(
+        x_ptr + offsets,
+        mask=mask,
+        other=0.0,
+    )
+
+    # Add scalar
+    x = x + add_value
+
+    # Clamp max at 0.0
+    x = tl.minimum(x, 0.0)
+
+    # GELU: 0.5 * x * (1 + erf(x / sqrt(2)))
+    inv_sqrt2 = 0.7071067811865475  # 1 / sqrt(2)
+    x_scaled = x * inv_sqrt2
+    x_erf = tl.math.erf(x_scaled)
+    x = 0.5 * x * (1.0 + x_erf) * x
+
+    # Multiply scalar
+    x = x * multiply_value
+
+    # Store result (no unsupported cache_modifier)
+    tl.store(
+        out_ptr + offsets,
+        x,
+        mask=mask,
+    )
+
+
+def fused_post_convtranspose(
+    x: torch.Tensor,
+    add_value: float,
+    multiply_value: float,
+) -> torch.Tensor:
+    """
+    Fused post-processing after ConvTranspose2d:
+      y = x + add_value
+      y = min(y, 0.0)
+      y = GELU(y)
+      y = y * multiply_value
+
+    Implemented as a single Triton kernel over the flattened tensor.
+    Grid is 1D over output numel; all fused ops share offsets/mask.
+    """
+    assert x.is_cuda, "Input must be a CUDA tensor for Triton kernels."
+
+    out = torch.empty_like(x)
+    numel = x.numel()
+
+    # Grid depends on the autotuned BLOCK_SIZE selected by Triton.
+    grid = lambda META: (triton.cdiv(numel, META["BLOCK_SIZE"]),)
+
+    fused_add_min_gelu_mul_kernel[grid](
+        x,
+        out,
+        numel,
+        float(add_value),
+        float(multiply_value),
+    )
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    ConvTranspose2d (PyTorch native) +
+    Fused: AddValue + Min(., 0) + GELU + MultiplyValue (Triton)
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, add_value, multiply_value):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose2d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+        )
+        self.add_value = float(add_value)
+        self.multiply_value = float(multiply_value)
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = fused_post_convtranspose(x, self.add_value, self.multiply_value)
+        return x
+```

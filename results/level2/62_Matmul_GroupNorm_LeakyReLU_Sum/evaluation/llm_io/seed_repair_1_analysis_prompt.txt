@@ -1,0 +1,473 @@
+You are a Triton kernel debugging expert. Analyze the error and identify the root cause.
+
+## ERROR LOG
+```
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 538, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251215_024837_batch_range56to88_openai_deepseek/62_Matmul_GroupNorm_LeakyReLU_Sum/code/kernel_20251215_033231.py", line 331, in forward
+    return fused_linear_groupnorm_leaky_add(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251215_024837_batch_range56to88_openai_deepseek/62_Matmul_GroupNorm_LeakyReLU_Sum/code/kernel_20251215_033231.py", line 307, in fused_linear_groupnorm_leaky_add
+    y = triton_groupnorm_leaky_add(y, gn_weight, gn_bias, num_groups, eps, negative_slope)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251215_024837_batch_range56to88_openai_deepseek/62_Matmul_GroupNorm_LeakyReLU_Sum/code/kernel_20251215_033231.py", line 257, in triton_groupnorm_leaky_add
+    groupnorm_stats_kernel[(N * G,)](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 347, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 569, in run
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 278, in compile
+    module = src.make_ir(options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 81, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 38:19:
+    for offset in range(0, group_size, BLOCK_SIZE):
+        offs_c = group_start + offset + block_offsets
+        mask = (n < N) & (offs_c < (group_start + group_size))
+        x = tl.load(
+            x_ptr + n * stride_xn + offs_c * stride_xc,
+            mask=mask,
+            other=0.0,
+        )
+        sum_val += tl.sum(x, axis=0)
+        sum_sq_val += tl.sum(x * x, axis=0)
+
+    group_size_f = tl.float32(group_size)
+                   ^
+TypeError("'dtype' object is not callable")
+```
+
+## Expected Behavior (PyTorch Reference)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    A model that performs a matrix multiplication, group normalization, leaky ReLU activation, and element-wise sum.
+    """
+    def __init__(self, input_size, hidden_size, num_groups, eps=1e-5, negative_slope=0.01):
+        super(Model, self).__init__()
+        self.fc = nn.Linear(input_size, hidden_size)
+        self.gn = nn.GroupNorm(num_groups=num_groups, num_channels=hidden_size, eps=eps)
+        self.leaky_relu = nn.LeakyReLU(negative_slope=negative_slope)
+
+    def forward(self, x):
+        """
+        Performs the forward pass of the model.
+
+        Args:
+            x: Input tensor of shape (batch_size, input_size).
+
+        Returns:
+            Output tensor of shape (batch_size, hidden_size).
+        """
+        x = self.fc(x)
+        x = self.gn(x)
+        x = self.leaky_relu(x)
+        x = x + x
+        return x
+
+
+batch_size = 1024
+input_size = 8192
+hidden_size = 8192
+num_groups = 512
+
+def get_inputs():
+    return [torch.rand(batch_size, input_size)]
+
+def get_init_inputs():
+    return [input_size, hidden_size, num_groups]
+```
+
+## Current Implementation (Broken Triton Kernel)
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+# =========================
+# 1. Linear (GEMM + bias)
+# =========================
+
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+        triton.Config(
+            {'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_warps=8,
+            num_stages=2,
+        ),
+    ],
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def linear_gemm_bias_kernel(
+    a_ptr, b_ptr, bias_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """
+    Compute: C = A @ B + bias
+    A: [M, K]
+    B: logically [K, N] (passed with strides so we can use weight [N, K] directly)
+    bias: [N]
+    C: [M, N]
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k in range(0, K, BLOCK_K):
+        k_mask = offs_k[None, :] < (K - k)
+        a = tl.load(
+            a_ptrs,
+            mask=(offs_m[:, None] < M) & k_mask,
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptrs,
+            mask=k_mask.T & (offs_n[None, :] < N),
+            other=0.0,
+        )
+        acc += tl.dot(a, b)
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Add linear bias (per output channel)
+    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc += bias[None, :]
+
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    tl.store(
+        c_ptrs, acc,
+        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+    )
+
+
+def triton_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    x: [M, K]
+    weight: [N, K] (nn.Linear.weight)
+    bias: [N]
+    returns: [M, N]
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+    x = x.contiguous()
+    weight = weight.contiguous()
+    M, K = x.shape
+    N, K_w = weight.shape
+    assert K == K_w, "Incompatible shapes for linear"
+
+    y = torch.empty((M, N), device=x.device, dtype=x.dtype)
+
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta['BLOCK_M']),
+            triton.cdiv(N, meta['BLOCK_N']),
+        )
+
+    linear_gemm_bias_kernel[grid](
+        x, weight, bias, y,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        weight.stride(1), weight.stride(0),  # treat weight as B[k, n]
+        y.stride(0), y.stride(1),
+    )
+    return y
+
+
+# =========================
+# 2. GroupNorm stats
+# =========================
+
+@triton.jit
+def groupnorm_stats_kernel(
+    x_ptr,          # [N, C]
+    mean_ptr,       # [N, G]
+    var_ptr,        # [N, G]
+    N, C, G,
+    stride_xn, stride_xc,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Compute per-(n, g) mean and variance over channels in group g for sample n.
+    Group size = C // G.
+    """
+    pid = tl.program_id(0)  # ranges over N * G
+    n = pid // G
+    g = pid % G
+
+    group_size = C // G
+    group_start = g * group_size
+
+    # If pid maps outside N (in case of overshoot), skip via masking when loading.
+    sum_val = tl.zeros((), dtype=tl.float32)
+    sum_sq_val = tl.zeros((), dtype=tl.float32)
+
+    block_offsets = tl.arange(0, BLOCK_SIZE)
+
+    # Single-pass accumulation: E[x], E[x^2]
+    for offset in range(0, group_size, BLOCK_SIZE):
+        offs_c = group_start + offset + block_offsets
+        mask = (n < N) & (offs_c < (group_start + group_size))
+        x = tl.load(
+            x_ptr + n * stride_xn + offs_c * stride_xc,
+            mask=mask,
+            other=0.0,
+        )
+        sum_val += tl.sum(x, axis=0)
+        sum_sq_val += tl.sum(x * x, axis=0)
+
+    group_size_f = tl.float32(group_size)
+    mean = sum_val / group_size_f
+    var = sum_sq_val / group_size_f - mean * mean
+
+    # Store mean and var for this (n, g)
+    idx = n * G + g
+    if n < N:
+        tl.store(mean_ptr + idx, mean)
+        tl.store(var_ptr + idx, var)
+
+
+# =========================
+# 3. GroupNorm + LeakyReLU + x+x
+# =========================
+
+@triton.jit
+def groupnorm_act_add_kernel(
+    x_ptr,          # [N, C]
+    y_ptr,          # [N, C]
+    mean_ptr,       # [N, G]
+    var_ptr,        # [N, G]
+    gamma_ptr,      # [C]
+    beta_ptr,       # [C]
+    N, C, G,
+    stride_xn, stride_xc,
+    stride_yn, stride_yc,
+    eps, negative_slope,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Apply GroupNorm (using precomputed mean/var), then LeakyReLU, then element-wise x + x.
+    """
+    pid_n = tl.program_id(0)
+    pid_c = tl.program_id(1)
+
+    n = pid_n
+    block_c_start = pid_c * BLOCK_SIZE
+
+    offs_c = block_c_start + tl.arange(0, BLOCK_SIZE)
+    mask = (n < N) & (offs_c < C)
+
+    x = tl.load(
+        x_ptr + n * stride_xn + offs_c * stride_xc,
+        mask=mask,
+        other=0.0,
+    )
+
+    group_size = C // G
+    group_ids = offs_c // group_size
+    mean_idx = n * G + group_ids
+    var_idx = mean_idx
+
+    mean = tl.load(mean_ptr + mean_idx, mask=mask, other=0.0)
+    var = tl.load(var_ptr + var_idx, mask=mask, other=0.0)
+
+    gamma = tl.load(gamma_ptr + offs_c, mask=mask, other=1.0)
+    beta = tl.load(beta_ptr + offs_c, mask=mask, other=0.0)
+
+    rstd = 1.0 / tl.sqrt(var + eps)
+    x_hat = (x - mean) * rstd
+    y = x_hat * gamma + beta
+
+    # LeakyReLU
+    y = tl.where(y >= 0, y, y * negative_slope)
+
+    # x + x
+    y = y + y
+
+    tl.store(
+        y_ptr + n * stride_yn + offs_c * stride_yc,
+        y,
+        mask=mask,
+    )
+
+
+def triton_groupnorm_leaky_add(
+    x: torch.Tensor,
+    weight: torch.Tensor,      # GroupNorm gamma, shape [C]
+    bias: torch.Tensor,        # GroupNorm beta, shape [C]
+    num_groups: int,
+    eps: float,
+    negative_slope: float,
+) -> torch.Tensor:
+    """
+    x: [N, C]
+    GroupNorm over channel dimension with num_groups, followed by LeakyReLU and x+x.
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+    x = x.contiguous()
+    weight = weight.contiguous()
+    bias = bias.contiguous()
+
+    N, C = x.shape
+    G = num_groups
+    assert C % G == 0, "C must be divisible by num_groups for GroupNorm"
+
+    mean = torch.empty((N, G), device=x.device, dtype=x.dtype)
+    var = torch.empty_like(mean)
+
+    BLOCK_SIZE = 128
+
+    # Stats kernel: grid over (N * G)
+    groupnorm_stats_kernel[(N * G,)](
+        x, mean, var,
+        N, C, G,
+        x.stride(0), x.stride(1),
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+
+    y = torch.empty_like(x)
+
+    # Apply kernel: 2D grid over (N, C tiles)
+    grid_n = N
+    grid_c = triton.cdiv(C, BLOCK_SIZE)
+    groupnorm_act_add_kernel[(grid_n, grid_c)](
+        x, y,
+        mean, var,
+        weight, bias,
+        N, C, G,
+        x.stride(0), x.stride(1),
+        y.stride(0), y.stride(1),
+        eps, negative_slope,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+
+    return y
+
+
+# =========================
+# 4. Fused wrapper
+# =========================
+
+def fused_linear_groupnorm_leaky_add(
+    x: torch.Tensor,
+    fc_weight: torch.Tensor,
+    fc_bias: torch.Tensor,
+    gn_weight: torch.Tensor,
+    gn_bias: torch.Tensor,
+    num_groups: int,
+    eps: float,
+    negative_slope: float,
+) -> torch.Tensor:
+    """
+    x: [batch_size, input_size]
+    Returns: [batch_size, hidden_size]
+    Implements:
+        y = Linear(x)
+        y = GroupNorm(y)
+        y = LeakyReLU(y)
+        y = y + y
+    """
+    y = triton_linear(x, fc_weight, fc_bias)
+    y = triton_groupnorm_leaky_add(y, gn_weight, gn_bias, num_groups, eps, negative_slope)
+    return y
+
+
+# =========================
+# 5. ModelNew
+# =========================
+
+class ModelNew(nn.Module):
+    """
+    Triton-accelerated version of the original model:
+      - Linear
+      - GroupNorm
+      - LeakyReLU
+      - Element-wise sum with itself
+    """
+
+    def __init__(self, input_size, hidden_size, num_groups, eps=1e-5, negative_slope=0.01):
+        super(ModelNew, self).__init__()
+        self.fc = nn.Linear(input_size, hidden_size)
+        self.gn = nn.GroupNorm(num_groups=num_groups, num_channels=hidden_size, eps=eps)
+        self.negative_slope = negative_slope
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return fused_linear_groupnorm_leaky_add(
+            x,
+            self.fc.weight, self.fc.bias,
+            self.gn.weight, self.gn.bias,
+            self.gn.num_groups,
+            self.gn.eps,
+            self.negative_slope,
+        )
+```
+
+---
+
+## Your Task
+
+Identify the **single most critical issue** that causes the error above.
+
+### Analysis Guidelines
+
+1. **Focus on root cause**, not symptoms
+   - Bad: "Output is wrong"
+   - Good: "BLOCK_K loop missing, only processes first 32 elements of K dimension"
+
+2. **Be specific about WHAT and WHERE**
+   - Bad: "Memory access issue"
+   - Good: "Line 45: tl.atomic_add(c_block_ptr, acc) - atomic_add requires scalar pointer, not block_ptr"
+
+3. **Prioritize by impact**
+   - Correctness bugs > Performance issues > Style problems
+   - Algorithm errors > Implementation details
+
+### Output Format
+
+**CRITICAL: You MUST output ONLY valid JSON. No other text allowed.**
+
+```json
+{
+  "critical_issue": "<Concise description of THE root cause, max 30 words>",
+  "why_it_matters": "<Why this causes the observed error, max 35 words>",
+  "minimal_fix_hint": "<What needs to change (not how), max 30 words>"
+}
+```
+
+**Remember**: Output ONLY the JSON block. No explanations, no commentary, no additional text.

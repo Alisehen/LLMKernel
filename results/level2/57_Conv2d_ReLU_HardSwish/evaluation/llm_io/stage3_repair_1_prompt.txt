@@ -1,0 +1,312 @@
+Fix the Triton kernel errors. Generate correct, high-performance code.
+
+Current Error Log:
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 538, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251215_024837_batch_range56to88_openai_deepseek/57_Conv2d_ReLU_HardSwish/code/kernel_20251215_031748.py", line 244, in forward
+    return conv_relu_hswish_triton(x, self.weight, self.bias)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251215_024837_batch_range56to88_openai_deepseek/57_Conv2d_ReLU_HardSwish/code/kernel_20251215_031748.py", line 216, in conv_relu_hswish_triton
+    conv_relu_hswish_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 347, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 192, in run
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 192, in <dictcomp>
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 170, in _bench
+    return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/testing.py", line 145, in do_bench
+    fn()
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 154, in kernel_call
+    self.pre_hook(full_nargs)
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 69, in _pre_hook
+    kwargs[name].zero_()
+    ~~~~~~^^^^^^
+KeyError: ''
+
+Main Critical Problem Analysis:
+Problem Analysis (from expert diagnosis):
+critical_issue: autotune reset_to_zero uses an empty string as tensor name: reset_to_zero=['']
+why_it_matters: Autotuner’s pre_hook looks up kwargs[''] to zero it, but no such argument exists, raising KeyError before any kernel run.
+minimal_fix_hint: Remove the empty entry or use a valid tensor argument name, e.g., reset_to_zero=[] or ['y_ptr'].
+
+Focus your fix on addressing the identified critical issue.
+
+
+Broken Code:
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        # Balanced, good for large problems
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+        # Wider channel tile – good when OC is large
+        triton.Config(
+            {'BLOCK_M': 32, 'BLOCK_N': 128, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+        # Taller spatial tile – good when NHW is large
+        triton.Config(
+            {'BLOCK_M': 128, 'BLOCK_N': 32, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+        # Narrow channel tile – good when OC is small / irregular
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+        # Small fallback tile for extreme register pressure / tiny shapes
+        triton.Config(
+            {'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 32},
+            num_warps=2,
+            num_stages=1,
+        ),
+    ],
+    key=['N', 'OC', 'H_out', 'W_out', 'C_in', 'K_H', 'K_W'],
+    reset_to_zero=[''],  # no pre-zeroing required, but keep signature minimal
+)
+@triton.jit
+def conv_relu_hswish_kernel(
+    x_ptr, w_ptr, b_ptr, y_ptr,
+    N, C_in, H, W,
+    OC, K_H, K_W,
+    H_out, W_out,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_wo, stride_wi, stride_wkh, stride_wkw,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    BLOCK_M: tl.constexpr,  # output positions per block (flattened N*H_out*W_out)
+    BLOCK_N: tl.constexpr,  # output channels per block
+    BLOCK_K: tl.constexpr,  # K tile = C_in*K_H*K_W per iteration
+):
+    # -----------------------------
+    # Program / tile indices
+    # -----------------------------
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    DHW = H_out * W_out
+    P = N * DHW
+    K_tot = C_in * K_H * K_W
+    KH_KW = K_H * K_W
+
+    # Offsets along flattened output position P and output channels OC
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_m = offs_m < P
+    mask_n = offs_n < OC
+
+    # Helpful hints to the compiler for vectorized memory access
+    tl.multiple_of(offs_m, BLOCK_M)
+    tl.multiple_of(offs_n, BLOCK_N)
+
+    # Decode flattened position -> (n, oh, ow)
+    n_idx = offs_m // DHW
+    rem = offs_m % DHW
+    oh_idx = rem // W_out
+    ow_idx = rem % W_out
+
+    # -----------------------------
+    # Precompute base pointers
+    # -----------------------------
+    # Base input pointer for each output position (no kernel offset / channel yet)
+    x_base = (
+        x_ptr
+        + n_idx[:, None] * stride_xn
+        + oh_idx[:, None] * stride_xh
+        + ow_idx[:, None] * stride_xw
+    )
+
+    # Base weight pointer for each output channel (no kernel offset / in-channel yet)
+    w_base = w_ptr + offs_n[None, :] * stride_wo
+
+    # -----------------------------
+    # Accumulator tile [BLOCK_M, BLOCK_N], always in fp32
+    # -----------------------------
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # -----------------------------
+    # Reduction over K = C_in * K_H * K_W
+    # -----------------------------
+    k_iter = tl.arange(0, BLOCK_K)
+    inv6 = 1.0 / 6.0  # used later for HardSwish; keep in register
+
+    for k0 in range(0, K_tot, BLOCK_K):
+        k_range = k0 + k_iter
+        mask_k = k_range < K_tot
+
+        # Map flattened K index -> (ic, kh, kw)
+        ic = k_range // KH_KW
+        rem_k = k_range % KH_KW
+        kh = rem_k // K_W
+        kw = rem_k % K_W
+
+        # Compute the per-K offset in input and weight tensors
+        # NOTE: we rely on precomputed x_base / w_base to minimize integer ops here.
+        x_ptrs = (
+            x_base
+            + ic[None, :] * stride_xc
+            + kh[None, :] * stride_xh
+            + kw[None, :] * stride_xw
+        )
+
+        w_ptrs = (
+            w_base
+            + ic[:, None] * stride_wi
+            + kh[:, None] * stride_wkh
+            + kw[:, None] * stride_wkw
+        )
+
+        # Masks for loads
+        x_mask = mask_m[:, None] & mask_k[None, :]
+        w_mask = mask_k[:, None] & mask_n[None, :]
+
+        # Load tiles; keep values in their native precision (fp16/bf16/fp32)
+        x_vals = tl.load(x_ptrs, mask=x_mask, other=0.0)
+        w_vals = tl.load(w_ptrs, mask=w_mask, other=0.0)
+
+        # Matrix multiply-accumulate using Tensor Cores where possible.
+        # Accumulate in fp32 for numerical robustness.
+        acc += tl.dot(x_vals, w_vals, out_dtype=tl.float32)
+
+    # -----------------------------
+    # Bias add (broadcast over M)
+    # -----------------------------
+    bias_vals = tl.load(b_ptr + offs_n, mask=mask_n, other=0.0)
+    acc = acc + bias_vals[None, :]
+
+    # -----------------------------
+    # Fused ReLU + HardSwish in registers
+    #
+    # y = relu(x)
+    # y = y * clamp((y + 3) / 6, 0, 1)
+    # -----------------------------
+    acc = tl.maximum(acc, 0.0)
+    t = acc + 3.0
+    t = tl.minimum(t, 6.0)
+    t = tl.maximum(t, 0.0)
+    acc = acc * (t * inv6)
+
+    # -----------------------------
+    # Store final result (single write)
+    # -----------------------------
+    y_ptrs = (
+        y_ptr
+        + n_idx[:, None] * stride_yn
+        + offs_n[None, :] * stride_yc
+        + oh_idx[:, None] * stride_yh
+        + ow_idx[:, None] * stride_yw
+    )
+    out_mask = mask_m[:, None] & mask_n[None, :]
+    # Let Triton handle cast from fp32 accumulator to destination dtype
+    tl.store(y_ptrs, acc, mask=out_mask)
+
+
+def conv_relu_hswish_triton(x, weight, bias):
+    """
+    x:      [N, C_in, H, W]
+    weight: [OC, C_in, K_H, K_W]
+    bias:   [OC]
+
+    Implements Conv2d (stride=1, padding=0, dilation=1) + ReLU + HardSwish
+    using a single fused Triton kernel.
+
+    For maximum performance on Ada (RTX 4090), run with x/weight/bias in
+    torch.float16 or torch.bfloat16 to leverage Tensor Cores. The kernel
+    will still work for float32 but will be slower.
+    """
+    x = x.contiguous()
+    weight = weight.contiguous()
+    bias = bias.contiguous()
+
+    N, C_in, H, W = x.shape
+    OC, C_w, K_H, K_W = weight.shape
+    assert C_w == C_in, "Incompatible in_channels between input and weight"
+
+    # Stride=1, padding=0, dilation=1
+    H_out = H - K_H + 1
+    W_out = W - K_W + 1
+    assert H_out > 0 and W_out > 0, "Invalid kernel size for given input dimensions"
+
+    # Output tensor: same dtype as input
+    y = torch.empty((N, OC, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    P = N * H_out * W_out
+
+    def grid(meta):
+        return (
+            triton.cdiv(P, meta['BLOCK_M']),
+            triton.cdiv(OC, meta['BLOCK_N']),
+        )
+
+    conv_relu_hswish_kernel[grid](
+        x, weight, bias, y,
+        N, C_in, H, W,
+        OC, K_H, K_W,
+        H_out, W_out,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        weight.stride(0), weight.stride(1), weight.stride(2), weight.stride(3),
+        y.stride(0), y.stride(1), y.stride(2), y.stride(3),
+    )
+
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-accelerated version of:
+        Conv2d (stride=1, no padding) -> ReLU -> x * clamp((x + 3) / 6, 0, 1)
+
+    For best performance on RTX 4090, use mixed-precision (float16 / bfloat16).
+    """
+    def __init__(self, in_channels, out_channels, kernel_size):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(
+            torch.randn(out_channels, in_channels, kernel_size, kernel_size)
+        )
+        self.bias = nn.Parameter(torch.randn(out_channels))
+
+    def forward(self, x):
+        return conv_relu_hswish_triton(x, self.weight, self.bias)
+```
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl, AND any other modules used (e.g., import math if using math.sqrt)
+   2. @triton.jit decorated kernel function(s) — NO continue/break/return inside loops (use masking)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels — THIS CLASS IS REQUIRED
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+3. Learn from previous repair attempts to avoid repeating the same mistakes
+4. Ensure ALL imports are included at the top (common mistake: forgetting `import math`)
+
+```python
+# <corrected code>
+```

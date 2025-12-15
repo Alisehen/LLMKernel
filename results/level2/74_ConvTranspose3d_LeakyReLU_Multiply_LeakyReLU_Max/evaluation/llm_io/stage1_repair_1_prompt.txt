@@ -1,0 +1,287 @@
+Fix the Triton kernel errors. Generate correct, high-performance code.
+
+Current Error Log:
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 538, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251214_114735_batch_range56to80_deepseek_deepseek/74_ConvTranspose3d_LeakyReLU_Multiply_LeakyReLU_Max/code/kernel_20251214_221344.py", line 211, in forward
+    x = fused_post_convtranspose(x, self.multiplier, self.negative_slope)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251214_114735_batch_range56to80_deepseek_deepseek/74_ConvTranspose3d_LeakyReLU_Multiply_LeakyReLU_Max/code/kernel_20251214_221344.py", line 185, in fused_post_convtranspose
+    fused_leaky_relu_multiply_pool_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 347, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 569, in run
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 278, in compile
+    module = src.make_ir(options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 81, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 81:24:
+
+                spatial_mask_in = d_mask & h_mask & w_mask
+                full_mask = spatial_mask_in & spatial_mask_out
+
+                # Load input for all C channels in vectorized manner
+                for c_block_start in range(0, C, BLOCK_C):
+                    c_mask = (c_block_start + offs_c) < C
+                    c_idx = c_block_start + offs_c
+
+                    # Compute base offset for this C block
+                    base_offset = (
+                        pid_n * stride_xn +
+                        ^
+ValueError('Cannot make_shape_compatible: incompatible dimensions at index 0: 64 and 2')
+
+Main Critical Problem Analysis:
+Problem Analysis (from expert diagnosis):
+critical_issue: Base offset calculation attempts to broadcast incompatible tensors with shapes [64,1,1,1] and [2,1,1,1] in same dimension.
+why_it_matters: Triton requires compatible dimensions for broadcasting; mixing BLOCK_C=64 and BLOCK_OD=2 in same axis fails compilation.
+minimal_fix_hint: Reshape d_in and h_in tensors to [1,BLOCK_OD,1,1] and [1,1,BLOCK_OH,1] before adding in base_offset.
+
+Focus your fix on addressing the identified critical issue.
+
+
+Broken Code:
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def fused_leaky_relu_multiply_pool_kernel(
+    x_ptr,
+    multiplier_ptr,
+    out_ptr,
+    N, C, D, H, W,
+    stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
+    stride_out_n, stride_out_c, stride_out_d, stride_out_h, stride_out_w,
+    negative_slope: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    BLOCK_OD: tl.constexpr,
+    BLOCK_OH: tl.constexpr,
+    BLOCK_OW: tl.constexpr,
+):
+    """
+    Optimized fused kernel with spatial tiling.
+    Each thread block processes: [BLOCK_C, BLOCK_OD, BLOCK_OH, BLOCK_OW]
+    """
+    pid_n = tl.program_id(0)
+    pid_od_block = tl.program_id(1)
+    pid_oh_block = tl.program_id(2)
+    
+    if pid_n >= N:
+        return
+    
+    D_out = D // 2
+    H_out = H // 2
+    W_out = W // 2
+    
+    # Output spatial block indices
+    od_start = pid_od_block * BLOCK_OD
+    oh_start = pid_oh_block * BLOCK_OH
+    
+    # Thread-local offsets
+    offs_c = tl.arange(0, BLOCK_C)
+    offs_od = tl.arange(0, BLOCK_OD)
+    offs_oh = tl.arange(0, BLOCK_OH)
+    offs_ow = tl.arange(0, BLOCK_OW)
+    
+    # Compute output spatial indices with boundary check
+    od_idx = od_start + offs_od[:, None, None, None]
+    oh_idx = oh_start + offs_oh[None, :, None, None]
+    ow_idx = offs_ow[None, None, None, :]
+    
+    # Boundary masks
+    od_mask = od_idx < D_out
+    oh_mask = oh_idx < H_out
+    ow_mask = ow_idx < W_out
+    
+    # Combined spatial mask for output
+    spatial_mask_out = od_mask & oh_mask & ow_mask
+    
+    # Initialize accumulation for max pooling
+    # Shape: [BLOCK_C, BLOCK_OD, BLOCK_OH, BLOCK_OW]
+    max_acc = tl.full((BLOCK_C, BLOCK_OD, BLOCK_OH, BLOCK_OW), 
+                     float('-inf'), dtype=tl.float32)
+    
+    # Iterate over pooling window (2x2x2)
+    for dd in range(2):
+        for dh in range(2):
+            for dw in range(2):
+                # Input spatial indices
+                d_in = (od_idx * 2 + dd)
+                h_in = (oh_idx * 2 + dh)
+                w_in = (ow_idx * 2 + dw)
+                
+                # Input boundary masks
+                d_mask = d_in < D
+                h_mask = h_in < H
+                w_mask = w_in < W
+                
+                spatial_mask_in = d_mask & h_mask & w_mask
+                full_mask = spatial_mask_in & spatial_mask_out
+                
+                # Load input for all C channels in vectorized manner
+                for c_block_start in range(0, C, BLOCK_C):
+                    c_mask = (c_block_start + offs_c) < C
+                    c_idx = c_block_start + offs_c
+                    
+                    # Compute base offset for this C block
+                    base_offset = (
+                        pid_n * stride_xn +
+                        c_idx[:, None, None, None] * stride_xc +
+                        d_in * stride_xd +
+                        h_in * stride_xh
+                    )
+                    
+                    # Vectorized load for all spatial positions
+                    w_offsets = w_in * stride_xw
+                    x_ptrs = base_offset[..., None] + w_offsets[..., None]
+                    
+                    # Load with broadcasting
+                    x_vals = tl.load(
+                        x_ptr + x_ptrs,
+                        mask=full_mask[..., None] & c_mask[:, None, None, None, None],
+                        other=0.0
+                    )
+                    
+                    # Fused operations
+                    # LeakyReLU
+                    leaky_mask = x_vals >= 0
+                    x_vals = tl.where(leaky_mask, x_vals, x_vals * negative_slope)
+                    
+                    # Multiply with multiplier
+                    multiplier = tl.load(
+                        multiplier_ptr + c_idx,
+                        mask=c_mask,
+                        other=0.0
+                    )
+                    x_vals = x_vals * multiplier[:, None, None, None, None]
+                    
+                    # Second LeakyReLU
+                    leaky_mask2 = x_vals >= 0
+                    x_vals = tl.where(leaky_mask2, x_vals, x_vals * negative_slope)
+                    
+                    # Update max accumulation
+                    current_val = tl.where(
+                        full_mask[..., None] & c_mask[:, None, None, None, None],
+                        x_vals,
+                        float('-inf')
+                    )
+                    max_acc = tl.maximum(max_acc, current_val)
+    
+    # Store results
+    for c_block_start in range(0, C, BLOCK_C):
+        c_mask = (c_block_start + offs_c) < C
+        c_idx = c_block_start + offs_c
+        
+        full_store_mask = (
+            spatial_mask_out[..., None] & 
+            c_mask[:, None, None, None, None]
+        )
+        
+        if not tl.max(tl.cast(full_store_mask, tl.int32)):
+            continue
+        
+        # Compute output offset
+        out_offset = (
+            pid_n * stride_out_n +
+            c_idx[:, None, None, None] * stride_out_c +
+            od_idx * stride_out_d +
+            oh_idx * stride_out_h
+        )
+        
+        w_offsets = ow_idx * stride_out_w
+        out_ptrs = out_offset[..., None] + w_offsets[..., None]
+        
+        tl.store(
+            out_ptr + out_ptrs,
+            max_acc,
+            mask=full_store_mask
+        )
+
+
+def fused_post_convtranspose(x, multiplier, negative_slope=0.2):
+    N, C, D, H, W = x.shape
+    
+    D_out = D // 2
+    H_out = H // 2
+    W_out = W // 2
+    
+    multiplier = multiplier.squeeze()
+    if multiplier.dim() == 4:
+        multiplier = multiplier.squeeze(-1).squeeze(-1).squeeze(-1)
+    
+    out = torch.empty((N, C, D_out, H_out, W_out), device=x.device, dtype=x.dtype)
+    
+    # Optimized block sizes for Ada Lovelace
+    BLOCK_C = 64  # Increased for better SM utilization
+    BLOCK_OD = 2   # Process multiple output D per thread block
+    BLOCK_OH = 2   # Process multiple output H per thread block
+    BLOCK_OW = 64  # Increased W processing
+    
+    # Grid calculation
+    grid_od = triton.cdiv(D_out, BLOCK_OD)
+    grid_oh = triton.cdiv(H_out, BLOCK_OH)
+    grid = (N, grid_od, grid_oh)
+    
+    fused_leaky_relu_multiply_pool_kernel[grid](
+        x, multiplier, out,
+        N, C, D, H, W,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
+        out.stride(0), out.stride(1), out.stride(2), out.stride(3), out.stride(4),
+        negative_slope=negative_slope,
+        BLOCK_C=BLOCK_C,
+        BLOCK_OD=BLOCK_OD,
+        BLOCK_OH=BLOCK_OH,
+        BLOCK_OW=BLOCK_OW,
+    )
+    return out
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, multiplier_shape):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(
+            in_channels, out_channels, kernel_size,
+            stride=stride, padding=padding, output_padding=output_padding
+        )
+        self.multiplier = nn.Parameter(torch.randn(out_channels))
+        self.negative_slope = 0.2
+        
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = fused_post_convtranspose(x, self.multiplier, self.negative_slope)
+        return x
+```
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl, AND any other modules used (e.g., import math if using math.sqrt)
+   2. @triton.jit decorated kernel function(s) — NO continue/break/return inside loops (use masking)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels — THIS CLASS IS REQUIRED
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+3. Learn from previous repair attempts to avoid repeating the same mistakes
+4. Ensure ALL imports are included at the top (common mistake: forgetting `import math`)
+
+```python
+# <corrected code>
+```

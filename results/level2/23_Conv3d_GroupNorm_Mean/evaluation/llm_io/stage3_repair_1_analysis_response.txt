@@ -1,0 +1,5 @@
+{
+  "critical_issue": "ModelNew defines standalone weight/bias parameters instead of conv.weight/conv.bias, so reference Conv3d parameters are never loaded and convolution uses different random weights.",
+  "why_it_matters": "Reference and Triton models are compared assuming identical parameters; mismatched convolution weights change all activations, leading to large systematic output differences (~0.7 error) despite correct kernel math.",
+  "minimal_fix_hint": "Make ModelNew use an nn.Conv3d named 'conv' (with weight/bias) or otherwise align parameter names so state_dict loading shares identical Conv3d parameters."
+}

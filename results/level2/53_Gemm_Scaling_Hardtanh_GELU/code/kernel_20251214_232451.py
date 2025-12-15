@@ -1,0 +1,139 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+import math
+
+
+@triton.autotune(
+    configs=[
+        # Optimized configurations within shared memory limits (101376 bytes)
+        # For fp16: shared memory = (BLOCK_M*BLOCK_K + BLOCK_K*BLOCK_N) * 2 bytes
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 16}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_stages=3, num_warps=2),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 16}, num_stages=2, num_warps=8),
+        # Conservative configurations for large dimensions
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=4, num_warps=2),
+        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=4, num_warps=2),
+    ],
+    key=['M', 'N', 'K']
+)
+@triton.jit
+def fused_gemm_scale_hardtanh_gelu_kernel(
+    a_ptr, b_ptr, bias_ptr, out_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_out_m, stride_out_n,
+    scaling_factor, hardtanh_min, hardtanh_max,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    # Program ID
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    
+    # Offsets
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    
+    # Initialize accumulator
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    # Tile pointers
+    a_ptrs = a_ptr + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
+    
+    # Main GEMM loop
+    for k in range(0, K, BLOCK_K):
+        k_remaining = K - k
+        
+        # Load A tile with masking
+        mask_a = (offs_m[:, None] < M) & (offs_k[None, :] < k_remaining)
+        a = tl.load(a_ptrs, mask=mask_a, other=0.0)
+        
+        # Load B tile with masking
+        mask_b = (offs_k[:, None] < k_remaining) & (offs_n[None, :] < N)
+        b = tl.load(b_ptrs, mask=mask_b, other=0.0)
+        
+        # Matrix multiplication with TF32 support
+        acc += tl.dot(a, b, allow_tf32=True)
+        
+        # Advance pointers
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+    
+    # Load bias with masking
+    bias_ptrs = bias_ptr + offs_n[None, :]
+    bias_mask = offs_n[None, :] < N
+    bias = tl.load(bias_ptrs, mask=bias_mask, other=0.0)
+    
+    # Fused operations
+    acc += bias
+    acc = acc * scaling_factor
+    acc = tl.minimum(tl.maximum(acc, hardtanh_min), hardtanh_max)
+    
+    # Fast GELU approximation
+    x = acc
+    gelu = x * 0.5 * (1.0 + tl.tanh(0.7978845608 * (x + 0.044715 * x * x * x)))
+    
+    # Store output with masking
+    out_ptrs = out_ptr + (offs_m[:, None] * stride_out_m + offs_n[None, :] * stride_out_n)
+    mask_out = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(out_ptrs, gelu, mask=mask_out)
+
+
+def fused_gemm_scale_hardtanh_gelu(x, weight, bias, scaling_factor, hardtanh_min, hardtanh_max):
+    # Ensure inputs are contiguous
+    x = x.contiguous()
+    weight = weight.contiguous()
+    bias = bias.contiguous()
+    
+    # Get dimensions
+    M, K = x.shape
+    N = weight.shape[0]
+    
+    # Transpose weight for column-major access
+    weight_t = weight.t().contiguous()
+    
+    # Output tensor
+    out = torch.empty((M, N), device=x.device, dtype=x.dtype)
+    
+    # Grid calculation
+    def grid(META):
+        return (
+            triton.cdiv(M, META['BLOCK_M']),
+            triton.cdiv(N, META['BLOCK_N']),
+        )
+    
+    # Launch kernel
+    fused_gemm_scale_hardtanh_gelu_kernel[grid](
+        x, weight_t, bias, out,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        weight_t.stride(0), weight_t.stride(1),
+        out.stride(0), out.stride(1),
+        scaling_factor, hardtanh_min, hardtanh_max,
+    )
+    
+    return out
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, scaling_factor, hardtanh_min, hardtanh_max):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        self.bias = nn.Parameter(torch.zeros(out_features))
+        self.scaling_factor = scaling_factor
+        self.hardtanh_min = hardtanh_min
+        self.hardtanh_max = hardtanh_max
+    
+    def forward(self, x):
+        return fused_gemm_scale_hardtanh_gelu(
+            x, self.weight, self.bias, 
+            self.scaling_factor, self.hardtanh_min, self.hardtanh_max
+        )

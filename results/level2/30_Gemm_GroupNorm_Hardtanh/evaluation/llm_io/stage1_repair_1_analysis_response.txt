@@ -1,0 +1,5 @@
+{
+  "critical_issue": "tl.multiple_of is called on scalar strides (stride_ak, stride_wk), which are constexpr scalars, not tensors/pointers, so semantic.multiple_of fails when accessing .shape.",
+  "why_it_matters": "semantic.multiple_of expects a tensor-like input with a .shape; passing constexpr scalars triggers the AttributeError seen during Triton compilation, preventing the GEMM kernel from compiling.",
+  "minimal_fix_hint": "Stop calling tl.multiple_of on stride_ak/stride_wk; either remove these hints or apply multiple_of to tensor/pointer variables like a_ptrs or w_ptrs instead."
+}

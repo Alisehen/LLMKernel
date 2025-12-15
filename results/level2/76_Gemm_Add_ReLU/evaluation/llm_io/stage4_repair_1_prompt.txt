@@ -1,0 +1,235 @@
+Fix the Triton kernel errors. Generate correct, high-performance code.
+
+Current Error Log:
+Traceback (most recent call last):
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 34, in wrapper
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 1814, in dot
+    return semantic.dot(input, other, acc, input_precision, max_num_imprecise_acc, out_dtype, _builder)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/semantic.py", line 1566, in dot
+    assert lhs.shape[-1].value == rhs.shape[
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: First input shape (['constexpr[64]', 'constexpr[32]']) and second input shape ['constexpr[64]', 'constexpr[32]'] are not compatible for matmul (second index of first shape (32) must be equal to first index of second shape (64)
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 538, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251214_114735_batch_range56to80_deepseek_deepseek/76_Gemm_Add_ReLU/code/kernel_20251214_232820.py", line 134, in forward
+    return fused_linear_relu(x, self.weight, self.bias)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251214_114735_batch_range56to80_deepseek_deepseek/76_Gemm_Add_ReLU/code/kernel_20251214_232820.py", line 107, in fused_linear_relu
+    fused_linear_relu_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 347, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 192, in run
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 192, in <dictcomp>
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 170, in _bench
+    return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/testing.py", line 145, in do_bench
+    fn()
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 156, in kernel_call
+    self.fn.run(
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 569, in run
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 278, in compile
+    module = src.make_ir(options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 81, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 49:15:
+    for k in range(k_tiles):
+        # Efficient masking: compute once, reuse for both loads
+        k_bound = K - k * BLOCK_K
+        x_mask = (offs_m[:, None] < M) & (offs_k[None, :] < k_bound)
+        w_mask = (offs_n[:, None] < N) & (offs_k[None, :] < k_bound)
+
+        # Load tiles with software pipelining
+        x_tile = tl.load(x_ptrs, mask=x_mask, other=0.0)
+        w_tile = tl.load(w_ptrs, mask=w_mask, other=0.0)
+
+        # Tensor core-accelerated matrix multiplication
+        acc += tl.dot(x_tile, w_tile, allow_tf32=True)
+               ^
+
+Main Critical Problem Analysis:
+Problem Analysis (from expert diagnosis):
+critical_issue: Weight matrix loaded as (BLOCK_N, BLOCK_K) but dot() expects (BLOCK_K, BLOCK_N) for x_tile (BLOCK_M, BLOCK_K).
+why_it_matters: Matrix multiplication requires inner dimensions to match: x_tile [M,K] @ weight [K,N], not [M,K] @ [N,K].
+minimal_fix_hint: Swap weight pointer offsets: w_ptr + offs_k[:,None]*stride_wk + offs_n[None,:]*stride_wn
+
+Focus your fix on addressing the identified critical issue.
+
+
+Broken Code:
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        # Conservative baseline - low register pressure
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=2, num_warps=4),
+        # Balanced for compute-bound - higher occupancy
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=3, num_warps=8),
+        # Aggressive for large matrices - maximizes tensor core utilization
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=3, num_warps=16),
+    ],
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def fused_linear_relu_kernel(
+    x_ptr,
+    w_ptr,
+    b_ptr,
+    out_ptr,
+    M,
+    N,
+    K,
+    stride_xm,
+    stride_xk,
+    stride_wk,
+    stride_wn,
+    stride_om,
+    stride_on,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    ACC_TYPE: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    
+    # Create offsets for the entire block
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    
+    # Pre-compute pointer increments for better ILP
+    x_ptrs = x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk
+    w_ptrs = w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk
+    k_step = BLOCK_K * stride_xk
+    
+    # Accumulator - use float32 for precision and tensor core compatibility
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
+    
+    # Compute K tiles
+    k_tiles = tl.cdiv(K, BLOCK_K)
+    for k in range(k_tiles):
+        # Efficient masking: compute once, reuse for both loads
+        k_bound = K - k * BLOCK_K
+        x_mask = (offs_m[:, None] < M) & (offs_k[None, :] < k_bound)
+        w_mask = (offs_n[:, None] < N) & (offs_k[None, :] < k_bound)
+        
+        # Load tiles with software pipelining
+        x_tile = tl.load(x_ptrs, mask=x_mask, other=0.0)
+        w_tile = tl.load(w_ptrs, mask=w_mask, other=0.0)
+        
+        # Tensor core-accelerated matrix multiplication
+        acc += tl.dot(x_tile, w_tile, allow_tf32=True)
+        
+        # Increment pointers with better ILP
+        x_ptrs += k_step
+        w_ptrs += k_step
+    
+    # Fused bias addition
+    if b_ptr is not None:
+        bias_ptrs = b_ptr + offs_n
+        bias_mask = offs_n < N
+        bias = tl.load(bias_ptrs, mask=bias_mask, other=0.0)
+        acc += bias[None, :]
+    
+    # In-place ReLU activation (minimal register usage)
+    zero = 0.0
+    acc = tl.where(acc > zero, acc, zero)
+    
+    # Store with coalesced writes
+    out_ptrs = out_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
+    out_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(out_ptrs, acc, mask=out_mask)
+
+
+def fused_linear_relu(x, weight, bias):
+    M, K = x.shape
+    N, K_w = weight.shape
+    assert K == K_w, f"Dimension mismatch: x K={K}, weight K={K_w}"
+    
+    # Ensure proper memory layout for tensor cores
+    weight_t = weight.t().contiguous()
+    out = torch.empty((M, N), device=x.device, dtype=x.dtype)
+    
+    # Accumulation dtype for optimal precision/performance
+    acc_dtype = tl.float32 if x.dtype in [torch.float16, torch.bfloat16] else tl.float32
+    
+    # Compute grid with minimal overhead
+    def grid(meta):
+        return (triton.cdiv(M, meta['BLOCK_M']), triton.cdiv(N, meta['BLOCK_N']))
+    
+    # Launch optimized kernel
+    fused_linear_relu_kernel[grid](
+        x_ptr=x,
+        w_ptr=weight_t,
+        b_ptr=bias if bias is not None else None,
+        out_ptr=out,
+        M=M,
+        N=N,
+        K=K,
+        stride_xm=x.stride(0),
+        stride_xk=x.stride(1),
+        stride_wk=weight_t.stride(0),
+        stride_wn=weight_t.stride(1),
+        stride_om=out.stride(0),
+        stride_on=out.stride(1),
+        ACC_TYPE=acc_dtype,
+    )
+    
+    return out
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, bias_shape):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+    
+    def forward(self, x):
+        return fused_linear_relu(x, self.weight, self.bias)
+```
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl, AND any other modules used (e.g., import math if using math.sqrt)
+   2. @triton.jit decorated kernel function(s) — NO continue/break/return inside loops (use masking)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels — THIS CLASS IS REQUIRED
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+3. Learn from previous repair attempts to avoid repeating the same mistakes
+4. Ensure ALL imports are included at the top (common mistake: forgetting `import math`)
+
+```python
+# <corrected code>
+```

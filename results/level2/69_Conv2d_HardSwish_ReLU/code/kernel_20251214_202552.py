@@ -1,0 +1,222 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+# Optimized configs for Ada Lovelace with tensor core utilization
+configs = [
+    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4, num_stages=2),
+    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=8, num_stages=2),
+    triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=8, num_stages=2),
+    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 32}, num_warps=8, num_stages=2),
+]
+
+@triton.autotune(configs=configs, key=['N', 'C_in', 'H', 'W', 'C_out', 'K_H', 'K_W'])
+@triton.jit
+def fused_conv_hardswish_relu_kernel(
+    # Inputs
+    x_ptr, w_ptr, bias_ptr, out_ptr,
+    # Tensor dimensions
+    N, C_in, H, W,
+    C_out, K_H, K_W,
+    # Strides for x
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    # Strides for weight
+    stride_woc, stride_wic, stride_wkh, stride_wkw,
+    # Strides for output
+    stride_on, stride_oc, stride_oh, stride_ow,
+    # Block sizes
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    # Tensor cores enable
+    USE_TMA: tl.constexpr = False,
+):
+    # -----------------------------------------------------------
+    # Program ID mapping
+    # -----------------------------------------------------------
+    pid_m = tl.program_id(0)  # output spatial dimension: N * H_out * W_out
+    pid_n = tl.program_id(1)  # output channels
+    pid_k = tl.program_id(2)  # input channels * kernel_h * kernel_w
+    
+    # Output spatial dimensions
+    H_out = H - K_H + 1
+    W_out = W - K_W + 1
+    DHW = H_out * W_out
+    
+    # -----------------------------------------------------------
+    # Create masks and offsets for BLOCK_M
+    # -----------------------------------------------------------
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    n_idx = offs_m // DHW
+    spatial_idx = offs_m % DHW
+    oh_idx = spatial_idx // W_out
+    ow_idx = spatial_idx % W_out
+    
+    # Mask for valid spatial positions
+    mask_m = (offs_m < N * DHW)
+    
+    # -----------------------------------------------------------
+    # Create masks and offsets for BLOCK_N
+    # -----------------------------------------------------------
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < C_out
+    
+    # -----------------------------------------------------------
+    # Create masks and offsets for BLOCK_K
+    # -----------------------------------------------------------
+    offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+    
+    # Decode K dimension to (ic, kh, kw)
+    kw_idx = offs_k % K_W
+    kh_idx = (offs_k // K_W) % K_H
+    ic_idx = offs_k // (K_H * K_W)
+    
+    # Mask for valid K positions
+    mask_k = offs_k < (C_in * K_H * K_W)
+    
+    # -----------------------------------------------------------
+    # Initialize accumulator - use fp32 for tensor core accumulation
+    # -----------------------------------------------------------
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    # -----------------------------------------------------------
+    # Loop over K dimension (input channels * kernel_h * kernel_w)
+    # -----------------------------------------------------------
+    for k_block in range(0, tl.cdiv(C_in * K_H * K_W, BLOCK_K)):
+        # Load input block with im2col
+        x_vals = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float16)
+        for i in range(BLOCK_K):
+            k = k_block * BLOCK_K + i
+            if k < C_in * K_H * K_W:
+                # Decode k to (ic, kh, kw)
+                kw = k % K_W
+                kh = (k // K_W) % K_H
+                ic = k // (K_H * K_W)
+                
+                # Compute input positions
+                ih = oh_idx + kh
+                iw = ow_idx + kw
+                
+                # Check bounds
+                ih_clamped = tl.maximum(tl.minimum(ih, H - 1), 0)
+                iw_clamped = tl.maximum(tl.minimum(iw, W - 1), 0)
+                
+                # Compute pointers and load
+                x_ptr_i = x_ptr + (
+                    n_idx * stride_xn + 
+                    ic * stride_xc + 
+                    ih_clamped * stride_xh + 
+                    iw_clamped * stride_xw
+                )
+                mask = mask_m & (ih >= 0) & (ih < H) & (iw >= 0) & (iw < W)
+                val = tl.load(x_ptr_i, mask=mask, other=0.0)
+                x_vals = tl.where(tl.arange(0, BLOCK_K)[None, :] == i, val[:, None], x_vals)
+        
+        # Load weight block
+        w_ptr_base = w_ptr + (offs_n[:, None] * stride_woc + 
+                             ic_idx[None, :] * stride_wic + 
+                             kh_idx[None, :] * stride_wkh + 
+                             kw_idx[None, :] * stride_wkw)
+        w_vals = tl.load(w_ptr_base, mask=mask_n[:, None] & mask_k[None, :], other=0.0)
+        
+        # Tensor core matrix multiplication (fp16 inputs, fp32 accumulation)
+        x_f16 = x_vals.to(tl.float16)
+        w_f16 = w_vals.to(tl.float16)
+        acc += tl.dot(x_f16, w_f16, out_dtype=tl.float32)
+    
+    # -----------------------------------------------------------
+    # Add bias
+    # -----------------------------------------------------------
+    if bias_ptr is not None:
+        bias_ptrs = bias_ptr + offs_n[None, :]
+        bias = tl.load(bias_ptrs, mask=mask_n[None, :], other=0.0)
+        acc += bias
+    
+    # -----------------------------------------------------------
+    # Hardswish + ReLU activation (fused, no intermediate stores)
+    # -----------------------------------------------------------
+    # Hardswish: x * min(max(x + 3, 0), 6) / 6
+    # Then ReLU: max(0, x)
+    shifted = acc + 3.0
+    relu6 = tl.where(shifted < 0.0, 0.0, tl.where(shifted > 6.0, 6.0, shifted))
+    hardswish = acc * relu6 / 6.0
+    out = tl.where(hardswish < 0.0, 0.0, hardswish)
+    
+    # -----------------------------------------------------------
+    # Store output (only one store - fused!)
+    # -----------------------------------------------------------
+    mask_out = mask_m[:, None] & mask_n[None, :]
+    out_ptrs = out_ptr + (
+        n_idx[:, None] * stride_on + 
+        offs_n[None, :] * stride_oc + 
+        oh_idx[:, None] * stride_oh + 
+        ow_idx[:, None] * stride_ow
+    )
+    tl.store(out_ptrs, out, mask=mask_out)
+
+def fused_conv_hardswish_relu(x, weight, bias, stride=1, padding=0, dilation=1):
+    N, C_in, H, W = x.shape
+    C_out, _, K_H, K_W = weight.shape
+    
+    # Output dimensions
+    H_out = H - K_H + 1
+    W_out = W - K_W + 1
+    P = N * H_out * W_out
+    
+    # Prepare output tensor
+    out = torch.empty((N, C_out, H_out, W_out), device=x.device, dtype=x.dtype)
+    
+    # Convert to optimal data types for tensor cores
+    x_contig = x.contiguous().to(torch.float16)
+    weight_contig = weight.contiguous().to(torch.float16)
+    bias_contig = bias.contiguous() if bias is not None else None
+    
+    # Grid calculation
+    def grid(META):
+        return (
+            triton.cdiv(P, META['BLOCK_M']),
+            triton.cdiv(C_out, META['BLOCK_N']),
+            triton.cdiv(C_in * K_H * K_W, META['BLOCK_K'])
+        )
+    
+    # Launch kernel
+    fused_conv_hardswish_relu_kernel[grid](
+        x_contig, weight_contig, bias_contig, out,
+        N, C_in, H, W,
+        C_out, K_H, K_W,
+        x_contig.stride(0), x_contig.stride(1), 
+        x_contig.stride(2), x_contig.stride(3),
+        weight_contig.stride(0), weight_contig.stride(1),
+        weight_contig.stride(2), weight_contig.stride(3),
+        out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+    )
+    
+    return out
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size):
+        super(ModelNew, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        
+        if isinstance(kernel_size, int):
+            kernel_size = (kernel_size, kernel_size)
+        
+        self.kernel_size = kernel_size
+        self.K_H, self.K_W = kernel_size
+        
+        # Initialize weights and bias
+        self.weight = nn.Parameter(
+            torch.randn(out_channels, in_channels, self.K_H, self.K_W, 
+                       dtype=torch.float16)  # Use fp16 for tensor cores
+        )
+        self.bias = nn.Parameter(
+            torch.randn(out_channels, dtype=torch.float32)  # Keep bias in fp32
+        )
+    
+    def forward(self, x):
+        # Convert input to fp16 if not already
+        if x.dtype != torch.float16:
+            x = x.to(torch.float16)
+        return fused_conv_hardswish_relu(x, self.weight, self.bias)

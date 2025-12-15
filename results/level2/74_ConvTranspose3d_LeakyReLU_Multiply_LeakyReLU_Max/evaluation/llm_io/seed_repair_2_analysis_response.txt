@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "Using tl.reduce incorrectly - missing required combine_fn argument for reduction operation.",
+  "why_it_matters": "Triton's tl.reduce requires a combine function (e.g., tl.max, tl.sum) but the code calls it without one, causing compilation error.",
+  "minimal_fix_hint": "Replace tl.reduce(full_mask, 0) with tl.max(tl.where(full_mask, 1, 0), axis=0) to check if any mask is true."
+}
+```

@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "K_TOTAL (C_in * K_H * K_W) is computed as a runtime int32 and used as tl.static_range end, which requires a constexpr.",
+  "why_it_matters": "tl.static_range needs a compile-time constant bound; a runtime int32[] causes Triton’s constexpr assertion and compilation failure before any execution.",
+  "minimal_fix_hint": "Make K_TOTAL a tl.constexpr (pass as constexpr arg or inline C_in*K_H*K_W directly) so tl.static_range’s end is compile-time constant."
+}
+```

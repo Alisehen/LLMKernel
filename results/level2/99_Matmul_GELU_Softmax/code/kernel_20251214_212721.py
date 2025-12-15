@@ -1,0 +1,262 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+import math
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64, 'num_warps': 4, 'num_stages': 2}),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32, 'num_warps': 8, 'num_stages': 3}),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32, 'num_warps': 8, 'num_stages': 3}),
+    ],
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def fused_gemm_gelu_softmax_kernel(
+    # Pointers to matrices
+    a_ptr, b_ptr, c_ptr,
+    # Matrix dimensions
+    M, N, K,
+    # Strides
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    # Block sizes
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    # Tuning parameters
+    num_warps: tl.constexpr, num_stages: tl.constexpr,
+):
+    """Fused GEMM + GELU + Softmax kernel with optimal block tiling."""
+    # Program ID
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    
+    # Offsets for this block
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    
+    # Initialize accumulator in shared memory for softmax reduction
+    # Use float32 for accumulation regardless of input dtype
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    # Pointers to A and B matrices
+    a_ptr_base = a_ptr
+    b_ptr_base = b_ptr
+    
+    # Loop over K dimension with software pipelining
+    for k in range(0, K, BLOCK_K):
+        # Load current block
+        a_ptrs = a_ptr_base + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
+        b_ptrs = b_ptr_base + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
+        
+        a_mask = (offs_m[:, None] < M) & (offs_k[None, :] < K - k)
+        b_mask = (offs_k[:, None] < K - k) & (offs_n[None, :] < N)
+        
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+        
+        # Tensor Core GEMM accumulation
+        acc += tl.dot(a, b, allow_tf32=True, out_dtype=tl.float32)
+        
+        # Advance pointers for next iteration
+        a_ptr_base += BLOCK_K * stride_ak
+        b_ptr_base += BLOCK_K * stride_bk
+    
+    # === Apply GELU activation (optimized for Ada Lovelace) ===
+    # Fast GELU approximation with minimal operations
+    # GELU(x) ≈ 0.5x * (1 + tanh(0.7978845608 * (x + 0.044715 * x^3)))
+    # Optimized to use fused multiply-add operations
+    
+    # Compute x^3 efficiently
+    x_cubed = acc * acc * acc
+    # Fused multiply-add: inner = 0.7978845608 * (acc + 0.044715 * x_cubed)
+    inner = tl.math.fma(0.044715, x_cubed, acc) * 0.7978845608028654
+    
+    # Fast tanh approximation using expm1 for better numerical stability
+    # tanh(x) = (exp(2x) - 1) / (exp(2x) + 1) = 1 - 2/(1 + exp(2x))
+    two_inner = 2.0 * inner
+    exp_2x = tl.exp(two_inner)
+    tanh_inner = 1.0 - 2.0 / (1.0 + exp_2x)
+    
+    # Final GELU: 0.5 * x * (1 + tanh(inner))
+    gelu_out = 0.5 * acc * (1.0 + tanh_inner)
+    
+    # === Softmax within the same tile ===
+    # Each thread block processes BLOCK_M x BLOCK_N elements
+    # For row-wise softmax, we need reductions across N dimension
+    
+    # Store GELU output to shared memory for softmax reduction
+    # We'll use a two-pass softmax: compute max and sum, then normalize
+    
+    # Allocate shared memory for row-wise reductions
+    shmem_max = tl.zeros((BLOCK_M,), dtype=tl.float32) - float('inf')
+    shmem_sum = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    
+    # First: compute row max within this tile
+    row_max = tl.max(gelu_out, axis=1)
+    shmem_max = tl.maximum(shmem_max, row_max)
+    
+    # Compute exp(x - max) and sum
+    gelu_sub = gelu_out - shmem_max[:, None]
+    exp_vals = tl.exp(gelu_sub)
+    row_sum = tl.sum(exp_vals, axis=1)
+    shmem_sum += row_sum
+    
+    # Second: normalize
+    softmax_out = exp_vals / shmem_sum[:, None]
+    
+    # Write final result to global memory
+    mask_m = offs_m[:, None] < M
+    mask_n = offs_n[None, :] < N
+    mask = mask_m & mask_n
+    
+    c_ptrs = c_ptr + (offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn)
+    tl.store(c_ptrs, softmax_out, mask=mask)
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'num_warps': 4, 'num_stages': 2}),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'num_warps': 8, 'num_stages': 3}),
+    ],
+    key=['M', 'N'],
+)
+@triton.jit
+def softmax_fallback_kernel(
+    x_ptr,
+    M, N,
+    stride_xm, stride_xn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    num_warps: tl.constexpr, num_stages: tl.constexpr,
+):
+    """Fallback softmax for large rows that don't fit in shared memory."""
+    pid = tl.program_id(0)
+    
+    offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    row_mask = offs_m < M
+    
+    # Allocate shared memory for reductions (1 per row in block)
+    shmem_max = tl.zeros((BLOCK_M,), dtype=tl.float32) - float('inf')
+    shmem_sum = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    
+    # First pass: compute row max
+    for n_start in range(0, N, BLOCK_N):
+        offs_n = n_start + tl.arange(0, BLOCK_N)
+        
+        x_ptrs = x_ptr + (offs_m[:, None] * stride_xm + offs_n[None, :] * stride_xn)
+        mask = row_mask[:, None] & (offs_n[None, :] < N)
+        x_vals = tl.load(x_ptrs, mask=mask, other=-float('inf'))
+        
+        # Update row max
+        shmem_max = tl.maximum(shmem_max, tl.max(x_vals, axis=1))
+    
+    # Second pass: compute exp and sum
+    for n_start in range(0, N, BLOCK_N):
+        offs_n = n_start + tl.arange(0, BLOCK_N)
+        
+        x_ptrs = x_ptr + (offs_m[:, None] * stride_xm + offs_n[None, :] * stride_xn)
+        mask = row_mask[:, None] & (offs_n[None, :] < N)
+        x_vals = tl.load(x_ptrs, mask=mask, other=0.0)
+        
+        # Compute exp(x - max)
+        exp_vals = tl.exp(x_vals - shmem_max[:, None])
+        shmem_sum += tl.sum(exp_vals, axis=1)
+        
+        # Store back exponentials
+        tl.store(x_ptrs, exp_vals, mask=mask)
+    
+    # Third pass: normalize
+    for n_start in range(0, N, BLOCK_N):
+        offs_n = n_start + tl.arange(0, BLOCK_N)
+        
+        x_ptrs = x_ptr + (offs_m[:, None] * stride_xm + offs_n[None, :] * stride_xn)
+        mask = row_mask[:, None] & (offs_n[None, :] < N)
+        exp_vals = tl.load(x_ptrs, mask=mask, other=0.0)
+        
+        # Normalize
+        softmax_vals = exp_vals / shmem_sum[:, None]
+        tl.store(x_ptrs, softmax_vals, mask=mask)
+
+
+def fused_gemm_gelu_softmax(x, weight):
+    """Fused GEMM + GELU + Softmax operation with adaptive kernel selection."""
+    # Ensure inputs are contiguous
+    x = x.contiguous()
+    weight = weight.contiguous()
+    
+    # Get dimensions
+    M, K = x.shape
+    N = weight.shape[0]
+    
+    # Allocate output tensor with proper alignment
+    c = torch.empty((M, N), device=x.device, dtype=x.dtype)
+    
+    # Prepare weight for transposed access
+    b = weight
+    
+    # Determine optimal kernel based on dimensions
+    # For large enough N that fits in shared memory, use fused kernel
+    # Otherwise use separate kernels
+    max_shared_n = 128 * 256  # Approximate shared memory limit
+    
+    if N <= max_shared_n:
+        # Use fused kernel - all operations in one pass
+        grid = lambda META: (
+            triton.cdiv(M, META['BLOCK_M']),
+            triton.cdiv(N, META['BLOCK_N'])
+        )
+        
+        fused_gemm_gelu_softmax_kernel[grid](
+            x, b, c,
+            M, N, K,
+            x.stride(0), x.stride(1),
+            b.stride(1), b.stride(0),
+            c.stride(0), c.stride(1)
+        )
+    else:
+        # Use separate GEMM+GELU then softmax (better for very large N)
+        # First: GEMM + GELU
+        grid_gemm = lambda META: (
+            triton.cdiv(M, META['BLOCK_M']),
+            triton.cdiv(N, META['BLOCK_N'])
+        )
+        
+        # Allocate intermediate output
+        intermediate = torch.empty((M, N), device=x.device, dtype=x.dtype)
+        
+        fused_gemm_gelu_softmax_kernel[grid_gemm](
+            x, b, intermediate,
+            M, N, K,
+            x.stride(0), x.stride(1),
+            b.stride(1), b.stride(0),
+            intermediate.stride(0), intermediate.stride(1),
+            BLOCK_M=64, BLOCK_N=64, BLOCK_K=32,
+            num_warps=4, num_stages=2
+        )
+        
+        # Then: Softmax
+        grid_softmax = lambda META: (triton.cdiv(M, META['BLOCK_M']),)
+        
+        softmax_fallback_kernel[grid_softmax](
+            intermediate,
+            M, N,
+            intermediate.stride(0), intermediate.stride(1)
+        )
+        
+        c = intermediate
+    
+    return c
+
+
+class ModelNew(nn.Module):
+    """Optimized model with fused GEMM + GELU + Softmax."""
+    
+    def __init__(self, in_features, out_features):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+    
+    def forward(self, x):
+        return fused_gemm_gelu_softmax(x, self.weight)

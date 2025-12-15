@@ -1,0 +1,5 @@
+{
+  "critical_issue": "ModelNew defines its own weight/bias parameters instead of using the Conv2d module’s parameters, so it does not share weights with the reference Model.",
+  "why_it_matters": "The reference and Triton models run with different convolution weights and biases, making their outputs fundamentally different and producing huge absolute errors across all samples.",
+  "minimal_fix_hint": "Use the same nn.Conv2d module as the reference or explicitly copy conv.weight and conv.bias into ModelNew’s parameters before running the Triton kernels."
+}

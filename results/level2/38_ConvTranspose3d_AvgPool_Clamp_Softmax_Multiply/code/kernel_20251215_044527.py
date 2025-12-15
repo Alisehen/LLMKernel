@@ -1,0 +1,222 @@
+# <corrected code>
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_L": 64}, num_warps=2, num_stages=2),
+        triton.Config({"BLOCK_L": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_L": 256}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_L": 512}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_L": 1024}, num_warps=8, num_stages=4),
+    ],
+    key=["L"],
+)
+@triton.jit
+def clamp_softmax_scale_kernel(
+    x_ptr,          # *const T, shape [B, C, L]
+    scale_ptr,      # *const T, shape [C]
+    out_ptr,        # *T,       shape [B, C, L]
+    B, C, L,        # int32
+    stride_xb, stride_xc, stride_xl,
+    stride_ob, stride_oc, stride_ol,
+    clamp_min, clamp_max,          # scalar
+    OUTPUT_DTYPE: tl.constexpr,    # output dtype (same as input tensor)
+    BLOCK_L: tl.constexpr,
+):
+    """
+    Fused kernel over x of shape [B, C, L]:
+
+      1) Clamp: y = clamp(x, clamp_min, clamp_max)
+      2) Spatial softmax over dimension L (per (b, c) row) with numerically
+         stable one-pass max+sum reduction.
+      3) Multiply by per-channel scale: scale[c]
+    """
+    pid = tl.program_id(0)
+    # Decode (b, c) from linear row index
+    b = pid // C
+    c = pid % C
+
+    # Row base pointers
+    row_x_ptr = x_ptr + b * stride_xb + c * stride_xc
+    row_out_ptr = out_ptr + b * stride_ob + c * stride_oc
+
+    # Per-channel scale (kept in fp32 for compute)
+    scale_val = tl.load(scale_ptr + c)
+    scale_val = scale_val.to(tl.float32)
+
+    # Clamp bounds in fp32
+    clamp_min_f32 = tl.full((), clamp_min, tl.float32)
+    clamp_max_f32 = tl.full((), clamp_max, tl.float32)
+
+    # -------------------------------------------------------------------------
+    # First pass: numerically-stable online computation of max and sum(exp).
+    # -------------------------------------------------------------------------
+    running_max = tl.full((), -float("inf"), tl.float32)
+    running_sum = tl.zeros((), dtype=tl.float32)
+
+    for start in range(0, L, BLOCK_L):
+        offs_l = start + tl.arange(0, BLOCK_L)
+        mask = offs_l < L
+
+        # Load and convert to fp32
+        x = tl.load(row_x_ptr + offs_l * stride_xl, mask=mask, other=0.0)
+        x = x.to(tl.float32)
+
+        # Clamp
+        x = tl.maximum(x, clamp_min_f32)
+        x = tl.minimum(x, clamp_max_f32)
+
+        # Mask out-of-bounds elements so they do not affect max/sum
+        x = tl.where(mask, x, -float("inf"))
+
+        # Block max
+        block_max = tl.max(x, axis=0)
+        new_max = tl.maximum(running_max, block_max)
+
+        # Rescale running_sum to new_max
+        scale_old = tl.exp(running_max - new_max)
+        running_max = new_max
+
+        # Sum of exp(x - new_max) over this block
+        exp_x = tl.exp(x - running_max) * mask
+        block_sum = tl.sum(exp_x, axis=0)
+
+        running_sum = running_sum * scale_old + block_sum
+
+    inv_sum = 1.0 / running_sum
+
+    # -------------------------------------------------------------------------
+    # Second pass: compute normalized softmax * scale and store.
+    # -------------------------------------------------------------------------
+    norm_scale = inv_sum * scale_val
+
+    for start in range(0, L, BLOCK_L):
+        offs_l = start + tl.arange(0, BLOCK_L)
+        mask = offs_l < L
+
+        x = tl.load(row_x_ptr + offs_l * stride_xl, mask=mask, other=0.0)
+        x = x.to(tl.float32)
+
+        # Clamp
+        x = tl.maximum(x, clamp_min_f32)
+        x = tl.minimum(x, clamp_max_f32)
+
+        # Compute softmax probability and apply per-channel scale
+        logits = x - running_max
+        probs = tl.exp(logits) * norm_scale
+
+        # Cast to desired output dtype
+        probs = probs.to(OUTPUT_DTYPE)
+
+        tl.store(row_out_ptr + offs_l * stride_ol, probs, mask=mask)
+
+
+def fused_clamp_softmax_scale(x, scale, clamp_min, clamp_max):
+    """
+    x:     [B, C, D, H, W]  (fp16 / bf16 / fp32)
+    scale: [1, C, 1, 1, 1] or [C]
+    Returns:
+        y: [B, C, D, H, W]
+        with y = softmax(clamp(x)) over spatial dims (D*H*W), then * scale (per-channel).
+    """
+    assert x.is_cuda, "Input must be on CUDA for Triton kernel"
+
+    B, C, D, H, W = x.shape
+    L = D * H * W
+
+    # Flatten spatial dimensions: [B, C, L]
+    x_flat = x.view(B, C, L)
+    out_flat = torch.empty_like(x_flat)
+
+    # Per-channel scale as 1D: [C]
+    scale_1d = scale.view(-1)
+
+    stride_xb, stride_xc, stride_xl = x_flat.stride()
+    stride_ob, stride_oc, stride_ol = out_flat.stride()
+
+    # 1D grid: one program per (b, c) row
+    grid = (B * C,)
+
+    # Map torch dtype to Triton dtype (for output cast)
+    if x.dtype == torch.float16:
+        output_dtype = tl.float16
+    elif x.dtype == torch.bfloat16:
+        output_dtype = tl.bfloat16
+    elif x.dtype == torch.float32:
+        output_dtype = tl.float32
+    else:
+        raise NotImplementedError(f"Unsupported dtype for Triton kernel: {x.dtype}")
+
+    # Pass clamp bounds as host scalars (not device tensors)
+    clamp_min_val = float(clamp_min)
+    clamp_max_val = float(clamp_max)
+
+    clamp_softmax_scale_kernel[grid](
+        x_flat,
+        scale_1d,
+        out_flat,
+        B,
+        C,
+        L,
+        stride_xb,
+        stride_xc,
+        stride_xl,
+        stride_ob,
+        stride_oc,
+        stride_ol,
+        clamp_min_val,
+        clamp_max_val,
+        OUTPUT_DTYPE=output_dtype,
+    )
+
+    return out_flat.view(B, C, D, H, W)
+
+
+class ModelNew(nn.Module):
+    """
+    Model that performs:
+      AvgPool3d (PyTorch) ->
+      ConvTranspose3d (PyTorch) ->
+      Clamp + Spatial Softmax + Per-channel Scale (Triton fused)
+    """
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size,
+        stride,
+        padding,
+        output_padding,
+        pool_kernel_size,
+        clamp_min,
+        clamp_max,
+    ):
+        super(ModelNew, self).__init__()
+        self.avg_pool = nn.AvgPool3d(pool_kernel_size)
+        # Keep ConvTranspose3d as PyTorch native
+        self.conv_transpose = nn.ConvTranspose3d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            output_padding=output_padding,
+        )
+        self.clamp_min = clamp_min
+        self.clamp_max = clamp_max
+        # Per-channel learnable scale
+        self.scale = nn.Parameter(torch.ones(1, out_channels, 1, 1, 1))
+
+    def forward(self, x):
+        """
+        x: [B, in_channels, D, H, W]
+        returns: [B, out_channels, D_out, H_out, W_out]
+        """
+        x = self.avg_pool(x)
+        x = self.conv_transpose(x)
+        x = fused_clamp_softmax_scale(x, self.scale, self.clamp_min, self.clamp_max)
+        return x

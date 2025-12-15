@@ -1,0 +1,172 @@
+# <complete ModelNew code with optimized Triton kernels>
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        # Main high-throughput config
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=3,
+        ),
+        # Asymmetric tiling (good when N is small / skinny)
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=3,
+        ),
+        # Smaller fallback for high register pressure / odd shapes
+        triton.Config(
+            {'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 32},
+            num_warps=2,
+            num_stages=3,
+        ),
+    ],
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def linear_sigmoid_row_sum_kernel(
+    a_ptr,         # [M, K] input
+    w_ptr,         # [N, K] nn.Linear weight (out_features x in_features)
+    bias_ptr,      # [N] bias
+    out_ptr,       # [M] output row sums
+    M, N, K,
+    stride_am, stride_ak,    # strides for a_ptr[m, k]
+    stride_wn, stride_wk,    # strides for w_ptr[n, k]
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """
+    Fused kernel computing:
+        y = x @ weight.T + bias
+        y = sigmoid(y)
+        out[m] = sum_n y[m, n]
+
+    This version:
+      - Tiles only over M in the grid (1D grid), loops over N inside the kernel.
+      - Eliminates atomic_add by assigning each row to exactly one program.
+      - Uses moderate BLOCK_* sizes to control register pressure.
+    """
+    pid_m = tl.program_id(0)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    m_mask = offs_m < M
+
+    # Accumulator for per-row sums over N
+    row_sum = tl.zeros((BLOCK_M,), dtype=tl.float32)
+
+    # Loop over N dimension in tiles
+    for n0 in range(0, N, BLOCK_N):
+        offs_n = n0 + tl.arange(0, BLOCK_N)
+        n_mask = offs_n < N
+
+        # Accumulator for this (M-tile, N-tile) over K
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+        # Reduction loop over K dimension
+        for k0 in range(0, K, BLOCK_K):
+            offs_k = k0 + tl.arange(0, BLOCK_K)
+            k_mask = offs_k < K
+
+            # Pointers for A[M, K]
+            a_ptrs = a_ptr + (
+                offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+            )
+            # Pointers for W[N, K] but accessed as B[K, N] = W[N, K]^T
+            # Shape we want: (BLOCK_K, BLOCK_N) corresponding to (k, n)
+            w_ptrs = w_ptr + (
+                offs_n[None, :] * stride_wn + offs_k[:, None] * stride_wk
+            )
+
+            a_mask = m_mask[:, None] & k_mask[None, :]
+            w_mask = k_mask[:, None] & n_mask[None, :]
+
+            a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+            w = tl.load(w_ptrs, mask=w_mask, other=0.0)
+
+            # (BLOCK_M, BLOCK_K) x (BLOCK_K, BLOCK_N) -> (BLOCK_M, BLOCK_N)
+            acc += tl.dot(a, w)
+
+        # Add bias[n] (broadcast along M)
+        bias = tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0)
+        acc += bias[None, :]
+
+        # Sigmoid in-place: acc = 1 / (1 + exp(-acc))
+        acc = -acc
+        acc = tl.exp(acc)
+        acc = 1.0 + acc
+        acc = 1.0 / acc
+
+        # Zero out contributions from out-of-range columns
+        acc = tl.where(n_mask[None, :], acc, 0.0)
+
+        # Accumulate into per-row sums
+        row_sum += tl.sum(acc, axis=1)
+
+    # Store per-row sums; no atomics needed (each row handled by one program)
+    tl.store(out_ptr + offs_m, row_sum, mask=m_mask)
+
+
+def fused_linear_sigmoid_sum(x: torch.Tensor,
+                             weight: torch.Tensor,
+                             bias: torch.Tensor) -> torch.Tensor:
+    """
+    Fused implementation of:
+        y = x @ weight.T + bias
+        y = sigmoid(y)
+        out = y.sum(dim=1, keepdim=True)
+
+    Args:
+        x:      [M, K]
+        weight: [N, K] (nn.Linear weight: out_features x in_features)
+        bias:   [N]
+
+    Returns:
+        out: [M, 1]
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda, "All tensors must be on CUDA device"
+    assert x.dtype == weight.dtype == bias.dtype == torch.float32, "Use float32 for this kernel"
+
+    M, K = x.shape
+    N, K_w = weight.shape
+    assert K == K_w, "Input feature dimension mismatch"
+
+    out = torch.empty((M,), device=x.device, dtype=x.dtype)
+
+    # Strides for A[M, K]
+    stride_am, stride_ak = x.stride()
+
+    # Strides for weight[N, K]
+    stride_wn, stride_wk = weight.stride()
+
+    def grid(meta):
+        return (triton.cdiv(M, meta['BLOCK_M']),)
+
+    linear_sigmoid_row_sum_kernel[grid](
+        x, weight, bias, out,
+        M, N, K,
+        stride_am, stride_ak,
+        stride_wn, stride_wk,
+    )
+
+    return out.view(M, 1)
+
+
+class ModelNew(nn.Module):
+    """
+    Model equivalent to the reference PyTorch model, but using a fused Triton kernel
+    for linear + sigmoid + row-wise sum.
+    """
+    def __init__(self, input_size, hidden_size):
+        super(ModelNew, self).__init__()
+        self.linear = nn.Linear(input_size, hidden_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.to(self.linear.weight.device)
+        return fused_linear_sigmoid_sum(x, self.linear.weight, self.linear.bias)

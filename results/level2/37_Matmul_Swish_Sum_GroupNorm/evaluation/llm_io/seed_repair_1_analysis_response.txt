@@ -1,0 +1,5 @@
+{
+  "critical_issue": "The Triton path omits the nn.Linear bias; matmul_swish_add_bias applies Swish(A@W) + bias instead of Swish(A@W + linear_bias) + extra_bias like the reference Model.",
+  "why_it_matters": "Because the pre-activation linear bias isn’t added, the activation statistics differ before GroupNorm, causing systematic numeric mismatches beyond the specified atol/rtol thresholds despite otherwise similar computation.",
+  "minimal_fix_hint": "Introduce and add a dedicated linear bias term to the matmul result before applying Swish, mirroring nn.Linear’s behavior in the reference PyTorch model."
+}

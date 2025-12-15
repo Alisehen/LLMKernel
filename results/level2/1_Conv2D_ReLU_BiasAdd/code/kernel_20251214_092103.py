@@ -1,0 +1,273 @@
+# <optimized Triton code>
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {
+                "BLOCK_M": 64,
+                "BLOCK_N": 64,
+                "BLOCK_K": 32,
+            },
+            num_warps=4,
+            num_stages=3,
+        ),
+        triton.Config(
+            {
+                "BLOCK_M": 128,
+                "BLOCK_N": 64,
+                "BLOCK_K": 32,
+            },
+            num_warps=8,
+            num_stages=4,
+        ),
+        triton.Config(
+            {
+                "BLOCK_M": 64,
+                "BLOCK_N": 128,
+                "BLOCK_K": 32,
+            },
+            num_warps=8,
+            num_stages=4,
+        ),
+        triton.Config(
+            {
+                "BLOCK_M": 128,
+                "BLOCK_N": 128,
+                "BLOCK_K": 32,
+            },
+            num_warps=8,
+            num_stages=5,
+        ),
+    ],
+    key=["P", "OC", "K_TOTAL"],
+)
+@triton.jit
+def conv2d_relu_double_bias_kernel(
+    x_ptr,          # *const float
+    w_ptr,          # *const float
+    conv_bias_ptr,  # *const float  (Conv2d bias, length = OC)
+    add_bias_ptr,   # *const float  (extra bias after ReLU, length = OC)
+    y_ptr,          # *float
+    N, C_in, H, W,
+    OC, H_out, W_out,
+    stride_x_n, stride_x_c, stride_x_h, stride_x_w,
+    stride_w_oc, stride_w_ic, stride_w_kh, stride_w_kw,
+    stride_y_n, stride_y_oc, stride_y_h, stride_y_w,
+    K_H, K_W,
+    P,              # total number of output positions = N * H_out * W_out  (M dimension)
+    K_TOTAL,        # total convolution reduction size = C_in * K_H * K_W   (K dimension)
+    BLOCK_M: tl.constexpr,  # tile over output positions (M)
+    BLOCK_N: tl.constexpr,  # tile over output channels (N)
+    BLOCK_K: tl.constexpr,  # tile over reduction dimension (K)
+):
+    # -------------------------------------------------------------------------
+    # Program IDs -> tile coordinates in output matrix [P, OC]
+    # -------------------------------------------------------------------------
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # [BLOCK_M] over P
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # [BLOCK_N] over OC
+
+    # Masks for output tile
+    mask_m = offs_m < P
+    mask_n = offs_n < OC
+
+    # Decode flattened output index m -> (n, oh, ow)
+    HW_out = H_out * W_out
+    n_idx = offs_m // HW_out
+    rem = offs_m % HW_out
+    oh_idx = rem // W_out
+    ow_idx = rem % W_out
+
+    # -------------------------------------------------------------------------
+    # Matmul-style convolution:
+    #   Y[M, N] = sum_{k=0}^{K_TOTAL-1}  A[M, k] * B[k, N]
+    #   A is "im2col(x)", B is reshaped weights
+    # -------------------------------------------------------------------------
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Loop over K dimension in BLOCK_K chunks
+    for k0 in range(0, K_TOTAL, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)  # [BLOCK_K] in reduction dim
+        mask_k = offs_k < K_TOTAL
+
+        # Decompose offs_k -> (ic, kh, kw)
+        khkw = K_H * K_W
+        ic = offs_k // khkw
+        rem_k = offs_k % khkw
+        kh = rem_k // K_W
+        kw = rem_k % K_W
+
+        # ---------------------------------------------------------------------
+        # Load A tile: [BLOCK_M, BLOCK_K] from x (im2col on the fly)
+        # A[m, k] = x[n, ic, oh+kh, ow+kw]
+        # ---------------------------------------------------------------------
+        in_h = oh_idx[:, None] + kh[None, :]
+        in_w = ow_idx[:, None] + kw[None, :]
+
+        a_ptrs = (
+            x_ptr
+            + n_idx[:, None] * stride_x_n
+            + ic[None, :] * stride_x_c
+            + in_h * stride_x_h
+            + in_w * stride_x_w
+        )
+
+        a_mask = mask_m[:, None] & mask_k[None, :]
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+
+        # ---------------------------------------------------------------------
+        # Load B tile: [BLOCK_K, BLOCK_N] from weights
+        # B[k, n] = w[n, ic, kh, kw]
+        # ---------------------------------------------------------------------
+        b_ptrs = (
+            w_ptr
+            + offs_n[None, :] * stride_w_oc
+            + ic[:, None] * stride_w_ic
+            + kh[:, None] * stride_w_kh
+            + kw[:, None] * stride_w_kw
+        )
+
+        b_mask = mask_k[:, None] & mask_n[None, :]
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+        # ---------------------------------------------------------------------
+        # Matmul update: [BLOCK_M, BLOCK_K] x [BLOCK_K, BLOCK_N]
+        # ---------------------------------------------------------------------
+        acc += tl.dot(a, b)
+
+    # -------------------------------------------------------------------------
+    # Fused post-ops: conv_bias -> ReLU -> add_bias
+    # All use the same (offs_m, offs_n) and masks (mask_m, mask_n).
+    # -------------------------------------------------------------------------
+    conv_bias_vals = tl.load(conv_bias_ptr + offs_n, mask=mask_n, other=0.0)  # [BLOCK_N]
+    acc += conv_bias_vals[None, :]
+
+    # ReLU
+    acc = tl.maximum(acc, 0.0)
+
+    # Extra bias after ReLU
+    add_bias_vals = tl.load(add_bias_ptr + offs_n, mask=mask_n, other=0.0)  # [BLOCK_N]
+    acc += add_bias_vals[None, :]
+
+    # -------------------------------------------------------------------------
+    # Store results: y[n, oc, oh, ow]
+    # -------------------------------------------------------------------------
+    y_ptrs = (
+        y_ptr
+        + n_idx[:, None] * stride_y_n
+        + offs_n[None, :] * stride_y_oc
+        + oh_idx[:, None] * stride_y_h
+        + ow_idx[:, None] * stride_y_w
+    )
+    tl.store(y_ptrs, acc, mask=mask_m[:, None] & mask_n[None, :])
+
+
+def fused_conv_relu_double_bias(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    conv_bias: torch.Tensor,
+    add_bias: torch.Tensor,
+) -> torch.Tensor:
+    """
+    x:         [N, C_in, H, W]
+    weight:    [OC, C_in, K_H, K_W]  (Conv2d weight)
+    conv_bias: [OC]                  (Conv2d bias, applied before ReLU)
+    add_bias:  [OC] or [OC, 1, 1]    (extra bias, applied after ReLU)
+
+    Computes: ReLU(conv2d(x, weight) + conv_bias) + add_bias
+    with stride=1, padding=0, dilation=1, groups=1.
+    """
+    assert x.is_cuda and weight.is_cuda and conv_bias.is_cuda and add_bias.is_cuda, \
+        "All tensors must be on CUDA"
+    assert x.dtype == weight.dtype == conv_bias.dtype == add_bias.dtype == torch.float32, \
+        "This implementation assumes float32 tensors"
+
+    N, C_in, H, W = x.shape
+    OC, Cw_in, K_H, K_W = weight.shape
+    assert C_in == Cw_in, "Input channels must match weight's in_channels"
+    assert conv_bias.numel() == OC, "conv_bias must be length = out_channels"
+
+    # For this implementation: stride=1, padding=0, dilation=1
+    H_out = H - K_H + 1
+    W_out = W - K_W + 1
+    assert H_out > 0 and W_out > 0, "Kernel size too large for input spatial dimensions"
+
+    # Biases: flatten to [OC]
+    conv_bias_flat = conv_bias.view(OC)
+    add_bias_flat = add_bias.view(OC)
+
+    # Allocate output
+    y = torch.empty((N, OC, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    # GEMM-style sizes
+    P = N * H_out * W_out                 # M dimension
+    K_TOTAL = C_in * K_H * K_W            # K dimension
+
+    # Strides
+    stride_x_n, stride_x_c, stride_x_h, stride_x_w = x.stride()
+    stride_w_oc, stride_w_ic, stride_w_kh, stride_w_kw = weight.stride()
+    stride_y_n, stride_y_oc, stride_y_h, stride_y_w = y.stride()
+
+    def grid(meta):
+        return (
+            triton.cdiv(P, meta["BLOCK_M"]),
+            triton.cdiv(OC, meta["BLOCK_N"]),
+        )
+
+    conv2d_relu_double_bias_kernel[grid](
+        x, weight, conv_bias_flat, add_bias_flat, y,
+        N, C_in, H, W,
+        OC, H_out, W_out,
+        stride_x_n, stride_x_c, stride_x_h, stride_x_w,
+        stride_w_oc, stride_w_ic, stride_w_kh, stride_w_kw,
+        stride_y_n, stride_y_oc, stride_y_h, stride_y_w,
+        K_H, K_W,
+        P, K_TOTAL,
+        # META-parameters are chosen by the autotuner
+    )
+
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-based replacement for:
+        Conv2d(in_channels, out_channels, kernel_size, bias=True) -> ReLU -> + extra_bias
+
+    Computes:
+        y = ReLU(conv2d(x, conv.weight) + conv.bias) + bias
+    where `bias` is an extra learnable bias broadcast over spatial dimensions.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, bias_shape):
+        super(ModelNew, self).__init__()
+        if isinstance(kernel_size, int):
+            k_h = k_w = kernel_size
+        else:
+            k_h, k_w = kernel_size
+
+        # Conv2d container for weight & bias parameters
+        self.conv = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=(k_h, k_w),
+            bias=True,
+        )
+        # Extra bias after ReLU, broadcast over spatial dims
+        self.bias = nn.Parameter(
+            torch.randn(*bias_shape)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return fused_conv_relu_double_bias(
+            x,
+            self.conv.weight,
+            self.conv.bias,
+            self.bias,
+        )

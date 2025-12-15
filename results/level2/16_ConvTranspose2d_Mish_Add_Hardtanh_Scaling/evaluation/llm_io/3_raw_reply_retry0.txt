@@ -1,0 +1,242 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+import math
+
+
+@triton.jit
+def fused_mish_add_hardtanh_scale_kernel(
+    x_ptr,
+    out_ptr,
+    N, C, H, W,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_on, stride_oc, stride_oh, stride_ow,
+    add_value,
+    scale,
+    BLOCK_C: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+):
+    """
+    Fused kernel: Mish + Add + Hardtanh + Scale
+    Input: [N, C, H, W] -> Output: [N, C, H, W]
+    """
+    pid_n = tl.program_id(0)
+    pid_c = tl.program_id(1)
+    pid_h = tl.program_id(2)
+
+    # Compute base pointers for this block
+    x_base = x_ptr + pid_n * stride_xn + pid_c * stride_xc + pid_h * stride_xh
+    out_base = out_ptr + pid_n * stride_on + pid_c * stride_oc + pid_h * stride_oh
+
+    # Create masks for W dimension
+    w_offsets = tl.arange(0, BLOCK_W)
+    w_mask = w_offsets < W
+
+    # Load block of data
+    x_ptrs = x_base + w_offsets * stride_xw
+    x_vals = tl.load(x_ptrs, mask=w_mask, other=0.0)
+
+    # Step 1: Mish activation
+    # Mish(x) = x * tanh(softplus(x))
+    # softplus(x) = log(1 + exp(x))
+    # We compute stable version to avoid overflow
+    
+    # Compute softplus(x) = log(1 + exp(x))
+    # For numerical stability: log(1 + exp(x)) = max(x, 0) + log(1 + exp(-|x|))
+    abs_x = tl.abs(x_vals)
+    max_zero_x = tl.where(x_vals > 0, x_vals, 0.0)
+    softplus = max_zero_x + tl.log(1.0 + tl.exp(-abs_x))
+    
+    # Compute tanh(softplus)
+    exp_pos = tl.exp(softplus)
+    exp_neg = tl.exp(-softplus)
+    tanh_softplus = (exp_pos - exp_neg) / (exp_pos + exp_neg + 1e-8)
+    
+    # Mish(x) = x * tanh(softplus(x))
+    mish_vals = x_vals * tanh_softplus
+
+    # Step 2: Add value
+    add_vals = mish_vals + add_value
+
+    # Step 3: Hardtanh activation (clamp to [-1, 1])
+    # Hardtanh: min(max(x, -1), 1)
+    hardtanh_vals = tl.where(add_vals < -1.0, -1.0, add_vals)
+    hardtanh_vals = tl.where(hardtanh_vals > 1.0, 1.0, hardtanh_vals)
+
+    # Step 4: Scale
+    scaled_vals = hardtanh_vals * scale
+
+    # Store results
+    out_ptrs = out_base + w_offsets * stride_ow
+    tl.store(out_ptrs, scaled_vals, mask=w_mask)
+
+
+@triton.jit
+def fused_mish_add_hardtanh_scale_kernel_2d(
+    x_ptr,
+    out_ptr,
+    N, C, H, W,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_on, stride_oc, stride_oh, stride_ow,
+    add_value,
+    scale,
+    BLOCK_C: tl.constexpr,
+    BLOCK_HW: tl.constexpr,
+):
+    """
+    Alternative 2D blocking kernel for better memory coalescing
+    Input: [N, C, H, W] -> Output: [N, C, H, W]
+    Each block processes BLOCK_C channels and BLOCK_HW spatial positions
+    """
+    pid_n = tl.program_id(0)
+    pid_chunk = tl.program_id(1)
+
+    # Calculate channel and spatial indices
+    c_offsets = tl.arange(0, BLOCK_C)
+    hw_offsets = tl.arange(0, BLOCK_HW)
+
+    # Split pid_chunk into spatial blocks
+    hw_start = pid_chunk * BLOCK_HW
+    hw_idx = hw_start + hw_offsets
+    
+    # FIX: Compute spatial indices safely with proper bounds
+    # Compute valid spatial mask first
+    spatial_size = H * W
+    valid_hw_mask = hw_idx < spatial_size
+    
+    # Compute h and w indices directly using integer arithmetic
+    # For invalid positions, we'll use mask to prevent access
+    h_idx = hw_idx // W
+    w_idx = hw_idx % W
+    
+    # Create masks for both dimensions
+    c_mask = c_offsets[:, None] < C
+    spatial_mask = valid_hw_mask[None, :]
+    
+    # Combine masks
+    mask = c_mask & spatial_mask
+
+    # Compute pointers for all positions in the block
+    x_ptrs = (
+        x_ptr + 
+        pid_n * stride_xn + 
+        c_offsets[:, None] * stride_xc + 
+        h_idx[None, :] * stride_xh + 
+        w_idx[None, :] * stride_xw
+    )
+    
+    # Load data
+    x_vals = tl.load(x_ptrs, mask=mask, other=0.0)
+
+    # Mish activation
+    abs_x = tl.abs(x_vals)
+    max_zero_x = tl.where(x_vals > 0, x_vals, 0.0)
+    softplus = max_zero_x + tl.log(1.0 + tl.exp(-abs_x))
+    exp_pos = tl.exp(softplus)
+    exp_neg = tl.exp(-softplus)
+    tanh_softplus = (exp_pos - exp_neg) / (exp_pos + exp_neg + 1e-8)
+    mish_vals = x_vals * tanh_softplus
+
+    # Add value
+    add_vals = mish_vals + add_value
+
+    # Hardtanh activation
+    hardtanh_vals = tl.where(add_vals < -1.0, -1.0, add_vals)
+    hardtanh_vals = tl.where(hardtanh_vals > 1.0, 1.0, hardtanh_vals)
+
+    # Scale
+    scaled_vals = hardtanh_vals * scale
+
+    # Store results
+    out_ptrs = (
+        out_ptr + 
+        pid_n * stride_on + 
+        c_offsets[:, None] * stride_oc + 
+        h_idx[None, :] * stride_oh + 
+        w_idx[None, :] * stride_ow
+    )
+    tl.store(out_ptrs, scaled_vals, mask=mask)
+
+
+def fused_post_convtranspose(x, add_value, scale, use_2d_kernel=True):
+    """
+    Fused: Mish + Add + Hardtanh + Scale
+    """
+    N, C, H, W = x.shape
+    out = torch.empty_like(x)
+    
+    if use_2d_kernel:
+        # Use 2D kernel with better memory coalescing
+        BLOCK_C = 16
+        BLOCK_HW = 64
+        
+        # Calculate number of spatial chunks
+        spatial_chunks = triton.cdiv(H * W, BLOCK_HW)
+        
+        grid = (
+            N,  # batch dimension
+            spatial_chunks,  # spatial chunks
+        )
+        
+        fused_mish_add_hardtanh_scale_kernel_2d[grid](
+            x, out,
+            N, C, H, W,
+            x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+            out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+            add_value, scale,
+            BLOCK_C=BLOCK_C,
+            BLOCK_HW=BLOCK_HW,
+            num_warps=4,
+        )
+    else:
+        # Use 3D kernel for simpler control
+        BLOCK_C = min(triton.next_power_of_2(C), 16)
+        BLOCK_H = min(triton.next_power_of_2(H), 64)
+        BLOCK_W = min(triton.next_power_of_2(W), 64)
+        
+        grid = (
+            N,  # batch dimension
+            triton.cdiv(C, BLOCK_C),  # channel dimension
+            triton.cdiv(H, BLOCK_H),  # height dimension
+        )
+        
+        fused_mish_add_hardtanh_scale_kernel[grid](
+            x, out,
+            N, C, H, W,
+            x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+            out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+            add_value, scale,
+            BLOCK_C=BLOCK_C,
+            BLOCK_H=BLOCK_H,
+            BLOCK_W=BLOCK_W,
+            num_warps=4,
+        )
+    
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    ConvTranspose2d (PyTorch native) + Fused Mish + Add + Hardtanh + Scale (Triton)
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, add_value, scale):
+        super(ModelNew, self).__init__()
+        # Keep ConvTranspose as PyTorch native - DO NOT reimplement in Triton
+        self.conv_transpose = nn.ConvTranspose2d(
+            in_channels, out_channels, kernel_size, 
+            stride, padding, output_padding
+        )
+        self.add_value = add_value
+        self.scale = scale
+        
+    def forward(self, x):
+        # Step 1: PyTorch native ConvTranspose2d
+        x = self.conv_transpose(x)
+        
+        # Step 2: Fused post-ops in Triton
+        x = fused_post_convtranspose(x, self.add_value, self.scale, use_2d_kernel=True)
+        return x
+```

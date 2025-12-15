@@ -1,0 +1,5 @@
+{
+  "critical_issue": "ModelNew creates new random weight and linear_bias parameters instead of reusing the reference nn.Linear's weight and bias, so its fused matmul+swish uses different parameters than the PyTorch model.",
+  "why_it_matters": "Because the parameters are not shared or copied, the Triton path computes with different weights/biases, leading to large systematic output mismatches that easily exceed the atol/rtol comparison thresholds.",
+  "minimal_fix_hint": "Reuse the original nn.Linear module’s weight and bias (or copy them) in ModelNew and pass them into the Triton kernel instead of defining independent Parameters."
+}

@@ -1,0 +1,319 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU
+GPU Name: 4090
+Architecture: Ada Lovelace
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+[OPTIMIZATION STAGE]
+
+## Current Optimization Stage
+
+Focus: Fine-tuning fused kernel parameters.
+
+Params:
+- num_warps ∈ {4, 8}
+- num_stages ∈ {2, 3}
+
+Conditional Rules (NOT one-size-fits-all):
+
+IF register pressure LOW (regs < 96, no spill):
+  - Try num_warps=8 for compute-bound fusion
+  - num_stages=3 may help hide latency
+
+IF register pressure HIGH (regs > 128 or occupancy_limit_registers):
+  - Use num_warps=4 (fewer warps = more registers per warp)
+  - Keep num_stages=2 (higher stages need more registers)
+
+IF multi-input fusion (3+ distinct loads):
+  - num_stages=2 preferred (each stage buffers all inputs)
+  - num_warps=4 often better than 8
+
+Autotune:
+- Max 2-3 configs to reduce compilation time
+- Always include conservative baseline (num_warps=4, num_stages=2)
+- Test before/after: revert if gain < 2%
+
+
+
+[CURRENT CODE]
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        # Balanced, good for large problems
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+        # Wider channel tile – good when OC is large
+        triton.Config(
+            {'BLOCK_M': 32, 'BLOCK_N': 128, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+        # Taller spatial tile – good when NHW is large
+        triton.Config(
+            {'BLOCK_M': 128, 'BLOCK_N': 32, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+        # Narrow channel tile – good when OC is small / irregular
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+        # Small fallback tile for extreme register pressure / tiny shapes
+        triton.Config(
+            {'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 32},
+            num_warps=2,
+            num_stages=1,
+        ),
+    ],
+    key=['N', 'OC', 'H_out', 'W_out', 'C_in', 'K_H', 'K_W'],
+    # We fully overwrite the output, so no tensor needs to be zeroed.
+    reset_to_zero=[],
+)
+@triton.jit
+def conv_relu_hswish_kernel(
+    x_ptr, w_ptr, b_ptr, y_ptr,
+    N, C_in, H, W,
+    OC, K_H, K_W,
+    H_out, W_out,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_wo, stride_wi, stride_wkh, stride_wkw,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    BLOCK_M: tl.constexpr,  # output positions per block (flattened N*H_out*W_out)
+    BLOCK_N: tl.constexpr,  # output channels per block
+    BLOCK_K: tl.constexpr,  # K tile = C_in*K_H*K_W per iteration
+):
+    # -----------------------------
+    # Program / tile indices
+    # -----------------------------
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    DHW = H_out * W_out
+    P = N * DHW
+    K_tot = C_in * K_H * K_W
+    KH_KW = K_H * K_W
+
+    # Offsets along flattened output position P and output channels OC
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_m = offs_m < P
+    mask_n = offs_n < OC
+
+    # Helpful hints to the compiler for vectorized memory access
+    tl.multiple_of(offs_m, BLOCK_M)
+    tl.multiple_of(offs_n, BLOCK_N)
+
+    # Decode flattened position -> (n, oh, ow)
+    n_idx = offs_m // DHW
+    rem = offs_m % DHW
+    oh_idx = rem // W_out
+    ow_idx = rem % W_out
+
+    # -----------------------------
+    # Precompute base pointers
+    # -----------------------------
+    # Base input pointer for each output position (no kernel offset / channel yet)
+    x_base = (
+        x_ptr
+        + n_idx[:, None] * stride_xn
+        + oh_idx[:, None] * stride_xh
+        + ow_idx[:, None] * stride_xw
+    )
+
+    # Base weight pointer for each output channel (no kernel offset / in-channel yet)
+    w_base = w_ptr + offs_n[None, :] * stride_wo
+
+    # -----------------------------
+    # Accumulator tile [BLOCK_M, BLOCK_N], always in fp32
+    # -----------------------------
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # -----------------------------
+    # Reduction over K = C_in * K_H * K_W
+    # -----------------------------
+    k_iter = tl.arange(0, BLOCK_K)
+    inv6 = 1.0 / 6.0  # used later for HardSwish; keep in register
+
+    for k0 in range(0, K_tot, BLOCK_K):
+        k_range = k0 + k_iter
+        mask_k = k_range < K_tot
+
+        # Map flattened K index -> (ic, kh, kw)
+        ic = k_range // KH_KW
+        rem_k = k_range % KH_KW
+        kh = rem_k // K_W
+        kw = rem_k % K_W
+
+        # Compute the per-K offset in input and weight tensors
+        x_ptrs = (
+            x_base
+            + ic[None, :] * stride_xc
+            + kh[None, :] * stride_xh
+            + kw[None, :] * stride_xw
+        )
+
+        w_ptrs = (
+            w_base
+            + ic[:, None] * stride_wi
+            + kh[:, None] * stride_wkh
+            + kw[:, None] * stride_wkw
+        )
+
+        # Masks for loads
+        x_mask = mask_m[:, None] & mask_k[None, :]
+        w_mask = mask_k[:, None] & mask_n[None, :]
+
+        # Load tiles; keep values in their native precision (fp16/bf16/fp32)
+        x_vals = tl.load(x_ptrs, mask=x_mask, other=0.0)
+        w_vals = tl.load(w_ptrs, mask=w_mask, other=0.0)
+
+        # Matrix multiply-accumulate using Tensor Cores where possible.
+        # Accumulate in fp32 for numerical robustness.
+        acc += tl.dot(x_vals, w_vals, out_dtype=tl.float32)
+
+    # -----------------------------
+    # Bias add (broadcast over M)
+    # -----------------------------
+    bias_vals = tl.load(b_ptr + offs_n, mask=mask_n, other=0.0)
+    acc = acc + bias_vals[None, :]
+
+    # -----------------------------
+    # Fused ReLU + HardSwish in registers
+    #
+    # y = relu(x)
+    # y = y * clamp((y + 3) / 6, 0, 1)
+    # -----------------------------
+    acc = tl.maximum(acc, 0.0)
+    t = acc + 3.0
+    t = tl.minimum(t, 6.0)
+    t = tl.maximum(t, 0.0)
+    acc = acc * (t * inv6)
+
+    # -----------------------------
+    # Store final result (single write)
+    # -----------------------------
+    y_ptrs = (
+        y_ptr
+        + n_idx[:, None] * stride_yn
+        + offs_n[None, :] * stride_yc
+        + oh_idx[:, None] * stride_yh
+        + ow_idx[:, None] * stride_yw
+    )
+    out_mask = mask_m[:, None] & mask_n[None, :]
+    tl.store(y_ptrs, acc, mask=out_mask)
+
+
+def conv_relu_hswish_triton(x, weight, bias):
+    """
+    x:      [N, C_in, H, W]
+    weight: [OC, C_in, K_H, K_W]
+    bias:   [OC]
+
+    Implements Conv2d (stride=1, padding=0, dilation=1) + ReLU + HardSwish
+    using a single fused Triton kernel.
+    """
+    x = x.contiguous()
+    weight = weight.contiguous()
+    bias = bias.contiguous()
+
+    N, C_in, H, W = x.shape
+    OC, C_w, K_H, K_W = weight.shape
+    assert C_w == C_in, "Incompatible in_channels between input and weight"
+
+    # Stride=1, padding=0, dilation=1
+    H_out = H - K_H + 1
+    W_out = W - K_W + 1
+    assert H_out > 0 and W_out > 0, "Invalid kernel size for given input dimensions"
+
+    # Output tensor: same dtype as input
+    y = torch.empty((N, OC, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    P = N * H_out * W_out
+
+    def grid(meta):
+        return (
+            triton.cdiv(P, meta['BLOCK_M']),
+            triton.cdiv(OC, meta['BLOCK_N']),
+        )
+
+    conv_relu_hswish_kernel[grid](
+        x, weight, bias, y,
+        N, C_in, H, W,
+        OC, K_H, K_W,
+        H_out, W_out,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        weight.stride(0), weight.stride(1), weight.stride(2), weight.stride(3),
+        y.stride(0), y.stride(1), y.stride(2), y.stride(3),
+    )
+
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-accelerated version of:
+        Conv2d (stride=1, no padding) -> ReLU -> x * clamp((x + 3) / 6, 0, 1)
+    """
+    def __init__(self, in_channels, out_channels, kernel_size):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(
+            torch.randn(out_channels, in_channels, kernel_size, kernel_size)
+        )
+        self.bias = nn.Parameter(torch.randn(out_channels))
+
+    def forward(self, x):
+        return conv_relu_hswish_triton(x, self.weight, self.bias)
+```
+
+[NCU PROFILING METRICS]
+{
+  "conv_relu_hswish_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 61.21,
+    "launch__grid_size": 127008,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 24.53,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 48.26,
+    "lts__t_sector_hit_rate.pct": 88.11
+  }
+}
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+TRITON API CONSTRAINTS (CRITICAL):
+- Triton has NO: tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

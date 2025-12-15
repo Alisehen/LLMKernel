@@ -1,0 +1,281 @@
+Fix the Triton kernel errors. Generate correct, high-performance code.
+
+Current Error Log:
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 538, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251214_114735_batch_range56to80_deepseek_deepseek/58_ConvTranspose3d_LogSumExp_HardSwish_Subtract_Clamp/code/kernel_20251214_130036.py", line 205, in forward
+    x = fused_post_convtranspose_optimized(x, self.bias)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251214_114735_batch_range56to80_deepseek_deepseek/58_ConvTranspose3d_LogSumExp_HardSwish_Subtract_Clamp/code/kernel_20251214_130036.py", line 176, in fused_post_convtranspose_optimized
+    fused_post_ops_kernel_optimized[grid_n, grid_spatial](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 347, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 569, in run
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 278, in compile
+    module = src.make_ir(options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 81, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 80:20:
+
+        # Load vectorized channel values
+        x_vec_vals = tl.load(
+            base_ptr + current_c_base * stride_xc,
+            mask=current_c_mask,
+            other=0.0
+        )
+
+        # Process vectorized values
+        for v in range(VEC_C):
+            # Extract individual channel values from vector
+            c_val = current_c_base[:, 0] + v
+                    ^
+ValueError('unsupported tensor index: constexpr[0]')
+
+Main Critical Problem Analysis:
+Problem Analysis (from expert diagnosis):
+critical_issue: Invalid 2D tensor indexing with current_c_base[:, 0] in Triton JIT kernel.
+why_it_matters: Triton does not support Python-style multi-dimensional tensor slicing or indexing within kernels.
+minimal_fix_hint: Replace 2D indexing with proper 1D tensor operations for channel offsets.
+
+Focus your fix on addressing the identified critical issue.
+
+
+Broken Code:
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+import math
+
+
+@triton.jit
+def fused_post_ops_kernel_optimized(
+    # Pointers to tensors
+    x_ptr,
+    bias_ptr,
+    out_ptr,
+    # Tensor dimensions
+    N, C, D, H, W,
+    # Strides for x
+    stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
+    # Strides for output
+    stride_on, stride_oc, stride_od, stride_oh, stride_ow,
+    # Block dimensions
+    BLOCK_C: tl.constexpr,
+    BLOCK_DHW: tl.constexpr,
+    VEC_C: tl.constexpr,  # Vectorization factor for channel dimension
+):
+    """
+    Optimized fused kernel with:
+    1. Vectorized loads for channel dimension
+    2. Optimized block sizes for Ada Lovelace
+    3. Improved memory access patterns
+    """
+    # Batch index
+    pid_n = tl.program_id(0)
+    # Spatial block index (flattened D*H*W dimension)
+    pid_spatial = tl.program_id(1)
+    
+    # Early return for out-of-bounds batches
+    if pid_n >= N:
+        return
+    
+    # Spatial indices - using tl.arange for better optimization
+    spatial_base = pid_spatial * BLOCK_DHW
+    spatial_offsets = spatial_base + tl.arange(0, BLOCK_DHW)
+    
+    # Calculate total spatial positions and mask
+    DHW = D * H * W
+    dhw_mask = spatial_offsets < DHW
+    
+    # Compute D, H, W indices more efficiently
+    hw = H * W
+    d_idx = spatial_offsets // hw
+    hw_rem = spatial_offsets % hw
+    h_idx = hw_rem // W
+    w_idx = hw_rem % W
+    
+    # Channel indices with vectorization
+    c_vec_idx = tl.arange(0, BLOCK_C // VEC_C)
+    c_vec_offsets = c_vec_idx * VEC_C
+    
+    # Initialize accumulators for LogSumExp reduction
+    max_vals = tl.full([BLOCK_DHW], -float('inf'), dtype=tl.float32)
+    sum_exp_vals = tl.zeros([BLOCK_DHW], dtype=tl.float32)
+    
+    # Loop over channel blocks with vectorization
+    for c_block_start in range(0, C, BLOCK_C):
+        # Current channel block with vectorization
+        current_c_base = c_block_start + c_vec_offsets[:, None]
+        current_c_mask = (current_c_base < C) & dhw_mask[None, :]
+        
+        # Calculate base pointer offsets for vectorized loads
+        base_ptr = (
+            x_ptr +
+            pid_n * stride_xn +
+            d_idx[None, :] * stride_xd +
+            h_idx[None, :] * stride_xh +
+            w_idx[None, :] * stride_xw
+        )
+        
+        # Load vectorized channel values
+        x_vec_vals = tl.load(
+            base_ptr + current_c_base * stride_xc,
+            mask=current_c_mask,
+            other=0.0
+        )
+        
+        # Process vectorized values
+        for v in range(VEC_C):
+            # Extract individual channel values from vector
+            c_val = current_c_base[:, 0] + v
+            c_active = c_val < C
+            
+            if VEC_C == 1:
+                x_vals = x_vec_vals
+            else:
+                # Extract single channel from vector
+                x_vals = x_vec_vals[:, :, v] if VEC_C > 1 else x_vec_vals
+            
+            # Update LogSumExp with current channel values
+            channel_mask = c_active[:, None] & dhw_mask[None, :]
+            if tl.sum(channel_mask) > 0:
+                # Get values only where mask is True
+                active_x_vals = tl.where(channel_mask, x_vals, -float('inf'))
+                
+                # Update max values
+                channel_max = tl.max(active_x_vals, axis=0)
+                new_max = tl.maximum(max_vals, channel_max)
+                
+                # Scale previous exponentials
+                if tl.sum(max_vals > -float('inf')) > 0:
+                    scale_prev = tl.exp(max_vals - new_max)
+                    sum_exp_vals = scale_prev * sum_exp_vals
+                else:
+                    sum_exp_vals = tl.zeros([BLOCK_DHW], dtype=tl.float32)
+                
+                # Add current exponentials
+                exp_vals = tl.exp(active_x_vals - new_max[None, :])
+                local_sum = tl.sum(exp_vals, axis=0)
+                scale_curr = tl.exp(channel_max - new_max)
+                sum_exp_vals = sum_exp_vals + scale_curr * local_sum
+                max_vals = new_max
+    
+    # Final LogSumExp computation
+    logsumexp_vals = max_vals + tl.log(sum_exp_vals)
+    
+    # HardSwish: x * sigmoid(x + 3) / 6
+    # Optimized implementation using fast math approximations
+    x_shifted = logsumexp_vals + 3.0
+    # Fast sigmoid approximation: 1 / (1 + exp(-x))
+    neg_x = -x_shifted
+    # Use piecewise approximation for better performance
+    sigmoid_vals = tl.where(
+        neg_x > 20.0, 0.0,
+        tl.where(
+            neg_x < -20.0, 1.0,
+            1.0 / (1.0 + tl.exp(neg_x))
+        )
+    )
+    hardswish_vals = logsumexp_vals * sigmoid_vals / 6.0
+    
+    # Subtract bias (scalar)
+    bias = tl.load(bias_ptr)
+    result_vals = hardswish_vals - bias
+    
+    # Clamp between -1 and 1 using min/max
+    result_vals = tl.minimum(tl.maximum(result_vals, -1.0), 1.0)
+    
+    # Store results with coalesced writes
+    out_ptrs = (
+        out_ptr +
+        pid_n * stride_on +
+        d_idx * stride_od +
+        h_idx * stride_oh +
+        w_idx * stride_ow
+    )
+    tl.store(out_ptrs, result_vals, mask=dhw_mask)
+
+
+def fused_post_convtranspose_optimized(x, bias):
+    """
+    Optimized fused post-convtranspose operations for Ada Lovelace
+    """
+    N, C, D, H, W = x.shape
+    out = torch.empty((N, 1, D, H, W), device=x.device, dtype=x.dtype)
+    
+    # Optimized block sizes for Ada Lovelace architecture
+    # Based on 128 SMs, 1024 threads/block max, and tensor cores
+    BLOCK_DHW = 256  # Increased spatial block for better occupancy
+    BLOCK_C = min(128, triton.next_power_of_2(C))  # Smaller channel blocks for better cache usage
+    VEC_C = 4 if C % 4 == 0 else 2 if C % 2 == 0 else 1  # Vectorization factor
+    
+    # Calculate grid size
+    DHW = D * H * W
+    grid_n = N
+    grid_spatial = triton.cdiv(DHW, BLOCK_DHW)
+    
+    # Launch optimized kernel
+    fused_post_ops_kernel_optimized[grid_n, grid_spatial](
+        x,
+        bias,
+        out,
+        N, C, D, H, W,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
+        out.stride(0), out.stride(1), out.stride(2), out.stride(3), out.stride(4),
+        BLOCK_C=BLOCK_C,
+        BLOCK_DHW=BLOCK_DHW,
+        VEC_C=VEC_C,
+    )
+    
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized ModelNew with vectorized Triton kernel for Ada Lovelace
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, bias_shape):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(
+            in_channels, out_channels, kernel_size, 
+            stride=stride, padding=padding
+        )
+        self.bias = nn.Parameter(torch.randn(1))
+        
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = fused_post_convtranspose_optimized(x, self.bias)
+        return x
+```
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl, AND any other modules used (e.g., import math if using math.sqrt)
+   2. @triton.jit decorated kernel function(s) — NO continue/break/return inside loops (use masking)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels — THIS CLASS IS REQUIRED
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+3. Learn from previous repair attempts to avoid repeating the same mistakes
+4. Ensure ALL imports are included at the top (common mistake: forgetting `import math`)
+
+```python
+# <corrected code>
+```

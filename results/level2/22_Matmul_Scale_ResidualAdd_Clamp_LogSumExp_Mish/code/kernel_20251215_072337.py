@@ -1,0 +1,287 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+# -----------------------------
+# Matmul + scale + residual + clamp
+# -----------------------------
+
+@triton.autotune(
+    configs=[
+        # Main config: balanced, good occupancy, limited register pressure
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8},
+            num_warps=4,
+            num_stages=3,
+        ),
+        # For skinny-N or when N is small
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32, 'GROUP_M': 8},
+            num_warps=4,
+            num_stages=2,
+        ),
+        # For skinny-M or when M is small, lowest register footprint fallback
+        triton.Config(
+            {'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8},
+            num_warps=2,
+            num_stages=2,
+        ),
+    ],
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def matmul_scale_residual_clamp_kernel(
+    a_ptr, b_ptr, bias_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    scale_factor, clamp_min, clamp_max,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr, GROUP_M: tl.constexpr,
+):
+    # Program id in 1D launch grid
+    pid = tl.program_id(0)
+
+    # Number of tiles
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+
+    # Grouped ordering along M to improve L2 reuse of B
+    group_size_m = GROUP_M
+    num_pid_in_group = group_size_m * num_pid_n
+    group_id = pid // num_pid_in_group
+    group_pid = pid % num_pid_in_group
+
+    pid_m = group_id * group_size_m + (group_pid % group_size_m)
+    pid_n = group_pid // group_size_m
+
+    # Row / column indices handled by this program
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+
+    # Base pointers for A and B tiles
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    # Accumulator in FP32
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # K loop
+    for k0 in range(0, K, BLOCK_K):
+        k = k0 + offs_k
+
+        a_mask = mask_m[:, None] & (k[None, :] < K)
+        b_mask = (k[:, None] < K) & mask_n[None, :]
+
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+        acc += tl.dot(a, b)
+
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Bias add (broadcast along M)
+    bias = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0)
+    acc = acc + bias[None, :]
+
+    # Fuse scaling (matmul + bias) * (scale_factor * 2.0)
+    # Recompute cheap mul instead of keeping an extra scalar live
+    acc = acc * (scale_factor * 2.0)
+
+    # Clamp
+    acc = tl.maximum(acc, clamp_min)
+    acc = tl.minimum(acc, clamp_max)
+
+    # Store result
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    c_mask = mask_m[:, None] & mask_n[None, :]
+    tl.store(c_ptrs, acc, mask=c_mask)
+
+
+def fused_matmul_scale_residual_clamp(x, weight, bias, scale_factor, clamp_min, clamp_max):
+    """
+    x:      (M, K), float32
+    weight: (N, K) as in nn.Linear (out_features, in_features)
+    bias:   (N,)
+    Returns: (M, N) float32
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+    M, K = x.shape
+    N = weight.shape[0]
+
+    # Ensure B is laid out as (K, N) contiguous for coalesced loads
+    b = weight.t().contiguous()  # (K, N)
+
+    c = torch.empty((M, N), device=x.device, dtype=torch.float32)
+
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta['BLOCK_M']) *
+            triton.cdiv(N, meta['BLOCK_N']),
+        )
+
+    matmul_scale_residual_clamp_kernel[grid](
+        x, b, bias, c,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        b.stride(0), b.stride(1),
+        c.stride(0), c.stride(1),
+        float(scale_factor), float(clamp_min), float(clamp_max),
+    )
+
+    return c
+
+
+# -----------------------------
+# Row-wise logsumexp + Mish, streaming 1-pass reduction
+# -----------------------------
+
+@triton.autotune(
+    configs=[
+        # Balanced config for typical row counts
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 128},
+            num_warps=4,
+            num_stages=1,
+        ),
+        # Higher row parallelism (smaller tile in M) for small-M cases
+        triton.Config(
+            {'BLOCK_M': 32, 'BLOCK_N': 128},
+            num_warps=2,
+            num_stages=1,
+        ),
+        # Smaller N tile to reduce register pressure when N is huge
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 64},
+            num_warps=2,
+            num_stages=1,
+        ),
+    ],
+    key=['M', 'N'],
+)
+@triton.jit
+def row_logsumexp_mish_kernel(
+    x_ptr, out_ptr,
+    M, N,
+    stride_xm, stride_xn,
+    stride_outm,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offs_m < M
+
+    offs_n = tl.arange(0, BLOCK_N)
+
+    neg_inf = -float("inf")
+    zero = 0.0
+
+    # Streaming logsumexp state per row
+    max_vals = tl.full((BLOCK_M,), neg_inf, dtype=tl.float32)
+    sum_exp = tl.zeros((BLOCK_M,), dtype=tl.float32)
+
+    # One-pass, numerically stable logsumexp along N
+    for n0 in range(0, N, BLOCK_N):
+        cols = n0 + offs_n
+        mask_n = cols < N
+        mask = mask_m[:, None] & mask_n[None, :]
+
+        x = tl.load(
+            x_ptr + offs_m[:, None] * stride_xm + cols[None, :] * stride_xn,
+            mask=mask,
+            other=neg_inf,
+        )
+
+        # Block max per row
+        block_max = tl.max(x, axis=1)
+
+        # Update running max
+        new_max = tl.maximum(max_vals, block_max)
+
+        # Rescale existing sum_exp to new_max
+        scale_old = tl.exp(max_vals - new_max)
+
+        # Contribution from this block
+        exp_x = tl.exp(x - new_max[:, None])
+        block_sum = tl.sum(exp_x, axis=1)
+
+        sum_exp = sum_exp * scale_old + block_sum
+        max_vals = new_max
+
+    # LogSumExp per row
+    lse = max_vals + tl.log(sum_exp)
+
+    # Mish activation on lse: mish(y) = y * tanh(softplus(y))
+    y = lse
+
+    # Numerically stable softplus
+    pos = y > zero
+    softplus_pos = y + tl.log(1.0 + tl.exp(-y))
+    softplus_neg = tl.log(1.0 + tl.exp(y))
+    softplus = tl.where(pos, softplus_pos, softplus_neg)
+
+    # tanh(z) via single exp: tanh(z) = (e^{2z} - 1) / (e^{2z} + 1)
+    t2 = tl.exp(2.0 * softplus)
+    tanh_sp = (t2 - 1.0) / (t2 + 1.0)
+
+    # y * mish(y) = y^2 * tanh(softplus(y))
+    y2 = y * y
+    out_val = y2 * tanh_sp
+
+    tl.store(out_ptr + offs_m * stride_outm, out_val, mask=mask_m)
+
+
+def fused_row_logsumexp_mish(x):
+    """
+    x: (M, N) -> out: (M, 1)
+    Applies logsumexp over dim=1, then y * mish(y).
+    """
+    assert x.is_cuda
+    M, N = x.shape
+    out = torch.empty((M, 1), device=x.device, dtype=torch.float32)
+
+    def grid(meta):
+        return (triton.cdiv(M, meta['BLOCK_M']),)
+
+    row_logsumexp_mish_kernel[grid](
+        x, out,
+        M, N,
+        x.stride(0), x.stride(1),
+        out.stride(0),
+    )
+
+    return out
+
+
+# -----------------------------
+# PyTorch module
+# -----------------------------
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_size, scale_factor, clamp_min, clamp_max):
+        super(ModelNew, self).__init__()
+        self.matmul = nn.Linear(input_size, hidden_size)
+        self.scale_factor = float(scale_factor)
+        self.clamp_min = float(clamp_min)
+        self.clamp_max = float(clamp_max)
+
+    def forward(self, x):
+        y = fused_matmul_scale_residual_clamp(
+            x,
+            self.matmul.weight,
+            self.matmul.bias,
+            self.scale_factor,
+            self.clamp_min,
+            self.clamp_max,
+        )
+        out = fused_row_logsumexp_mish(y)
+        return out

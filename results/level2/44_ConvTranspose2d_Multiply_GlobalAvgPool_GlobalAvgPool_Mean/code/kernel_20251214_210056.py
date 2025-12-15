@@ -1,0 +1,210 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def fused_multiply_gap_kernel_optimized(
+    x_ptr,  # Input pointer
+    out_ptr,  # Output pointer
+    multiplier,
+    N, C, H, W,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_on, stride_oc, stride_oh, stride_ow,
+    BLOCK_C: tl.constexpr,
+    BLOCK_HW: tl.constexpr,
+):
+    """
+    Optimized fused kernel: Multiply scalar + Global Average Pooling over H,W
+    Input: [N, C, H, W] -> Output: [N, C, 1, 1]
+    
+    Key optimizations:
+    1. 2D grid for better parallelism
+    2. Vectorized loads for memory coalescing
+    3. Loop unrolling for reduction
+    4. Precomputed spatial size and inverse
+    """
+    pid_n = tl.program_id(0)  # Batch dimension
+    pid_c_block = tl.program_id(1)  # Channel block index
+    
+    # Boundary check for batch
+    if pid_n >= N:
+        return
+    
+    # Channel offsets for this block
+    c_offsets = pid_c_block * BLOCK_C + tl.arange(0, BLOCK_C)
+    c_mask = c_offsets < C
+    
+    # Initialize accumulation for each channel in this block
+    channel_sum = tl.zeros((BLOCK_C,), dtype=tl.float32)
+    
+    # Precompute spatial size and its inverse
+    spatial_size = H * W
+    inv_spatial_size = 1.0 / spatial_size
+    
+    # Process spatial dimensions in tiles with unrolling
+    hw_size = spatial_size
+    num_tiles = tl.cdiv(hw_size, BLOCK_HW)
+    
+    # Use unrolled loop for better instruction-level parallelism
+    for tile_idx in range(0, num_tiles, 1):
+        hw_start = tile_idx * BLOCK_HW
+        hw_offsets = hw_start + tl.arange(0, BLOCK_HW)
+        hw_mask = hw_offsets < hw_size
+        
+        # Convert 1D spatial offset to 2D (h, w)
+        h = hw_offsets // W
+        w = hw_offsets % W
+        
+        # Compute base pointer with broadcasted spatial dimension
+        # Using explicit broadcasting for better vectorization
+        x_base = pid_n * stride_xn + c_offsets[:, None] * stride_xc
+        h_offsets = h[None, :] * stride_xh
+        w_offsets = w[None, :] * stride_xw
+        
+        # Combined pointer offsets
+        ptr_offsets = x_base + h_offsets + w_offsets  # Shape: [BLOCK_C, BLOCK_HW]
+        
+        # Create 2D mask for valid positions
+        mask_2d = c_mask[:, None] & hw_mask[None, :]
+        
+        # Load with vectorization hint
+        block = tl.load(x_ptr + ptr_offsets, mask=mask_2d, other=0.0)
+        
+        # Accumulate using fast reduction
+        channel_sum += tl.sum(block, axis=1)
+    
+    # Compute average and apply multiplier in one fused operation
+    result = channel_sum * (multiplier * inv_spatial_size)
+    
+    # Store results at position (n, c, 0, 0)
+    out_base = pid_n * stride_on + c_offsets * stride_oc
+    tl.store(out_ptr + out_base, result, mask=c_mask)
+
+
+@triton.jit
+def fused_multiply_gap_kernel_small(
+    x_ptr,  # Input pointer
+    out_ptr,  # Output pointer
+    multiplier,
+    N, C, H, W,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_on, stride_oc, stride_oh, stride_ow,
+    BLOCK_C: tl.constexpr,
+):
+    """
+    Optimized kernel for small spatial dimensions (H*W <= 256)
+    Uses full spatial parallelism without tiling
+    """
+    pid_n = tl.program_id(0)  # Batch dimension
+    pid_c = tl.program_id(1)  # Channel index
+    
+    # Boundary checks
+    if pid_n >= N or pid_c >= C:
+        return
+    
+    # Precompute spatial size and inverse
+    spatial_size = H * W
+    inv_spatial_size = 1.0 / spatial_size
+    
+    # Initialize sum
+    channel_sum = 0.0
+    
+    # Process all spatial positions in parallel
+    hw_idx = tl.arange(0, spatial_size)
+    h = hw_idx // W
+    w = hw_idx % W
+    
+    # Compute pointer offsets for all spatial positions
+    ptr_offset = pid_n * stride_xn + pid_c * stride_xc + h * stride_xh + w * stride_xw
+    
+    # Load all spatial positions
+    mask = hw_idx < spatial_size
+    spatial_data = tl.load(x_ptr + ptr_offset, mask=mask, other=0.0)
+    
+    # Sum all spatial positions
+    channel_sum = tl.sum(spatial_data)
+    
+    # Compute result
+    result = channel_sum * multiplier * inv_spatial_size
+    
+    # Store result
+    out_offset = pid_n * stride_on + pid_c * stride_oc
+    tl.store(out_ptr + out_offset, result)
+
+
+def fused_multiply_gap(x, multiplier):
+    """
+    Fused: Multiply scalar + Global Average Pooling
+    Input: [N, C, H, W] -> Output: [N, C, 1, 1]
+    
+    Auto-selects between two optimized kernels based on spatial size
+    """
+    N, C, H, W = x.shape
+    spatial_size = H * W
+    
+    # Output tensor with shape [N, C, 1, 1]
+    out = torch.empty((N, C, 1, 1), device=x.device, dtype=x.dtype)
+    
+    # Choose kernel based on spatial size
+    if spatial_size <= 256:
+        # Use small spatial kernel for better occupancy
+        BLOCK_C = 1  # Process one channel per thread
+        grid = (N, C)
+        
+        fused_multiply_gap_kernel_small[grid](
+            x, out, multiplier,
+            N, C, H, W,
+            x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+            out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+            BLOCK_C=BLOCK_C,
+        )
+    else:
+        # Use tiled kernel for large spatial dimensions
+        # Optimized block sizes for Ada Lovelace
+        BLOCK_C = min(triton.next_power_of_2(C), 64)  # Reduced for better occupancy
+        BLOCK_HW = min(triton.next_power_of_2(spatial_size), 512)
+        
+        # Ensure we have enough threads for good occupancy
+        if BLOCK_C * BLOCK_HW < 256:
+            BLOCK_HW = 256 // BLOCK_C
+        
+        grid = (N, triton.cdiv(C, BLOCK_C))
+        
+        fused_multiply_gap_kernel_optimized[grid](
+            x, out, multiplier,
+            N, C, H, W,
+            x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+            out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+            BLOCK_C=BLOCK_C,
+            BLOCK_HW=BLOCK_HW,
+        )
+    
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    ConvTranspose2d (PyTorch native) + Fused multiply + GAP
+    
+    NOTE: ConvTranspose2d uses PyTorch's native implementation.
+    Only the scalar multiplication and global average pooling are fused in Triton.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, 
+                 output_padding, multiplier):
+        super(ModelNew, self).__init__()
+        # ConvTranspose2d remains PyTorch native
+        self.conv_transpose = nn.ConvTranspose2d(
+            in_channels, out_channels, kernel_size, 
+            stride=stride, padding=padding, 
+            output_padding=output_padding
+        )
+        self.multiplier = multiplier
+    
+    def forward(self, x):
+        # Step 1: PyTorch native ConvTranspose2d
+        x = self.conv_transpose(x)
+        # Step 2: Fused scalar multiplication + global average pooling
+        x = fused_multiply_gap(x, self.multiplier)
+        return x

@@ -1,0 +1,271 @@
+Fix the Triton kernel errors. Generate correct, high-performance code.
+
+Current Error Log:
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 626, in compare_and_bench
+    raise ValueError(
+ValueError: Outputs are not close (atol=0.001, rtol=0.01). max_abs_err=5.138e-02, mean_abs_err=1.549e-02
+
+Main Critical Problem Analysis:
+Problem Analysis (from expert diagnosis):
+critical_issue: Softmax computed per tile instead of across entire row dimension (N=8192).
+why_it_matters: Softmax requires global reduction over all columns per row; tile-local reduction causes incorrect normalization.
+minimal_fix_hint: Implement two-pass kernel: first compute row-wise max/sum reductions, then apply normalized softmax.
+
+Focus your fix on addressing the identified critical issue.
+
+
+Broken Code:
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+import math
+
+
+@triton.jit
+def fused_gemm_gelu_softmax_kernel(
+    # Pointers to matrices
+    a_ptr, b_ptr, c_ptr,
+    # Matrix dimensions
+    M, N, K,
+    # Strides
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    # Block sizes
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    """
+    Fused GEMM + GELU + Softmax kernel optimized for Ada Lovelace.
+    Uses tile size 64x64x32 for TF32 tensor cores with reduced register pressure.
+    """
+    pid = tl.program_id(0)
+    pid_m = pid // tl.cdiv(N, BLOCK_N)
+    pid_n = pid % tl.cdiv(N, BLOCK_N)
+    
+    # Grid swizzling for better L2 cache usage
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid_m // GROUP_SIZE_M
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (pid_m % group_size_m)
+    
+    # Offsets for this block
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    rk = tl.arange(0, BLOCK_K)
+    
+    # Initialize accumulator
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    # Prefetch pointers
+    a_ptrs_base = a_ptr + (rm[:, None] * stride_am + rk[None, :] * stride_ak)
+    b_ptrs_base = b_ptr + (rk[:, None] * stride_bk + rn[None, :] * stride_bn)
+    
+    # Compute block of C = A * B
+    for k in range(0, K, BLOCK_K):
+        # Load blocks of A and B with masking
+        a_mask = (rm[:, None] < M) & (rk[None, :] < K - k)
+        b_mask = (rk[:, None] < K - k) & (rn[None, :] < N)
+        
+        a = tl.load(a_ptrs_base, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs_base, mask=b_mask, other=0.0)
+        
+        # Accumulate matrix product
+        acc += tl.dot(a, b, allow_tf32=True)
+        
+        # Move pointers
+        a_ptrs_base += BLOCK_K * stride_ak
+        b_ptrs_base += BLOCK_K * stride_bk
+    
+    # Apply GELU activation (fast approximation optimized for Triton)
+    # Using: GELU(x) ≈ 0.5x(1 + tanh(√(2/π)(x + 0.044715x³)))
+    # Precompute constants
+    sqrt_2_over_pi = 0.7978845608028654
+    gelu_coeff = 0.044715
+    
+    # GELU computation with reduced register usage
+    x = acc
+    x_sq = x * x  # Reuse x_sq for softmax
+    x_cubed = x_sq * x
+    inner = sqrt_2_over_pi * (x + gelu_coeff * x_cubed)
+    
+    # Fast tanh approximation using exponential with overflow protection
+    # tanh(x) = (exp(2x) - 1) / (exp(2x) + 1) = 1 - 2 / (exp(2x) + 1)
+    two_inner = 2.0 * inner
+    # Use clamp to prevent overflow
+    exp_val = tl.exp(tl.minimum(two_inner, 20.0))
+    tanh_val = 1.0 - 2.0 / (exp_val + 1.0)
+    
+    gelu_out = 0.5 * x * (1.0 + tanh_val)
+    
+    # Fused softmax within the same tile
+    # Row-wise softmax over N dimension within each tile
+    row_max = tl.max(gelu_out, axis=1)[:, None]
+    # Subtract max for numerical stability
+    exp_input = gelu_out - row_max
+    # Compute exponentials
+    exp_vals = tl.exp(exp_input)
+    # Row sum
+    row_sum = tl.sum(exp_vals, axis=1)[:, None]
+    # Normalize to get softmax
+    softmax_out = exp_vals / row_sum
+    
+    # Store final output
+    mask_m = rm[:, None] < M
+    mask_n = rn[None, :] < N
+    mask = mask_m & mask_n
+    
+    c_ptrs = c_ptr + (rm[:, None] * stride_cm + rn[None, :] * stride_cn)
+    tl.store(c_ptrs, softmax_out, mask=mask)
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_warps=8),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_warps=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_warps=4),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_warps=4),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_warps=4),
+    ],
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def fused_gemm_gelu_softmax_kernel_autotune(
+    a_ptr, b_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    pid_m = pid // tl.cdiv(N, BLOCK_N)
+    pid_n = pid % tl.cdiv(N, BLOCK_N)
+    
+    # Grid swizzling
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid_m // GROUP_SIZE_M
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (pid_m % group_size_m)
+    
+    # Offsets
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    rk = tl.arange(0, BLOCK_K)
+    
+    # Initialize accumulator
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    # Prefetch pointers
+    a_ptrs_base = a_ptr + (rm[:, None] * stride_am + rk[None, :] * stride_ak)
+    b_ptrs_base = b_ptr + (rk[:, None] * stride_bk + rn[None, :] * stride_bn)
+    
+    # Compute block of C = A * B
+    for k in range(0, K, BLOCK_K):
+        a_mask = (rm[:, None] < M) & (rk[None, :] < K - k)
+        b_mask = (rk[:, None] < K - k) & (rn[None, :] < N)
+        
+        a = tl.load(a_ptrs_base, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs_base, mask=b_mask, other=0.0)
+        
+        acc += tl.dot(a, b, allow_tf32=True)
+        
+        a_ptrs_base += BLOCK_K * stride_ak
+        b_ptrs_base += BLOCK_K * stride_bk
+    
+    # GELU activation (optimized for register usage)
+    x = acc
+    sqrt_2_over_pi = 0.7978845608028654
+    gelu_coeff = 0.044715
+    
+    # Compute GELU with reduced intermediate storage
+    x_sq = x * x
+    x_cubed = x_sq * x
+    inner = sqrt_2_over_pi * (x + gelu_coeff * x_cubed)
+    
+    # Fast tanh with overflow protection
+    two_inner = 2.0 * inner
+    exp_val = tl.exp(tl.minimum(two_inner, 20.0))
+    tanh_val = 1.0 - 2.0 / (exp_val + 1.0)
+    
+    gelu_out = 0.5 * x * (1.0 + tanh_val)
+    
+    # Fused softmax
+    row_max = tl.max(gelu_out, axis=1)[:, None]
+    exp_input = gelu_out - row_max
+    exp_vals = tl.exp(exp_input)
+    row_sum = tl.sum(exp_vals, axis=1)[:, None]
+    softmax_out = exp_vals / row_sum
+    
+    # Store output
+    mask_m = rm[:, None] < M
+    mask_n = rn[None, :] < N
+    mask = mask_m & mask_n
+    
+    c_ptrs = c_ptr + (rm[:, None] * stride_cm + rn[None, :] * stride_cn)
+    tl.store(c_ptrs, softmax_out, mask=mask)
+
+
+def fused_gemm_gelu_softmax(x, weight):
+    """Fused GEMM + GELU + Softmax operation with optimized Triton kernel."""
+    # Ensure inputs are contiguous
+    x = x.contiguous()
+    weight = weight.contiguous()
+    
+    # Get dimensions
+    M, K = x.shape
+    N = weight.shape[0]
+    
+    # Allocate output tensor
+    c = torch.empty((M, N), device=x.device, dtype=x.dtype)
+    
+    # Grid calculation
+    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']) * triton.cdiv(N, META['BLOCK_N']),)
+    
+    # Launch optimized kernel
+    fused_gemm_gelu_softmax_kernel_autotune[grid](
+        x, weight, c,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        weight.stride(1), weight.stride(0),
+        c.stride(0), c.stride(1),
+    )
+    
+    return c
+
+
+class ModelNew(nn.Module):
+    """Optimized model with fully fused GEMM + GELU + Softmax."""
+    
+    def __init__(self, in_features, out_features):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+        nn.init.kaiming_normal_(self.weight, nonlinearity='linear')
+    
+    def forward(self, x):
+        return fused_gemm_gelu_softmax(x, self.weight)
+```
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl, AND any other modules used (e.g., import math if using math.sqrt)
+   2. @triton.jit decorated kernel function(s) — NO continue/break/return inside loops (use masking)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels — THIS CLASS IS REQUIRED
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+3. Learn from previous repair attempts to avoid repeating the same mistakes
+4. Ensure ALL imports are included at the top (common mistake: forgetting `import math`)
+
+```python
+# <corrected code>
+```

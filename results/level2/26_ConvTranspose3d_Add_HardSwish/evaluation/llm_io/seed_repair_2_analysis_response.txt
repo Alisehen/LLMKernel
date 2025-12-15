@@ -1,0 +1,5 @@
+{
+  "critical_issue": "Triton kernel computes HardSwish activation only, but model requires x * HardSwish(x).",
+  "why_it_matters": "Results are off by factor of (conv_out + add_input), causing large numerical error (max ~0.27).",
+  "minimal_fix_hint": "Change kernel to compute x * relu6(x+3)/6 then multiply again by x: output = x * (x * relu6(x+3)/6)."
+}

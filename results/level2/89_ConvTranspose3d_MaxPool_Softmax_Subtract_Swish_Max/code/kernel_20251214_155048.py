@@ -1,0 +1,196 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def fused_post_pool_ops_kernel_optimized(
+    x_ptr,  # Input tensor after max pooling [N, C, D, H, W]
+    bias_ptr,  # Bias parameter [C]
+    out_ptr,  # Output tensor [N, D, H, W]
+    N, C, D, H, W,
+    stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
+    stride_out_n, stride_out_d, stride_out_h, stride_out_w,
+    BLOCK_C: tl.constexpr,
+    BLOCK_DHW: tl.constexpr,
+    NUM_WARPS: tl.constexpr = 8,
+    NUM_STAGES: tl.constexpr = 2,
+):
+    """
+    Optimized fused kernel with single-pass channel reduction.
+    Processes BLOCK_DHW spatial positions and reduces across channels in one pass.
+    """
+    pid_n = tl.program_id(0)  # batch index
+    pid_spatial = tl.program_id(1)  # flattened spatial index
+    
+    if pid_n >= N:
+        return
+    
+    # Reconstruct spatial indices
+    spatial_idx = pid_spatial * BLOCK_DHW + tl.arange(0, BLOCK_DHW)
+    
+    # Compute d, h, w indices from flattened spatial index
+    DHW = D * H * W
+    d = spatial_idx // (H * W)
+    hw_rem = spatial_idx % (H * W)
+    h = hw_rem // W
+    w = hw_rem % W
+    
+    # Mask for valid spatial positions
+    spatial_mask = spatial_idx < DHW
+    
+    # Initialize accumulators in registers (no intermediate stores)
+    # max_val for softmax stability, exp_sum for denominator
+    max_val = tl.full((BLOCK_DHW,), float('-inf'), dtype=tl.float32)
+    exp_sum = tl.zeros((BLOCK_DHW,), dtype=tl.float32)
+    final_max = tl.full((BLOCK_DHW,), float('-inf'), dtype=tl.float32)
+    
+    # Single pass over channels - fuse all computations
+    for c in range(0, C, BLOCK_C):
+        c_offs = c + tl.arange(0, BLOCK_C)
+        c_mask = c_offs < C
+        
+        # Load input block [BLOCK_C, BLOCK_DHW]
+        x_ptrs = (
+            x_ptr +
+            pid_n * stride_xn +
+            c_offs[:, None] * stride_xc +
+            d[None, :] * stride_xd +
+            h[None, :] * stride_xh +
+            w[None, :] * stride_xw
+        )
+        x_vals = tl.load(x_ptrs, mask=c_mask[:, None] & spatial_mask[None, :], other=float('-inf'))
+        
+        # Update max for softmax stability (online algorithm)
+        channel_max = tl.max(x_vals, axis=0)
+        new_max = tl.maximum(max_val, channel_max)
+        
+        # Rescale existing exp_sum and add new exp values
+        scale_factor = tl.exp(max_val - new_max)
+        exp_sum = exp_sum * scale_factor
+        
+        # Compute exp for current block with new max
+        exp_vals = tl.exp(x_vals - new_max[None, :])
+        block_exp_sum = tl.sum(exp_vals, axis=0)
+        exp_sum += block_exp_sum
+        
+        # Update max_val
+        max_val = new_max
+        
+        # Compute softmax for current block
+        softmax_vals = exp_vals / tl.maximum(exp_sum[None, :], 1e-12)
+        
+        # Load bias and subtract
+        bias_vals = tl.load(bias_ptr + c_offs, mask=c_mask, other=0.0)
+        sub_vals = softmax_vals - bias_vals[:, None]
+        
+        # Swish activation: x * sigmoid(x) = x / (1 + exp(-x))
+        # Optimized: compute sigmoid once, reuse for swish
+        neg_sub = -sub_vals
+        exp_neg = tl.exp(neg_sub)
+        sigmoid_vals = 1.0 / (1.0 + exp_neg)
+        swish_vals = sub_vals * sigmoid_vals
+        
+        # Find max across channels (online reduction)
+        channel_swish_max = tl.max(swish_vals, axis=0)
+        final_max = tl.maximum(final_max, channel_swish_max)
+    
+    # Single output store - no intermediate stores
+    out_ptrs = (
+        out_ptr +
+        pid_n * stride_out_n +
+        d * stride_out_d +
+        h * stride_out_h +
+        w * stride_out_w
+    )
+    tl.store(out_ptrs, final_max, mask=spatial_mask)
+
+
+def fused_post_pool_ops(x: torch.Tensor, bias: torch.Tensor):
+    """
+    Optimized fused operations with single-pass channel reduction.
+    
+    Args:
+        x: Tensor of shape [N, C, D, H, W]
+        bias: Tensor of shape [C]
+    
+    Returns:
+        Tensor of shape [N, D, H, W]
+    """
+    N, C, D, H, W = x.shape
+    
+    # Output tensor: max across channels removes the channel dimension
+    out = torch.empty((N, D, H, W), device=x.device, dtype=x.dtype)
+    
+    # Optimized block sizes for Ada Lovelace (RTX 4090)
+    # BLOCK_C: 128 channels per block (good for register usage and Tensor Cores)
+    # BLOCK_DHW: 32 spatial positions (increased for better parallelism)
+    BLOCK_C = min(128, triton.next_power_of_2(C))
+    BLOCK_DHW = 32
+    
+    # Calculate grid
+    DHW = D * H * W
+    grid_n = N
+    grid_spatial = triton.cdiv(DHW, BLOCK_DHW)
+    grid = (grid_n, grid_spatial)
+    
+    # Launch optimized kernel with tuned parameters
+    fused_post_pool_ops_kernel_optimized[grid](
+        x, bias, out,
+        N, C, D, H, W,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
+        out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+        BLOCK_C=BLOCK_C,
+        BLOCK_DHW=BLOCK_DHW,
+        num_warps=8,  # 8 warps = 256 threads, optimal for Ada Lovelace
+        num_stages=2,  # Start with 2 stages as per optimization guidelines
+    )
+    
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model with single-pass fused kernel for post-pool operations.
+    
+    ConvTranspose3d and MaxPool3d remain in PyTorch due to complexity.
+    The subsequent operations (softmax, subtract, swish, max) are fused in a single Triton kernel.
+    """
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size,
+        stride,
+        padding,
+        output_padding,
+        pool_kernel_size,
+        pool_stride,
+        pool_padding
+    ):
+        super(ModelNew, self).__init__()
+        # Keep ConvTranspose3d and MaxPool3d as PyTorch native
+        self.conv_transpose = nn.ConvTranspose3d(
+            in_channels, out_channels, kernel_size,
+            stride=stride, padding=padding, output_padding=output_padding
+        )
+        self.max_pool = nn.MaxPool3d(
+            kernel_size=pool_kernel_size,
+            stride=pool_stride,
+            padding=pool_padding
+        )
+        # Bias for subtraction
+        self.subtract = nn.Parameter(torch.randn(out_channels))
+    
+    def forward(self, x):
+        # Step 1: PyTorch native ConvTranspose3d
+        x = self.conv_transpose(x)
+        
+        # Step 2: PyTorch native MaxPool3d
+        x = self.max_pool(x)
+        
+        # Step 3: Optimized fused post-ops in Triton (single pass)
+        x = fused_post_pool_ops(x, self.subtract)
+        
+        return x

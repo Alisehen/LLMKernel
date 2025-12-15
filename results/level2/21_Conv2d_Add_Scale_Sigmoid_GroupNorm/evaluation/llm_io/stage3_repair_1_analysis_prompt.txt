@@ -1,0 +1,424 @@
+You are a Triton kernel debugging expert. Analyze the error and identify the root cause.
+
+## ERROR LOG
+```
+Traceback (most recent call last):
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 34, in wrapper
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+TypeError: arange() got an unexpected keyword argument 'dtype'
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 538, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251215_070831_batch_range21to25_openai_deepseek/21_Conv2d_Add_Scale_Sigmoid_GroupNorm/code/kernel_20251215_071619.py", line 268, in forward
+    x = fused_conv_bias_scale_sigmoid(
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251215_070831_batch_range21to25_openai_deepseek/21_Conv2d_Add_Scale_Sigmoid_GroupNorm/code/kernel_20251215_071619.py", line 203, in fused_conv_bias_scale_sigmoid
+    conv_bias_scale_sigmoid_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 347, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 192, in run
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 192, in <dictcomp>
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 170, in _bench
+    return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/testing.py", line 145, in do_bench
+    fn()
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 156, in kernel_call
+    self.fn.run(
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 569, in run
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 278, in compile
+    module = src.make_ir(options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 81, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 23:31:
+    stride_wo, stride_wi, stride_wkh, stride_wkw,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # 2D program id: [P, C_out] -> [M-tile, N-tile]
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    # Offsets in flattened spatial+batch dimension and output-channel dimension
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M, dtype=tl.int32)
+                               ^
+```
+
+## Expected Behavior (PyTorch Reference)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs a convolution, adds a bias term, scales, applies sigmoid, and performs group normalization.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, num_groups, bias_shape, scale_shape):
+        super(Model, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.bias = nn.Parameter(torch.randn(bias_shape)) 
+        self.scale = nn.Parameter(torch.randn(scale_shape))
+        self.group_norm = nn.GroupNorm(num_groups, out_channels)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = x + self.bias
+        x = x * self.scale
+        x = torch.sigmoid(x)
+        x = self.group_norm(x)
+        return x
+
+batch_size = 128
+in_channels = 8
+out_channels = 32
+height = width = 256
+kernel_size = 3
+num_groups = 8
+bias_shape = (out_channels, 1, 1)
+scale_shape = (out_channels, 1, 1)
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, num_groups, bias_shape, scale_shape]
+```
+
+## Current Implementation (Broken Triton Kernel)
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        # Higher occupancy / lower register pressure (default-leaning)
+        triton.Config(
+            {'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+        triton.Config(
+            {'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 32},
+            num_warps=2,
+            num_stages=2,
+        ),
+        # For very large channel sizes, a deeper K-tile may help
+        triton.Config(
+            {'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 64},
+            num_warps=4,
+            num_stages=2,
+        ),
+    ],
+    key=['P', 'C_out'],
+)
+@triton.jit
+def conv_bias_scale_sigmoid_kernel(
+    x_ptr,           # *f32/f16, input:  [N, C_in, H_in, W_in]
+    w_ptr,           # *f32/f16, weight: [C_out, C_in, KH, KW]
+    conv_bias_ptr,   # *f32,    conv bias: [C_out]
+    bias_ptr,        # *f32,    extra bias: [C_out]
+    scale_ptr,       # *f32,    scale: [C_out]
+    y_ptr,           # *f32/f16, output: [N, C_out, H_out, W_out]
+    N, C_in, H_in, W_in,
+    C_out, KH: tl.constexpr, KW: tl.constexpr,
+    H_out, W_out, P,  # P = N * H_out * W_out
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_wo, stride_wi, stride_wkh, stride_wkw,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # 2D program id: [P, C_out] -> [M-tile, N-tile]
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    # Offsets in flattened spatial+batch dimension and output-channel dimension
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M, dtype=tl.int32)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N, dtype=tl.int32)
+
+    mask_m = offs_m < P
+    mask_n = offs_n < C_out
+
+    tl.multiple_of(offs_m, BLOCK_M)
+    tl.multiple_of(offs_n, BLOCK_N)
+
+    # Decode (n, oh, ow) from flat index offs_m
+    HW = H_out * W_out
+    n_idx = offs_m // HW
+    rem = offs_m - n_idx * HW
+    oh_idx = rem // W_out
+    ow_idx = rem - oh_idx * W_out
+
+    # Base pointer for this (n, oh, ow) tile into input x
+    # x[n, :, oh, ow]
+    x_base = (
+        x_ptr
+        + n_idx[:, None] * stride_xn
+        + oh_idx[:, None] * stride_xh
+        + ow_idx[:, None] * stride_xw
+    )
+
+    # Base pointer for this output-channel tile into weights
+    # w[co, :, :, :]
+    w_base = w_ptr + offs_n[None, :] * stride_wo
+
+    # Accumulator in fp32
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Total reduction length: K = C_in * KH * KW
+    K_total = C_in * KH * KW
+    k_hw = KH * KW
+
+    k_start = 0
+    while k_start < K_total:
+        offs_k = k_start + tl.arange(0, BLOCK_K, dtype=tl.int32)
+        mask_k = offs_k < K_total
+        tl.multiple_of(offs_k, BLOCK_K)
+
+        # Map flattened kernel index -> (ic, kh, kw)
+        ic = offs_k // k_hw
+        rem_k = offs_k - ic * k_hw
+        kh = rem_k // KW
+        kw = rem_k - kh * KW
+
+        # Input tile: x[n, ic, oh+kh, ow+kw] -> [BLOCK_M, BLOCK_K]
+        x_ptrs = (
+            x_base
+            + ic[None, :] * stride_xc
+            + kh[None, :] * stride_xh
+            + kw[None, :] * stride_xw
+        )
+        x_tile = tl.load(
+            x_ptrs,
+            mask=mask_m[:, None] & mask_k[None, :],
+            other=0.0,
+        )
+
+        # Weight tile: w[co, ic, kh, kw] -> [BLOCK_K, BLOCK_N]
+        w_ptrs = (
+            w_base
+            + ic[:, None] * stride_wi
+            + kh[:, None] * stride_wkh
+            + kw[:, None] * stride_wkw
+        )
+        w_tile = tl.load(
+            w_ptrs,
+            mask=mask_k[:, None] & mask_n[None, :],
+            other=0.0,
+        )
+
+        # Matrix multiply accumulate
+        acc += tl.dot(x_tile, w_tile)
+
+        k_start += BLOCK_K
+
+    # Fused epilogue: conv_bias -> extra bias -> scale -> sigmoid
+    # Load per-output-channel parameters once per N-tile
+    conv_b = tl.load(conv_bias_ptr + offs_n, mask=mask_n, other=0.0)
+    extra_b = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0)
+    scale = tl.load(scale_ptr + offs_n, mask=mask_n, other=0.0)
+
+    # Combine biases first (scalar per channel), then scale
+    total_b = conv_b + extra_b
+    acc = acc + total_b[None, :]
+    acc = acc * scale[None, :]
+
+    # Sigmoid: 1 / (1 + exp(-x)), done in-place to minimize temporaries
+    acc = -acc
+    acc = tl.exp(acc)
+    acc = 1.0 / (1.0 + acc)
+
+    # Store output: y[n, co, oh, ow]
+    y_ptrs = (
+        y_ptr
+        + n_idx[:, None] * stride_yn
+        + offs_n[None, :] * stride_yc
+        + oh_idx[:, None] * stride_yh
+        + ow_idx[:, None] * stride_yw
+    )
+    tl.store(
+        y_ptrs,
+        acc,
+        mask=mask_m[:, None] & mask_n[None, :],
+    )
+
+
+def fused_conv_bias_scale_sigmoid(x, weight, conv_bias, bias, scale):
+    """
+    x:        [N, C_in, H_in, W_in]
+    weight:   [C_out, C_in, KH, KW]
+    conv_bias:[C_out]
+    bias:     [C_out, 1, 1]
+    scale:    [C_out, 1, 1]
+    returns:  [N, C_out, H_out, W_out]
+    """
+    assert x.ndim == 4
+    assert weight.ndim == 4
+
+    N, C_in, H_in, W_in = x.shape
+    C_out, Cw_in, KH, KW = weight.shape
+    assert Cw_in == C_in, "Weight in_channels must match input channels"
+
+    # Valid convolution (no padding, stride=1)
+    H_out = H_in - KH + 1
+    W_out = W_in - KW + 1
+    assert H_out > 0 and W_out > 0, "Invalid spatial size for given kernel"
+    P = N * H_out * W_out
+
+    # Flatten bias/scale to [C_out]
+    bias_flat = bias.view(C_out)
+    scale_flat = scale.view(C_out)
+
+    # Allocate output
+    y = torch.empty((N, C_out, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    # Grid covers the 2D output domain [P, C_out]
+    def grid(meta):
+        return (
+            triton.cdiv(P, meta['BLOCK_M']),
+            triton.cdiv(C_out, meta['BLOCK_N']),
+        )
+
+    conv_bias_scale_sigmoid_kernel[grid](
+        x,
+        weight,
+        conv_bias,
+        bias_flat,
+        scale_flat,
+        y,
+        N,
+        C_in,
+        H_in,
+        W_in,
+        C_out,
+        KH,
+        KW,
+        H_out,
+        W_out,
+        P,
+        x.stride(0),
+        x.stride(1),
+        x.stride(2),
+        x.stride(3),
+        weight.stride(0),
+        weight.stride(1),
+        weight.stride(2),
+        weight.stride(3),
+        y.stride(0),
+        y.stride(1),
+        y.stride(2),
+        y.stride(3),
+    )
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-based replacement for:
+      Conv2d -> add bias -> scale -> sigmoid -> GroupNorm
+
+    Convolution, conv.bias, extra bias, scale, and sigmoid are fused in a Triton kernel;
+    GroupNorm is applied using PyTorch.
+
+    A nn.Conv2d module named `conv` is kept so that state_dict key compatibility
+    with the reference model (`conv.weight` / `conv.bias`) is preserved.
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size, num_groups, bias_shape, scale_shape):
+        super(ModelNew, self).__init__()
+
+        if isinstance(kernel_size, int):
+            kh = kw = kernel_size
+        else:
+            kh, kw = kernel_size
+        self.kernel_size = (kh, kw)
+
+        # Conv module purely to hold parameters with names `conv.weight` / `conv.bias`
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, bias=True)
+
+        # Extra bias and scale (broadcast over spatial dims)
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.scale = nn.Parameter(torch.randn(scale_shape))
+
+        # GroupNorm as in the original model
+        self.group_norm = nn.GroupNorm(num_groups, out_channels)
+
+    def forward(self, x):
+        x = fused_conv_bias_scale_sigmoid(
+            x,
+            self.conv.weight,
+            self.conv.bias,
+            self.bias,
+            self.scale,
+        )
+        x = self.group_norm(x)
+        return x
+```
+
+---
+
+## Your Task
+
+Identify the **single most critical issue** that causes the error above.
+
+### Analysis Guidelines
+
+1. **Focus on root cause**, not symptoms
+   - Bad: "Output is wrong"
+   - Good: "BLOCK_K loop missing, only processes first 32 elements of K dimension"
+
+2. **Be specific about WHAT and WHERE**
+   - Bad: "Memory access issue"
+   - Good: "Line 45: tl.atomic_add(c_block_ptr, acc) - atomic_add requires scalar pointer, not block_ptr"
+
+3. **Prioritize by impact**
+   - Correctness bugs > Performance issues > Style problems
+   - Algorithm errors > Implementation details
+
+### Output Format
+
+**CRITICAL: You MUST output ONLY valid JSON. No other text allowed.**
+
+```json
+{
+  "critical_issue": "<Concise description of THE root cause, max 30 words>",
+  "why_it_matters": "<Why this causes the observed error, max 35 words>",
+  "minimal_fix_hint": "<What needs to change (not how), max 30 words>"
+}
+```
+
+**Remember**: Output ONLY the JSON block. No explanations, no commentary, no additional text.

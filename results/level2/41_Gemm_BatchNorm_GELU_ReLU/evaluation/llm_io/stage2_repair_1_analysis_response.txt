@@ -1,0 +1,5 @@
+{
+  "critical_issue": "The kernel uses a custom tanh/exp GELU approximation instead of PyTorch’s default erf-based GELU, so activations don’t numerically match the reference.",
+  "why_it_matters": "This different GELU formulation changes output values enough that some elements exceed the specified atol/rtol thresholds, triggering the max_abs_err mismatch in the comparison.",
+  "minimal_fix_hint": "Replace the custom tanh/exp GELU block with an erf-based GELU matching torch.nn.functional.gelu’s exact formulation."
+}

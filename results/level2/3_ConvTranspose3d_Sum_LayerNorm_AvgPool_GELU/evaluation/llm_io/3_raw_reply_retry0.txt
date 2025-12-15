@@ -1,0 +1,193 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def add_layernorm_lastdim_kernel(
+    x_ptr,            # [rows * width]
+    ln_weight_ptr,    # [width]
+    ln_bias_ptr,      # [width]
+    sum_weight_ptr,   # scalar parameter
+    out_ptr,          # [rows * width]
+    rows,             # number of rows
+    width,            # normalization dimension size (flattened last dims)
+    inv_width,        # 1.0 / width (float)
+    eps,              # layernorm epsilon (float)
+    BLOCK_W: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+):
+    # Program id along the row-block dimension
+    pid = tl.program_id(0)
+
+    # Offset along the width dimension
+    offs_w = tl.arange(0, BLOCK_W)
+    col_mask = offs_w < width
+
+    # Load scalar sum_weight once per program
+    sum_weight = tl.load(sum_weight_ptr)
+
+    # Load LayerNorm affine parameters once per program and keep in registers
+    gamma = tl.load(ln_weight_ptr + offs_w, mask=col_mask, other=1.0).to(tl.float32)
+    beta = tl.load(ln_bias_ptr + offs_w, mask=col_mask, other=0.0).to(tl.float32)
+
+    # Base row index for this program
+    row_block_start = pid * BLOCK_R
+
+    # Process multiple rows per program to reuse gamma/beta and sum_weight
+    for r in range(BLOCK_R):
+        row = row_block_start + r
+        row_mask = row < rows
+        mask = row_mask & col_mask
+
+        # Pointer offsets for this row
+        row_start = row * width
+        ptrs = x_ptr + row_start + offs_w
+
+        # Load input row
+        x = tl.load(ptrs, mask=mask, other=0.0)
+
+        # Add scalar
+        x = x + sum_weight
+
+        # Compute mean/var in fp32
+        x_f32 = x.to(tl.float32)
+        mean = tl.sum(x_f32, axis=0) * inv_width
+        diff = x_f32 - mean
+        var = tl.sum(diff * diff, axis=0) * inv_width
+        inv_std = tl.rsqrt(var + eps)
+
+        # Normalize and apply affine in fp32
+        y = diff * inv_std
+        y = y * gamma + beta
+
+        # Cast back to input dtype
+        y = y.to(x.dtype)
+
+        # Store result (single logical output tensor, no intermediate stores)
+        out_ptrs = out_ptr + row_start + offs_w
+        tl.store(out_ptrs, y, mask=mask)
+
+
+def fused_add_layernorm_lastdim(x: torch.Tensor,
+                                sum_weight: torch.Tensor,
+                                ln_module: nn.LayerNorm) -> torch.Tensor:
+    """
+    Fused: x = x + sum_weight; x = LayerNorm(x) over the last normalized_shape dims.
+    """
+    assert x.is_contiguous(), "Input x must be contiguous"
+    orig_shape = x.shape
+    x_dim = x.dim()
+
+    normalized_shape = tuple(ln_module.normalized_shape)
+    norm_ndim = len(normalized_shape)
+    assert norm_ndim >= 1, "normalized_shape must have at least one dimension"
+    assert x_dim >= norm_ndim, (
+        f"Input rank {x_dim} is smaller than normalized_shape rank {norm_ndim}"
+    )
+    assert tuple(orig_shape[-norm_ndim:]) == normalized_shape, (
+        f"Input trailing shape {tuple(orig_shape[-norm_ndim:])} "
+        f"does not match LayerNorm normalized_shape {normalized_shape}"
+    )
+
+    # Flatten trailing normalized dimensions into a single width dimension
+    width = 1
+    for d in normalized_shape:
+        width *= d
+    rows = x.numel() // width
+
+    x_2d = x.view(rows, width)
+    out_2d = torch.empty_like(x_2d)
+
+    # Flatten LayerNorm affine parameters
+    ln_weight = ln_module.weight.view(-1)
+    ln_bias = ln_module.bias.view(-1)
+    assert ln_weight.numel() == width and ln_bias.numel() == width, (
+        "Flattened LayerNorm weight/bias must have size equal to "
+        "the product of normalized_shape"
+    )
+    eps = ln_module.eps
+
+    # BLOCK_W: next power-of-two >= width, capped
+    MAX_BLOCK_W = 1024
+    BLOCK_W = 1 << (width - 1).bit_length()
+    if BLOCK_W > MAX_BLOCK_W:
+        raise ValueError(
+            f"Normalized dimension size {width} exceeds maximum supported BLOCK_W={MAX_BLOCK_W}; "
+            f"got width={width}."
+        )
+
+    # Number of rows processed per program to reuse gamma/beta and sum_weight
+    # 4 is a good balance for large batches on Ada while keeping enough CTAs.
+    BLOCK_R = 4
+
+    inv_width = 1.0 / float(width)
+
+    def grid(meta):
+        return (triton.cdiv(rows, meta["BLOCK_R"]),)
+
+    # Heuristic for warps: more warps for wider vectors
+    num_warps = 4 if BLOCK_W <= 256 else 8
+
+    add_layernorm_lastdim_kernel[grid](
+        x_2d,
+        ln_weight,
+        ln_bias,
+        sum_weight,
+        out_2d,
+        rows,
+        width,
+        inv_width,
+        eps,
+        BLOCK_W=BLOCK_W,
+        BLOCK_R=BLOCK_R,
+        num_warps=num_warps,
+        num_stages=2,
+    )
+
+    out = out_2d.view(orig_shape)
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    Model that performs a 3D transposed convolution, followed by a fused
+    (add scalar + LayerNorm over the last normalized_shape dims), then
+    average pooling and GELU.
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size, stride,
+                 padding, output_padding, sum_weight, norm_shape, pool_kernel_size):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            output_padding=output_padding,
+        )
+
+        # Scalar parameter for the sum
+        self.sum_weight = nn.Parameter(torch.tensor(sum_weight))
+
+        # LayerNorm over the last normalized_shape dims
+        self.norm = nn.LayerNorm(norm_shape)
+
+        # Remaining PyTorch ops
+        self.avg_pool = nn.AvgPool3d(kernel_size=pool_kernel_size)
+        self.gelu = nn.GELU()
+
+    def forward(self, x):
+        # x: [N, C_in, D, H, W]
+        x = self.conv_transpose(x)  # [N, C_out, D_out, H_out, W_out]
+
+        # Fused: add scalar + LayerNorm over the last dims as defined by self.norm
+        x = fused_add_layernorm_lastdim(x, self.sum_weight, self.norm)
+
+        x = self.avg_pool(x)
+        x = self.gelu(x)
+        return x
+```

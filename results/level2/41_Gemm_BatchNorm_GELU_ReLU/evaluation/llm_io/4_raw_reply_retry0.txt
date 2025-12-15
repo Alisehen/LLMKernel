@@ -1,0 +1,275 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        # High arithmetic intensity, moderate register footprint
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_M": 4},
+            num_warps=4,
+            num_stages=2,
+        ),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_M": 8},
+            num_warps=4,
+            num_stages=2,
+        ),
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 32, "GROUP_M": 8},
+            num_warps=4,
+            num_stages=2,
+        ),
+        # Smaller tiles to reduce register usage / improve occupancy
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32, "GROUP_M": 8},
+            num_warps=2,
+            num_stages=2,
+        ),
+        # Slightly deeper K to increase compute / load ratio
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_M": 4},
+            num_warps=4,
+            num_stages=2,
+        ),
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_M": 4},
+            num_warps=4,
+            num_stages=2,
+        ),
+    ],
+    key=["M", "N", "K"],
+)
+@triton.jit
+def fused_gemm_bn_gelu_relu_kernel(
+    a_ptr,              # *f32, (M, K)
+    b_ptr,              # *f32, (K, N) = weight^T
+    bias_lin_ptr,       # *f32, (N,)
+    bn_weight_ptr,      # *f32, (N,)
+    bn_bias_ptr,        # *f32, (N,)
+    bn_mean_ptr,        # *f32, (N,)
+    bn_var_ptr,         # *f32, (N,)
+    c_ptr,              # *f32, (M, N)
+
+    M, N, K,
+    eps,                # f32, BN epsilon
+
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    # 1D program id mapped to 2D (pid_m, pid_n) with M-grouping to maximize
+    # B-tile reuse in L2, while avoiding any intermediate stores.
+    pid = tl.program_id(0)
+
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+
+    num_pid_in_group = GROUP_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_M
+    group_size_m = tl.minimum(num_pid_m - first_pid_m, GROUP_M)
+
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    # Offsets for this block
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+
+    tl.multiple_of(offs_m, BLOCK_M)
+    tl.multiple_of(offs_n, BLOCK_N)
+    tl.multiple_of(offs_k, BLOCK_K)
+
+    # FP32 accumulator for GEMM
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Initial pointers for this block
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    # GEMM main loop
+    k = 0
+    while k < K:
+        k_mask = (k + offs_k) < K
+
+        a = tl.load(
+            a_ptrs,
+            mask=mask_m[:, None] & k_mask[None, :],
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptrs,
+            mask=k_mask[:, None] & mask_n[None, :],
+            other=0.0,
+        )
+
+        # TF32 tensor cores on fp32 inputs
+        acc += tl.dot(a, b, allow_tf32=True)
+
+        # Advance pointers along K
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+        k += BLOCK_K
+
+    # ---- FUSED EPILOGUE: BN (eval) + GELU + ReLU ----
+    # All operations stay in registers; no intermediate stores.
+
+    # Per-channel parameters (broadcast along M)
+    bias_lin = tl.load(
+        bias_lin_ptr + offs_n,
+        mask=mask_n,
+        other=0.0,
+    )[None, :]
+
+    bn_weight = tl.load(
+        bn_weight_ptr + offs_n,
+        mask=mask_n,
+        other=1.0,
+    )[None, :]
+    bn_bias = tl.load(
+        bn_bias_ptr + offs_n,
+        mask=mask_n,
+        other=0.0,
+    )[None, :]
+    bn_mean = tl.load(
+        bn_mean_ptr + offs_n,
+        mask=mask_n,
+        other=0.0,
+    )[None, :]
+    bn_var = tl.load(
+        bn_var_ptr + offs_n,
+        mask=mask_n,
+        other=1.0,
+    )[None, :]
+
+    # BatchNorm (eval): y = (x + bias_lin - mean) / sqrt(var + eps) * weight + bias
+    acc = acc + bias_lin
+    inv_std = tl.rsqrt(bn_var + eps)
+    acc = (acc - bn_mean) * inv_std
+    acc = acc * bn_weight + bn_bias
+
+    # GELU via erf approximation, computed in-place on acc
+    # gelu(x) = 0.5 * x * (1 + erf(x / sqrt(2)))
+    sqrt_2_inv = 0.7071067811865476  # 1/sqrt(2)
+
+    u = acc * sqrt_2_inv
+    sign = tl.where(u >= 0, 1.0, -1.0)
+    absu = tl.abs(u)
+    t = 1.0 / (1.0 + 0.3275911 * absu)
+
+    a1 = 0.254829592
+    a2 = -0.284496736
+    a3 = 1.421413741
+    a4 = -1.453152027
+    a5 = 1.061405429
+
+    poly = (((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t)
+    erf_u = sign * (1.0 - poly * tl.exp(-absu * absu))
+
+    acc = 0.5 * acc * (1.0 + erf_u)
+
+    # ReLU in-place
+    acc = tl.maximum(acc, 0.0)
+
+    # Single final store: no intermediate stores were used
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    out_mask = mask_m[:, None] & mask_n[None, :]
+    tl.store(c_ptrs, acc, mask=out_mask)
+
+
+def fused_gemm_bn_gelu_relu(x: torch.Tensor, linear: nn.Linear, bn: nn.BatchNorm1d):
+    """
+    Fused eval-mode path:
+        y = ReLU(GELU(BN(x @ W^T + b)))
+    Uses a single high-performance Triton kernel on CUDA.
+    """
+    assert linear.bias is not None, "Linear layer must have bias for this fused kernel."
+
+    if x.device.type != "cuda":
+        y = linear(x)
+        y = bn(y)
+        y = torch.nn.functional.gelu(y)
+        y = torch.nn.functional.relu(y)
+        return y
+
+    M, K = x.shape
+    N = linear.weight.shape[0]
+
+    # Ensure fp32 inputs for stable BN/GELU and optimal TF32 matmul
+    x_fp32 = x.to(device=x.device, dtype=torch.float32)
+    W = linear.weight.to(device=x.device, dtype=torch.float32, non_blocking=True)
+    B = W.t().contiguous()  # (K, N), row-major
+
+    y = torch.empty((M, N), device=x.device, dtype=torch.float32)
+
+    # BN parameters (eval uses running stats)
+    bn_weight = bn.weight.to(device=x.device, dtype=torch.float32, non_blocking=True)
+    bn_bias = bn.bias.to(device=x.device, dtype=torch.float32, non_blocking=True)
+    bn_mean = bn.running_mean.to(device=x.device, dtype=torch.float32, non_blocking=True)
+    bn_var = bn.running_var.to(device=x.device, dtype=torch.float32, non_blocking=True)
+    eps = float(bn.eps)
+
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]),
+        )
+
+    fused_gemm_bn_gelu_relu_kernel[grid](
+        x_fp32,
+        B,
+        linear.bias.to(device=x.device, dtype=torch.float32, non_blocking=True),
+        bn_weight,
+        bn_bias,
+        bn_mean,
+        bn_var,
+        y,
+        M,
+        N,
+        K,
+        eps,
+        x_fp32.stride(0),
+        x_fp32.stride(1),
+        B.stride(0),
+        B.stride(1),
+        y.stride(0),
+        y.stride(1),
+    )
+
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    GEMM + BatchNorm + GELU + ReLU.
+    Uses fused Triton kernel in eval mode on CUDA, and the standard PyTorch
+    implementation (preserving BN training semantics) otherwise.
+    """
+
+    def __init__(self, in_features, out_features):
+        super(ModelNew, self).__init__()
+        self.gemm = nn.Linear(in_features, out_features)
+        self.batch_norm = nn.BatchNorm1d(out_features)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.training or x.device.type != "cuda":
+            x = self.gemm(x)
+            x = self.batch_norm(x)
+            x = torch.nn.functional.gelu(x)
+            x = torch.nn.functional.relu(x)
+            return x
+
+        return fused_gemm_bn_gelu_relu(x, self.gemm, self.batch_norm)
+```

@@ -1,0 +1,160 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+import math
+
+
+@triton.autotune(
+    configs=[
+        # Tensor-core optimized configurations for Ada Lovelace
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64}, num_stages=4, num_warps=8),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_stages=4, num_warps=8),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 64}, num_stages=4, num_warps=8),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_stages=4, num_warps=8),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_stages=4, num_warps=4),
+        # Larger K blocks for better memory efficiency
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 128}, num_stages=3, num_warps=8),
+    ],
+    key=['M', 'N', 'K']
+)
+@triton.jit
+def fused_gemm_scale_hardtanh_gelu_kernel(
+    a_ptr, b_ptr, bias_ptr, out_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_out_m, stride_out_n,
+    scaling_factor, hardtanh_min, hardtanh_max,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    # 2D launch grid optimized for SM occupancy
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    
+    # Precompute boundary conditions for better instruction scheduling
+    m_bound = pid_m * BLOCK_M + BLOCK_M <= M
+    n_bound = pid_n * BLOCK_N + BLOCK_N <= N
+    
+    # Offsets with static indexing optimization
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    
+    # Initialize accumulator in float32 for TF32 tensor cores
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    # Precompute pointer bases
+    a_base = a_ptr + offs_m[:, None] * stride_am
+    b_base = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+    
+    # Main matmul loop with software pipelining
+    for k in range(0, K, BLOCK_K):
+        k_remaining = K - k
+        
+        # Load A tile with boundary check
+        mask_a = (offs_m[:, None] < M) & (offs_k[None, :] < k_remaining)
+        a = tl.load(a_base + offs_k[None, :] * stride_ak, mask=mask_a, other=0.0)
+        
+        # Load B tile with boundary check  
+        mask_b = (offs_k[:, None] < k_remaining) & (offs_n[None, :] < N)
+        b = tl.load(b_base, mask=mask_b, other=0.0)
+        
+        # TF32 tensor core acceleration
+        acc += tl.dot(a, b, allow_tf32=True)
+        
+        # Advance B pointer
+        b_base += BLOCK_K * stride_bk
+    
+    # Fused bias addition with same grid indexing
+    bias_ptrs = bias_ptr + offs_n[None, :]
+    bias_mask = (offs_n[None, :] < N)
+    bias = tl.load(bias_ptrs, mask=bias_mask, other=0.0)
+    acc += bias
+    
+    # Fused scaling with same grid
+    acc = acc * scaling_factor
+    
+    # Fused hardtanh with same grid - use min/max for better instruction throughput
+    acc = tl.minimum(tl.maximum(acc, hardtanh_min), hardtanh_max)
+    
+    # Optimized GELU (tanh approximation) with same grid
+    # Constants precomputed for better instruction scheduling
+    sqrt_2_over_pi = 0.7978845608
+    gelu_coeff = 0.044715
+    half = 0.5
+    one = 1.0
+    two = 2.0
+    
+    x = acc
+    x_sq = x * x
+    x_cubed = x_sq * x  # Reuse x_sq
+    inner = sqrt_2_over_pi * (x + gelu_coeff * x_cubed)
+    
+    # Optimized tanh: (1 - exp(-2x)) / (1 + exp(-2x)) 
+    # Use exp(-2x) = 1 / exp(2x) for numerical stability
+    exp_2x = tl.exp(two * inner)
+    tanh_val = (exp_2x - one) / (exp_2x + one)
+    
+    acc = half * x * (one + tanh_val)
+    
+    # Store output with precomputed boundary mask
+    out_ptrs = out_ptr + offs_m[:, None] * stride_out_m + offs_n[None, :] * stride_out_n
+    mask_out = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(out_ptrs, acc, mask=mask_out)
+
+
+def fused_gemm_scale_hardtanh_gelu(x, weight, bias, scaling_factor, hardtanh_min, hardtanh_max):
+    # Ensure inputs are contiguous and in optimal layout
+    x = x.contiguous()
+    weight = weight.contiguous()
+    bias = bias.contiguous()
+    
+    # Get dimensions
+    M, K = x.shape
+    N = weight.shape[0]
+    
+    # Transpose weight once for column-major access (B matrix)
+    weight_t = weight.t().contiguous()
+    
+    # Output tensor with optimal memory layout
+    out = torch.empty((M, N), device=x.device, dtype=x.dtype)
+    
+    # Grid calculation optimized for SM occupancy
+    def grid(META):
+        return (
+            triton.cdiv(M, META['BLOCK_M']),
+            triton.cdiv(N, META['BLOCK_N']),
+        )
+    
+    # Launch kernel with optimal parameters
+    fused_gemm_scale_hardtanh_gelu_kernel[grid](
+        x, weight_t, bias, out,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        weight_t.stride(0), weight_t.stride(1),
+        out.stride(0), out.stride(1),
+        scaling_factor, hardtanh_min, hardtanh_max,
+    )
+    
+    return out
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, scaling_factor, hardtanh_min, hardtanh_max):
+        super(ModelNew, self).__init__()
+        # Initialize weight with Kaiming uniform for stable training
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        self.bias = nn.Parameter(torch.zeros(out_features))
+        self.scaling_factor = scaling_factor
+        self.hardtanh_min = hardtanh_min
+        self.hardtanh_max = hardtanh_max
+    
+    def forward(self, x):
+        return fused_gemm_scale_hardtanh_gelu(
+            x, self.weight, self.bias, 
+            self.scaling_factor, self.hardtanh_min, self.hardtanh_max
+        )

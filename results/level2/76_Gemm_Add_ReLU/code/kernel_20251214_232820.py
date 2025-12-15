@@ -1,0 +1,134 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        # Conservative baseline - low register pressure
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=2, num_warps=4),
+        # Balanced for compute-bound - higher occupancy
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=3, num_warps=8),
+        # Aggressive for large matrices - maximizes tensor core utilization
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=3, num_warps=16),
+    ],
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def fused_linear_relu_kernel(
+    x_ptr,
+    w_ptr,
+    b_ptr,
+    out_ptr,
+    M,
+    N,
+    K,
+    stride_xm,
+    stride_xk,
+    stride_wk,
+    stride_wn,
+    stride_om,
+    stride_on,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    ACC_TYPE: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    
+    # Create offsets for the entire block
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    
+    # Pre-compute pointer increments for better ILP
+    x_ptrs = x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk
+    w_ptrs = w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk
+    k_step = BLOCK_K * stride_xk
+    
+    # Accumulator - use float32 for precision and tensor core compatibility
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
+    
+    # Compute K tiles
+    k_tiles = tl.cdiv(K, BLOCK_K)
+    for k in range(k_tiles):
+        # Efficient masking: compute once, reuse for both loads
+        k_bound = K - k * BLOCK_K
+        x_mask = (offs_m[:, None] < M) & (offs_k[None, :] < k_bound)
+        w_mask = (offs_n[:, None] < N) & (offs_k[None, :] < k_bound)
+        
+        # Load tiles with software pipelining
+        x_tile = tl.load(x_ptrs, mask=x_mask, other=0.0)
+        w_tile = tl.load(w_ptrs, mask=w_mask, other=0.0)
+        
+        # Tensor core-accelerated matrix multiplication
+        acc += tl.dot(x_tile, w_tile, allow_tf32=True)
+        
+        # Increment pointers with better ILP
+        x_ptrs += k_step
+        w_ptrs += k_step
+    
+    # Fused bias addition
+    if b_ptr is not None:
+        bias_ptrs = b_ptr + offs_n
+        bias_mask = offs_n < N
+        bias = tl.load(bias_ptrs, mask=bias_mask, other=0.0)
+        acc += bias[None, :]
+    
+    # In-place ReLU activation (minimal register usage)
+    zero = 0.0
+    acc = tl.where(acc > zero, acc, zero)
+    
+    # Store with coalesced writes
+    out_ptrs = out_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
+    out_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(out_ptrs, acc, mask=out_mask)
+
+
+def fused_linear_relu(x, weight, bias):
+    M, K = x.shape
+    N, K_w = weight.shape
+    assert K == K_w, f"Dimension mismatch: x K={K}, weight K={K_w}"
+    
+    # Ensure proper memory layout for tensor cores
+    weight_t = weight.t().contiguous()
+    out = torch.empty((M, N), device=x.device, dtype=x.dtype)
+    
+    # Accumulation dtype for optimal precision/performance
+    acc_dtype = tl.float32 if x.dtype in [torch.float16, torch.bfloat16] else tl.float32
+    
+    # Compute grid with minimal overhead
+    def grid(meta):
+        return (triton.cdiv(M, meta['BLOCK_M']), triton.cdiv(N, meta['BLOCK_N']))
+    
+    # Launch optimized kernel
+    fused_linear_relu_kernel[grid](
+        x_ptr=x,
+        w_ptr=weight_t,
+        b_ptr=bias if bias is not None else None,
+        out_ptr=out,
+        M=M,
+        N=N,
+        K=K,
+        stride_xm=x.stride(0),
+        stride_xk=x.stride(1),
+        stride_wk=weight_t.stride(0),
+        stride_wn=weight_t.stride(1),
+        stride_om=out.stride(0),
+        stride_on=out.stride(1),
+        ACC_TYPE=acc_dtype,
+    )
+    
+    return out
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, bias_shape):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+    
+    def forward(self, x):
+        return fused_linear_relu(x, self.weight, self.bias)

@@ -1,0 +1,234 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU
+GPU Name: 4090
+Architecture: Ada Lovelace
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+[OPTIMIZATION STAGE]
+
+## Current Optimization Stage
+
+Focus: Grid layout & indexing for FUSED operations.
+
+⚠️ FUSION EXCLUSIONS (do NOT apply fusion rules to these):
+- Reduction ops (sum, mean, softmax along axis)
+- Atomic operations
+- Irregular/data-dependent access patterns
+- Cross-block dependencies
+
+Key Principle:
+- All fused ops share the SAME grid AND the SAME (offsets, mask) tuple
+- Grid covers OUTPUT tensor dimensions
+
+Hard Rules:
+- Every fused op MUST use identical offset calculation
+- Every fused op MUST use identical boundary mask
+- If broadcast needed: explicit `[None, :]` or `[:, None]`, NOT different offsets
+- Element-wise: 1D grid, single `offs = pid * BLOCK + tl.arange(0, BLOCK)`
+- Matmul fusion: 2D grid, `offs_m/offs_n` shared by bias add & activation
+
+Verification:
+- Check: all tl.load/tl.store use same `offsets` variable
+- Check: all masks derived from same boundary condition
+- If ANY op needs different indexing → do NOT fuse, split kernel
+
+
+
+[CURRENT CODE]
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def fused_add_hardswish_kernel(
+    conv_out_ptr,      # [N, C, D, H, W]
+    add_input_ptr,     # [N, C, D, H, W]
+    out_ptr,           # [N, C, D, H, W]
+    N, C, D, H, W,
+    stride_conv_n, stride_conv_c, stride_conv_d, stride_conv_h, stride_conv_w,
+    stride_add_n, stride_add_c, stride_add_d, stride_add_h, stride_add_w,
+    stride_out_n, stride_out_c, stride_out_d, stride_out_h, stride_out_w,
+    BLOCK_C: tl.constexpr,
+):
+    """
+    Fused kernel: Add + (x * HardSwish(x)) activation
+    Output = x * (x * relu6(x + 3) / 6) where x = conv_out + add_input
+    """
+    pid_n = tl.program_id(0)  # batch index
+    pid_chunk = tl.program_id(1)  # chunk of C dimension
+    
+    if pid_n >= N:
+        return
+    
+    # Compute offsets for C dimension
+    c_offsets = pid_chunk * BLOCK_C + tl.arange(0, BLOCK_C)
+    c_mask = c_offsets < C
+    
+    # Compute base pointers for this batch and C chunk
+    conv_base = conv_out_ptr + pid_n * stride_conv_n
+    add_base = add_input_ptr + pid_n * stride_add_n
+    out_base = out_ptr + pid_n * stride_out_n
+    
+    # Process all spatial positions for this C chunk
+    for idx in range(D * H * W):
+        # Compute spatial indices
+        d_idx = idx // (H * W)
+        h_idx = (idx % (H * W)) // W
+        w_idx = idx % W
+        
+        # Load conv output values for this spatial position
+        conv_ptrs = (conv_base + 
+                     c_offsets * stride_conv_c +
+                     d_idx * stride_conv_d +
+                     h_idx * stride_conv_h +
+                     w_idx * stride_conv_w)
+        conv_vals = tl.load(conv_ptrs, mask=c_mask, other=0.0)
+        
+        # Load add_input values for this spatial position
+        add_ptrs = (add_base +
+                    c_offsets * stride_add_c +
+                    d_idx * stride_add_d +
+                    h_idx * stride_add_h +
+                    w_idx * stride_add_w)
+        add_vals = tl.load(add_ptrs, mask=c_mask, other=0.0)
+        
+        # Add operation: x = conv_out + add_input
+        x = conv_vals + add_vals
+        
+        # Compute x * HardSwish(x) = x * (x * relu6(x + 3) / 6)
+        # Step 1: Compute relu6(x + 3)
+        x_plus_3 = x + 3.0
+        relu6_val = tl.minimum(tl.maximum(x_plus_3, 0.0), 6.0)
+        
+        # Step 2: Compute x * relu6(x + 3) / 6
+        hardswish_x = x * relu6_val / 6.0
+        
+        # Step 3: Multiply by x again for final output
+        output_val = x * hardswish_x
+        
+        # Store result
+        out_ptrs = (out_base +
+                    c_offsets * stride_out_c +
+                    d_idx * stride_out_d +
+                    h_idx * stride_out_h +
+                    w_idx * stride_out_w)
+        tl.store(out_ptrs, output_val, mask=c_mask)
+
+
+def fused_add_hardswish(conv_out, add_input):
+    """
+    Fused Add + (x * HardSwish(x)) operation
+    Args:
+        conv_out: [N, C, D, H, W] - output from ConvTranspose3d
+        add_input: [N, C, D, H, W] - tensor to add (same shape)
+    Returns:
+        [N, C, D, H, W] - result after Add + (x * HardSwish(x))
+    """
+    assert conv_out.shape == add_input.shape, "Shapes must match"
+    N, C, D, H, W = conv_out.shape
+    
+    # Output tensor
+    out = torch.empty_like(conv_out)
+    
+    # Configurations for autotuning
+    configs = [
+        triton.Config({'BLOCK_C': 32}, num_warps=4),
+        triton.Config({'BLOCK_C': 64}, num_warps=8),
+        triton.Config({'BLOCK_C': 128}, num_warps=8),
+        triton.Config({'BLOCK_C': 256}, num_warps=16),
+    ]
+    
+    # Use dictionary-style access for config parameters
+    block_c = configs[0].kwargs['BLOCK_C']
+    
+    # Launch kernel
+    grid = (N, triton.cdiv(C, block_c))
+    fused_add_hardswish_kernel[grid](
+        conv_out, add_input, out,
+        N, C, D, H, W,
+        conv_out.stride(0), conv_out.stride(1), conv_out.stride(2),
+        conv_out.stride(3), conv_out.stride(4),
+        add_input.stride(0), add_input.stride(1), add_input.stride(2),
+        add_input.stride(3), add_input.stride(4),
+        out.stride(0), out.stride(1), out.stride(2),
+        out.stride(3), out.stride(4),
+        BLOCK_C=block_c,
+    )
+    
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    ConvTranspose3d (PyTorch native) + Fused Add + (x * HardSwish(x)) (Triton)
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, bias_shape):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(
+            in_channels, out_channels, kernel_size,
+            stride=stride, padding=padding, output_padding=output_padding
+        )
+        self.register_parameter('bias', nn.Parameter(torch.randn(bias_shape)))
+
+    def forward(self, x, add_input):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_channels, D, H, W).
+            add_input (torch.Tensor): Tensor to add after transposed convolution, 
+                                     of shape (batch_size, out_channels, D_out, H_out, W_out).
+        Returns:
+            torch.Tensor: Output tensor after ConvTranspose3d, Add, and x * HardSwish(x).
+        """
+        # Step 1: PyTorch native ConvTranspose3d
+        x = self.conv_transpose(x)
+        
+        # Step 2: Fused Add + (x * HardSwish(x)) in Triton
+        x = fused_add_hardswish(x, add_input)
+        
+        return x
+```
+
+[NCU PROFILING METRICS]
+{
+  "fused_add_hardswish_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 18.93,
+    "launch__grid_size": 256,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 16.6,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 24.98,
+    "lts__t_sector_hit_rate.pct": 80.0
+  }
+}
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+TRITON API CONSTRAINTS (CRITICAL):
+- Triton has NO: tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

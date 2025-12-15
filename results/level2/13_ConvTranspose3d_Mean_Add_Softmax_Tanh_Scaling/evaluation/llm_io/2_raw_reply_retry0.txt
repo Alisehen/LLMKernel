@@ -1,0 +1,322 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+# ---------------------------------------------------------------------------
+# Kernel 1: Mean over depth (D)  ->  mean[b, c, h, w] in fp32
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def mean_over_depth_kernel(
+    x_ptr,         # [B, C, D, H, W]
+    mean_ptr,      # [B, C, H, W] (fp32)
+    B, C, D, H, W,
+    stride_xb, stride_xc, stride_xd, stride_xh, stride_xw,
+    stride_mb, stride_mc, stride_mh, stride_mw,
+    BLOCK_W: tl.constexpr,
+):
+    """
+    Each program computes mean over D for a tile of W for fixed (b, c, h).
+
+    Grid:
+      pid0 = b * (C*H) + c * H + h   (0 .. B*C*H - 1)
+      pid1 = w-tile index            (0 .. ceil_div(W, BLOCK_W) - 1)
+    """
+    pid_bch = tl.program_id(0)
+    pid_w = tl.program_id(1)
+
+    # Decode (b, c, h)
+    bc_h = C * H
+    b = pid_bch // bc_h
+    tmp = pid_bch % bc_h
+    c = tmp // H
+    h = tmp % H
+
+    # Out-of-bounds guard on b,c,h (avoid chained boolean OR)
+    if b >= B:
+        return
+    if c >= C:
+        return
+    if h >= H:
+        return
+
+    # Tile of W this program handles
+    offs_w = pid_w * BLOCK_W + tl.arange(0, BLOCK_W)
+    mask_w = offs_w < W
+
+    # Accumulate over D in fp32
+    acc = tl.zeros((BLOCK_W,), dtype=tl.float32)
+
+    # Loop over depth
+    for d in range(0, D):
+        x_ptrs = (
+            x_ptr
+            + b * stride_xb
+            + c * stride_xc
+            + d * stride_xd
+            + h * stride_xh
+            + offs_w * stride_xw
+        )
+        x_vals = tl.load(x_ptrs, mask=mask_w, other=0.0)
+        acc += x_vals.to(tl.float32)
+
+    # Final mean
+    mean_vals = acc / D
+
+    # Store to mean tensor [B, C, H, W]
+    mean_ptrs = (
+        mean_ptr
+        + b * stride_mb
+        + c * stride_mc
+        + h * stride_mh
+        + offs_w * stride_mw
+    )
+    tl.store(mean_ptrs, mean_vals, mask=mask_w)
+
+
+# ---------------------------------------------------------------------------
+# Kernel 2: Bias + softmax over C + tanh + scaling
+#           Input:  mean[b, c, h, w] (fp32)
+#           Output: out[b, c, 0, h, w] (x.dtype)
+# ---------------------------------------------------------------------------
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_C': 64}, num_warps=2, num_stages=2),
+        triton.Config({'BLOCK_C': 128}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_C': 256}, num_warps=8, num_stages=2),
+    ],
+    key=['C'],
+)
+@triton.jit
+def fused_bias_softmax_tanh_scale_kernel(
+    mean_ptr,      # [B, C, H, W] (fp32)
+    bias_ptr,      # [C]          (same dtype as out)
+    out_ptr,       # [B, C, 1, H, W]
+    B, C, H, W,
+    stride_mb, stride_mc, stride_mh, stride_mw,
+    stride_ob, stride_oc, stride_od, stride_oh, stride_ow,
+    scaling_factor,
+    BLOCK_C: tl.constexpr,
+):
+    """
+    For each (b, h, w), compute:
+      v_c = mean[b, c, h, w] + bias[c]
+      softmax over c: s_c = exp(v_c - max_v) / sum_c exp(v_c - max_v)
+      y_c = scaling_factor * tanh(s_c)
+
+    Grid:
+      pid = b * (H*W) + h * W + w  (0 .. B*H*W - 1)
+      Each program handles all C (in BLOCK_C tiles) for one (b, h, w).
+    """
+    pid = tl.program_id(0)
+    bhw = H * W
+    b = pid // bhw
+    hw = pid % bhw
+    h = hw // W
+    w = hw % W
+
+    # Out-of-bounds guard on b,h,w (avoid chained boolean OR)
+    if b >= B:
+        return
+    if h >= H:
+        return
+    if w >= W:
+        return
+
+    offs_c = tl.arange(0, BLOCK_C)
+    neg_inf = -float('inf')
+
+    # ------------------------------------------------------------------ #
+    # Pass 1: compute max over channels for numerical stability          #
+    # ------------------------------------------------------------------ #
+    max_val = neg_inf
+
+    c0 = 0
+    while c0 < C:
+        c_idxs = c0 + offs_c
+        mask_c = c_idxs < C
+
+        mean_ptrs = (
+            mean_ptr
+            + b * stride_mb
+            + c_idxs * stride_mc
+            + h * stride_mh
+            + w * stride_mw
+        )
+        mean_vals = tl.load(mean_ptrs, mask=mask_c, other=0.0)  # fp32
+
+        bias_vals = tl.load(bias_ptr + c_idxs, mask=mask_c, other=0.0)
+        bias_vals = bias_vals.to(tl.float32)
+
+        v = mean_vals + bias_vals
+        v = tl.where(mask_c, v, neg_inf)
+        local_max = tl.max(v, axis=0)
+        max_val = tl.maximum(max_val, local_max)
+
+        c0 += BLOCK_C
+
+    # ------------------------------------------------------------------ #
+    # Pass 2: compute denominator (sum of exp) for softmax               #
+    # ------------------------------------------------------------------ #
+    sum_exp = tl.zeros((), dtype=tl.float32)
+
+    c0 = 0
+    while c0 < C:
+        c_idxs = c0 + offs_c
+        mask_c = c_idxs < C
+
+        mean_ptrs = (
+            mean_ptr
+            + b * stride_mb
+            + c_idxs * stride_mc
+            + h * stride_mh
+            + w * stride_mw
+        )
+        mean_vals = tl.load(mean_ptrs, mask=mask_c, other=0.0)
+
+        bias_vals = tl.load(bias_ptr + c_idxs, mask=mask_c, other=0.0)
+        bias_vals = bias_vals.to(tl.float32)
+
+        v = mean_vals + bias_vals
+        v = tl.where(mask_c, v, neg_inf)
+
+        exp_vals = tl.exp(v - max_val)
+        exp_vals = tl.where(mask_c, exp_vals, 0.0)
+        sum_exp += tl.sum(exp_vals, axis=0)
+
+        c0 += BLOCK_C
+
+    inv_denom = 1.0 / sum_exp
+
+    # ------------------------------------------------------------------ #
+    # Pass 3: compute final softmax, tanh, scale, and store              #
+    # ------------------------------------------------------------------ #
+    c0 = 0
+    while c0 < C:
+        c_idxs = c0 + offs_c
+        mask_c = c_idxs < C
+
+        mean_ptrs = (
+            mean_ptr
+            + b * stride_mb
+            + c_idxs * stride_mc
+            + h * stride_mh
+            + w * stride_mw
+        )
+        mean_vals = tl.load(mean_ptrs, mask=mask_c, other=0.0)
+
+        bias_vals = tl.load(bias_ptr + c_idxs, mask=mask_c, other=0.0)
+        bias_vals = bias_vals.to(tl.float32)
+
+        v = mean_vals + bias_vals
+        v = tl.where(mask_c, v, neg_inf)
+
+        # Softmax
+        exp_vals = tl.exp(v - max_val)
+        softmax_vals = exp_vals * inv_denom
+
+        # tanh via stable exponential form: tanh(x) = (1 - e^{-2x}) / (1 + e^{-2x})
+        e_neg_2x = tl.exp(-2.0 * softmax_vals)
+        tanh_vals = (1.0 - e_neg_2x) / (1.0 + e_neg_2x)
+
+        out_vals = tanh_vals * scaling_factor
+
+        out_ptrs = (
+            out_ptr
+            + b * stride_ob
+            + c_idxs * stride_oc
+            + h * stride_oh
+            + w * stride_ow
+        )
+        tl.store(out_ptrs, out_vals, mask=mask_c)
+
+        c0 += BLOCK_C
+
+
+# ---------------------------------------------------------------------------
+# Wrapper for launching kernels
+# ---------------------------------------------------------------------------
+
+def fused_post_convtranspose_3d(x: torch.Tensor, bias: torch.Tensor, scaling_factor: float):
+    """
+    x:    [B, C, D, H, W] - output of ConvTranspose3d
+    bias: [1, C, 1, 1, 1] - broadcastable bias
+    return: [B, C, 1, H, W] after mean(D) + bias + softmax(C) + tanh + scaling
+    """
+    assert x.is_cuda, "Input must be on CUDA for Triton kernels"
+    B, C, D, H, W = x.shape
+
+    # Per-channel bias as [C]
+    bias_flat = bias.view(-1)  # [C]
+
+    # Intermediate mean over depth in fp32 for better numerical stability
+    mean = torch.empty((B, C, H, W), device=x.device, dtype=torch.float32)
+
+    # Final output (same dtype as x)
+    out = torch.empty((B, C, 1, H, W), device=x.device, dtype=x.dtype)
+
+    # ---------------------- Launch mean_over_depth_kernel -------------------
+    BLOCK_W = 64  # good default for contiguous W dimension
+
+    grid_mean = (B * C * H, triton.cdiv(W, BLOCK_W))
+    mean_over_depth_kernel[grid_mean](
+        x,
+        mean,
+        B, C, D, H, W,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
+        mean.stride(0), mean.stride(1), mean.stride(2), mean.stride(3),
+        BLOCK_W=BLOCK_W,
+    )
+
+    # ---------------- Launch fused_bias_softmax_tanh_scale_kernel ----------
+    grid_softmax = (B * H * W,)
+
+    fused_bias_softmax_tanh_scale_kernel[grid_softmax](
+        mean,
+        bias_flat,
+        out,
+        B, C, H, W,
+        mean.stride(0), mean.stride(1), mean.stride(2), mean.stride(3),
+        out.stride(0), out.stride(1), out.stride(2), out.stride(3), out.stride(4),
+        float(scaling_factor),
+    )
+
+    return out
+
+
+# ---------------------------------------------------------------------------
+# PyTorch module integrating ConvTranspose3d with optimized Triton kernels
+# ---------------------------------------------------------------------------
+
+class ModelNew(nn.Module):
+    """
+    PyTorch ConvTranspose3d + Triton-optimized post-ops:
+
+      1. ConvTranspose3d  (PyTorch native)
+      2. Mean over depth (D)       [Triton kernel]
+      3. Bias add                  \
+      4. Softmax over channels (C)  > fused in Triton kernel
+      5. Tanh                      /
+      6. Scaling                   [Triton kernel]
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, scaling_factor):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+        )
+        self.bias = nn.Parameter(torch.randn(1, out_channels, 1, 1, 1))
+        self.scaling_factor = float(scaling_factor)
+
+    def forward(self, x):
+        x = self.conv_transpose(x)  # [B, C, D, H, W]
+        x = fused_post_convtranspose_3d(x, self.bias, self.scaling_factor)
+        return x
+```

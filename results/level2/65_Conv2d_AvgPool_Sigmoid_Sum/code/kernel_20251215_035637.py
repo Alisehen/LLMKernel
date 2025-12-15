@@ -1,0 +1,233 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def fused_conv_avgpool_sigmoid_sum_kernel(
+    x_ptr, w_ptr, b_ptr, out_ptr,
+    N, H, W,
+    Hp, Wp, total_hw,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_wn, stride_wc, stride_wh, stride_ww,
+    C_IN: tl.constexpr, C_OUT: tl.constexpr,
+    K: tl.constexpr, POOL_K: tl.constexpr,
+    BLOCK_HW: tl.constexpr, BLOCK_C: tl.constexpr,
+):
+    """
+    Fused kernel:
+        Conv2d (valid, stride=1, no padding)
+        -> AvgPool2d (kernel=POOL_K, stride=POOL_K)
+        -> Sigmoid
+        -> Sum over [C_out, Hp, Wp] per batch element.
+
+    - No intermediate conv-out tensor is written to global memory.
+    - Single global write per output element via atomic_add(out[n], tile_sum).
+    """
+
+    # Grid decomposition:
+    #   pid_hw : tiles over pooled spatial positions (Hp * Wp)
+    #   pid_c  : tiles over output channels
+    #   pid_n  : batch index
+    pid_hw = tl.program_id(0)
+    pid_c = tl.program_id(1)
+    pid_n = tl.program_id(2)
+
+    # Tiled pooled spatial indices
+    offs_hw = pid_hw * BLOCK_HW + tl.arange(0, BLOCK_HW)
+    hw_mask = offs_hw < total_hw
+
+    # Decode flattened pooled index -> (ohp, owp)
+    ohp = offs_hw // Wp
+    owp = offs_hw % Wp
+
+    # Base conv-out spatial indices for each pooled cell
+    # conv_out[h, w] pooled with kernel POOL_K & stride POOL_K
+    oh_base = ohp * POOL_K
+    ow_base = owp * POOL_K
+
+    # Tiled output channels
+    offs_c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
+    c_mask = offs_c < C_OUT
+
+    # Joint mask for valid (pooled_hw, channel) pairs
+    full_mask = hw_mask[:, None] & c_mask[None, :]
+
+    # Accumulator for sum of conv pre-activations over pooling window
+    # Shape: [BLOCK_HW, BLOCK_C]
+    acc_pre = tl.zeros((BLOCK_HW, BLOCK_C), dtype=tl.float32)
+
+    # Convolution + pooling (pre-activation only, bias fused later)
+    # H_out = H - K + 1, W_out = W - K + 1
+    # pooled output coordinates: (ohp, owp)
+    #   conv-out positions covered by pooling window:
+    #     oh = oh_base + ph,  ph in [0, POOL_K)
+    #     ow = ow_base + pw,  pw in [0, POOL_K)
+    #   input positions:
+    #     ih = oh + kh
+    #     iw = ow + kw
+    for ic in range(C_IN):
+        for kh in tl.static_range(0, K):
+            for kw in tl.static_range(0, K):
+                # Load weights once per (ic, kh, kw, channel-tile)
+                w_offsets = (
+                    offs_c * stride_wn
+                    + ic * stride_wc
+                    + kh * stride_wh
+                    + kw * stride_ww
+                )
+                w_vals = tl.load(
+                    w_ptr + w_offsets,
+                    mask=c_mask,
+                    other=0.0,
+                ).to(tl.float32)  # [BLOCK_C]
+
+                # Iterate over pooling window, reusing w_vals
+                for ph in tl.static_range(0, POOL_K):
+                    oh = oh_base + ph  # [BLOCK_HW]
+                    for pw in tl.static_range(0, POOL_K):
+                        ow = ow_base + pw  # [BLOCK_HW]
+
+                        ih = oh + kh  # [BLOCK_HW]
+                        iw = ow + kw  # [BLOCK_HW]
+
+                        x_offsets = (
+                            pid_n * stride_xn
+                            + ic * stride_xc
+                            + ih * stride_xh
+                            + iw * stride_xw
+                        )
+                        x_vals = tl.load(
+                            x_ptr + x_offsets,
+                            mask=hw_mask,
+                            other=0.0,
+                        ).to(tl.float32)  # [BLOCK_HW]
+
+                        # Outer product: [BLOCK_HW] x [BLOCK_C] -> [BLOCK_HW, BLOCK_C]
+                        acc_pre += x_vals[:, None] * w_vals[None, :]
+
+    # Average over pooling window and add bias:
+    #   avg = bias + (1 / POOL_K^2) * sum_preact
+    pool_area = float(POOL_K * POOL_K)
+    bias_vals = tl.load(
+        b_ptr + offs_c,
+        mask=c_mask,
+        other=0.0,
+    ).to(tl.float32)  # [BLOCK_C]
+
+    avg = acc_pre / pool_area + bias_vals[None, :]  # [BLOCK_HW, BLOCK_C]
+
+    # Sigmoid: 1 / (1 + exp(-x))
+    neg = -avg
+    exp_neg = tl.exp(neg)
+    sig = 1.0 / (1.0 + exp_neg)
+
+    # Zero out inactive lanes
+    sig = sig * full_mask.to(sig.dtype)
+
+    # Reduce tile contributions over pooled HW and channels -> scalar
+    tile_sum = tl.sum(sig, axis=0)      # sum over HW
+    tile_sum = tl.sum(tile_sum, axis=0) # sum over channels
+
+    # Single global write: accumulate into out[n]
+    tl.atomic_add(out_ptr + pid_n, tile_sum)
+
+
+def fused_conv_avgpool_sigmoid_sum_triton(x, weight, bias, kernel_size: int, pool_kernel_size: int):
+    """
+    x       : [N, C_in, H, W]
+    weight  : [C_out, C_in, K, K]
+    bias    : [C_out]
+    Returns : [N] (sum over C_out, Hp, Wp of sigmoid(avg_pool(conv2d(x))))
+    """
+    assert x.ndim == 4
+    assert weight.ndim == 4
+    assert bias.ndim == 1
+
+    N, C_in, H, W = x.shape
+    C_out, C_in_w, K, K_w = weight.shape
+    assert C_in_w == C_in and K_w == kernel_size and K == kernel_size
+    assert bias.shape[0] == C_out
+
+    # Conv2d valid (stride=1, padding=0)
+    H_out = H - kernel_size + 1
+    W_out = W - kernel_size + 1
+    assert H_out > 0 and W_out > 0
+
+    # AvgPool2d over conv output with kernel=pool_kernel_size, stride=pool_kernel_size
+    stride = pool_kernel_size
+    Hp = (H_out - pool_kernel_size) // stride + 1
+    Wp = (W_out - pool_kernel_size) // stride + 1
+    assert Hp > 0 and Wp > 0
+    # By construction with stride == kernel, windows are non-overlapping
+
+    x_contig = x.contiguous()
+    w_contig = weight.contiguous()
+    b_contig = bias.contiguous()
+
+    # Final output: one scalar per batch item
+    out = torch.zeros((N,), device=x.device, dtype=x.dtype)
+
+    total_hw = Hp * Wp
+
+    # Tiling parameters: chosen to balance compute and occupancy on Ada (RTX 4090)
+    BLOCK_HW = 64   # pooled spatial positions per program
+    BLOCK_C = 16    # output channels per program
+
+    grid = lambda META: (
+        triton.cdiv(total_hw, META["BLOCK_HW"]),  # pooled H*W tiles
+        triton.cdiv(C_out, META["BLOCK_C"]),      # channel tiles
+        N,                                        # batch
+    )
+
+    fused_conv_avgpool_sigmoid_sum_kernel[grid](
+        x_contig, w_contig, b_contig, out,
+        N, H, W,
+        Hp, Wp, total_hw,
+        x_contig.stride(0), x_contig.stride(1),
+        x_contig.stride(2), x_contig.stride(3),
+        w_contig.stride(0), w_contig.stride(1),
+        w_contig.stride(2), w_contig.stride(3),
+        C_IN=C_in,
+        C_OUT=C_out,
+        K=kernel_size,
+        POOL_K=pool_kernel_size,
+        BLOCK_HW=BLOCK_HW,
+        BLOCK_C=BLOCK_C,
+        num_warps=4,
+        num_stages=2,
+    )
+
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    Fused Triton implementation of:
+      Conv2d (valid, stride=1, no padding)
+      -> AvgPool2d (kernel=pool_kernel_size, stride=pool_kernel_size)
+      -> Sigmoid
+      -> Sum over [C_out, Hp, Wp]
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size, pool_kernel_size):
+        super(ModelNew, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.pool_kernel_size = pool_kernel_size
+
+        self.weight = nn.Parameter(
+            torch.randn(out_channels, in_channels, kernel_size, kernel_size)
+        )
+        self.bias = nn.Parameter(torch.randn(out_channels))
+
+    def forward(self, x):
+        # x: [N, C_in, H, W]
+        out = fused_conv_avgpool_sigmoid_sum_triton(
+            x, self.weight, self.bias,
+            self.kernel_size,
+            self.pool_kernel_size,
+        )
+        return out

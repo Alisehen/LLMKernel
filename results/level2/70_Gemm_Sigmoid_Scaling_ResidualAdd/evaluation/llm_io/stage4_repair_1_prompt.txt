@@ -1,0 +1,205 @@
+Fix the Triton kernel errors. Generate correct, high-performance code.
+
+Current Error Log:
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 626, in compare_and_bench
+    raise ValueError(
+ValueError: Outputs are not close (atol=0.001, rtol=0.01). max_abs_err=8.905e-02, mean_abs_err=6.091e-02
+
+Main Critical Problem Analysis:
+Problem Analysis (from expert diagnosis):
+critical_issue: Inaccurate sigmoid approximation causes large numerical error vs torch.sigmoid
+why_it_matters: Piecewise linear approximation error (up to 0.05) magnified by scaling factor 2.0 exceeds tolerance (atol=0.001).
+minimal_fix_hint: Replace custom sigmoid approximation with tl.sigmoid() for numerical accuracy.
+
+Focus your fix on addressing the identified critical issue.
+
+
+Broken Code:
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'num_warps': 4, 'num_stages': 2}),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'num_warps': 8, 'num_stages': 3}),
+    ],
+    key=['M', 'N', 'K']
+)
+@triton.jit
+def fused_gemm_sigmoid_scale_resadd_kernel(
+    # Pointers to matrices
+    a_ptr, b_ptr, bias_ptr, c_ptr,
+    # Matrix dimensions
+    M, N, K,
+    # Stride information
+    stride_am, stride_ak, 
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    # Block sizes and launch config
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    # Scaling factor
+    scaling_factor,
+    # Optimization parameters
+    num_warps: tl.constexpr, num_stages: tl.constexpr,
+):
+    # Program ID: which block of C we're computing
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    
+    # Reorder to improve L2 cache hits - better memory access pattern
+    pid_m = pid // num_pid_n
+    pid_n = pid % num_pid_n
+    
+    # Create block offsets with proper masking
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    
+    # Create pointers for the first blocks of A and B
+    # Use more efficient pointer arithmetic
+    a_ptrs = a_ptr + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
+    
+    # Accumulator - initialize once
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    # Compute block of C = A * B
+    # Unroll K-loop for better performance with tensor cores
+    for k in range(0, tl.cdiv(K, BLOCK_K)):
+        # Generate masks once to reduce computation
+        k_remaining = K - k * BLOCK_K
+        a_mask = (offs_m[:, None] < M) & (offs_k[None, :] < k_remaining)
+        b_mask = (offs_k[:, None] < k_remaining) & (offs_n[None, :] < N)
+        
+        # Load blocks with proper masking
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+        
+        # Use tensor cores with TF32 for Ada Lovelace
+        accumulator = tl.dot(a, b, accumulator, allow_tf32=True)
+        
+        # Move pointers efficiently
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+    
+    # Add bias efficiently with broadcast
+    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    accumulator += bias[None, :]
+    
+    # Store original output for residual connection
+    original_output = accumulator
+    
+    # Compute sigmoid using fast approximation for Ada Lovelace
+    # Use piecewise linear approximation for faster computation
+    # sigmoid(x) ≈ 0.5 + 0.5 * x / (1 + |x|) for |x| < 5
+    # This is much faster than exp() on Ada GPUs
+    x_abs = tl.abs(accumulator)
+    x_clamped = tl.where(x_abs < 5.0, accumulator, tl.where(accumulator > 0, 5.0, -5.0))
+    sigmoid_result = 0.5 + 0.5 * x_clamped / (1.0 + tl.abs(x_clamped))
+    
+    # Handle tails more efficiently
+    sigmoid_result = tl.where(x_abs < 5.0, sigmoid_result, 
+                             tl.where(accumulator > 0, 1.0, 0.0))
+    
+    # Scale and add residual
+    output = sigmoid_result * scaling_factor + original_output
+    
+    # Store output to C with efficient masking
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, output, mask=mask)
+
+def fused_gemm_sigmoid_scale_resadd(x, weight, bias, scaling_factor):
+    """
+    Fused operation: GEMM -> Sigmoid -> Scaling -> Residual Add
+    
+    Args:
+        x: Input tensor of shape (M, K)
+        weight: Weight tensor of shape (N, K)
+        bias: Bias tensor of shape (N,)
+        scaling_factor: Scaling factor for sigmoid output
+        
+    Returns:
+        Output tensor of shape (M, N)
+    """
+    M, K = x.shape
+    N, K_w = weight.shape
+    assert K == K_w, f"Dimension mismatch: x has K={K}, weight has K={K_w}"
+    
+    # Allocate output tensor
+    output = torch.empty((M, N), device=x.device, dtype=x.dtype)
+    
+    # Transpose weight for column-major access
+    weight_t = weight.t().contiguous()
+    
+    # Ensure tensors are properly aligned for tensor cores
+    # Ada Lovelace works best with 16-byte alignment
+    if K % 16 != 0:
+        # Pad if needed for optimal tensor core performance
+        padded_K = ((K + 15) // 16) * 16
+        x_padded = torch.nn.functional.pad(x, (0, padded_K - K))
+        weight_padded = torch.nn.functional.pad(weight_t, (0, padded_K - K))
+    else:
+        x_padded = x
+        weight_padded = weight_t
+    
+    # Grid dimensions - 1D launch for better occupancy
+    grid = lambda meta: (triton.cdiv(M, meta['BLOCK_M']) * triton.cdiv(N, meta['BLOCK_N']),)
+    
+    # Launch kernel with optimized parameters
+    fused_gemm_sigmoid_scale_resadd_kernel[grid](
+        x_padded, weight_padded, bias, output,
+        M, N, K,
+        x_padded.stride(0), x_padded.stride(1),
+        weight_padded.stride(0), weight_padded.stride(1),
+        output.stride(0), output.stride(1),
+        scaling_factor=scaling_factor,
+    )
+    
+    return output
+
+class ModelNew(nn.Module):
+    """
+    Model implementing the pattern "Gemm_Sigmoid_Scaling_ResidualAdd".
+    """
+    def __init__(self, input_size, hidden_size, scaling_factor):
+        super(ModelNew, self).__init__()
+        # Initialize weights with proper scaling for better convergence
+        std = (2.0 / (input_size + hidden_size)) ** 0.5
+        self.weight = nn.Parameter(torch.randn(hidden_size, input_size) * std)
+        self.bias = nn.Parameter(torch.zeros(hidden_size))
+        self.scaling_factor = scaling_factor
+
+    def forward(self, x):
+        """
+        Forward pass of the model.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, input_size).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, hidden_size).
+        """
+        return fused_gemm_sigmoid_scale_resadd(
+            x, self.weight, self.bias, self.scaling_factor
+        )
+```
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl, AND any other modules used (e.g., import math if using math.sqrt)
+   2. @triton.jit decorated kernel function(s) — NO continue/break/return inside loops (use masking)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels — THIS CLASS IS REQUIRED
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+3. Learn from previous repair attempts to avoid repeating the same mistakes
+4. Ensure ALL imports are included at the top (common mistake: forgetting `import math`)
+
+```python
+# <corrected code>
+```

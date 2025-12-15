@@ -1,0 +1,212 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+# ------------------------------
+# Triton GEMM: Linear (matmul + bias)
+# ------------------------------
+
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32},
+            num_warps=4,
+        ),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32},
+            num_warps=4,
+        ),
+    ],
+    key=["M", "N", "K"],
+)
+@triton.jit
+def linear_kernel(
+    a_ptr,  # [M, K]
+    b_ptr,  # [K, N]  (weight.T)
+    bias_ptr,  # [N]
+    c_ptr,  # [M, N]
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k in range(0, K, BLOCK_K):
+        k_remaining = K - k
+        a = tl.load(
+            a_ptrs,
+            mask=(offs_m[:, None] < M) & (offs_k[None, :] < k_remaining),
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptrs,
+            mask=(offs_k[:, None] < k_remaining) & (offs_n[None, :] < N),
+            other=0.0,
+        )
+        acc += tl.dot(a, b, allow_tf32=True)
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Add bias
+    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc += bias[None, :]
+
+    # Write output
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    tl.store(
+        c_ptrs,
+        acc,
+        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+    )
+
+
+def triton_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    x: [M, K]
+    weight: [N, K] (same as nn.Linear.weight)
+    bias: [N]
+    returns: [M, N] = x @ weight.T + bias
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+    M, K = x.shape
+    N, Kw = weight.shape
+    assert Kw == K, "in_features mismatch"
+
+    # We use weight.T as [K, N] for GEMM
+    b = weight.t().contiguous()
+    y = torch.empty((M, N), device=x.device, dtype=x.dtype)
+
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_M"]),
+        triton.cdiv(N, META["BLOCK_N"]),
+    )
+
+    linear_kernel[grid](
+        x, b, bias, y,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        b.stride(0), b.stride(1),
+        y.stride(0), y.stride(1),
+    )
+    return y
+
+
+# ------------------------------
+# Triton kernel: MaxPool1d(kernel_size=2, stride=2) + sum + scale
+# Input: [B, L]
+# Output: [B]
+# s[b] = scale * sum_j max(x[b, 2j], x[b, 2j+1])
+# ------------------------------
+
+@triton.jit
+def maxpool_sum_scale_kernel(
+    x_ptr,       # [B, L]
+    out_ptr,     # [B]
+    B,           # batch size
+    L2,          # number of pooled positions = L // 2
+    stride_xb,   # stride over batch dim
+    stride_xl,   # stride over feature dim
+    scale,       # scaling factor (float32)
+    BLOCK_WIN: tl.constexpr,  # number of pooled positions processed per iteration
+):
+    pid_b = tl.program_id(0)
+    if pid_b >= B:
+        return
+
+    offs_win = tl.arange(0, BLOCK_WIN)
+    acc = tl.zeros((), dtype=tl.float32)
+
+    # Iterate over pooled positions in chunks of BLOCK_WIN
+    for start in range(0, L2, BLOCK_WIN):
+        win_idx = start + offs_win  # pooled index j
+        mask = win_idx < L2
+
+        col0 = 2 * win_idx
+        col1 = col0 + 1
+
+        ptr0 = x_ptr + pid_b * stride_xb + col0 * stride_xl
+        ptr1 = x_ptr + pid_b * stride_xb + col1 * stride_xl
+
+        v0 = tl.load(ptr0, mask=mask, other=-float("inf"))
+        v1 = tl.load(ptr1, mask=mask, other=-float("inf"))
+
+        vmax = tl.maximum(v0, v1)
+        acc += tl.sum(vmax, axis=0)
+
+    acc = acc * scale
+    tl.store(out_ptr + pid_b, acc)
+
+
+def triton_maxpool_sum_scale(x: torch.Tensor, scale: float) -> torch.Tensor:
+    """
+    x: [B, L]
+    returns: [B]
+    Implements: MaxPool1d(kernel_size=2, stride=2) on last dim,
+    then sum over pooled dim, then multiply by scale.
+    """
+    assert x.is_cuda
+    B, L = x.shape
+    L2 = L // 2  # floor, matches MaxPool1d(kernel_size=2, stride=2)
+
+    out = torch.empty((B,), device=x.device, dtype=x.dtype)
+    BLOCK_WIN = 128  # power-of-2
+
+    grid = (B,)
+
+    maxpool_sum_scale_kernel[grid](
+        x, out,
+        B, L2,
+        x.stride(0), x.stride(1),
+        float(scale),
+        BLOCK_WIN=BLOCK_WIN,
+    )
+    return out
+
+
+# ------------------------------
+# PyTorch module using Triton kernels
+# ------------------------------
+
+class ModelNew(nn.Module):
+    """
+    Model that performs matrix multiplication, max pooling, sum, and scaling
+    using Triton kernels for the heavy computations.
+    """
+    def __init__(self, in_features, out_features, kernel_size, scale_factor):
+        super(ModelNew, self).__init__()
+        assert kernel_size == 2, "This implementation assumes kernel_size=2"
+        self.in_features = in_features
+        self.out_features = out_features
+        self.scale_factor = float(scale_factor)
+
+        # Parameters analogous to nn.Linear(in_features, out_features)
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.bias = nn.Parameter(torch.randn(out_features))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Ensure CUDA tensors for Triton
+        assert x.is_cuda, "Input must be a CUDA tensor for Triton kernels"
+
+        # Linear: x @ W^T + b
+        x = triton_linear(x, self.weight, self.bias)  # [B, out_features]
+
+        # MaxPool1d(kernel_size=2, stride=2) + sum over last dim + scale
+        x = triton_maxpool_sum_scale(x, self.scale_factor)  # [B]
+
+        return x

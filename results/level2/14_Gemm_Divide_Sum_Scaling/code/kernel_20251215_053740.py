@@ -1,0 +1,133 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 64,  'BLOCK_K': 128, 'SPLIT_K': 1}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_K': 128, 'SPLIT_K': 1}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_K': 256, 'SPLIT_K': 2}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_K': 256, 'SPLIT_K': 2}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_K': 512, 'SPLIT_K': 4}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_K': 512, 'SPLIT_K': 4}, num_warps=8, num_stages=2),
+    ],
+    key=['M', 'K'],
+)
+@triton.jit
+def gemv_scaled_splitk_kernel(
+    x_ptr,          # *float32, shape [M, K]
+    wsum_ptr,       # *float32, shape [K]
+    y_ptr,          # *float32, shape [M]
+    M, K,           # int32
+    stride_xm, stride_xk,
+    stride_ym,
+    alpha,          # float32 scalar (scaling_factor / 2)
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_k = tl.program_id(1)
+
+    # Rows handled by this program
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offs_m < M
+
+    # Accumulator for partial dot-products
+    acc = tl.zeros((BLOCK_M,), dtype=tl.float32)
+
+    # Column indices within a tile
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Split-K range for this program along K
+    K_block = tl.cdiv(K, SPLIT_K)
+    k_start = pid_k * K_block
+    k_end = tl.minimum(k_start + K_block, K)
+
+    k = k_start
+    while k < k_end:
+        k_offsets = k + offs_k
+        mask_k = k_offsets < k_end
+
+        x_ptrs = x_ptr + offs_m[:, None] * stride_xm + k_offsets[None, :] * stride_xk
+        wsum_ptrs = wsum_ptr + k_offsets
+
+        x = tl.load(x_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0)
+        wsum = tl.load(wsum_ptrs, mask=mask_k, other=0.0)
+
+        prod = x * wsum[None, :]
+        acc += tl.sum(prod, axis=1)
+
+        k += BLOCK_K
+
+    # Scale partial result
+    acc = acc * alpha
+
+    # Atomic accumulate into y (Split-K)
+    y_ptrs = y_ptr + offs_m * stride_ym
+    tl.atomic_add(y_ptrs, acc, mask=mask_m)
+
+
+def fused_matmul_div_sum_scale(x: torch.Tensor, weight: torch.Tensor, scaling_factor: float) -> torch.Tensor:
+    """
+    Computes:
+        y = scaling_factor * sum_{h} ( (x @ weight.T)[..., h] / 2 )
+      which is algebraically equal to:
+        y = (scaling_factor / 2) * x @ weight.sum(dim=0)
+    and returns y with shape (batch_size, 1).
+    """
+    assert x.is_cuda and weight.is_cuda, "Inputs must be on CUDA device"
+    assert x.dtype == weight.dtype, "x and weight must have the same dtype"
+
+    M, K = x.shape
+    H, K_w = weight.shape
+    assert K_w == K, "Incompatible shapes between x and weight"
+
+    # Precompute column-wise sum over hidden dimension (on GPU, contiguous for coalescing)
+    weight_sum = weight.sum(dim=0).contiguous()
+
+    # Overall scaling: divide by 2, then multiply by scaling_factor
+    alpha = float(scaling_factor) * 0.5
+
+    # Output buffer; kernel uses atomic_add, so initialize to zeros
+    y = torch.zeros((M,), device=x.device, dtype=x.dtype)
+
+    grid = lambda META: (
+        triton.cdiv(M, META['BLOCK_M']),
+        META['SPLIT_K'],
+    )
+
+    gemv_scaled_splitk_kernel[grid](
+        x,
+        weight_sum,
+        y,
+        M,
+        K,
+        x.stride(0),
+        x.stride(1),
+        y.stride(0),
+        alpha,
+    )
+
+    return y.view(M, 1)
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-accelerated version of the original Model.
+
+    It uses the algebraic identity:
+        sum_h ( (x @ W^T)[b, h] / 2 ) * s
+      = (s / 2) * x[b] · (sum_h W[h])
+    to reduce the computation to a matrix-vector product.
+    """
+
+    def __init__(self, input_size, hidden_size, scaling_factor):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.randn(hidden_size, input_size))
+        self.scaling_factor = scaling_factor
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return fused_matmul_div_sum_scale(x, self.weight, self.scaling_factor)

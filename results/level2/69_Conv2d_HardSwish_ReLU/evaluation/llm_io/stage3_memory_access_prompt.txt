@@ -1,0 +1,216 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU
+GPU Name: 4090
+Architecture: Ada Lovelace
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+[OPTIMIZATION STAGE]
+
+## Current Optimization Stage
+
+Focus: Memory pattern for fused operations.
+
+Key Principle:
+- Fusion benefit = eliminated INTERMEDIATE stores
+- Multiple input loads are OK; intermediate stores are NOT
+
+Rules:
+- ✅ Multiple tl.load() for different inputs (x, weight, bias) - OK
+- ❌ tl.store() for intermediate results - NEVER (this is what fusion eliminates)
+- ✅ Single tl.store() for final output - required
+
+Verification:
+- Count tl.store() calls: should equal number of OUTPUT tensors (usually 1)
+- Intermediate values: must stay in registers between ops
+- If you see store-then-load pattern for same data → BUG, refactor
+
+Multi-input Fusion Pattern:
+```
+x = tl.load(input_ptr + offs, mask=mask)
+w = tl.load(weight_ptr + ..., mask=...)  # OK: different input
+b = tl.load(bias_ptr + ..., mask=...)    # OK: different input
+y = op1(x, w)  # in registers
+z = op2(y, b)  # in registers
+tl.store(out_ptr + offs, z, mask=mask)   # single output store
+```
+
+num_stages: start with 2, only increase if memory stalls high AND registers OK
+
+
+
+[CURRENT CODE]
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+configs = [
+    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32}, num_warps=4),
+    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32}, num_warps=4),
+    triton.Config({'BLOCK_M': 256, 'BLOCK_N': 32}, num_warps=8),
+]
+
+@triton.autotune(configs=configs, key=['N', 'C_out', 'H', 'W'])
+@triton.jit
+def fused_conv_hardswish_relu_kernel(
+    x_ptr, w_ptr, bias_ptr, out_ptr,
+    N, C_in, H, W,
+    C_out, K_H, K_W,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_woc, stride_wic, stride_wkh, stride_wkw,
+    stride_on, stride_oc, stride_oh, stride_ow,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    
+    H_out = H - K_H + 1
+    W_out = W - K_W + 1
+    DHW = H_out * W_out
+    
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    n_idx = offs_m // DHW
+    spatial_idx = offs_m % DHW
+    oh_idx = spatial_idx // W_out
+    ow_idx = spatial_idx % W_out
+    
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    for ic in range(C_in):
+        for kh in range(K_H):
+            for kw in range(K_W):
+                ih = oh_idx + kh
+                iw = ow_idx + kw
+                mask_m = (offs_m < N * DHW) & (ih >= 0) & (ih < H) & (iw >= 0) & (iw < W)
+                
+                x_ptrs = x_ptr + (
+                    n_idx * stride_xn + 
+                    ic * stride_xc + 
+                    ih * stride_xh + 
+                    iw * stride_xw
+                )
+                x_vals = tl.load(x_ptrs, mask=mask_m, other=0.0)
+                
+                w_base = w_ptr + ic * stride_wic + kh * stride_wkh + kw * stride_wkw
+                w_vals = tl.load(w_base + offs_n * stride_woc, mask=offs_n < C_out, other=0.0)
+                
+                acc += x_vals[:, None] * w_vals[None, :]
+    
+    # Fix: Use proper pointer arithmetic with mask
+    if bias_ptr is not None:
+        bias_ptrs = bias_ptr + offs_n
+        bias = tl.load(bias_ptrs, mask=offs_n < C_out, other=0.0)
+        acc += bias[None, :]
+    
+    shifted = acc + 3.0
+    relu6 = tl.minimum(tl.maximum(shifted, 0.0), 6.0)
+    hardswish = acc * relu6 / 6.0
+    out = tl.maximum(hardswish, 0.0)
+    
+    mask_out = (offs_m[:, None] < N * DHW) & (offs_n[None, :] < C_out)
+    out_ptrs = out_ptr + (
+        n_idx[:, None] * stride_on + 
+        offs_n[None, :] * stride_oc + 
+        oh_idx[:, None] * stride_oh + 
+        ow_idx[:, None] * stride_ow
+    )
+    tl.store(out_ptrs, out, mask=mask_out)
+
+
+def fused_conv_hardswish_relu(x, weight, bias, stride=1, padding=0, dilation=1):
+    N, C_in, H, W = x.shape
+    C_out, _, K_H, K_W = weight.shape
+    
+    H_out = H - K_H + 1
+    W_out = W - K_W + 1
+    out = torch.empty((N, C_out, H_out, W_out), device=x.device, dtype=x.dtype)
+    
+    P = N * H_out * W_out
+    
+    grid = lambda META: (
+        triton.cdiv(P, META['BLOCK_M']),
+        triton.cdiv(C_out, META['BLOCK_N']),
+    )
+    
+    weight_contig = weight.contiguous()
+    # Fix: Pass bias tensor directly, not bias.data_ptr()
+    bias_contig = bias.contiguous() if bias is not None else None
+    
+    fused_conv_hardswish_relu_kernel[grid](
+        x, weight_contig, bias_contig, out,
+        N, C_in, H, W,
+        C_out, K_H, K_W,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        weight_contig.stride(0), weight_contig.stride(1),
+        weight_contig.stride(2), weight_contig.stride(3),
+        out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+    )
+    
+    return out
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size):
+        super(ModelNew, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        
+        if isinstance(kernel_size, int):
+            kernel_size = (kernel_size, kernel_size)
+        
+        self.kernel_size = kernel_size
+        self.K_H, self.K_W = kernel_size
+        
+        self.weight = nn.Parameter(
+            torch.randn(out_channels, in_channels, self.K_H, self.K_W)
+        )
+        self.bias = nn.Parameter(torch.randn(out_channels))
+    
+    def forward(self, x):
+        return fused_conv_hardswish_relu(x, self.weight, self.bias)
+```
+
+[NCU PROFILING METRICS]
+{
+  "fused_conv_hardswish_relu_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 92.06,
+    "launch__grid_size": 31752,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 41.33,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 25.17,
+    "lts__t_sector_hit_rate.pct": 90.14
+  }
+}
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+TRITON API CONSTRAINTS (CRITICAL):
+- Triton has NO: tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

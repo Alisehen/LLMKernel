@@ -1,0 +1,428 @@
+```python
+# <optimized Triton code>
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+# -------------------------------------------------------------
+# 1. GEMM + bias: [B, K] @ [N, K]^T -> [B, N]
+#    Fine-tuned for SM89 (Ada, RTX 4090)
+#
+#    NCU shows this as the main bottleneck with low active warps.
+#    We keep the tile shape fixed and autotune only num_warps /
+#    num_stages to reduce compile time and follow the tuning rules:
+#      - Baseline: num_warps=4, num_stages=2  (safe for register
+#        pressure, multi-input fusion A/W/bias)
+#      - Variant 1: num_warps=4, num_stages=3 (higher pipeline depth
+#        if registers allow)
+#      - Variant 2: num_warps=8, num_stages=2 (more parallelism if
+#        register pressure is low)
+# -------------------------------------------------------------
+
+@triton.autotune(
+    configs=[
+        # Conservative baseline
+        triton.Config(
+            {'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+        # Deeper pipelining (if registers allow)
+        triton.Config(
+            {'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=3,
+        ),
+        # Higher parallelism for compute-bound cases
+        triton.Config(
+            {'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32},
+            num_warps=8,
+            num_stages=2,
+        ),
+    ],
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def linear_kernel(
+    a_ptr, w_ptr, bias_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_wn, stride_wk,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """
+    Compute: C = A @ W^T + bias
+    A: [M, K], row-major
+    W: [N, K]  (we treat it as [K, N] via (stride_wk, stride_wn))
+    bias: [N]
+    C: [M, N]
+    """
+
+    tl.static_assert(BLOCK_M % 16 == 0)
+    tl.static_assert(BLOCK_N % 16 == 0)
+    tl.static_assert(BLOCK_K % 8 == 0)
+
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Base pointers for the first K-tile
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    w_ptrs = w_ptr + offs_k[:, None] * stride_wk + offs_n[None, :] * stride_wn
+
+    # Accumulator in FP32
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Main K loop
+    for k in range(0, K, BLOCK_K):
+        k_mask = (k + offs_k) < K
+
+        a = tl.load(
+            a_ptrs,
+            mask=(offs_m[:, None] < M) & k_mask[None, :],
+            other=0.0,
+        )
+        w = tl.load(
+            w_ptrs,
+            mask=k_mask[:, None] & (offs_n[None, :] < N),
+            other=0.0,
+        )
+
+        # Tensor core matmul; allow_tf32 for maximum throughput on Ada
+        acc += tl.dot(a, w, allow_tf32=True)
+
+        a_ptrs += BLOCK_K * stride_ak
+        w_ptrs += BLOCK_K * stride_wk
+
+    # Fused bias add + store
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+
+    bias = tl.load(
+        bias_ptr + offs_n,
+        mask=offs_n < N,
+        other=0.0,
+    )
+    acc += bias[None, :]
+
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    tl.store(c_ptrs, acc, mask=c_mask)
+
+
+# -------------------------------------------------------------
+# 2. GroupNorm over channels for [B, C] + fused row-wise min: [B]
+#
+#    NCU shows this kernel has good occupancy already. We keep
+#    num_warps=4, num_stages=2 (multi-input fusion of x, gamma, beta)
+#    to avoid register pressure explosion and keep atomics amortized.
+# -------------------------------------------------------------
+
+@triton.jit
+def groupnorm_rowmin_kernel(
+    x_ptr,        # [B, C]  (output of GEMM)
+    gamma_ptr,    # [C]
+    beta_ptr,     # [C]
+    mins_ptr,     # [B]     (output: per-row minimum after GroupNorm+affine)
+    B, C, G,
+    channels_per_group,
+    stride_xb, stride_xc,
+    stride_gamma, stride_beta,
+    eps,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    GroupNorm over channels for 2D input [B, C], fused with row-wise minimum.
+
+    Grid:
+      pid in [0, B*G)
+      b = pid // G, g = pid % G
+      One program handles one (b, g) group.
+    """
+    pid = tl.program_id(0)
+    b = pid // G
+    g = pid % G
+
+    if b >= B:
+        return
+
+    offs = tl.arange(0, BLOCK_SIZE)
+    c_idx = g * channels_per_group + offs
+
+    # Mask over channels within this group
+    valid_ch = (offs < channels_per_group) & (c_idx < C)
+
+    # Load group slice
+    x = tl.load(
+        x_ptr + b * stride_xb + c_idx * stride_xc,
+        mask=valid_ch,
+        other=0.0,
+    )
+
+    group_size = channels_per_group
+
+    # Compute mean and variance over the group
+    mean = tl.sum(x, axis=0) / group_size
+    mean2 = tl.sum(x * x, axis=0) / group_size
+    var = mean2 - mean * mean
+    inv_std = 1.0 / tl.sqrt(var + eps)
+
+    x_hat = (x - mean) * inv_std
+
+    # Affine parameters
+    gamma = tl.load(
+        gamma_ptr + c_idx * stride_gamma,
+        mask=valid_ch,
+        other=1.0,
+    )
+    beta = tl.load(
+        beta_ptr + c_idx * stride_beta,
+        mask=valid_ch,
+        other=0.0,
+    )
+
+    y = x_hat * gamma + beta
+
+    # Compute this group's contribution to the row-wise minimum.
+    large = 1e30
+    y_masked = tl.where(valid_ch, y, large)
+    group_min = tl.min(y_masked, axis=0)
+
+    # Atomically accumulate into per-row minima.
+    tl.atomic_min(mins_ptr + b, group_min)
+
+
+# -------------------------------------------------------------
+# 3. Broadcast outer-sum: [B] + [C] -> [1, C, B, 1]
+#
+#    This kernel is light; NCU shows low SM utilization, so we can
+#    afford aggressive parallelism. We keep the workshape fixed and
+#    autotune only num_warps / num_stages:
+#      - Baseline: 4 warps, 2 stages
+#      - Variant:  8 warps, 3 stages (low register pressure, helps
+#                  hide latency when B,C are large)
+# -------------------------------------------------------------
+
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {'BLOCK_C': 64, 'BLOCK_B': 64},
+            num_warps=4,
+            num_stages=2,
+        ),
+        triton.Config(
+            {'BLOCK_C': 64, 'BLOCK_B': 64},
+            num_warps=8,
+            num_stages=3,
+        ),
+    ],
+    key=['C', 'B'],
+)
+@triton.jit
+def broadcast_add_bias_kernel(
+    min_ptr,     # [B]
+    bias_ptr,    # [C]
+    out_ptr,     # [1, C, B, 1]
+    B, C,
+    stride_min,
+    stride_bias,
+    stride_o0, stride_o1, stride_o2, stride_o3,
+    BLOCK_C: tl.constexpr, BLOCK_B: tl.constexpr,
+):
+    """
+    Compute outer sum:
+      out[0, c, b, 0] = min_vals[b] + bias[c]
+    Shapes:
+      min_vals: [B]
+      bias:     [C]
+      out:      [1, C, B, 1]
+    """
+    pid_c = tl.program_id(0)
+    pid_b = tl.program_id(1)
+
+    offs_c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
+    offs_b = pid_b * BLOCK_B + tl.arange(0, BLOCK_B)
+
+    mask_c = offs_c < C
+    mask_b = offs_b < B
+    mask = mask_c[:, None] & mask_b[None, :]
+
+    bias_vals = tl.load(
+        bias_ptr + offs_c * stride_bias,
+        mask=mask_c,
+        other=0.0,
+    )
+    min_vals = tl.load(
+        min_ptr + offs_b * stride_min,
+        mask=mask_b,
+        other=0.0,
+    )
+
+    # Outer sum: [BLOCK_C, BLOCK_B]
+    res = bias_vals[:, None] + min_vals[None, :]
+
+    out_ptrs = (
+        out_ptr
+        + offs_c[:, None] * stride_o1
+        + offs_b[None, :] * stride_o2
+    )
+    tl.store(out_ptrs, res, mask=mask)
+
+
+# -------------------------------------------------------------
+# 4. Python wrapper: kernel launch + grid calculation
+# -------------------------------------------------------------
+
+def fused_linear_groupnorm_min_bias(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    linear_bias: torch.Tensor,
+    gn_weight: torch.Tensor,
+    gn_bias: torch.Tensor,
+    num_groups: int,
+    final_bias: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """
+    x:          [B, in_features]
+    weight:     [out_features, in_features]
+    linear_bias:[out_features]
+    gn_weight:  [out_features]
+    gn_bias:    [out_features]
+    final_bias: [1, out_features, 1, 1]
+
+    Returns:
+      out: [1, out_features, B, 1]
+
+    Pipeline:
+      1) GEMM + bias       (Triton, tensor-core, tf32)
+      2) GroupNorm + min   (fused in one Triton kernel; no y_norm writes)
+      3) Broadcast + bias  (Triton)
+    """
+    assert x.is_cuda and weight.is_cuda and final_bias.is_cuda
+    B, K = x.shape
+    N = weight.shape[0]
+    C = N
+    assert gn_weight.shape[0] == C
+    assert gn_bias.shape[0] == C
+    assert C % num_groups == 0
+    channels_per_group = C // num_groups
+
+    # -----------------------------
+    # 1) GEMM + bias: [B, K] @ [K, N] -> [B, N]
+    # -----------------------------
+    y = torch.empty((B, N), device=x.device, dtype=torch.float32)
+
+    def grid_linear(meta):
+        return (
+            triton.cdiv(B, meta['BLOCK_M']),
+            triton.cdiv(N, meta['BLOCK_N']),
+        )
+
+    linear_kernel[grid_linear](
+        x, weight, linear_bias, y,
+        B, N, K,
+        x.stride(0), x.stride(1),
+        weight.stride(0), weight.stride(1),
+        y.stride(0), y.stride(1),
+    )
+
+    # -----------------------------
+    # 2) GroupNorm over channels + fused row-wise min: [B, C] -> [B]
+    # -----------------------------
+    # Initialize row-wise minima with a large value for atomic_min
+    mins = torch.full(
+        (B,),
+        1e30,
+        device=x.device,
+        dtype=torch.float32,
+    )
+
+    # Choose BLOCK_SIZE as next power-of-two ≥ channels_per_group for efficient reductions
+    BLOCK_SIZE = min(
+        1024,  # Triton max vector length
+        1 << (channels_per_group - 1).bit_length(),
+    )
+
+    grid_gn = (B * num_groups,)
+
+    groupnorm_rowmin_kernel[grid_gn](
+        y,
+        gn_weight,
+        gn_bias,
+        mins,
+        B, C, num_groups,
+        channels_per_group,
+        y.stride(0), y.stride(1),
+        gn_weight.stride(0), gn_bias.stride(0),
+        eps,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=4,     # high occupancy, good balance per NCU
+        num_stages=2,    # safer for multi-input fusion (x, gamma, beta)
+    )
+
+    # -----------------------------
+    # 3) Broadcast add with final bias: [1, C, B, 1]
+    # -----------------------------
+    out = torch.empty((1, C, B, 1), device=x.device, dtype=torch.float32)
+    bias_vec = final_bias.view(C)
+
+    def grid_bcast(meta):
+        return (
+            triton.cdiv(C, meta['BLOCK_C']),
+            triton.cdiv(B, meta['BLOCK_B']),
+        )
+
+    broadcast_add_bias_kernel[grid_bcast](
+        mins,
+        bias_vec,
+        out,
+        B, C,
+        mins.stride(0),
+        bias_vec.stride(0),
+        out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+    )
+
+    return out
+
+
+# -------------------------------------------------------------
+# 5. nn.Module wrapper
+# -------------------------------------------------------------
+
+class ModelNew(nn.Module):
+    """
+    Model that performs:
+      Linear (GEMM) -> GroupNorm -> min over channels -> bias add (broadcast)
+    Implemented with aggressively optimized Triton kernels.
+
+    Key optimizations:
+      - GEMM autotunes num_warps / num_stages on a fixed tensor-core-
+        friendly tile for SM89, as suggested by the NCU profile.
+      - GroupNorm and row-wise min are fused into a single kernel.
+      - Broadcast add is autotuned with a high-parallelism variant.
+    """
+
+    def __init__(self, in_features, out_features, num_groups, bias_shape):
+        super(ModelNew, self).__init__()
+        self.gemm = nn.Linear(in_features, out_features)
+        self.group_norm = nn.GroupNorm(num_groups, out_features)
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return fused_linear_groupnorm_min_bias(
+            x,
+            self.gemm.weight,
+            self.gemm.bias,
+            self.group_norm.weight,
+            self.group_norm.bias,
+            self.group_norm.num_groups,
+            self.bias,
+            self.group_norm.eps,
+        )
+```

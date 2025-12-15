@@ -1,0 +1,5 @@
+{
+  "critical_issue": "Using unsupported tensor indexing `b_mask_n[0, :]` in Triton mask for tl.load.",
+  "why_it_matters": "Triton tensors don’t support Python-style slicing with constexpr indices, so `b_mask_n[0, :]` triggers a compilation ValueError before the kernel can run.",
+  "minimal_fix_hint": "Avoid slicing; use a 1D mask like `offs_n < N` directly in tl.load instead of `b_mask_n[0, :]`."
+}

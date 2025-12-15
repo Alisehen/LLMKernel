@@ -1,0 +1,344 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_warps=2, num_stages=2),
+    ],
+    key=['N', 'C_out', 'H_out', 'W_out'],
+)
+@triton.jit
+def conv2d_sub1_tanh_kernel(
+    x_ptr, w_ptr, b_ptr, y_ptr,
+    N, H_in, W_in,
+    H_out, W_out,
+    P,                      # N * H_out * W_out
+    subtract1,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_wo, stride_wi, stride_wk_h, stride_wk_w,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    C_in: tl.constexpr,     # in_channels
+    C_out: tl.constexpr,    # out_channels
+    K_H: tl.constexpr,      # kernel height
+    K_W: tl.constexpr,      # kernel width
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """
+    Fused Conv2d -> bias -> subtract1 -> tanh.
+
+    Implicit-GEMM layout:
+      M = N * H_out * W_out         (flattened output positions)
+      N = C_out                     (output channels)
+      K = C_in * K_H * K_W          (reduction dim)
+
+    Grid:
+      pid_m over M, pid_n over N.
+    """
+    pid_m = tl.program_id(0)  # over flattened output positions
+    pid_n = tl.program_id(1)  # over output channels
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    mask_m = offs_m < P
+    mask_n = offs_n < C_out
+    mn_mask = mask_m[:, None] & mask_n[None, :]
+
+    HW_out = H_out * W_out
+
+    # Decode flat output index -> (n, oh, ow)
+    n_idx = offs_m // HW_out
+    rem = offs_m % HW_out
+    oh_idx = rem // W_out
+    ow_idx = rem % W_out
+
+    # Base input pointers for the top-left of each convolution window [BLOCK_M, 1]
+    base_x_ptrs = (
+        x_ptr
+        + n_idx[:, None] * stride_xn
+        + oh_idx[:, None] * stride_xh
+        + ow_idx[:, None] * stride_xw
+    )
+
+    # Base weight pointers for each output channel [1, BLOCK_N]
+    base_w_ptrs = w_ptr + offs_n[None, :] * stride_wo
+
+    # Accumulator over [BLOCK_M, BLOCK_N]
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Convolution as matmul: loop over K dimension in BLOCK_K chunks
+    K_HW = K_H * K_W
+    K_total = C_in * K_HW
+
+    for k_start in range(0, K_total, BLOCK_K):
+        offs_k = k_start + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < K_total
+
+        # Decode K index -> (ic, kh, kw)
+        ic = offs_k // K_HW
+        rem_k = offs_k % K_HW
+        kh = rem_k // K_W
+        kw = rem_k % K_W
+
+        # Input tile [BLOCK_M, BLOCK_K]
+        x_offsets_k = (
+            ic[None, :] * stride_xc
+            + kh[None, :] * stride_xh
+            + kw[None, :] * stride_xw
+        )
+        x_ptrs = base_x_ptrs + x_offsets_k
+        x_mask = mask_m[:, None] & mask_k[None, :]
+        x_block = tl.load(x_ptrs, mask=x_mask, other=0.0)
+
+        # Weight tile [BLOCK_K, BLOCK_N]
+        w_offsets_k = (
+            ic[:, None] * stride_wi
+            + kh[:, None] * stride_wk_h
+            + kw[:, None] * stride_wk_w
+        )
+        w_ptrs = base_w_ptrs + w_offsets_k
+        w_mask = mask_k[:, None] & mask_n[None, :]
+        w_block = tl.load(w_ptrs, mask=w_mask, other=0.0)
+
+        # FMA over K
+        acc += tl.dot(x_block, w_block)
+
+    # Fused epilogue: bias -> subtract1 -> tanh (in-place to reduce registers)
+    b_vals = tl.load(b_ptr + offs_n, mask=mask_n, other=0.0)  # [BLOCK_N]
+    acc += b_vals[None, :]
+    acc -= subtract1
+
+    # tanh(x) = (e^{2x} - 1) / (e^{2x} + 1)
+    tmp = 2.0 * acc
+    tmp = tl.exp(tmp)
+    acc = (tmp - 1.0) / (tmp + 1.0)
+
+    # Store output
+    y_ptrs = (
+        y_ptr
+        + n_idx[:, None] * stride_yn
+        + offs_n[None, :] * stride_yc
+        + oh_idx[:, None] * stride_yh
+        + ow_idx[:, None] * stride_yw
+    )
+    tl.store(y_ptrs, acc, mask=mn_mask)
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32}, num_warps=2, num_stages=2),
+    ],
+    key=['N', 'C', 'H_out', 'W_out'],
+)
+@triton.jit
+def avgpool2d_sub2_kernel(
+    x_ptr, y_ptr,
+    N, C, H_in, W_in,
+    H_out, W_out,
+    P_out,                 # N * H_out * W_out
+    pool_k: tl.constexpr,
+    subtract2,
+    denom,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """
+    Fused AvgPool2d (kernel=pool_k, stride=pool_k, no padding) + subtract2.
+
+    We exploit: mean(x - subtract2) == mean(x) - subtract2
+    so subtract2 is applied *after* pooling to save math in the inner loops.
+    """
+    pid_m = tl.program_id(0)  # flattened (N, H_out, W_out)
+    pid_n = tl.program_id(1)  # channels
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    mask_m = offs_m < P_out
+    mask_n = offs_n < C
+    mn_mask = mask_m[:, None] & mask_n[None, :]
+
+    HW_out = H_out * W_out
+    n_idx = offs_m // HW_out
+    rem = offs_m % HW_out
+    oh_idx = rem // W_out
+    ow_idx = rem % W_out
+
+    # Top-left corner of each pooling window in input space
+    h0 = oh_idx * pool_k
+    w0 = ow_idx * pool_k
+
+    # Base pointer for each output position and channel [BLOCK_M, BLOCK_N]
+    base_x_ptrs = (
+        x_ptr
+        + n_idx[:, None] * stride_xn
+        + offs_n[None, :] * stride_xc
+        + h0[:, None] * stride_xh
+        + w0[:, None] * stride_xw
+    )
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Non-overlapping tiles, in-bounds by construction -> no spatial bounds checks
+    for ph in range(0, pool_k):
+        for pw in range(0, pool_k):
+            x_ptrs = base_x_ptrs + ph * stride_xh + pw * stride_xw
+            vals = tl.load(x_ptrs, mask=mn_mask, other=0.0)
+            acc += vals
+
+    # Average and fused subtract2 (mean(x - subtract2) = mean(x) - subtract2)
+    acc = acc * denom - subtract2
+
+    y_ptrs = (
+        y_ptr
+        + n_idx[:, None] * stride_yn
+        + offs_n[None, :] * stride_yc
+        + oh_idx[:, None] * stride_yh
+        + ow_idx[:, None] * stride_yw
+    )
+    tl.store(y_ptrs, acc, mask=mn_mask)
+
+
+def conv2d_sub1_tanh_triton(x, weight, bias, subtract1_value):
+    """
+    x:       [N, C_in, H_in, W_in], float32
+    weight:  [C_out, C_in, K_H, K_W], float32
+    bias:    [C_out], float32
+    Returns: [N, C_out, H_out, W_out]
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+    assert x.dtype == weight.dtype == bias.dtype == torch.float32
+
+    N, C_in, H_in, W_in = x.shape
+    C_out, C_in_w, K_H, K_W = weight.shape
+    assert C_in_w == C_in, "Inconsistent in_channels"
+    assert K_H == K_W, "Only square kernels supported"
+
+    # Valid conv, stride=1, no padding
+    H_out = H_in - K_H + 1
+    W_out = W_in - K_W + 1
+    assert H_out > 0 and W_out > 0
+
+    y = torch.empty((N, C_out, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    P = N * H_out * W_out
+
+    def grid(META):
+        return (
+            triton.cdiv(P, META['BLOCK_M']),
+            triton.cdiv(C_out, META['BLOCK_N']),
+        )
+
+    conv2d_sub1_tanh_kernel[grid](
+        x, weight, bias, y,
+        N, H_in, W_in,
+        H_out, W_out,
+        P,
+        float(subtract1_value),
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        weight.stride(0), weight.stride(1), weight.stride(2), weight.stride(3),
+        y.stride(0), y.stride(1), y.stride(2), y.stride(3),
+        C_in=C_in,
+        C_out=C_out,
+        K_H=K_H,
+        K_W=K_W,
+    )
+
+    return y
+
+
+def avgpool2d_sub2_triton(x, subtract2_value, kernel_size_pool):
+    """
+    x: [N, C, H_in, W_in]
+    AvgPool2d with kernel_size=kernel_size_pool, stride=kernel_size_pool, padding=0.
+    subtract2_value is applied after pooling (mathematically equivalent to subtracting before).
+    """
+    assert x.is_cuda
+
+    N, C, H_in, W_in = x.shape
+    k = int(kernel_size_pool)
+
+    # PyTorch-style AvgPool2d (no padding, stride=k, dilation=1)
+    H_out = (H_in - k) // k + 1
+    W_out = (W_in - k) // k + 1
+    assert H_out > 0 and W_out > 0
+
+    y = torch.empty((N, C, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    P_out = N * H_out * W_out
+    denom = float(1.0 / (k * k))
+
+    def grid(META):
+        return (
+            triton.cdiv(P_out, META['BLOCK_M']),
+            triton.cdiv(C, META['BLOCK_N']),
+        )
+
+    avgpool2d_sub2_kernel[grid](
+        x, y,
+        N, C, H_in, W_in,
+        H_out, W_out,
+        P_out,
+        k,
+        float(subtract2_value),
+        denom,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        y.stride(0), y.stride(1), y.stride(2), y.stride(3),
+    )
+
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Triton implementation of:
+        Conv2d -> subtract(subtract1_value) -> tanh -> subtract(subtract2_value) -> AvgPool2d
+
+    Assumptions:
+        - Conv2d: stride=1, padding=0, dilation=1, groups=1
+        - kernel_size is an integer (square kernel)
+        - AvgPool2d: kernel_size=kernel_size_pool, stride=kernel_size_pool, padding=0
+        - All tensors are float32
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size,
+                 subtract1_value, subtract2_value, kernel_size_pool):
+        super(ModelNew, self).__init__()
+        if isinstance(kernel_size, tuple):
+            assert kernel_size[0] == kernel_size[1], "Only square kernels supported"
+            kernel_size = kernel_size[0]
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = int(kernel_size)
+        self.kernel_size_pool = int(kernel_size_pool)
+
+        self.weight = nn.Parameter(
+            torch.randn(out_channels, in_channels, self.kernel_size, self.kernel_size)
+        )
+        self.bias = nn.Parameter(torch.randn(out_channels))
+
+        self.subtract1_value = float(subtract1_value)
+        self.subtract2_value = float(subtract2_value)
+
+    def forward(self, x):
+        x = x.contiguous()
+        w = self.weight.contiguous()
+        b = self.bias.contiguous()
+
+        y = conv2d_sub1_tanh_triton(x, w, b, self.subtract1_value)
+        y = avgpool2d_sub2_triton(y, self.subtract2_value, self.kernel_size_pool)
+        return y
+```

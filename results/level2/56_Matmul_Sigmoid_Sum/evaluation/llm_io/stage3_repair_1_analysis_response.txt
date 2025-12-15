@@ -1,0 +1,5 @@
+{
+  "critical_issue": "The kernel uses the nn.Linear weight in the wrong orientation, effectively computing x @ weight instead of x @ weight.T.",
+  "why_it_matters": "This mismatched weight layout makes every matmul element differ from PyTorch’s reference, so all downstream sigmoid and sums deviate massively, producing the large absolute errors observed.",
+  "minimal_fix_hint": "Change the matmul to use weight.T (or swap weight’s strides) so it exactly matches x @ weight.T."
+}

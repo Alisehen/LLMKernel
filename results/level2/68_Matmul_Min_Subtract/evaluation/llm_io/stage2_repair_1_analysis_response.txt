@@ -1,0 +1,5 @@
+{
+  "critical_issue": "grid function returns a plain int instead of a tuple of grid dimensions",
+  "why_it_matters": "Triton’s jit.run calls len(grid); ints have no length, causing TypeError before the kernel can launch or be benchmarked.",
+  "minimal_fix_hint": "Make grid(meta) return a tuple, e.g. (triton.cdiv(M, meta['BLOCK_M']) * triton.cdiv(N, meta['BLOCK_N']),)."
+}

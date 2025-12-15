@@ -1,0 +1,216 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+import math
+
+
+@triton.jit
+def swish_activation(x):
+    """Swish activation: x * sigmoid(x)"""
+    sigmoid = 1.0 / (1.0 + tl.exp(-x))
+    return x * sigmoid
+
+
+@triton.jit
+def hardswish_activation(x):
+    """HardSwish activation: x * relu6(x + 3) / 6"""
+    # Compute relu6(x + 3) - clip between 0 and 6
+    x_plus_3 = x + 3.0
+    relu6 = tl.where(x_plus_3 < 0.0, 0.0, 
+                    tl.where(x_plus_3 > 6.0, 6.0, x_plus_3))
+    return x * relu6 / 6.0
+
+
+@triton.jit
+def fused_swish_groupnorm_hardswish_kernel(
+    x_ptr,
+    weight_ptr,
+    bias_ptr,
+    out_ptr,
+    N, C, D, H, W,
+    groups,
+    eps,
+    stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
+    BLOCK_C: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Fused kernel: Swish + GroupNorm + HardSwish
+    Input: [N, C, D, H, W], groups for GroupNorm
+    Output: [N, C, D, H, W]
+    
+    Each program processes one group in one sample across all spatial positions.
+    We use program_id(0) for batch, program_id(1) for groups.
+    """
+    pid_n = tl.program_id(0)  # batch index
+    pid_g = tl.program_id(1)  # group index
+    
+    if pid_n >= N or pid_g >= groups:
+        return
+    
+    # Calculate group parameters
+    group_size = C // groups
+    start_c = pid_g * group_size
+    end_c = start_c + group_size
+    
+    # Offsets for channels in this group
+    offs_c = tl.arange(0, BLOCK_C)
+    c_mask = (start_c + offs_c < end_c)
+    
+    # Precompute spatial dimensions
+    DHW = D * H * W
+    offs_spatial = tl.arange(0, BLOCK_SIZE)
+    
+    # Step 1: Compute mean and variance for the group
+    # We accumulate across all spatial positions and channels in the group
+    sum_val = tl.zeros((BLOCK_C,), dtype=tl.float32)
+    sum_sq = tl.zeros((BLOCK_C,), dtype=tl.float32)
+    count = 0
+    
+    for spatial_base in range(0, DHW, BLOCK_SIZE):
+        spatial_offs = spatial_base + offs_spatial
+        spatial_mask = spatial_offs < DHW
+        
+        # Reconstruct spatial indices
+        d_idx = spatial_offs // (H * W)
+        h_idx = (spatial_offs % (H * W)) // W
+        w_idx = spatial_offs % W
+        
+        # Accumulate across all channels in the group
+        for c in range(group_size):
+            c_idx = start_c + c
+            if c_idx >= C:
+                break
+                
+            # Calculate pointer offsets
+            x_ptrs = (x_ptr + 
+                     pid_n * stride_xn + 
+                     c_idx * stride_xc +
+                     d_idx * stride_xd +
+                     h_idx * stride_xh +
+                     w_idx * stride_xw)
+            
+            # Load and apply Swish
+            x_vals = tl.load(x_ptrs, mask=spatial_mask, other=0.0)
+            x_swish = swish_activation(x_vals)
+            
+            # Accumulate for mean and variance
+            sum_val = tl.where(c_mask & (offs_c == c), sum_val + tl.sum(x_swish, axis=0), sum_val)
+            sum_sq = tl.where(c_mask & (offs_c == c), sum_sq + tl.sum(x_swish * x_swish, axis=0), sum_sq)
+        
+        count += tl.sum(spatial_mask) * tl.sum(c_mask)
+    
+    # Compute mean and variance for the group
+    group_mean = tl.sum(sum_val) / (count + eps)
+    group_var = tl.sum(sum_sq) / (count + eps) - group_mean * group_mean
+    
+    # Step 2: Apply normalization and activations
+    for spatial_base in range(0, DHW, BLOCK_SIZE):
+        spatial_offs = spatial_base + offs_spatial
+        spatial_mask = spatial_offs < DHW
+        
+        # Reconstruct spatial indices
+        d_idx = spatial_offs // (H * W)
+        h_idx = (spatial_offs % (H * W)) // W
+        w_idx = spatial_offs % W
+        
+        for c in range(group_size):
+            c_idx = start_c + c
+            if c_idx >= C:
+                break
+                
+            # Load input
+            x_ptrs = (x_ptr + 
+                     pid_n * stride_xn + 
+                     c_idx * stride_xc +
+                     d_idx * stride_xd +
+                     h_idx * stride_xh +
+                     w_idx * stride_xw)
+            
+            x_vals = tl.load(x_ptrs, mask=spatial_mask, other=0.0)
+            
+            # Apply Swish
+            x_swish = swish_activation(x_vals)
+            
+            # Apply GroupNorm
+            x_norm = (x_swish - group_mean) / tl.sqrt(group_var + eps)
+            
+            # Load weight and bias for this channel
+            weight = tl.load(weight_ptr + c_idx)
+            bias = tl.load(bias_ptr + c_idx)
+            
+            # Apply affine transformation
+            x_gn = x_norm * weight + bias
+            
+            # Apply HardSwish
+            x_final = hardswish_activation(x_gn)
+            
+            # Store result
+            out_ptrs = (out_ptr + 
+                       pid_n * stride_xn + 
+                       c_idx * stride_xc +
+                       d_idx * stride_xd +
+                       h_idx * stride_xh +
+                       w_idx * stride_xw)
+            
+            tl.store(out_ptrs, x_final, mask=spatial_mask)
+
+
+def fused_post_convtranspose_3d(x, weight, bias, groups, eps):
+    """
+    Fused: Swish + GroupNorm + HardSwish for 5D tensors
+    """
+    N, C, D, H, W = x.shape
+    out = torch.empty_like(x)
+    
+    # Choose block sizes (powers of 2)
+    BLOCK_C = triton.next_power_of_2(C // groups)
+    BLOCK_SIZE = 128  # Spatial block size
+    
+    # Grid: (batch, groups)
+    grid = (N, groups)
+    
+    fused_swish_groupnorm_hardswish_kernel[grid](
+        x, weight, bias, out,
+        N, C, D, H, W,
+        groups, eps,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
+        BLOCK_C=BLOCK_C,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    ConvTranspose3d (PyTorch native) + Fused post-ops (Triton)
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, groups, eps, bias=True):
+        super(ModelNew, self).__init__()
+        # Keep ConvTranspose3d as PyTorch native
+        self.conv_transpose = nn.ConvTranspose3d(
+            in_channels, out_channels, kernel_size, 
+            stride=stride, padding=padding, bias=bias
+        )
+        
+        # GroupNorm parameters - we'll use these in the fused kernel
+        self.group_norm = nn.GroupNorm(num_groups=groups, num_channels=out_channels, eps=eps)
+        self.groups = groups
+        self.eps = eps
+
+    def forward(self, x):
+        # Step 1: PyTorch native ConvTranspose3d
+        x = self.conv_transpose(x)
+        
+        # Step 2: Fused post-ops in Triton
+        x = fused_post_convtranspose_3d(
+            x, 
+            self.group_norm.weight, 
+            self.group_norm.bias,
+            self.groups,
+            self.eps
+        )
+        
+        return x

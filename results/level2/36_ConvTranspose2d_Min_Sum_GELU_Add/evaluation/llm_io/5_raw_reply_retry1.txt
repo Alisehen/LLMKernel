@@ -1,0 +1,98 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def fused_min_sum_gelu_bias_kernel(
+    x_ptr,
+    bias_ptr,
+    out_ptr,
+    N, C, H, W,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_on, stride_ow,
+    BLOCK_H: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    num_stages: tl.constexpr = 2,
+):
+    pid_n = tl.program_id(0)
+    pid_w = tl.program_id(1)
+    
+    offs_h = tl.arange(0, BLOCK_H)
+    h_mask = offs_h < H
+    
+    min_vals = tl.full((BLOCK_H,), float('inf'), dtype=tl.float32)
+    
+    x_ptr_n = x_ptr + pid_n * stride_xn + pid_w * stride_xw
+    bias_val = tl.load(bias_ptr)
+    
+    for c_block in range(0, C, BLOCK_C):
+        offs_c = tl.arange(0, BLOCK_C) + c_block
+        c_mask = offs_c < C
+        
+        x_ptrs = x_ptr_n + offs_c[:, None] * stride_xc + offs_h[None, :] * stride_xh
+        x_block = tl.load(x_ptrs, mask=c_mask[:, None] & h_mask[None, :], other=float('inf'))
+        
+        block_min = tl.min(x_block, axis=0)
+        min_vals = tl.minimum(min_vals, block_min)
+    
+    valid_min_vals = tl.where(h_mask, min_vals, 0.0)
+    sum_val = tl.sum(valid_min_vals, axis=0)
+    
+    # Optimized GELU approximation (fused operations)
+    sqrt_2_over_pi = 0.7978845608028654
+    gelu_coef = 0.044715
+    
+    x2 = sum_val * sum_val
+    x3 = x2 * sum_val
+    inner = sqrt_2_over_pi * (sum_val + gelu_coef * x3)
+    
+    # Fast tanh approximation: 1 + tanh(x) = 2/(1 + exp(-2x))
+    exp_val = tl.exp(-2.0 * inner)
+    gelu_result = sum_val / (1.0 + exp_val)  # 0.5 * x * (2/(1+exp(-2x))) = x/(1+exp(-2x))
+    
+    result = gelu_result + bias_val
+    
+    out_ptr_nw = out_ptr + pid_n * stride_on + pid_w * stride_ow
+    tl.store(out_ptr_nw, result)
+
+
+def fused_post_convtranspose(x, bias):
+    N, C, H, W = x.shape
+    
+    out = torch.empty((N, 1, 1, W), device=x.device, dtype=x.dtype)
+    
+    BLOCK_H = min(triton.next_power_of_2(H), 32)
+    BLOCK_C = 128
+    
+    grid = (N, W)
+    
+    fused_min_sum_gelu_bias_kernel[grid](
+        x, bias, out,
+        N, C, H, W,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        out.stride(0), out.stride(3),
+        BLOCK_H=BLOCK_H,
+        BLOCK_C=BLOCK_C,
+        num_stages=2,
+    )
+    
+    return out
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, bias_shape):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose2d(
+            in_channels, out_channels, kernel_size, 
+            stride, padding, output_padding
+        )
+        self.bias = nn.Parameter(torch.randn(1))
+        
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = fused_post_convtranspose(x, self.bias)
+        return x
+```
