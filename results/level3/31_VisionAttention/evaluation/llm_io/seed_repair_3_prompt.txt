@@ -1,0 +1,299 @@
+Fix the Triton kernel errors. Generate correct, high-performance code.
+
+Current Error Log:
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 659, in compare_and_bench
+    ref_t  = _bench(ref_model,  inp, dev, warmup, repeat)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 148, in _bench
+    model(*inp)
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/KernelBench/p/31_VisionAttention.py", line 24, in forward
+    attn_output, _ = self.attn(x, x, x)
+                     ^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/activation.py", line 1488, in forward
+    attn_output, attn_output_weights = F.multi_head_attention_forward(
+                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/functional.py", line 6450, in multi_head_attention_forward
+    attn_output_weights = torch.bmm(q_scaled, k.transpose(-2, -1))
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 8.00 GiB. GPU 0 has a total capacity of 23.52 GiB of which 6.83 GiB is free. Including non-PyTorch memory, this process has 16.62 GiB memory in use. Of the allocated memory 8.27 GiB is allocated by PyTorch, and 7.88 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+
+Main Critical Problem Analysis:
+Problem Analysis (from expert diagnosis):
+critical_issue: The reference nn.MultiheadAttention builds a dense [B*num_heads, S, S] attention matrix with S=H*W=16384, which alone requires ~8 GiB and exhausts GPU memory.
+why_it_matters: torch.bmm(q_scaled, k.transpose(-2, -1)) allocates this huge S×S tensor, matching the 8.00 GiB allocation in the traceback, so the run OOMs before the Triton kernel is used.
+minimal_fix_hint: Avoid dense S×S attention in the reference path—use a memory-efficient (FlashAttention-style) implementation or reduce H*W so S² comfortably fits GPU memory.
+
+Focus your fix on addressing the identified critical issue.
+
+
+Broken Code:
+```python
+# <corrected code>
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+import math
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_D': 64}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_D': 64}, num_warps=8, num_stages=2),
+    ],
+    key=['S'],
+)
+@triton.jit
+def mha_fwd_kernel(
+    q_ptr, k_ptr, v_ptr, o_ptr,
+    stride_qbh, stride_qm, stride_qd,
+    stride_kbh, stride_km, stride_kd,
+    stride_vbh, stride_vm, stride_vd,
+    stride_obh, stride_om, stride_od,
+    BH, S, D, scale,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr,
+):
+    """
+    Fused scaled dot-product attention kernel (FlashAttention-style):
+
+    Inputs:
+      Q, K, V: [BH, S, D]
+    Output:
+      O: [BH, S, D]
+
+    Softmax is along the sequence dimension S for each query position.
+    """
+    pid_bh = tl.program_id(0)  # batch_head index
+    pid_m = tl.program_id(1)   # query block index
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # [BLOCK_M] query indices
+    offs_d = tl.arange(0, BLOCK_D)                    # [BLOCK_D] head_dim tile indices
+
+    # Validity masks
+    q_valid = offs_m < S
+    d_valid = offs_d < D
+
+    # Pointers for Q block: shape [BLOCK_M, BLOCK_D]
+    q_ptrs = (
+        q_ptr
+        + pid_bh * stride_qbh
+        + offs_m[:, None] * stride_qm
+        + offs_d[None, :] * stride_qd
+    )
+    q = tl.load(q_ptrs, mask=q_valid[:, None] & d_valid[None, :], other=0.0)
+    q = tl.cast(q, tl.float32)
+
+    # Running stats for streaming softmax
+    m_i = tl.full((BLOCK_M,), -1e9, dtype=tl.float32)      # logit max per row
+    l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)           # sum of exp per row
+    acc = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)   # accumulated output
+
+    offs_n = tl.arange(0, BLOCK_N)  # key indices per block
+
+    for n_start in range(0, S, BLOCK_N):
+        k_idx = n_start + offs_n  # [BLOCK_N]
+        k_valid = k_idx < S
+
+        # K block: [BLOCK_N, BLOCK_D]
+        k_ptrs = (
+            k_ptr
+            + pid_bh * stride_kbh
+            + k_idx[:, None] * stride_km
+            + offs_d[None, :] * stride_kd
+        )
+        k = tl.load(k_ptrs, mask=k_valid[:, None] & d_valid[None, :], other=0.0)
+        k = tl.cast(k, tl.float32)
+
+        # V block: [BLOCK_N, BLOCK_D]
+        v_ptrs = (
+            v_ptr
+            + pid_bh * stride_vbh
+            + k_idx[:, None] * stride_vm
+            + offs_d[None, :] * stride_vd
+        )
+        v = tl.load(v_ptrs, mask=k_valid[:, None] & d_valid[None, :], other=0.0)
+        v = tl.cast(v, tl.float32)
+
+        # Compute attention scores: [BLOCK_M, BLOCK_N]
+        scores = tl.dot(q, tl.trans(k), allow_tf32=True) * scale
+
+        # Mask out-of-range queries/keys with large negative
+        mask_qk = q_valid[:, None] & k_valid[None, :]
+        scores = tl.where(mask_qk, scores, -1e9)
+
+        # Update streaming softmax stats
+        scores_max = tl.max(scores, axis=1)           # [BLOCK_M]
+        m_i_new = tl.maximum(m_i, scores_max)         # [BLOCK_M]
+        exp_m_diff = tl.exp(m_i - m_i_new)            # [BLOCK_M]
+
+        scores_shifted = scores - m_i_new[:, None]    # [BLOCK_M, BLOCK_N]
+        exp_scores = tl.exp(scores_shifted)
+        exp_scores = tl.where(mask_qk, exp_scores, 0.0)
+
+        sum_exp = tl.sum(exp_scores, axis=1)          # [BLOCK_M]
+        l_i_new = l_i * exp_m_diff + sum_exp          # [BLOCK_M]
+
+        # Avoid divide-by-zero for invalid rows
+        l_i_new = tl.where(q_valid, l_i_new, 1.0)
+
+        # Accumulate output: acc = acc * alpha + (exp_scores @ v) / l_i_new
+        alpha = tl.where(
+            l_i_new > 0,
+            (l_i * exp_m_diff) / l_i_new,
+            0.0,
+        )
+        block_acc = tl.dot(exp_scores, v, allow_tf32=True)  # [BLOCK_M, BLOCK_D]
+        acc = acc * alpha[:, None] + block_acc / l_i_new[:, None]
+
+        m_i = m_i_new
+        l_i = l_i_new
+
+    # Write back O
+    o_ptrs = (
+        o_ptr
+        + pid_bh * stride_obh
+        + offs_m[:, None] * stride_om
+        + offs_d[None, :] * stride_od
+    )
+    tl.store(o_ptrs, acc, mask=q_valid[:, None] & d_valid[None, :])
+
+
+def triton_mha(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int) -> torch.Tensor:
+    """
+    Wrapper for the Triton fused scaled dot-product attention.
+
+    q, k, v: [B, S, E]
+    Returns: [B, S, E]
+    """
+    assert q.is_cuda and k.is_cuda and v.is_cuda
+    B, S, E = q.shape
+    assert k.shape == (B, S, E)
+    assert v.shape == (B, S, E)
+    assert E % num_heads == 0, "embed_dim must be divisible by num_heads"
+
+    head_dim = E // num_heads
+    scale = 1.0 / math.sqrt(head_dim)
+
+    # [B, S, E] -> [B, num_heads, S, head_dim] -> [BH, S, head_dim]
+    q_heads = (
+        q.view(B, S, num_heads, head_dim)
+        .permute(0, 2, 1, 3)
+        .contiguous()
+        .view(B * num_heads, S, head_dim)
+    )
+    k_heads = (
+        k.view(B, S, num_heads, head_dim)
+        .permute(0, 2, 1, 3)
+        .contiguous()
+        .view(B * num_heads, S, head_dim)
+    )
+    v_heads = (
+        v.view(B, S, num_heads, head_dim)
+        .permute(0, 2, 1, 3)
+        .contiguous()
+        .view(B * num_heads, S, head_dim)
+    )
+
+    BH = B * num_heads
+    o_heads = torch.empty_like(q_heads)
+
+    grid = lambda META: (
+        BH,
+        triton.cdiv(S, META['BLOCK_M']),
+    )
+
+    mha_fwd_kernel[grid](
+        q_heads, k_heads, v_heads, o_heads,
+        q_heads.stride(0), q_heads.stride(1), q_heads.stride(2),
+        k_heads.stride(0), k_heads.stride(1), k_heads.stride(2),
+        v_heads.stride(0), v_heads.stride(1), v_heads.stride(2),
+        o_heads.stride(0), o_heads.stride(1), o_heads.stride(2),
+        BH, S, head_dim, scale,
+    )
+
+    # [BH, S, D] -> [B, num_heads, S, D] -> [B, S, E]
+    o = (
+        o_heads.view(B, num_heads, S, head_dim)
+        .permute(0, 2, 1, 3)
+        .contiguous()
+        .view(B, S, E)
+    )
+    return o
+
+
+class ModelNew(nn.Module):
+    def __init__(self, embed_dim, num_heads):
+        """
+        Attention block using a custom Triton fused scaled dot-product attention
+        and sharing parameters with nn.MultiheadAttention for exact alignment.
+        """
+        super(ModelNew, self).__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
+
+        # Use nn.MultiheadAttention so parameters (in_proj/out_proj) align exactly
+        # with the reference model's MultiheadAttention.
+        self.mha = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, x):
+        """
+        x: (B, C, H, W)
+        returns: (B, C, H, W)
+        """
+        B, C, H, W = x.shape
+        S = H * W
+        E = C
+        assert E == self.embed_dim, "Channel dimension must equal embed_dim"
+
+        # (B, C, H, W) -> (B, S, E)
+        x_seq = x.view(B, C, S).permute(0, 2, 1)  # (B, S, E)
+
+        # Use MultiheadAttention's projection weights so parameters are shared.
+        # This matches nn.MultiheadAttention's internal in_proj_qkv for self-attention.
+        qkv = F.linear(x_seq, self.mha.in_proj_weight, self.mha.in_proj_bias)
+        q, k, v = qkv.chunk(3, dim=-1)  # each: (B, S, E)
+
+        # Triton fused attention with aligned Q/K/V
+        attn_out = triton_mha(q, k, v, self.num_heads)  # (B, S, E)
+
+        # Use MultiheadAttention's out_proj for parameter alignment
+        out = F.linear(attn_out, self.mha.out_proj.weight, self.mha.out_proj.bias)
+
+        # Output projection + residual + layernorm
+        out = self.norm(out + x_seq)  # (B, S, E)
+
+        # (B, S, E) -> (B, C, H, W)
+        out = out.permute(0, 2, 1).view(B, C, H, W)
+        return out
+```
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl, AND any other modules used (e.g., import math if using math.sqrt)
+   2. @triton.jit decorated kernel function(s) — NO continue/break/return inside loops (use masking)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels — THIS CLASS IS REQUIRED
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+3. Learn from previous repair attempts to avoid repeating the same mistakes
+4. Ensure ALL imports are included at the top (common mistake: forgetting `import math`)
+
+```python
+# <corrected code>
+```

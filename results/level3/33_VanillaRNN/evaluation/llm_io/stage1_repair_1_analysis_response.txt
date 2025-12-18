@@ -1,0 +1,5 @@
+{
+  "critical_issue": "Using unsupported Triton tensor indexing: `mask_n[0, :]` when loading bias.",
+  "why_it_matters": "Triton does not allow indexing a tensor with a constexpr scalar, so `mask_n[0, :]` triggers `unsupported tensor index: constexpr[0]` during compilation.",
+  "minimal_fix_hint": "Avoid 2D mask slicing; use a 1D mask like `offs_n < N` directly in `tl.load` for bias."
+}

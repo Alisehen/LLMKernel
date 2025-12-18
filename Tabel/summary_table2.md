@@ -5,18 +5,18 @@
 | 3_Batched_matrix_multiplication | 1.44 | ✅ |
 | 4_Matrix_vector_multiplication | 1.11 | ✅ |
 | 5_Matrix_scalar_multiplication | 1.2 | ✅ |
-| 6_Matmul_with_large_K_dimension | 0.9 | ✅ |
+| 6_Matmul_with_large_K_dimension | 1.01 | ✅ |
 | 7_Matmul_with_small_K_dimension | 1.71 | ✅ |
-| 8_Matmul_with_irregular_shapes | 0.92 | ✅ |
+| 8_Matmul_with_irregular_shapes | 0.62 | ✅ |
 | 9_Tall_skinny_matrix_multiplication | 1.57 | ✅ |
 | 10_3D_tensor_matrix_multiplication | 1.2 | ✅ |
-| 11 | 2.08 | ✅ |
+| 11 | 1.42 | ✅ |
 | 12_Matmul_with_diagonal_matrices | 0.84 | ✅ |
 | 13_Matmul_for_symmetric_matrices | 1.05 | ✅ |
 | 14_Matmul_for_upper_triangular_matrices | 8.8 | ✅ |
 | 15_Matmul_for_lower_triangular_matrices | 1.01 | ✅ |
 | 16_Matmul_with_transposed_A | 1.6 | ✅ |
-| 17_Matmul_with_transposed_B | 0.83 | ✅ |
+| 17_Matmul_with_transposed_B | 0.23 | ✅ |
 | 18_Matmul_with_transposed_both | 1.2 | ✅ |
 | 19_ReLU | 1.25 | ✅ |
 | 20_LeakyReLU | 2.6 | ✅ |
@@ -54,14 +54,16 @@
 | 52_Argmin_over_a_dimension | 1.36 | ✅ |
 | 53_Min_reduction_over_a_dimension | 1.99 | ✅ |
 | 54_conv_standard_3D_square_input_square_kernel | 2.05 | ✅ |
-| 55_conv_standard_2D_asymmetric_input_square_kernel | 1.1 | ✅ |
+| 55_conv_standard_2D_asymmetric_input_square_kernel | 1.08 | ✅ |
 | 56_conv_standard_2D_asymmetric_input_asymmetric_kernel | 1.15 | ✅ |
 | 57_conv_transposed_2D_square_input_square_kernel | 5.2 | ✅ |
 | 58_conv_transposed_3D_asymmetric_input_asymmetric_kernel | 1.66 | ✅ |
 | 59_conv_standard_3D_asymmetric_input_square_kernel | 0.78 | ✅ |
 | 60_conv_standard_3D_square_input_asymmetric_kernel | 1.59 | ✅ |
 | 61_conv_transposed_3D_square_input_square_kernel | 1.05 | ✅ |
+
 | 62_conv_standard_2D_square_input_asymmetric_kernel | 1.6 | ✅ |
+
 | 63_conv_standard_2D_square_input_square_kernel | 1.55 | ✅ |
 | 64_conv_transposed_1D | 1.02 | ✅ |
 | 65_conv_transposed_2D_square_input_asymmetric_kernel | 0.71 | ✅ |
@@ -79,7 +81,7 @@
 | 77_conv_transposed_3D_square_padded_dilated_strided | 1.05 | ✅ |
 | 78_conv_transposed_2D_asymmetric_padded | 0.76 | ✅ |
 | 79_conv_transposed_1D_asymmetric_padded_strided_dilated | 1.48 | ✅ |
-| 80_conv_standard_2D_square_asymmetric_dilated_padded | 1.2 | ✅ |
+| 80_conv_standard_2D_square_asymmetric_dilated_padded | 1.01 | ✅ |
 | 81_conv_transposed_2D_asymmetric_square_dilated_padded_strided | 1.05 | ✅ |
 | 82_conv_depthwise_2D_square_square | 1.41 | ✅ |
 | 83_conv_depthwise_2D_square_asymmetric | 1.01 | ✅ |

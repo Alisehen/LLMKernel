@@ -10,7 +10,7 @@
 | 8_Matmul_with_irregular_shapes | 0 | ✅ |
 | 9_Tall_skinny_matrix_multiplication | 0 | ✅ |
 | 10_3D_tensor_matrix_multiplication | 0 | ✅ |
-| 11 | 1.28 | ✅ |
+| 11 | 0 | ✅ |
 | 12_Matmul_with_diagonal_matrices | 0 | ✅ |
 | 13_Matmul_for_symmetric_matrices | 0 | ✅ |
 | 14_Matmul_for_upper_triangular_matrices | 0 | ✅ |
@@ -18,17 +18,17 @@
 | 16_Matmul_with_transposed_A | 0 | ✅ |
 | 17_Matmul_with_transposed_B | 0 | ✅ |
 | 18_Matmul_with_transposed_both | 0 | ✅ |
-| 19_ReLU | 0.6770 | ✅ |
-| 20_LeakyReLU | 0.6780 | ✅ |
-| 21_Sigmoid | 0.6777 | ✅ |
+| 19_ReLU | 0.6763 | ✅ |
+| 20_LeakyReLU | 0.6763 | ✅ |
+| 21_Sigmoid | 0.6770 | ✅ |
 | 22_Tanh | 0.6768 | ✅ |
-| 23_Softmax | 0.7967 | ✅ |
+| 23_Softmax | 0 | ✅ |
 | 24_LogSoftmax | 0 | ✅ |
 | 25_Swish | 1.68 | ✅ |
 | 26_GELU | 0 | ✅ |
 | 27_SELU | 0.676 | ✅ |
 | 28_HardSigmoid | 0.676 | ✅ |
-| 29_Softplus | 0.6770 | ✅ |
+| 29_Softplus | 0.6755 | ✅ |
 | 30_Softsign | 2.6923 | ✅ |
 | 31 | 0 | ✅ |
 | 32 | 1.01 | ✅ |
@@ -58,8 +58,8 @@
 | 56_conv_standard_2D_asymmetric_input_asymmetric_kernel | 0.02 | ✅ |
 | 57_conv_transposed_2D_square_input_square_kernel | 0.2 | ✅ |
 | 58_conv_transposed_3D_asymmetric_input_asymmetric_kernel | 0.2 | ✅ |
-| 59_conv_standard_3D_asymmetric_input_square_kernel | 1.6 | ✅ |
-| 60_conv_standard_3D_square_input_asymmetric_kernel | 0.4 | ✅ |
+| 59_conv_standard_3D_asymmetric_input_square_kernel | 1.57 | ✅ |
+| 60_conv_standard_3D_square_input_asymmetric_kernel | 0.34 | ✅ |
 | 61_conv_transposed_3D_square_input_square_kernel | 0.5 | ✅ |
 | 62_conv_standard_2D_square_input_asymmetric_kernel | 0 | ✅ |
 | 63_conv_standard_2D_square_input_square_kernel | 0.55 | ✅ |
@@ -67,7 +67,7 @@
 | 65_conv_transposed_2D_square_input_asymmetric_kernel | 0 | ✅ |
 | 66_conv_standard_3D_asymmetric_input_asymmetric_kernel | 0.45 | ✅ |
 | 67_conv_standard_1D | 0.6 | ✅ |
-| 68_conv_transposed_3D_square_input_asymmetric_kernel | 0 | ✅ |
+| 68_conv_transposed_3D_square_input_asymmetric_kernel | 0.08 | ✅ |
 | 69_conv_transposed_2D_asymmetric_input_asymmetric_kernel | 0 | ✅ |
 | 70_conv_transposed_3D_asymmetric_input_square_kernel | 0 | ✅ |
 | 71_conv_transposed_2D_asymmetric_input_square_kernel | 0.35 | ✅ |
@@ -93,10 +93,10 @@
 | 91_cumsum_reverse | 0.76 | ✅ |
 | 92_cumsum_exclusive | 0 | ✅ |
 | 93_masked_cumsum | 0.2359 | ✅ |
-| 94_MSELoss | 3.0658 | ✅ |
+| 94_MSELoss | 3.03 | ✅ |
 | 95_CrossEntropyLoss | 0 | ✅ |
 | 96_HuberLoss_score | 0 |
-| 97_ScaledDotProductAttention | 1.52 | ✅ |
+| 97_ScaledDotProductAttention | 1.47 | ✅ |
 | 98_KLDivLoss | 0 | ✅ |
 | 99_TripletMarginLoss | 0 | ✅ |
 | 100_HingeLoss | 0 | ✅ |

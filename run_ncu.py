@@ -108,6 +108,7 @@ def profile_bench(
     auto_sudo: bool = True,  # Automatically retry with sudo if permission denied
     ref_file: Optional[str] = None,  # Reference file path (default: ref_0.py)
     test_file: Optional[str] = None,  # Test file path (default: test_kernel_0.py)
+    timeout: Optional[int] = 300,  # Timeout in seconds (default: 5 minutes)
 ) -> Path:
     ncu_bin = shutil.which("ncu") or "/usr/local/cuda/bin/ncu"
     csv_path = Path(out_csv).resolve()
@@ -170,7 +171,12 @@ def profile_bench(
                 cmd.insert(insert_pos, f"--kernel-name=::regex:^({pattern})(\\(|$)")
 
     print("[ncu] running:", " ".join(cmd))
-    proc = subprocess.run(cmd, env=env, text=True, capture_output=True)
+    try:
+        proc = subprocess.run(cmd, env=env, text=True, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        print(f"[ncu] ⚠️ Command timed out after {timeout} seconds")
+        csv_path.write_text("", encoding="utf-8")
+        return csv_path
 
     # Print NCU output for debugging
     if proc.stdout:
@@ -205,7 +211,12 @@ def profile_bench(
         ]
 
         print("[ncu] retry running:", " ".join(cmd_no_filter))
-        proc = subprocess.run(cmd_no_filter, env=env, text=True, capture_output=True)
+        try:
+            proc = subprocess.run(cmd_no_filter, env=env, text=True, capture_output=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            print(f"[ncu] ⚠️ Retry command timed out after {timeout} seconds")
+            csv_path.write_text("", encoding="utf-8")
+            return csv_path
 
         # Print full output for debugging
         if proc.stdout:
@@ -251,7 +262,12 @@ def profile_bench(
             print("[ncu] sudo command:", " ".join(sudo_cmd[:10]) + "...")  # Print first few args
 
             # Run with sudo (this will prompt for password interactively)
-            proc_sudo = subprocess.run(sudo_cmd, env=env, text=True, capture_output=True)
+            try:
+                proc_sudo = subprocess.run(sudo_cmd, env=env, text=True, capture_output=True, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                print(f"[ncu] ⚠️ Sudo command timed out after {timeout} seconds")
+                csv_path.write_text("", encoding="utf-8")
+                return csv_path
 
             if proc_sudo.stdout:
                 print("[ncu sudo stdout]:", proc_sudo.stdout[:500])

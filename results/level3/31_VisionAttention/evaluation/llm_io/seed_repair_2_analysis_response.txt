@@ -1,0 +1,5 @@
+{
+  "critical_issue": "ModelNew uses separate q/k/v/out Linear layers whose parameters don’t correspond to nn.MultiheadAttention’s weights, so the two models are not parameter-aligned.",
+  "why_it_matters": "The harness compares outputs assuming identical weights. Because Q/K/V/out projections differ from the reference MultiheadAttention, activations diverge even if the Triton kernel is correct, causing large output mismatches.",
+  "minimal_fix_hint": "Reuse nn.MultiheadAttention inside ModelNew or map its in_proj/out_proj weights into ModelNew’s projections so both models share identical parameters."
+}

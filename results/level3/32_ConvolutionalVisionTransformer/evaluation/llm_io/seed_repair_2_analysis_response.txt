@@ -1,0 +1,5 @@
+{
+  "critical_issue": "Triton kernel uses tl.dot(..., allow_tf32=True), performing TF32 matmul while PyTorch reference uses full FP32; this precision mismatch causes large numerical divergence across the transformer stack.",
+  "why_it_matters": "TF32 truncates FP32 mantissas; over long K=8192 reductions and many nonlinear layers, accumulated rounding error easily exceeds the 0.1 atol/rtol thresholds.",
+  "minimal_fix_hint": "Disable TF32 in the Triton matmul: call tl.dot without allow_tf32 or set allow_tf32=False so computation matches PyTorch FP32 behavior."
+}

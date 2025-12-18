@@ -1,0 +1,7 @@
+```json
+{
+  "critical_issue": "The PyTorch reference uses nn.MultiheadAttention, which materializes an S×S attention matrix (S=H×W=16384), requiring ~8GB and causing CUDA OOM.",
+  "why_it_matters": "compare_and_bench first runs the reference model; the full attention weight tensor allocation fails before the Triton kernel is invoked, so benchmarking and correctness checks cannot proceed.",
+  "minimal_fix_hint": "Change the reference to a memory-efficient attention (e.g., FlashAttention-style) or reduce sequence length/image size so nn.MultiheadAttention fits in GPU memory."
+}
+```

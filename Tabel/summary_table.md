@@ -45,37 +45,29 @@
 | 43_Max_Pooling_3D | 1.37 | ✅ |
 | 44 | 0.88 | ✅ |
 | 45_Average_Pooling_2D | 1.08 | ✅ |
-| 46_Average_Pooling_3D | 0.9 | ✅ |
-
-| 47_Sum_reduction_over_a_dimension | 0 | ✅ |
-
+| 46_Average_Pooling_3D | 1.01 | ✅ |
+| 47_Sum_reduction_over_a_dimension | 1.01 | ✅ |
 | 48_Mean_reduction_over_a_dimension | 3.4170 | ✅ |
-
-| 49_Max_reduction_over_a_dimension | 0 | ✅ |
-
+| 49_Max_reduction_over_a_dimension | 0.18 | ✅ |
 | 50_conv_standard_2D_square_input_square_kernel | 1.23 | ✅ |
 | 51_Argmax_over_a_dimension | 1.1 | ✅ |
 | 52_Argmin_over_a_dimension | 1.04 | ✅ |
 | 53_Min_reduction_over_a_dimension | 1.1 | ✅ |
 | 54_conv_standard_3D_square_input_square_kernel | 0.82 | ✅ |
 | 55_conv_standard_2D_asymmetric_input_square_kernel | 0.5 | ✅ |
-
-| 56_conv_standard_2D_asymmetric_input_asymmetric_kernel | 0 | ✅ |
+| 56_conv_standard_2D_asymmetric_input_asymmetric_kernel | 0.1 | ✅ |
 | 57_conv_transposed_2D_square_input_square_kernel | 0.42 | ✅ |
 | 58_conv_transposed_3D_asymmetric_input_asymmetric_kernel | 0.5 | ✅ |
-
 | 59_conv_standard_3D_asymmetric_input_square_kernel | 1.6 | ✅ |
 | 60_conv_standard_3D_square_input_asymmetric_kernel | 0.78 | ✅ |
 | 61_conv_transposed_3D_square_input_square_kernel | 1.2 | ✅ |
-
 | 62_conv_standard_2D_square_input_asymmetric_kernel | 0.5 | ✅ |
-
 | 63_conv_standard_2D_square_input_square_kernel | 0.7 | ✅ |
 | 64_conv_transposed_1D | 1.2577 | ✅ |
 | 65_conv_transposed_2D_square_input_asymmetric_kernel | 1.248 | ✅ |
 | 66_conv_standard_3D_asymmetric_input_asymmetric_kernel | 0.68 | ✅ |
 | 67_conv_standard_1D | 1.01 | ✅ |
-| 68_conv_transposed_3D_square_input_asymmetric_kernel | 0.26 | ✅ |
+| 68_conv_transposed_3D_square_input_asymmetric_kernel | 0.32 | ✅ |
 | 69_conv_transposed_2D_asymmetric_input_asymmetric_kernel | 0.82 | ✅ |
 | 70_conv_transposed_3D_asymmetric_input_square_kernel | 0.75 | ✅ |
 | 71_conv_transposed_2D_asymmetric_input_square_kernel | 0.3726 | ✅ |

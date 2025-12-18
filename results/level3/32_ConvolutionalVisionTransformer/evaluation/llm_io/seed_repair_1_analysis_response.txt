@@ -1,0 +1,5 @@
+{
+  "critical_issue": "The Triton-based fused linear layers use separate Parameters (linear_proj_weight/fc_out_weight) that are never tied or synced with the reference nn.Linear weights/biases.",
+  "why_it_matters": "Because the fused layers have different randomly initialized weights from the reference model, even a correct kernel computes with mismatched parameters, producing outputs that differ well beyond the comparison tolerance.",
+  "minimal_fix_hint": "Ensure fused_linear uses the exact same weight and bias tensors as the reference nn.Linear layers by sharing or copying those parameters instead of independently initialized Parameters."
+}

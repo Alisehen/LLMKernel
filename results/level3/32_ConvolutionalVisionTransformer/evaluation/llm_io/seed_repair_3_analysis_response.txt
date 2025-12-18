@@ -1,0 +1,5 @@
+{
+  "critical_issue": "Custom _reset_parameters in ModelNew reinitializes linear_proj and fc_out, making their weights differ from the reference Model's parameters.",
+  "why_it_matters": "Because the test compares Model and ModelNew outputs with shared initialization, re-randomizing these layers changes the entire network's computation, leading to large numerical differences despite a correct Triton matmul implementation.",
+  "minimal_fix_hint": "Remove _reset_parameters or ensure ModelNew loads the exact state_dict from the reference Model instead of reinitializing linear_proj and fc_out."
+}
