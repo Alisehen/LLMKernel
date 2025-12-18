@@ -1,0 +1,5 @@
+{
+  "critical_issue": "HEAD_DIM=96 is not a power of 2 but used in tl.arange(0, HEAD_DIM), which Triton requires to have power-of-2 range.",
+  "why_it_matters": "Triton’s tl.arange demands a compile-time power-of-2 range; passing HEAD_DIM=96 triggers the ValueError during compilation, preventing kernel generation.",
+  "minimal_fix_hint": "Introduce a BLOCK_D that is a power of 2 for tl.arange and iterate over head_dim in chunks or avoid tl.arange’s power-of-2 constraint."
+}

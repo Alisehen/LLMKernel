@@ -1,0 +1,212 @@
+```python
+# <complete ModelNew code with optimized Triton kernels>
+
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def causal_self_attn_fwd_kernel(
+    q_ptr, k_ptr, v_ptr, o_ptr,
+    T, D,
+    stride_qb, stride_qt, stride_qd,
+    stride_kb, stride_kt, stride_kd,
+    stride_vb, stride_vt, stride_vd,
+    stride_ob, stride_ot, stride_od,
+    scale,
+    BLOCK_D: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """
+    Compute causal self-attention in a single pass, without materializing the attention matrix.
+
+    Inputs:
+      Q, K, V: [BH, T, D]
+    Output:
+      O:       [BH, T, D]
+
+    Each program instance computes one (bh, t) output vector O[bh, t, :].
+    It streams over all key/value positions j in blocks of size BLOCK_N with
+    an online softmax for numerical stability, applying the causal mask j <= t.
+    """
+    pid_t = tl.program_id(0)  # sequence position index (0 .. T-1)
+    pid_bh = tl.program_id(1)  # batch*head index (0 .. BH-1)
+
+    offs_d = tl.arange(0, BLOCK_D)
+    mask_d = offs_d < D
+
+    # Load query vector q[bh, t, :]
+    q_ptrs = q_ptr + pid_bh * stride_qb + pid_t * stride_qt + offs_d * stride_qd
+    q = tl.load(q_ptrs, mask=mask_d, other=0.0)
+
+    # Online softmax stats
+    m_i = tl.full((1,), -float("inf"), dtype=tl.float32)[0]  # running max
+    l_i = tl.zeros((), dtype=tl.float32)                     # running sum of exp
+    acc = tl.zeros((BLOCK_D,), dtype=tl.float32)             # accumulated output
+
+    # Loop over keys/values in blocks of BLOCK_N
+    for start_n in range(0, T, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        mask_n = offs_n < T
+
+        # Load K block: [BLOCK_N, BLOCK_D]
+        k_ptrs = k_ptr + pid_bh * stride_kb + offs_n[:, None] * stride_kt + offs_d[None, :] * stride_kd
+        k_block = tl.load(k_ptrs, mask=mask_n[:, None] & mask_d[None, :], other=0.0)
+
+        # Scores = q @ K^T  -> [BLOCK_N]
+        # Use float32 for stability
+        q_f = q.to(tl.float32)
+        k_f = k_block.to(tl.float32)
+        scores = tl.sum(k_f * q_f[None, :], axis=1) * scale
+
+        # Causal mask: only allow j <= t
+        mask_causal = offs_n <= pid_t
+        scores = tl.where(mask_n & mask_causal, scores, -float("inf"))
+
+        # Numerically stable online softmax update
+        current_max = tl.max(scores, axis=0)
+        m_i_new = tl.maximum(m_i, current_max)
+        exp_diff = tl.exp(m_i - m_i_new)
+        p = tl.exp(scores - m_i_new)  # [BLOCK_N]
+        l_i = l_i * exp_diff + tl.sum(p, axis=0)
+
+        # Load V block: [BLOCK_N, BLOCK_D]
+        v_ptrs = v_ptr + pid_bh * stride_vb + offs_n[:, None] * stride_vt + offs_d[None, :] * stride_vd
+        v_block = tl.load(v_ptrs, mask=mask_n[:, None] & mask_d[None, :], other=0.0)
+        v_f = v_block.to(tl.float32)
+
+        # Weighted sum: sum_j p_j * V_j
+        contrib = tl.sum(v_f * p[:, None], axis=0)  # [BLOCK_D]
+        acc = acc * exp_diff + contrib
+
+        m_i = m_i_new
+
+    # Final normalize
+    out = acc / l_i
+
+    # Store result
+    o_ptrs = o_ptr + pid_bh * stride_ob + pid_t * stride_ot + offs_d * stride_od
+    tl.store(o_ptrs, out.to(tl.float32), mask=mask_d)
+
+
+def fused_causal_attention(q, k, v):
+    """
+    q, k, v: tensors of shape [B, n_head, T, head_dim], contiguous.
+    Returns: y of same shape.
+    """
+    assert q.is_cuda and k.is_cuda and v.is_cuda
+    assert q.shape == k.shape == v.shape
+    B, n_head, T, D = q.shape
+    BH = B * n_head
+
+    # Flatten batch and head: [BH, T, D]
+    q_flat = q.view(BH, T, D).contiguous()
+    k_flat = k.view(BH, T, D).contiguous()
+    v_flat = v.view(BH, T, D).contiguous()
+
+    o_flat = torch.empty_like(q_flat)
+
+    stride_qb, stride_qt, stride_qd = q_flat.stride()
+    stride_kb, stride_kt, stride_kd = k_flat.stride()
+    stride_vb, stride_vt, stride_vd = v_flat.stride()
+    stride_ob, stride_ot, stride_od = o_flat.stride()
+
+    scale = 1.0 / math.sqrt(D)
+
+    grid = (T, BH)
+    causal_self_attn_fwd_kernel[grid](
+        q_flat, k_flat, v_flat, o_flat,
+        T, D,
+        stride_qb, stride_qt, stride_qd,
+        stride_kb, stride_kt, stride_kd,
+        stride_vb, stride_vt, stride_vd,
+        stride_ob, stride_ot, stride_od,
+        scale,
+        BLOCK_D=128,
+        BLOCK_N=128,
+        num_warps=4,
+    )
+
+    # Reshape back to [B, n_head, T, D]
+    y = o_flat.view(B, n_head, T, D)
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-accelerated variant of the original masked multi-head self-attention block.
+
+    The attention core (QK^T + causal mask + softmax + @V) is fused into a single
+    Triton kernel when attention dropout is inactive (p == 0 or eval mode).
+    When attention dropout is active during training, it falls back to the
+    exact PyTorch implementation for correctness.
+    """
+
+    def __init__(self, n_embd, n_head, attn_pdrop, resid_pdrop, max_seqlen):
+        super().__init__()
+        assert n_embd % n_head == 0
+        self.n_head = n_head
+        self.n_embd = n_embd
+        self.head_dim = n_embd // n_head
+
+        # key, query, value projections for all heads, but in a batch
+        self.c_attn = nn.Linear(n_embd, 3 * n_embd)
+        # output projection
+        self.c_proj = nn.Linear(n_embd, n_embd)
+        # regularization
+        self.attn_dropout = nn.Dropout(attn_pdrop)
+        self.resid_dropout = nn.Dropout(resid_pdrop)
+        # causal mask as in original (kept for fallback path)
+        self.register_buffer(
+            "bias",
+            torch.tril(torch.ones(max_seqlen, max_seqlen))
+            .view(1, 1, max_seqlen, max_seqlen),
+        )
+
+    def forward(self, x):
+        B, T, C = x.size()
+
+        # If attention dropout is active in training, fall back to the exact PyTorch path
+        if self.training and self.attn_dropout.p > 0.0:
+            q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+            k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+            q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+            v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
+            att = F.softmax(att, dim=-1)
+            att = self.attn_dropout(att)
+            y = att @ v  # (B, nh, T, hs)
+            y = y.transpose(1, 2).contiguous().view(B, T, C)
+            y = self.resid_dropout(self.c_proj(y))
+            return y
+
+        # Fused Triton path (attention dropout is effectively inactive)
+        qkv = self.c_attn(x)  # [B, T, 3*C]
+        q, k, v = qkv.split(self.n_embd, dim=2)
+
+        # Shape to [B, n_head, T, head_dim]
+        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2).contiguous()
+        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2).contiguous()
+        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2).contiguous()
+
+        if not x.is_cuda:
+            # CPU fallback: use un-fused PyTorch implementation for correctness
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
+            att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
+            att = F.softmax(att, dim=-1)
+            y = att @ v
+        else:
+            # Triton fused attention core
+            y = fused_causal_attention(q, k, v)
+
+        # Re-assemble heads and apply output projection + residual dropout
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        y = self.resid_dropout(self.c_proj(y))
+        return y
+```

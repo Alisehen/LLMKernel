@@ -1,0 +1,202 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {
+                "BLOCK_M": 64,
+                "BLOCK_N": 64,
+                "BLOCK_K": 32,
+                "NUM_WARPS": 4,
+                "NUM_STAGES": 2,
+            },
+            num_stages=2,
+            num_warps=4,
+        ),
+        triton.Config(
+            {
+                "BLOCK_M": 128,
+                "BLOCK_N": 32,
+                "BLOCK_K": 32,
+                "NUM_WARPS": 4,
+                "NUM_STAGES": 2,
+            },
+            num_stages=2,
+            num_warps=4,
+        ),
+    ],
+    key=["M", "N", "K"],
+)
+@triton.jit
+def linear_bias_relu_kernel(
+    a_ptr,  # [M, K]
+    b_ptr,  # [K, N]
+    bias_ptr,  # [N]
+    c_ptr,  # [M, N]
+    M, N, K,
+    stride_am, stride_ak,  # strides for A
+    stride_bk, stride_bn,  # strides for B
+    stride_cm, stride_cn,  # strides for C
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    DO_RELU: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k in range(0, K, BLOCK_K):
+        a = tl.load(
+            a_ptrs,
+            mask=(offs_m[:, None] < M) & (offs_k[None, :] < K - k),
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptrs,
+            mask=(offs_k[:, None] < K - k) & (offs_n[None, :] < N),
+            other=0.0,
+        )
+        acc += tl.dot(a, b, allow_tf32=True)
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Add bias
+    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc += bias[None, :]
+
+    # Optional ReLU
+    if DO_RELU:
+        acc = tl.maximum(acc, 0.0)
+
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    tl.store(c_ptrs, acc, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+
+
+def triton_linear_bias_relu(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, relu: bool):
+    """
+    x: [M, K]
+    weight: [out_features, in_features] (same as nn.Linear.weight)
+    bias: [out_features]
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+    assert x.dtype == weight.dtype == bias.dtype
+
+    M, K = x.shape
+    # weight is [out, in]; we need [K, N] = [in, out]
+    wt = weight.t().contiguous()
+    K_w, N = wt.shape
+    assert K_w == K, "Input feature dim mismatch"
+
+    c = torch.empty((M, N), device=x.device, dtype=x.dtype)
+
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_M"]),
+        triton.cdiv(N, META["BLOCK_N"]),
+    )
+
+    linear_bias_relu_kernel[grid](
+        x,
+        wt,
+        bias,
+        c,
+        M,
+        N,
+        K,
+        x.stride(0),
+        x.stride(1),
+        wt.stride(0),
+        wt.stride(1),
+        c.stride(0),
+        c.stride(1),
+        DO_RELU=relu,
+    )
+    return c
+
+
+class ModelNew(nn.Module):
+    def __init__(self, num_classes=1000):
+        """
+        AlexNet-like model with Triton-optimized fully connected layers.
+        """
+        super(ModelNew, self).__init__()
+
+        # Convolutional + pooling layers (same structure as original)
+        self.conv1 = nn.Conv2d(in_channels=3, out_channels=96, kernel_size=11, stride=4, padding=2)
+        self.relu1 = nn.ReLU(inplace=True)
+        self.maxpool1 = nn.MaxPool2d(kernel_size=3, stride=2)
+
+        self.conv2 = nn.Conv2d(in_channels=96, out_channels=256, kernel_size=5, padding=2)
+        self.relu2 = nn.ReLU(inplace=True)
+        self.maxpool2 = nn.MaxPool2d(kernel_size=3, stride=2)
+
+        self.conv3 = nn.Conv2d(in_channels=256, out_channels=384, kernel_size=3, padding=1)
+        self.relu3 = nn.ReLU(inplace=True)
+
+        self.conv4 = nn.Conv2d(in_channels=384, out_channels=384, kernel_size=3, padding=1)
+        self.relu4 = nn.ReLU(inplace=True)
+
+        self.conv5 = nn.Conv2d(in_channels=384, out_channels=256, kernel_size=3, padding=1)
+        self.relu5 = nn.ReLU(inplace=True)
+        self.maxpool3 = nn.MaxPool2d(kernel_size=3, stride=2)
+
+        # Fully connected layers (weights kept as nn.Linear to reuse initialization)
+        self.fc1 = nn.Linear(in_features=256 * 6 * 6, out_features=4096)
+        self.relu6 = nn.ReLU(inplace=True)
+        self.dropout1 = nn.Dropout(p=0.0)
+
+        self.fc2 = nn.Linear(in_features=4096, out_features=4096)
+        self.relu7 = nn.ReLU(inplace=True)
+        self.dropout2 = nn.Dropout(p=0.0)
+
+        self.fc3 = nn.Linear(in_features=4096, out_features=num_classes)
+
+    def forward(self, x):
+        """
+        :param x: Tensor of shape (batch_size, 3, 224, 224)
+        :return: Tensor of shape (batch_size, num_classes)
+        """
+        # Convolutional stack
+        x = self.conv1(x)
+        x = self.relu1(x)
+        x = self.maxpool1(x)
+
+        x = self.conv2(x)
+        x = self.relu2(x)
+        x = self.maxpool2(x)
+
+        x = self.conv3(x)
+        x = self.relu3(x)
+
+        x = self.conv4(x)
+        x = self.relu4(x)
+
+        x = self.conv5(x)
+        x = self.relu5(x)
+        x = self.maxpool3(x)
+
+        # Flatten
+        x = torch.flatten(x, 1)
+
+        # Triton-optimized fully connected layers
+        x = triton_linear_bias_relu(x, self.fc1.weight, self.fc1.bias, relu=True)
+        x = self.dropout1(x)  # p=0.0 so this is effectively a no-op
+
+        x = triton_linear_bias_relu(x, self.fc2.weight, self.fc2.bias, relu=True)
+        x = self.dropout2(x)  # p=0.0 so this is effectively a no-op
+
+        x = triton_linear_bias_relu(x, self.fc3.weight, self.fc3.bias, relu=False)
+
+        return x

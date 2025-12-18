@@ -1,0 +1,287 @@
+```python
+# <optimized Triton code>
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+# -----------------------------------------------------------------------------
+# Triton kernel: y = exp(segsum(x_cumsum)) given x_cumsum = cumsum(x, dim=-1)
+# Computes, for each row m and positions (i, j):
+#   y[m, i, j] = exp(x_cumsum[m, i] - x_cumsum[m, j]) if i >= j else 0
+# -----------------------------------------------------------------------------
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_I": 32, "BLOCK_J": 32}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_I": 64, "BLOCK_J": 32}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_I": 32, "BLOCK_J": 64}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_I": 64, "BLOCK_J": 64}, num_warps=8, num_stages=2),
+    ],
+    key=["T"],
+)
+@triton.jit
+def segsum_exp_kernel(
+    x_cumsum_ptr,  # [M, T]
+    y_ptr,         # [M, T, T]
+    M, T,
+    stride_xm, stride_xt,
+    stride_ym, stride_yi, stride_yj,
+    BLOCK_I: tl.constexpr,
+    BLOCK_J: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_i = tl.program_id(1)
+    pid_j = tl.program_id(2)
+
+    if pid_m >= M:
+        return
+
+    offs_i = pid_i * BLOCK_I + tl.arange(0, BLOCK_I)
+    offs_j = pid_j * BLOCK_J + tl.arange(0, BLOCK_J)
+
+    mask_i = offs_i < T
+    mask_j = offs_j < T
+
+    # Load cumsum along last dim for the selected i/j indices
+    base_x = x_cumsum_ptr + pid_m * stride_xm
+    x_i_ptrs = base_x + offs_i * stride_xt
+    x_j_ptrs = base_x + offs_j * stride_xt
+
+    cumsum_i = tl.load(x_i_ptrs, mask=mask_i, other=0.0)  # [BLOCK_I]
+    cumsum_j = tl.load(x_j_ptrs, mask=mask_j, other=0.0)  # [BLOCK_J]
+
+    # Broadcast to [BLOCK_I, BLOCK_J] and compute differences in registers
+    diff = cumsum_i[:, None] - cumsum_j[None, :]
+
+    # Valid region within T and lower-triangular (i >= j)
+    valid_mask = mask_i[:, None] & mask_j[None, :]
+    tri_mask = offs_i[:, None] >= offs_j[None, :]
+    full_mask = valid_mask & tri_mask
+
+    # exp(segsum): exp(cumsum[i] - cumsum[j]) for i >= j, else 0
+    out = tl.where(full_mask, tl.exp(diff), 0.0)
+
+    y_ptrs = (
+        y_ptr
+        + pid_m * stride_ym
+        + offs_i[:, None] * stride_yi
+        + offs_j[None, :] * stride_yj
+    )
+    tl.store(y_ptrs, out, mask=valid_mask)
+
+
+# -----------------------------------------------------------------------------
+# Wrapper: exp(segsum(x)) along the last dimension, using Triton
+# -----------------------------------------------------------------------------
+def segsum_exp_triton(x: torch.Tensor) -> torch.Tensor:
+    """
+    Compute exp(segsum(x)) along the last dimension using Triton.
+
+    segsum(x)[..., i, j] = cumsum(x)[..., i] - cumsum(x)[..., j] for i >= j,
+                           = -inf otherwise
+    exp(segsum(x)) therefore is:
+        exp(cumsum[i] - cumsum[j]) for i >= j
+        0                         otherwise
+
+    Args:
+        x: tensor of shape (..., T), CUDA tensor.
+
+    Returns:
+        Tensor of shape (..., T, T) with exp(segsum(x)).
+    """
+    assert x.is_cuda, "segsum_exp_triton expects a CUDA tensor"
+    x_cumsum = torch.cumsum(x, dim=-1).contiguous()
+    *prefix_shape, T = x_cumsum.shape
+    if T == 0:
+        return x_cumsum.new_empty(*prefix_shape, 0, 0)
+
+    M = x_cumsum.numel() // T
+    x_2d = x_cumsum.view(M, T)
+
+    y = torch.empty((M, T, T), device=x.device, dtype=x.dtype)
+
+    stride_xm, stride_xt = x_2d.stride()
+    stride_ym, stride_yi, stride_yj = y.stride()
+
+    def grid(meta):
+        return (
+            M,
+            triton.cdiv(T, meta["BLOCK_I"]),
+            triton.cdiv(T, meta["BLOCK_J"]),
+        )
+
+    segsum_exp_kernel[grid](
+        x_2d,
+        y,
+        M,
+        T,
+        stride_xm,
+        stride_xt,
+        stride_ym,
+        stride_yi,
+        stride_yj,
+    )
+
+    return y.view(*prefix_shape, T, T)
+
+
+# -----------------------------------------------------------------------------
+# Fallback (naive) implementation: exp(segsum(x)) in pure PyTorch
+# -----------------------------------------------------------------------------
+def segsum_exp_naive(x: torch.Tensor) -> torch.Tensor:
+    """
+    Fallback implementation of exp(segsum(x)) using PyTorch.
+    """
+    T = x.size(-1)
+    if T == 0:
+        return x.new_empty(*x.shape, 0)
+
+    x_cumsum = torch.cumsum(x, dim=-1)
+    x_segsum = x_cumsum[..., :, None] - x_cumsum[..., None, :]
+
+    # Lower-triangular mask (including diagonal)
+    mask = torch.tril(
+        torch.ones(T, T, device=x.device, dtype=torch.bool),
+        diagonal=0,
+    )
+    # Broadcast mask to leading dimensions
+    while mask.dim() < x_segsum.dim():
+        mask = mask.unsqueeze(0)
+    x_segsum = x_segsum.masked_fill(~mask, float("-inf"))
+
+    return torch.exp(x_segsum)
+
+
+# -----------------------------------------------------------------------------
+# Full model with Triton-accelerated segsum
+# -----------------------------------------------------------------------------
+class ModelNew(nn.Module):
+    def __init__(self, batch_size, seq_length, n_heads, d_head, d_state, block_len=64):
+        """
+        Mamba Structured State Space model with Triton-accelerated segsum.
+
+        :param batch_size: Size of the batch
+        :param seq_length: Length of the input sequence
+        :param n_heads: Number of attention heads
+        :param d_head: Dimension of each head
+        :param d_state: Dimension of the state space
+        :param block_len: Length of each block for chunked computation
+        """
+        super(ModelNew, self).__init__()
+
+        assert seq_length % block_len == 0, "Sequence length must be divisible by block length"
+
+        self.batch_size = batch_size
+        self.seq_length = seq_length
+        self.n_heads = n_heads
+        self.d_head = d_head
+        self.d_state = d_state
+        self.block_len = block_len
+
+        # Initialize parameters (same as original model)
+        self.A = nn.Parameter(torch.randn(batch_size, seq_length, n_heads))
+        self.B = nn.Parameter(torch.randn(batch_size, seq_length, n_heads, d_state))
+        self.C = nn.Parameter(torch.randn(batch_size, seq_length, n_heads, d_state))
+
+    def segsum_exp(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Compute exp(segsum(x)) along the last dimension.
+
+        Uses Triton kernel on CUDA tensors, falls back to a naive PyTorch
+        implementation otherwise.
+        """
+        if x.is_cuda:
+            return segsum_exp_triton(x)
+        else:
+            return segsum_exp_naive(x)
+
+    def forward(self, X, initial_states=None):
+        """
+        Forward pass implementing the SSD operation, matching the original Model.
+
+        :param X: Input tensor of shape (batch, length, n_heads, d_head)
+        :param initial_states: Optional initial states
+        :return: Output tensor Y and final state
+        """
+        B, L, H, P = X.shape
+        C = self.block_len
+        assert L % C == 0
+        num_chunks = L // C
+
+        # 0. Reshape into blocks/chunks (equivalent to einops rearrange)
+        # X: (b, (c l), h, p) -> (b, c, l, h, p)
+        X_blocks = X.view(B, num_chunks, C, H, P)
+
+        # A: (b, (c l), h) -> (b, c, l, h)
+        A_blocks0 = self.A.view(B, num_chunks, C, H)
+        # B, C: (b, (c l), h, n) -> (b, c, l, h, n)
+        B_blocks = self.B.view(B, num_chunks, C, H, self.d_state)
+        C_blocks = self.C.view(B, num_chunks, C, H, self.d_state)
+
+        # A_blocks: (b, h, c, l)
+        A_blocks = A_blocks0.permute(0, 3, 1, 2).contiguous()
+        A_cumsum = torch.cumsum(A_blocks, dim=-1)
+
+        # 1. Compute diagonal block outputs
+        # L = exp(segsum(A_blocks))  -- via Triton-accelerated segsum_exp
+        L = self.segsum_exp(A_blocks)  # (b, h, c, l, l)
+
+        # Original einsum:
+        # "bclhn,bcshn,bhcls,bcshp->bclhp"
+        # Shapes:
+        #   C_blocks: (b, c, l, h, n)
+        #   B_blocks: (b, c, s, h, n)  (s == l)
+        #   L:        (b, h, c, l, s)
+        #   X_blocks: (b, c, s, h, p)
+        Y_diag = torch.einsum(
+            "bclhn,bcshn,bhcls,bcshp->bclhp",
+            C_blocks,
+            B_blocks,
+            L,
+            X_blocks,
+        )
+
+        # 2. Compute intra-chunk states
+        decay_states = torch.exp(A_cumsum[:, :, :, -1:].sub(A_cumsum))
+        # "bclhn,bhcl,bclhp->bchpn"
+        states = torch.einsum(
+            "bclhn,bhcl,bclhp->bchpn",
+            B_blocks,
+            decay_states,
+            X_blocks,
+        )
+
+        # 3. Compute inter-chunk recurrence
+        if initial_states is None:
+            initial_states = torch.zeros_like(states[:, :1])
+        states = torch.cat([initial_states, states], dim=1)
+
+        # Pad last element of A_cumsum across chunks and apply segsum + exp
+        # Original: torch.exp(self.segsum(F.pad(A_cumsum[:, :, :, -1], (1, 0))))
+        # A_cumsum[:, :, :, -1]: (b, h, c)
+        decay_input = torch.nn.functional.pad(A_cumsum[:, :, :, -1], (1, 0))
+        # decay_chunk: (b, h, c+1, c+1)
+        decay_chunk = self.segsum_exp(decay_input)
+
+        # "bhzc,bchpn->bzhpn"
+        new_states = torch.einsum("bhzc,bchpn->bzhpn", decay_chunk, states)
+        states = new_states[:, :-1]
+
+        # 4. Compute state-to-output conversion
+        state_decay_out = torch.exp(A_cumsum)
+        # "bclhn,bchpn,bhcl->bclhp"
+        Y_off = torch.einsum(
+            "bclhn,bchpn,bhcl->bclhp",
+            C_blocks,
+            states,
+            state_decay_out,
+        )
+
+        # Combine diagonal and off-diagonal terms
+        Y = Y_diag + Y_off  # (b, c, l, h, p)
+        Y = Y.reshape(B, num_chunks * C, H, P)
+
+        return Y
+```

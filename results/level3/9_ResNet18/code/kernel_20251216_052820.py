@@ -1,0 +1,335 @@
+# <complete ModelNew code with optimized Triton kernels>
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+# -----------------------------------------------------------------------------------
+# FUSED RESIDUAL ADD + RELU (elementwise, 1D grid, shared offsets & mask)
+# -----------------------------------------------------------------------------------
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_SIZE": 1024}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_SIZE": 2048}, num_warps=8, num_stages=1),
+    ],
+    key=["n_elements"],
+)
+@triton.jit
+def residual_add_relu_kernel(
+    x_ptr,     # pointer to main branch tensor
+    y_ptr,     # pointer to residual / identity tensor
+    out_ptr,   # pointer to output tensor
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    # 1D grid over the flattened output tensor
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+
+    # All fused ops (add + ReLU) share the SAME offsets & mask
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    y = tl.load(y_ptr + offsets, mask=mask, other=0.0)
+
+    z = x + y
+    z = tl.maximum(z, 0.0)
+
+    tl.store(out_ptr + offsets, z, mask=mask)
+
+
+def fused_residual_add_relu(x: torch.Tensor, identity: torch.Tensor) -> torch.Tensor:
+    """
+    Fused elementwise: out = ReLU(x + identity)
+    Both inputs are NCHW tensors of the same shape.
+    """
+    assert x.shape == identity.shape, "Shapes of main and identity must match"
+    x_contig = x.contiguous()
+    id_contig = identity.contiguous()
+    out = torch.empty_like(x_contig)
+
+    n_elements = x_contig.numel()
+
+    # Grid strictly 1D, derived from BLOCK_SIZE chosen by autotuner
+    grid = lambda META: (triton.cdiv(n_elements, META["BLOCK_SIZE"]),)
+
+    residual_add_relu_kernel[grid](
+        x_contig,
+        id_contig,
+        out,
+        n_elements,
+    )
+    return out
+
+
+# -----------------------------------------------------------------------------------
+# FUSED LINEAR: GEMM + BIAS (2D grid over [M, N], shared offs_m/offs_n)
+# -----------------------------------------------------------------------------------
+
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32},
+            num_warps=4,
+            num_stages=3,
+        ),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32},
+            num_warps=4,
+            num_stages=3,
+        ),
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 32},
+            num_warps=4,
+            num_stages=3,
+        ),
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64},
+            num_warps=8,
+            num_stages=3,
+        ),
+    ],
+    key=["M", "N", "K"],
+)
+@triton.jit
+def linear_gemm_bias_kernel(
+    a_ptr,        # [M, K]
+    b_ptr,        # [K, N]
+    bias_ptr,     # [N]
+    c_ptr,        # [M, N]
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # 2D grid: each program computes a BLOCK_M x BLOCK_N tile of C
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Hints to the compiler for better memory accesses
+    tl.multiple_of(offs_m, BLOCK_M)
+    tl.multiple_of(offs_n, BLOCK_N)
+    tl.multiple_of(offs_k, BLOCK_K)
+
+    # Initialize accumulator
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Masks that depend only on M,N (shared across all fused ops)
+    a_mask_m = offs_m < M
+    b_mask_n = offs_n < N
+
+    # Base pointers for the first K-tile
+    a_ptrs = a_ptr + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
+
+    # Main K loop
+    for k in range(0, K, BLOCK_K):
+        k_offsets = k + offs_k
+        k_mask = k_offsets < K
+
+        a_mask = a_mask_m[:, None] & k_mask[None, :]
+        b_mask = k_mask[:, None] & b_mask_n[None, :]
+
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+        # Matmul uses the same (offs_m, offs_n) tile that defines the grid
+        acc += tl.dot(a, b, allow_tf32=True)
+
+        # Advance pointers to the next K-tile
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Fused bias add: same offs_n / boundary as the GEMM tile
+    bias = tl.load(bias_ptr + offs_n, mask=b_mask_n, other=0.0)
+    acc += bias[None, :]
+
+    # Store C tile; mask consistent with offs_m/offs_n
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    c_mask = a_mask_m[:, None] & b_mask_n[None, :]
+    tl.store(c_ptrs, acc, mask=c_mask)
+
+
+def fused_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    Fused linear layer: x @ weight.T + bias
+    x: [M, K]
+    weight: [N, K] (same as nn.Linear.weight)
+    bias: [N]
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda, "Tensors must be on CUDA for Triton"
+    M, K = x.shape
+    N, Kw = weight.shape
+    assert Kw == K, "Incompatible shapes for linear"
+    assert bias.shape[0] == N, "Bias shape mismatch"
+
+    # B is [K, N] for better coalescing on K dimension
+    B = weight.t().contiguous()
+    A = x.contiguous()
+    C = torch.empty((M, N), device=x.device, dtype=x.dtype)
+
+    # 2D grid over output [M, N]; all fused ops share this tiling
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_M"]),
+        triton.cdiv(N, META["BLOCK_N"]),
+    )
+
+    linear_gemm_bias_kernel[grid](
+        A,
+        B,
+        bias,
+        C,
+        M,
+        N,
+        K,
+        A.stride(0),
+        A.stride(1),
+        B.stride(0),
+        B.stride(1),
+        C.stride(0),
+        C.stride(1),
+    )
+    return C
+
+
+# -----------------------------------------------------------------------------------
+# Model definition using the optimized Triton kernels
+# -----------------------------------------------------------------------------------
+
+class BasicBlockNew(nn.Module):
+    expansion = 1
+
+    def __init__(self, in_channels, out_channels, stride=1, downsample=None):
+        """
+        :param in_channels: Number of input channels
+        :param out_channels: Number of output channels
+        :param stride: Stride for the first convolutional layer
+        :param downsample: Downsample layer for the shortcut connection
+        """
+        super(BasicBlockNew, self).__init__()
+        self.conv1 = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=3,
+            stride=stride,
+            padding=1,
+            bias=False,
+        )
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(
+            out_channels,
+            out_channels,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            bias=False,
+        )
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.downsample = downsample
+        self.stride = stride
+
+    def forward(self, x):
+        """
+        :param x: Input tensor, shape (batch_size, in_channels, height, width)
+        :return: Output tensor, shape (batch_size, out_channels, height, width)
+        """
+        identity = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        if self.downsample is not None:
+            identity = self.downsample(x)
+
+        # Fused residual add + ReLU kernel (1D grid over flattened NCHW)
+        out = fused_residual_add_relu(out, identity)
+
+        return out
+
+
+class ModelNew(nn.Module):
+    def __init__(self, num_classes=1000):
+        """
+        :param num_classes: Number of output classes
+        """
+        super(ModelNew, self).__init__()
+        self.in_channels = 64
+
+        self.conv1 = nn.Conv2d(
+            3,
+            64,
+            kernel_size=7,
+            stride=2,
+            padding=3,
+            bias=False,
+        )
+        self.bn1 = nn.BatchNorm2d(64)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+
+        self.layer1 = self._make_layer(BasicBlockNew, 64, 2, stride=1)
+        self.layer2 = self._make_layer(BasicBlockNew, 128, 2, stride=2)
+        self.layer3 = self._make_layer(BasicBlockNew, 256, 2, stride=2)
+        self.layer4 = self._make_layer(BasicBlockNew, 512, 2, stride=2)
+
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(512 * BasicBlockNew.expansion, num_classes)
+
+    def _make_layer(self, block, out_channels, blocks, stride=1):
+        downsample = None
+        if stride != 1 or self.in_channels != out_channels * block.expansion:
+            downsample = nn.Sequential(
+                nn.Conv2d(
+                    self.in_channels,
+                    out_channels * block.expansion,
+                    kernel_size=1,
+                    stride=stride,
+                    bias=False,
+                ),
+                nn.BatchNorm2d(out_channels * block.expansion),
+            )
+
+        layers = []
+        layers.append(block(self.in_channels, out_channels, stride, downsample))
+        self.in_channels = out_channels * block.expansion
+        for _ in range(1, blocks):
+            layers.append(block(self.in_channels, out_channels))
+
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        """
+        :param x: Input tensor, shape (batch_size, 3, height, width)
+        :return: Output tensor, shape (batch_size, num_classes)
+        """
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+
+        # Fused GEMM + bias for the final FC layer
+        x = fused_linear(x, self.fc.weight, self.fc.bias)
+
+        return x

@@ -1,0 +1,329 @@
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def global_avg_pool2d_kernel(
+    x_ptr, out_ptr,
+    B, C, H, W,
+    stride_xb, stride_xc, stride_xh, stride_xw,
+    stride_ob, stride_oc,
+    BLOCK_HW: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    bc = pid
+    b = bc // C
+    c = bc % C
+
+    # Base pointer for (b, c, 0, 0)
+    x_base_ptr = x_ptr + b * stride_xb + c * stride_xc
+
+    n_hw = H * W
+    acc = tl.zeros((), dtype=tl.float32)
+
+    for hw_offset in range(0, n_hw, BLOCK_HW):
+        offs = hw_offset + tl.arange(0, BLOCK_HW)
+        mask = offs < n_hw
+
+        h_idx = offs // W
+        w_idx = offs % W
+
+        ptrs = x_base_ptr + h_idx * stride_xh + w_idx * stride_xw
+        vals = tl.load(ptrs, mask=mask, other=0.0)
+        vals = vals.to(tl.float32)
+        acc += tl.sum(vals, axis=0)
+
+    # Compute mean over H*W
+    avg = acc / (H * W)
+
+    out_ptrs = out_ptr + b * stride_ob + c * stride_oc
+    tl.store(out_ptrs, avg.to(tl.float32))
+
+
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {
+                "BLOCK_M": 64,
+                "BLOCK_N": 64,
+                "BLOCK_K": 32,
+            },
+            num_stages=2,
+            num_warps=4,
+        ),
+        triton.Config(
+            {
+                "BLOCK_M": 128,
+                "BLOCK_N": 64,
+                "BLOCK_K": 32,
+            },
+            num_stages=2,
+            num_warps=4,
+        ),
+    ],
+    key=["M", "N", "K"],
+)
+@triton.jit
+def linear_gemm_kernel(
+    a_ptr,  # [M, K]
+    b_ptr,  # [K, N] (weight^T)
+    bias_ptr,  # [N]
+    c_ptr,  # [M, N]
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k in range(0, K, BLOCK_K):
+        k_mask = offs_k[None, :] < (K - k)
+        a = tl.load(
+            a_ptrs,
+            mask=(offs_m[:, None] < M) & k_mask,
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptrs,
+            mask=k_mask.T & (offs_n[None, :] < N),
+            other=0.0,
+        )
+        acc += tl.dot(a, b, allow_tf32=True)
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Add bias
+    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc += bias[None, :]
+
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    tl.store(
+        c_ptrs,
+        acc.to(tl.float32),
+        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+    )
+
+
+def global_avg_pool2d_triton(x: torch.Tensor) -> torch.Tensor:
+    """
+    Global average pooling over spatial dimensions for NCHW tensors.
+
+    Args:
+        x: Tensor of shape [B, C, H, W]
+
+    Returns:
+        Tensor of shape [B, C]
+    """
+    assert x.is_cuda, "Input must be on CUDA device"
+    B, C, H, W = x.shape
+    out = torch.empty((B, C), device=x.device, dtype=x.dtype)
+
+    stride_xb, stride_xc, stride_xh, stride_xw = x.stride()
+    stride_ob, stride_oc = out.stride()
+
+    grid = lambda META: (B * C,)
+
+    global_avg_pool2d_kernel[grid](
+        x,
+        out,
+        B,
+        C,
+        H,
+        W,
+        stride_xb,
+        stride_xc,
+        stride_xh,
+        stride_xw,
+        stride_ob,
+        stride_oc,
+        BLOCK_HW=64,
+    )
+
+    return out
+
+
+def linear_triton(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    Fused linear layer using Triton GEMM.
+
+    Computes: y = x @ weight.T + bias
+
+    Args:
+        x: [B, in_features]
+        weight: [out_features, in_features]
+        bias: [out_features]
+
+    Returns:
+        y: [B, out_features]
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda, "Tensors must be on CUDA device"
+    assert x.dtype == weight.dtype == bias.dtype, "Dtypes must match"
+
+    M, K = x.shape
+    out_features, in_features = weight.shape
+    assert K == in_features, "Incompatible shapes for linear"
+
+    N = out_features
+    y = torch.empty((M, N), device=x.device, dtype=x.dtype)
+
+    # Use weight^T layout [K, N]
+    w_t = weight.t().contiguous()
+
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_M"]),
+        triton.cdiv(N, META["BLOCK_N"]),
+    )
+
+    linear_gemm_kernel[grid](
+        x,
+        w_t,
+        bias,
+        y,
+        M,
+        N,
+        K,
+        x.stride(0),
+        x.stride(1),
+        w_t.stride(0),
+        w_t.stride(1),
+        y.stride(0),
+        y.stride(1),
+    )
+
+    return y
+
+
+class ModelNew(nn.Module):
+    def __init__(self, num_classes=1000):
+        """
+        MobileNetV2-like architecture with Triton-accelerated
+        global average pooling and final linear layer.
+        """
+        super(ModelNew, self).__init__()
+
+        def _make_divisible(v, divisor, min_value=None):
+            if min_value is None:
+                min_value = divisor
+            new_v = max(min_value, int(v + divisor / 2) // divisor * divisor)
+            if new_v < 0.9 * v:
+                new_v += divisor
+            return new_v
+
+        def _inverted_residual_block(inp, oup, stride, expand_ratio):
+            hidden_dim = int(inp * expand_ratio)
+
+            layers = []
+            if expand_ratio != 1:
+                # Pointwise conv
+                layers.append(nn.Conv2d(inp, hidden_dim, 1, 1, 0, bias=False))
+                layers.append(nn.BatchNorm2d(hidden_dim))
+                layers.append(nn.ReLU6(inplace=True))
+
+            layers.extend([
+                # Depthwise conv
+                nn.Conv2d(hidden_dim, hidden_dim, 3, stride, 1,
+                          groups=hidden_dim, bias=False),
+                nn.BatchNorm2d(hidden_dim),
+                nn.ReLU6(inplace=True),
+                # Pointwise linear conv
+                nn.Conv2d(hidden_dim, oup, 1, 1, 0, bias=False),
+                nn.BatchNorm2d(oup),
+            ])
+
+            # Note: original code ignores residual connections; we do the same.
+            return nn.Sequential(*layers)
+
+        input_channel = 32
+        last_channel = 1280
+        inverted_residual_setting = [
+            # t, c, n, s
+            [1, 16, 1, 1],
+            [6, 24, 2, 2],
+            [6, 32, 3, 2],
+            [6, 64, 4, 2],
+            [6, 96, 3, 1],
+            [6, 160, 3, 2],
+            [6, 320, 1, 1],
+        ]
+
+        # First layer
+        features = [
+            nn.Conv2d(3, input_channel, 3, 2, 1, bias=False),
+            nn.BatchNorm2d(input_channel),
+            nn.ReLU6(inplace=True),
+        ]
+
+        # Inverted residual blocks
+        for t, c, n, s in inverted_residual_setting:
+            output_channel = _make_divisible(c, 8)
+            for i in range(n):
+                stride = s if i == 0 else 1
+                features.append(_inverted_residual_block(
+                    input_channel, output_channel, stride, expand_ratio=t
+                ))
+                input_channel = output_channel
+
+        # Last several layers (without AdaptiveAvgPool2d here)
+        features.append(
+            nn.Conv2d(input_channel, last_channel, 1, 1, 0, bias=False)
+        )
+        features.append(nn.BatchNorm2d(last_channel))
+        features.append(nn.ReLU6(inplace=True))
+
+        self.features = nn.Sequential(*features)
+
+        # Classifier (we will bypass its Linear in forward, but keep for parameters & init)
+        self.classifier = nn.Sequential(
+            nn.Dropout(0.0),
+            nn.Linear(last_channel, num_classes),
+        )
+
+        # Weight initialization (same as original)
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out")
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0, 0.01)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        """
+        Forward pass with Triton-accelerated global average pooling
+        and final linear layer.
+
+        Input:  x of shape (batch_size, 3, 224, 224)
+        Output: logits of shape (batch_size, num_classes)
+        """
+        x = self.features(x)          # [B, C, H, W]
+        x = global_avg_pool2d_triton(x)  # [B, C], C == last_channel
+
+        # Dropout from classifier (p=0.0 by default, but keep for correctness)
+        dropout = self.classifier[0]
+        x = F.dropout(x, p=dropout.p, training=self.training)
+
+        linear = self.classifier[1]
+        x = linear_triton(x, linear.weight, linear.bias)
+        return x
+```

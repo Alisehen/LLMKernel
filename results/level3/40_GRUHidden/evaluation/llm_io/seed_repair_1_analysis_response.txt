@@ -1,0 +1,5 @@
+{
+  "critical_issue": "ModelNew creates and initializes its own GRU weights instead of matching nn.GRU’s parameters, so the reference Model and ModelNew run with different weights.",
+  "why_it_matters": "Different weight tensors mean the two GRUs implement different functions; even with identical inputs, their hidden states diverge, producing the observed large output discrepancies.",
+  "minimal_fix_hint": "Make ModelNew’s parameters mirror nn.GRU (same shapes) and load/copy the reference GRU’s state_dict instead of reinitializing with custom reset_parameters."
+}

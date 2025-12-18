@@ -1,0 +1,193 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU
+GPU Name: 4090
+Architecture: Ada Lovelace
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+[OPTIMIZATION STAGE]f
+
+## Current Optimization Stage
+
+Focus: BLOCK_SIZE with register pressure awareness.
+
+Key Principle:
+- Fusion increases register usage (intermediates stay in registers)
+- Spill to local memory kills fusion benefit
+
+Register Pressure Signals (from NCU):
+- launch__registers_per_thread > 128 → likely spilling
+- launch__occupancy_limit_registers < other limits → register-bound
+
+Rules:
+- Start conservative: BLOCK_SIZE ∈ {256, 512} for element-wise
+- For matmul fusion: BLOCK_M/N ∈ {32, 64}, BLOCK_K ∈ {32}
+- If registers > 128: reduce BLOCK_* by half
+- Trade-off: recompute cheap ops (e.g., x*0.5) vs store intermediate
+
+When to Recompute vs Keep:
+- Keep: expensive ops (exp, log, div, sqrt)
+- Recompute: cheap ops (add, mul, max) if register pressure high
+- Example: `y = relu(x); z = y * scale` → keep y
+- Example: `y = x * 0.5; z = y + bias` → can recompute y if needed
+
+Autotune:
+- 2-3 BLOCK_SIZE configs, always include smaller fallback
+
+
+
+[CURRENT CODE]
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_SIZE": 2048}, num_stages=2, num_warps=8),
+        triton.Config({"BLOCK_SIZE": 1024}, num_stages=2, num_warps=4),
+        triton.Config({"BLOCK_SIZE": 512}, num_stages=2, num_warps=4),
+    ],
+    key=["N"],
+)
+@triton.jit
+def residual_add_relu_kernel(
+    x_ptr,      # *f32 / *f16 / *bf16
+    y_ptr,      # same dtype as x_ptr
+    out_ptr,    # same dtype as x_ptr
+    N,          # total number of elements
+    BLOCK_SIZE: tl.constexpr,
+):
+    # 1D grid: each program processes a contiguous chunk of the flattened tensor
+    pid = tl.program_id(0)
+
+    # Shared indexing for all fused ops (add + ReLU)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < N
+
+    # Coalesced vectorized loads using identical offsets & mask
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    y = tl.load(y_ptr + offsets, mask=mask, other=0.0)
+
+    # Fused residual add + ReLU, all on the same offsets
+    z = x + y
+    z = tl.maximum(z, 0.0)
+
+    # Coalesced store using the same offsets & mask
+    tl.store(out_ptr + offsets, z, mask=mask)
+
+
+def residual_add_relu(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """
+    Fused residual add + ReLU:
+        out = ReLU(x + y)
+    x, y: same shape, same dtype, CUDA tensors.
+    """
+    # Ensure contiguous, identical shape & dtype for simple linear indexing
+    x_c = x.contiguous()
+    y_c = y.contiguous()
+    assert x_c.shape == y_c.shape, "Input tensors must have the same shape"
+    assert x_c.dtype == y_c.dtype, "Input tensors must have the same dtype"
+    assert x_c.is_cuda and y_c.is_cuda, "Inputs must be CUDA tensors"
+
+    out = torch.empty_like(x_c)
+    N = out.numel()
+
+    # 1D grid over the flattened output tensor
+    def grid(meta):
+        return (triton.cdiv(N, meta["BLOCK_SIZE"]),)
+
+    residual_add_relu_kernel[grid](x_c, y_c, out, N)
+
+    return out
+
+
+class ModelNew(nn.Module):
+    expansion = 1
+
+    def __init__(self, in_channels, out_channels, stride=1):
+        super(ModelNew, self).__init__()
+        self.conv1 = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=3,
+            stride=stride,
+            padding=1,
+            bias=False,
+        )
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(
+            out_channels,
+            out_channels,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            bias=False,
+        )
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.downsample = nn.Sequential(
+            nn.Conv2d(
+                in_channels,
+                out_channels * self.expansion,
+                kernel_size=1,
+                stride=stride,
+                bias=False,
+            ),
+            nn.BatchNorm2d(out_channels * self.expansion),
+        )
+        self.stride = stride
+
+    def forward(self, x):
+        identity = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        if self.downsample is not None:
+            identity = self.downsample(x)
+
+        # Fused residual add + ReLU in Triton with a shared 1D grid and offsets
+        out = residual_add_relu(out, identity)
+
+        return out
+```
+
+[NCU PROFILING METRICS]
+No NCU metrics available (skipped for network-level model)
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+TRITON API CONSTRAINTS (CRITICAL):
+- Triton has NO: tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

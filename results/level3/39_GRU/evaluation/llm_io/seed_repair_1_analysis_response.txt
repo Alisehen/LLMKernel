@@ -1,0 +1,5 @@
+{
+  "critical_issue": "gru_step_kernel assumes gate layout [r,z,n] along dim1, but PyTorch GRU stores gates as [z,r,n], so reset and update gates are swapped.",
+  "why_it_matters": "Swapping r and z changes both sigmoid gates and the final hidden-state blend, yielding systematically incorrect GRU dynamics and output values that diverge beyond the specified atol/rtol thresholds.",
+  "minimal_fix_hint": "Adjust gate indexing so the first H slice is z, the second H slice is r, and the third remains n to match PyTorch’s gate ordering."
+}

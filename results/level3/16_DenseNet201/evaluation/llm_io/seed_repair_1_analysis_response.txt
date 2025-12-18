@@ -1,0 +1,5 @@
+{
+  "critical_issue": "GPU out-of-memory: DenseNet201 forward exhausts device memory before Triton kernels run, error raised when BatchNorm2d tries allocating 20 MiB activation.",
+  "why_it_matters": "Insufficient free GPU memory, not a Triton kernel bug, prevents BatchNorm2d from allocating its output tensor, so the entire forward pass fails before completion.",
+  "minimal_fix_hint": "Decrease memory usage: lower batch size or input resolution, terminate other GPU workloads, or run inference under torch.no_grad to avoid saving gradients."
+}

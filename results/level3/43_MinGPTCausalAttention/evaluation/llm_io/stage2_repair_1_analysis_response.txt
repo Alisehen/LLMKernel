@@ -1,0 +1,5 @@
+{
+  "critical_issue": "Using tl.arange(0, HEAD_DIM) where HEAD_DIM=96, which is not a power-of-two, violating Triton’s arange constraint.",
+  "why_it_matters": "Triton requires the compile-time range of tl.arange to be a power of two. Passing HEAD_DIM=96 triggers the arange validation and raises the compilation error.",
+  "minimal_fix_hint": "Avoid non-power-of-two HEAD_DIM in tl.arange; use a power-of-two extent with masking or change indexing logic to not depend on HEAD_DIM directly."
+}

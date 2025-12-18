@@ -1,0 +1,5 @@
+{
+  "critical_issue": "The Triton kernel computes exp(cumsum[i] - cumsum[j]), but the PyTorch reference effectively uses the opposite order (exp(cumsum[j] - cumsum[i])), inverting all decay factors.",
+  "why_it_matters": "Flipping the subtraction order turns decays into growth (and vice versa), drastically changing L and decay_chunk, which propagates through Y_diag and recurrence, causing huge numeric discrepancies.",
+  "minimal_fix_hint": "Swap the subtraction order in the Triton kernel so it matches x_cumsum[..., :, None] - x_cumsum[..., None, :]."
+}

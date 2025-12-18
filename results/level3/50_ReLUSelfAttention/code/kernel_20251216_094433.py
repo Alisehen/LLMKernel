@@ -1,0 +1,299 @@
+# <corrected code>
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+import math
+
+
+@triton.jit
+def qk_relu_kernel(
+    q_ptr, k_ptr, out_ptr,
+    T, D,                        # sequence length, head dimension
+    stride_qbh, stride_qm, stride_qk,
+    stride_kbh, stride_km, stride_kk,
+    stride_obh, stride_om, stride_on,
+    scale,                       # precomputed 1/sqrt(D)
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """
+    Compute attention scores for one (batch, head) pair:
+    out[b,h,m,n] = ReLU( scale * (q[b,h,m,:] @ k[b,h,n,:]) ) with causal mask (n <= m),
+    where q, k shapes are (BH, T, D) and out shape is (BH, T, T).
+
+    Grid:
+      pid_m: blocks over query positions (M dimension, T)
+      pid_n: blocks over key positions (N dimension, T)
+      pid_bh: batch*head index (BH dimension)
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    pid_bh = tl.program_id(2)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    q_batch_ptr = q_ptr + pid_bh * stride_qbh
+    k_batch_ptr = k_ptr + pid_bh * stride_kbh
+    out_batch_ptr = out_ptr + pid_bh * stride_obh
+
+    # Pointers to the first K-tile
+    q_ptrs = q_batch_ptr + offs_m[:, None] * stride_qm + offs_k[None, :] * stride_qk
+    k_ptrs = k_batch_ptr + offs_k[:, None] * stride_kk + offs_n[None, :] * stride_km
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Loop over K dimension (head size D)
+    for k in range(0, D, BLOCK_K):
+        k_offsets = k + offs_k
+
+        q_mask = (offs_m[:, None] < T) & (k_offsets[None, :] < D)
+        k_mask = (k_offsets[:, None] < D) & (offs_n[None, :] < T)
+
+        q_tile = tl.load(q_ptrs, mask=q_mask, other=0.0)
+        k_tile = tl.load(k_ptrs, mask=k_mask, other=0.0)
+
+        acc += tl.dot(q_tile, k_tile, allow_tf32=True)
+
+        # Advance pointers to next K tile
+        q_ptrs += BLOCK_K * stride_qk
+        k_ptrs += BLOCK_K * stride_kk
+
+    # Apply scaling
+    acc = acc * scale
+
+    # Causal + bounds masks
+    causal = offs_n[None, :] <= offs_m[:, None]
+    in_bounds_m = offs_m[:, None] < T
+    in_bounds_n = offs_n[None, :] < T
+
+    # Mask used for value selection (causal AND in-bounds)
+    value_mask = causal & in_bounds_m & in_bounds_n
+
+    # ReLU then zero-out non-causal or out-of-bounds positions
+    acc = tl.maximum(acc, 0.0)
+    acc = tl.where(value_mask, acc, 0.0)
+
+    # Store mask must be ONLY in-bounds; we must still write zeros
+    # for non-causal positions that are inside the T x T domain.
+    out_ptrs = out_batch_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
+    store_mask = in_bounds_m & in_bounds_n
+    tl.store(out_ptrs, acc, mask=store_mask)
+
+
+@triton.jit
+def attn_v_kernel(
+    att_ptr, v_ptr, out_ptr,
+    M, N, K,                    # M: T (seq), N: D (head dim), K: T (seq)
+    stride_ab, stride_am, stride_ak,
+    stride_bb, stride_bk, stride_bn,
+    stride_cb, stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """
+    Batched matmul:
+      out[b, m, n] = sum_k att[b, m, k] * v[b, k, n]
+    with shapes:
+      att: (BH, M=T, K=T)
+      v:   (BH, K=T, N=D)
+      out: (BH, M=T, N=D)
+
+    Grid:
+      pid_m: blocks over M (sequence length)
+      pid_n: blocks over N (head dimension)
+      pid_bh: batch*head index (BH dimension)
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    pid_bh = tl.program_id(2)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    a_batch_ptr = att_ptr + pid_bh * stride_ab
+    b_batch_ptr = v_ptr + pid_bh * stride_bb
+    c_batch_ptr = out_ptr + pid_bh * stride_cb
+
+    a_ptrs = a_batch_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_batch_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k in range(0, K, BLOCK_K):
+        k_offsets = k + offs_k
+
+        a_mask = (offs_m[:, None] < M) & (k_offsets[None, :] < K)
+        b_mask = (k_offsets[:, None] < K) & (offs_n[None, :] < N)
+
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+        acc += tl.dot(a, b, allow_tf32=True)
+
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    c_ptrs = c_batch_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, acc, mask=c_mask)
+
+
+def triton_qk_relu(q: torch.Tensor, k: torch.Tensor, scale: float) -> torch.Tensor:
+    """
+    q, k: tensors of shape (B, H, T, D), on CUDA, same dtype
+    Returns:
+      att: (B, H, T, T) with causal masking and ReLU applied.
+           Equivalent to:
+             att = (q @ k.transpose(-2, -1)) * scale
+             att = masked_fill(causal_mask == 0, 0)
+             att = F.relu(att)
+    """
+    assert q.is_cuda and k.is_cuda
+    assert q.shape == k.shape
+    B, H, T, D = q.shape
+    BH = B * H
+
+    # Flatten batch and head dimensions for Triton
+    q_bh = q.contiguous().view(BH, T, D)
+    k_bh = k.contiguous().view(BH, T, D)
+
+    att_bh = torch.empty((BH, T, T), device=q.device, dtype=q.dtype)
+
+    stride_qbh, stride_qm, stride_qk = q_bh.stride()
+    stride_kbh, stride_km, stride_kk = k_bh.stride()
+    stride_obh, stride_om, stride_on = att_bh.stride()
+
+    # Launch configuration
+    def grid(meta):
+        return (
+            triton.cdiv(T, meta["BLOCK_M"]),
+            triton.cdiv(T, meta["BLOCK_N"]),
+            BH,
+        )
+
+    qk_relu_kernel[grid](
+        q_bh, k_bh, att_bh,
+        T, D,
+        stride_qbh, stride_qm, stride_qk,
+        stride_kbh, stride_km, stride_kk,
+        stride_obh, stride_om, stride_on,
+        float(scale),
+        BLOCK_M=64,
+        BLOCK_N=64,
+        BLOCK_K=64,
+    )
+
+    return att_bh.view(B, H, T, T)
+
+
+def triton_attn_v(att: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """
+    att: (B, H, T, T)  (already masked and ReLUed)
+    v:   (B, H, T, D)
+    Returns:
+      y: (B, H, T, D)  = att @ v
+    """
+    assert att.is_cuda and v.is_cuda
+    B, H, T, T2 = att.shape
+    assert T == T2
+    B2, H2, T3, D = v.shape
+    assert (B2, H2, T3) == (B, H, T)
+
+    BH = B * H
+
+    att_bh = att.contiguous().view(BH, T, T)
+    v_bh = v.contiguous().view(BH, T, D)
+    out_bh = torch.empty((BH, T, D), device=v.device, dtype=v.dtype)
+
+    M = T
+    K = T
+    N = D
+
+    stride_ab, stride_am, stride_ak = att_bh.stride()    # (BH, M, K)
+    stride_bb, stride_bk, stride_bn = v_bh.stride()      # (BH, K, N)
+    stride_cb, stride_cm, stride_cn = out_bh.stride()    # (BH, M, N)
+
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta["BLOCK_M"]),
+            triton.cdiv(N, meta["BLOCK_N"]),
+            BH,
+        )
+
+    attn_v_kernel[grid](
+        att_bh, v_bh, out_bh,
+        M, N, K,
+        stride_ab, stride_am, stride_ak,
+        stride_bb, stride_bk, stride_bn,
+        stride_cb, stride_cm, stride_cn,
+        BLOCK_M=64,
+        BLOCK_N=64,
+        BLOCK_K=64,
+    )
+
+    return out_bh.view(B, H, T, D)
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized multi-head masked self-attention layer
+    that uses ReLU instead of Softmax for attention weights.
+
+    This preserves the structure of the original Model but
+    replaces the attention computation with fused Triton kernels:
+      - q @ k^T + scaling + causal mask + ReLU
+      - (att) @ v
+    """
+    def __init__(self, n_embd, n_head, max_seqlen):
+        super().__init__()
+        assert n_embd % n_head == 0
+        self.c_attn = nn.Linear(n_embd, 3 * n_embd)
+        self.c_proj = nn.Linear(n_embd, n_embd)
+
+        # Causal mask buffer kept for API compatibility, though
+        # Triton kernel directly implements an equivalent causal mask
+        self.register_buffer(
+            "bias",
+            torch.tril(torch.ones(max_seqlen, max_seqlen))
+            .view(1, 1, max_seqlen, max_seqlen),
+        )
+
+        self.n_head = n_head
+        self.n_embd = n_embd
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, C = x.size()
+        assert C == self.n_embd
+        assert T <= self.bias.size(-1), "Sequence length exceeds max_seqlen"
+
+        # Compute Q, K, V projections
+        qkv = self.c_attn(x)  # (B, T, 3*C)
+        q, k, v = qkv.split(self.n_embd, dim=2)
+
+        # Reshape into (B, H, T, D)
+        H = self.n_head
+        D = C // H
+        q = q.view(B, T, H, D).permute(0, 2, 1, 3).contiguous()
+        k = k.view(B, T, H, D).permute(0, 2, 1, 3).contiguous()
+        v = v.view(B, T, H, D).permute(0, 2, 1, 3).contiguous()
+
+        # Triton fused QK^T + scale + causal mask + ReLU
+        scale = 1.0 / math.sqrt(D)
+        att = triton_qk_relu(q, k, scale)  # (B, H, T, T)
+
+        # Triton matmul att @ v
+        y = triton_attn_v(att, v)          # (B, H, T, D)
+
+        # Re-assemble heads: (B, T, C)
+        y = y.permute(0, 2, 1, 3).contiguous().view(B, T, C)
+
+        # Note: original provided Model does not apply c_proj in forward,
+        # so we follow that behavior for exact equivalence.
+        return y

@@ -1,0 +1,315 @@
+```python
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 32},
+            num_warps=8,
+            num_stages=3,
+        ),
+    ],
+    key=["M", "N", "K"],
+)
+@triton.jit
+def _linear_kernel(
+    a_ptr,  # [M, K]
+    b_ptr,  # [K, N]
+    c_ptr,  # [M, N]
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k in range(0, K, BLOCK_K):
+        k_remaining = K - k
+        a = tl.load(
+            a_ptrs,
+            mask=(offs_m[:, None] < M) & (offs_k[None, :] < k_remaining),
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptrs,
+            mask=(offs_k[:, None] < k_remaining) & (offs_n[None, :] < N),
+            other=0.0,
+        )
+        acc += tl.dot(a, b, allow_tf32=True)
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    c = acc.to(tl.float32)
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    tl.store(c_ptrs, c, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+
+
+def triton_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """
+    x: [M, K]
+    weight: [K, N]
+    returns: [M, N]
+    """
+    assert x.is_cuda and weight.is_cuda, "Inputs must be CUDA tensors"
+    assert x.dtype == weight.dtype == torch.float32, "Only float32 supported for now"
+
+    x = x.contiguous()
+    w = weight.contiguous()
+
+    M, K = x.shape
+    K_w, N = w.shape
+    assert K_w == K, "Incompatible dimensions for matmul"
+
+    c = torch.empty((M, N), device=x.device, dtype=x.dtype)
+
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_M"]),
+        triton.cdiv(N, META["BLOCK_N"]),
+    )
+
+    _linear_kernel[grid](
+        x,
+        w,
+        c,
+        M,
+        N,
+        K,
+        x.stride(0),
+        x.stride(1),
+        w.stride(0),
+        w.stride(1),
+        c.stride(0),
+        c.stride(1),
+    )
+
+    return c
+
+
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {"BLOCK_M": 32, "BLOCK_N": 64, "BLOCK_K": 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32},
+            num_warps=8,
+            num_stages=3,
+        ),
+    ],
+    key=["M", "N", "K"],
+)
+@triton.jit
+def _batched_matmul_kernel(
+    a_ptr,  # [B, M, K]
+    b_ptr,  # [B, K, N]
+    c_ptr,  # [B, M, N]
+    B,
+    M,
+    N,
+    K,
+    stride_ab,
+    stride_am,
+    stride_ak,
+    stride_bb,
+    stride_bk,
+    stride_bn,
+    stride_cb,
+    stride_cm,
+    stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    pid_b = tl.program_id(2)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    a_batch_ptr = a_ptr + pid_b * stride_ab
+    b_batch_ptr = b_ptr + pid_b * stride_bb
+    c_batch_ptr = c_ptr + pid_b * stride_cb
+
+    a_ptrs = a_batch_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_batch_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k in range(0, K, BLOCK_K):
+        k_remaining = K - k
+        a = tl.load(
+            a_ptrs,
+            mask=(offs_m[:, None] < M) & (offs_k[None, :] < k_remaining),
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptrs,
+            mask=(offs_k[:, None] < k_remaining) & (offs_n[None, :] < N),
+            other=0.0,
+        )
+        acc += tl.dot(a, b, allow_tf32=True)
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    c = acc.to(tl.float32)
+    c_ptrs = c_batch_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    tl.store(c_ptrs, c, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+
+
+def triton_batched_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """
+    a: [B, M, K]
+    b: [B, K, N]
+    returns: [B, M, N]
+    """
+    assert a.is_cuda and b.is_cuda, "Inputs must be CUDA tensors"
+    assert a.dtype == b.dtype == torch.float32, "Only float32 supported for now"
+
+    a = a.contiguous()
+    b = b.contiguous()
+
+    B, M, K = a.shape
+    B_b, K_b, N = b.shape
+    assert B_b == B and K_b == K, "Incompatible dimensions for batched matmul"
+
+    c = torch.empty((B, M, N), device=a.device, dtype=a.dtype)
+
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_M"]),
+        triton.cdiv(N, META["BLOCK_N"]),
+        B,
+    )
+
+    _batched_matmul_kernel[grid](
+        a,
+        b,
+        c,
+        B,
+        M,
+        N,
+        K,
+        a.stride(0),
+        a.stride(1),
+        a.stride(2),
+        b.stride(0),
+        b.stride(1),
+        b.stride(2),
+        c.stride(0),
+        c.stride(1),
+        c.stride(2),
+    )
+
+    return c
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-accelerated version of the NetVLAD-like module.
+    Replaces the two main matmuls with Triton kernels, keeping
+    BatchNorm, softmax and normalizations in PyTorch for stability.
+    """
+
+    def __init__(self, cluster_size, feature_size, ghost_clusters):
+        super(ModelNew, self).__init__()
+
+        self.feature_size = feature_size
+        self.cluster_size = cluster_size
+        self.ghost_clusters = ghost_clusters
+
+        init_sc = 1.0 / math.sqrt(feature_size)
+        clusters = cluster_size + ghost_clusters
+
+        # (w, b) in the paper
+        self.clusters = nn.Parameter(init_sc * torch.randn(feature_size, clusters))
+        self.batch_norm = nn.BatchNorm1d(clusters)
+        # visual words c_k
+        self.clusters2 = nn.Parameter(
+            init_sc * torch.randn(1, feature_size, cluster_size)
+        )
+        self.out_dim = self.cluster_size * feature_size
+
+    def forward(self, x, mask=None):
+        """
+        x: B x N x D
+        returns: B x (D*K)
+        """
+        B, max_sample, D = x.shape
+        assert D == self.feature_size
+
+        x_flat = x.view(-1, self.feature_size).contiguous()  # BN x D
+
+        if x_flat.device != self.clusters.device:
+            msg = f"x.device {x_flat.device} != cluster.device {self.clusters.device}"
+            raise ValueError(msg)
+
+        # BN x (K+G) using Triton GEMM
+        assignment = triton_linear(x_flat, self.clusters)
+
+        # BatchNorm over feature dimension (clusters)
+        assignment = self.batch_norm(assignment)
+
+        # Softmax over clusters (K+G)
+        assignment = F.softmax(assignment, dim=1)  # BN x (K+G)
+
+        # Remove ghost clusters
+        assignment = assignment[:, : self.cluster_size]  # BN x K
+
+        # BN x K -> B x N x K
+        assignment = assignment.view(B, max_sample, self.cluster_size)
+
+        # Sum over N
+        a_sum = assignment.sum(dim=1, keepdim=True)  # B x 1 x K
+        a = a_sum * self.clusters2  # (B x 1 x K) * (1 x D x K) -> B x D x K
+
+        # Prepare for batched GEMM: (B,K,N) x (B,N,D) -> (B,K,D)
+        assignment_t = assignment.transpose(1, 2).contiguous()  # B x K x N
+        x_reshaped = x.view(B, max_sample, self.feature_size).contiguous()  # B x N x D
+
+        # Triton batched matmul
+        vlad = triton_batched_matmul(assignment_t, x_reshaped)  # B x K x D
+        vlad = vlad.transpose(1, 2)  # B x D x K
+
+        vlad = vlad - a  # B x D x K
+
+        # L2 intra norm over feature dimension D
+        vlad = F.normalize(vlad, p=2.0, dim=1)
+
+        # Flatten + L2 norm over descriptor dimension
+        vlad = vlad.reshape(B, self.cluster_size * self.feature_size)
+        vlad = F.normalize(vlad, p=2.0, dim=1)
+
+        return vlad
+```

@@ -1,0 +1,283 @@
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+
+# =====================================================================
+# 1x1 CONV + BIAS + RELU KERNEL (NCHW, CONTIGUOUS, FP32)
+# Implements Y = ReLU( X @ W + b ) where:
+#   X: (B, Cin, H, W)  -> reshaped to (M=B*H*W, K=Cin)
+#   W: (Cin, Cout)
+#   Y: (B, Cout, H, W) -> reshaped to (M, N=Cout)
+# =====================================================================
+
+@triton.autotune(
+    configs=[
+        # Good defaults for Ada / 4090; autotuner will pick best per shape.
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+        triton.Config(
+            {'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+        triton.Config(
+            {'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32},
+            num_warps=8,
+            num_stages=2,
+        ),
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 32},
+            num_warps=8,
+            num_stages=2,
+        ),
+    ],
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def conv1x1_bias_relu_kernel(
+    x_ptr,         # *f32, input:  (B, Cin, H, W), contiguous NCHW
+    w_ptr,         # *f32, weight: (Cin, Cout) as row-major (K, N)
+    bias_ptr,      # *f32, bias:   (Cout,)
+    y_ptr,         # *f32, output: (B, Cout, H, W), contiguous NCHW
+
+    M,             # total number of output pixels = B * H * W
+    N,             # Cout
+    K,             # Cin
+
+    HW,            # H * W
+
+    stride_in_n,   # x.stride(0) == Cin * H * W
+    stride_in_c,   # x.stride(1) == H * W
+    stride_out_n,  # y.stride(0) == Cout * H * W
+    stride_out_c,  # y.stride(1) == H * W
+
+    stride_w_k,    # w_t.stride(0)
+    stride_w_n,    # w_t.stride(1)
+
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # -----------------------------------------------------------------
+    # Program IDs: tile over M (output pixels) and N (output channels)
+    # -----------------------------------------------------------------
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+
+    # -----------------------------------------------------------------
+    # Map flattened pixel index m -> (batch, hw_offset)
+    #   m in [0, B*H*W)
+    #   batch_idx = m // (H*W)
+    #   hw_offset = m % (H*W)
+    # We avoid explicit h/w decomposition to cut integer math.
+    # -----------------------------------------------------------------
+    b_idx = offs_m // HW
+    hw_offset = offs_m - b_idx * HW
+
+    base_in = b_idx * stride_in_n + hw_offset
+    base_out = b_idx * stride_out_n + hw_offset
+
+    # -----------------------------------------------------------------
+    # Accumulator
+    # -----------------------------------------------------------------
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # -----------------------------------------------------------------
+    # Main K loop
+    # -----------------------------------------------------------------
+    for k_start in range(0, K, BLOCK_K):
+        k_idx = k_start + tl.arange(0, BLOCK_K)
+        mask_k = k_idx < K
+
+        # A tile: input X, shape (BLOCK_M, BLOCK_K)
+        # each row m: base_in[m] + k * stride_in_c
+        a_ptrs = x_ptr + base_in[:, None] + k_idx[None, :] * stride_in_c
+        a = tl.load(a_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0)
+
+        # B tile: weight W^T, shape (BLOCK_K, BLOCK_N)
+        # stored as (K, N) with strides (stride_w_k, stride_w_n)
+        b_ptrs = w_ptr + k_idx[:, None] * stride_w_k + offs_n[None, :] * stride_w_n
+        b = tl.load(b_ptrs, mask=mask_k[:, None] & mask_n[None, :], other=0.0)
+
+        a = a.to(tl.float32)
+        b = b.to(tl.float32)
+
+        acc += tl.dot(a, b, allow_tf32=True)
+
+    # -----------------------------------------------------------------
+    # Fused bias add + ReLU
+    # All fused ops share the SAME offs_n / masks over N.
+    # -----------------------------------------------------------------
+    bias = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0).to(tl.float32)
+    acc += bias[None, :]
+    acc = tl.maximum(acc, 0.0)
+
+    # -----------------------------------------------------------------
+    # Store
+    # -----------------------------------------------------------------
+    y_ptrs = y_ptr + base_out[:, None] + offs_n[None, :] * stride_out_c
+    tl.store(y_ptrs, acc, mask=mask_m[:, None] & mask_n[None, :])
+
+
+# =====================================================================
+# WRAPPER: 1x1 CONV + BIAS + RELU (Triton)
+# =====================================================================
+
+def conv1x1_bias_relu_triton(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    Fused 1x1 convolution + bias + ReLU using Triton.
+
+    Args:
+        x:      (B, Cin, H, W), contiguous NCHW, float32.
+        weight: (Cout, Cin, 1, 1) or (Cout, Cin), float32.
+        bias:   (Cout,), float32.
+
+    Returns:
+        y: (B, Cout, H, W), contiguous NCHW, float32.
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda, "All tensors must be CUDA tensors"
+    assert x.dtype == weight.dtype == bias.dtype == torch.float32, "Only float32 is supported"
+
+    # Enforce standard contiguous NCHW to match kernel indexing simplifications
+    x = x.contiguous()
+    B, Cin, H, W = x.shape
+    HW = H * W
+
+    # Weight to 2D (Cout, Cin)
+    if weight.dim() == 4:
+        Cout = weight.shape[0]
+        assert weight.shape[1] == Cin and weight.shape[2] == 1 and weight.shape[3] == 1
+        w_2d = weight.view(Cout, Cin)
+    else:
+        Cout, Cin_w = weight.shape
+        assert Cin_w == Cin
+        w_2d = weight
+
+    M = B * HW  # number of output pixels
+    N = Cout
+    K = Cin
+
+    # Output tensor
+    y = torch.empty((B, Cout, H, W), device=x.device, dtype=x.dtype, memory_format=torch.contiguous_format)
+
+    # Store weight as (K, N) for matmul
+    w_t = w_2d.t().contiguous()  # (Cin, Cout)
+
+    # Strides (NCHW contiguous)
+    stride_in_n, stride_in_c, _, _ = x.stride()
+    stride_out_n, stride_out_c, _, _ = y.stride()
+    stride_w_k, stride_w_n = w_t.stride()
+
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta['BLOCK_M']),
+            triton.cdiv(N, meta['BLOCK_N']),
+        )
+
+    conv1x1_bias_relu_kernel[grid](
+        x, w_t, bias, y,
+        M, N, K,
+        HW,
+        stride_in_n, stride_in_c,
+        stride_out_n, stride_out_c,
+        stride_w_k, stride_w_n,
+    )
+    return y
+
+
+# =====================================================================
+# MODEL
+# =====================================================================
+
+class ModelNew(nn.Module):
+    """
+    SqueezeNet-like model with Triton-accelerated 1x1 convolutions
+    in Fire modules and classifier, optimized for Ada / RTX 4090.
+    """
+
+    class FireModuleTriton(nn.Module):
+        """
+        FireModule with Triton-optimized 1x1 convolutions (squeeze and expand1x1).
+        3x3 path uses standard PyTorch Conv2d + ReLU.
+        """
+
+        def __init__(self, in_channels, squeeze_channels, expand1x1_channels, expand3x3_channels):
+            super(ModelNew.FireModuleTriton, self).__init__()
+
+            # Squeeze: 1x1 conv
+            self.squeeze = nn.Conv2d(in_channels, squeeze_channels, kernel_size=1)
+            # Expand 1x1 path
+            self.expand1x1 = nn.Conv2d(squeeze_channels, expand1x1_channels, kernel_size=1)
+            # Expand 3x3 path
+            self.expand3x3 = nn.Conv2d(squeeze_channels, expand3x3_channels, kernel_size=3, padding=1)
+
+        def forward(self, x):
+            # Squeeze 1x1 + ReLU (fused in Triton)
+            x = conv1x1_bias_relu_triton(x, self.squeeze.weight, self.squeeze.bias)
+
+            # Expand 1x1 + ReLU (fused in Triton)
+            out1 = conv1x1_bias_relu_triton(x, self.expand1x1.weight, self.expand1x1.bias)
+
+            # Expand 3x3 + ReLU (PyTorch)
+            out3 = F.relu(self.expand3x3(x), inplace=False)
+
+            # Concatenate along channel dimension
+            return torch.cat([out1, out3], dim=1)
+
+    def __init__(self, num_classes=1000):
+        super(ModelNew, self).__init__()
+
+        Fire = ModelNew.FireModuleTriton
+
+        # Feature extractor
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 96, kernel_size=7, stride=2),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=3, stride=2, ceil_mode=True),
+
+            Fire(96, 16, 64, 64),
+            Fire(128, 16, 64, 64),
+            Fire(128, 32, 128, 128),
+            nn.MaxPool2d(kernel_size=3, stride=2, ceil_mode=True),
+
+            Fire(256, 32, 128, 128),
+            Fire(256, 48, 192, 192),
+            Fire(384, 48, 192, 192),
+            Fire(384, 64, 256, 256),
+            nn.MaxPool2d(kernel_size=3, stride=2, ceil_mode=True),
+
+            Fire(512, 64, 256, 256),
+        )
+
+        # Classifier
+        self.dropout = nn.Dropout(p=0.0)
+        self.class_conv = nn.Conv2d(512, num_classes, kernel_size=1)
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+
+    def forward(self, x):
+        """
+        :param x: Input tensor, shape (batch_size, 3, height, width)
+        :return: Output tensor, shape (batch_size, num_classes)
+        """
+        x = self.features(x)
+
+        x = self.dropout(x)
+        # Classifier 1x1 conv + bias + ReLU via Triton
+        x = conv1x1_bias_relu_triton(x, self.class_conv.weight, self.class_conv.bias)
+        x = self.avgpool(x)
+
+        return torch.flatten(x, 1)
+```

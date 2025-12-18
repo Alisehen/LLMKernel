@@ -1,0 +1,5 @@
+{
+  "critical_issue": "m_i is initialized via `tl.full((1,), ...)[0]`, and Triton forbids indexing tensors with a constexpr like `[0]`.",
+  "why_it_matters": "This unsupported tensor indexing triggers a compilation-time `unsupported tensor index: constexpr[0]` error, preventing the kernel from compiling and running at all.",
+  "minimal_fix_hint": "Initialize m_i as a scalar, e.g. `tl.full((), -float(\"inf\"), dtype=tl.float32)` or equivalent, without any `[...]` indexing."
+}

@@ -1,0 +1,274 @@
+
+Write a correct and reasonably fast Triton kernel to replace the given PyTorch operator.
+This is a SEED implementation: prioritize correctness and stable compilation.
+
+Rules:
+- Use `tl.program_id(axis)` (axis=0/1/2 only)
+- Use `tl.arange()` for block indices
+- Operate on blocks (no CUDA thread model)
+- No manual shared memory or synchronization
+
+Hard Constraints:
+- All BLOCK_* are `tl.constexpr` and powers of 2
+- `tl.arange(0, BLOCK)` requires BLOCK to be power-of-2
+- No dynamic `tl.reshape()` or view
+- `tl.load` / `tl.store`: scalar ptr → scalar, block ptr → block
+- No Python control flow on `tl.tensor` or BLOCK_*
+- Triton does NOT support `continue`, `break`, or `return` inside loops — use masking instead
+- Import ALL modules you use (e.g., `import math` if using `math.sqrt`)
+- Do NOT index tensors with loop variables: `tensor[:, i]` or `tensor[i, :]` where i is a loop var is INVALID
+- Triton has NO: tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+- @triton.autotune: use at most 2-3 configs to reduce compilation time
+
+## Full Network Optimization
+- Preserve model structure (helper classes, Sequential, ModuleList)
+- Fuse adjacent ops in forward() where beneficial
+
+Output Format (STRICT):
+1. Imports (torch, torch.nn, triton, triton.language, and any other needed modules like math)
+2. `@triton.jit` kernel(s)
+3. Wrapper function(s)
+4. `class ModelNew(nn.Module)` — this class is REQUIRED
+
+Do NOT include testing code or `if __name__ == "__main__"`.
+
+Example PyTorch:
+'''
+import torch
+import torch.nn as nn
+
+
+class Model(nn.Module):
+    """
+    Fusion example: Gemm + Add + ReLU
+    Three operations fused together.
+    """
+    def __init__(self, in_features, out_features, bias_shape):
+        super(Model, self).__init__()
+        self.gemm = nn.Linear(in_features, out_features)
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+
+    def forward(self, x):
+        x = self.gemm(x)
+        x = x + self.bias
+        x = torch.relu(x)
+        return x
+
+
+def get_inputs():
+    return [torch.randn(128, 512).cuda()]
+
+
+def get_init_inputs():
+    return [512, 512, (512,)]
+'''
+
+Example Triton:
+'''
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def fused_gemm_add_relu_kernel(
+    a_ptr, b_ptr, bias_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k in range(0, K, BLOCK_K):
+        a = tl.load(a_ptrs, mask=(offs_m[:, None] < M) & (offs_k[None, :] < K - k), other=0.0)
+        b = tl.load(b_ptrs, mask=(offs_k[:, None] < K - k) & (offs_n[None, :] < N), other=0.0)
+        acc += tl.dot(a, b, allow_tf32=True)
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Fused: add bias
+    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc += bias[None, :]
+
+    # Fused: ReLU
+    acc = tl.maximum(acc, 0.0)
+
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    tl.store(c_ptrs, acc, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+
+
+def fused_gemm_add_relu(x, weight, bias):
+    M, K = x.shape
+    N = weight.shape[0]
+    c = torch.empty((M, N), device=x.device, dtype=x.dtype)
+    b = weight.t().contiguous()
+    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']), triton.cdiv(N, META['BLOCK_N']))
+    fused_gemm_add_relu_kernel[grid](
+        x, b, bias, c, M, N, K,
+        x.stride(0), x.stride(1), b.stride(0), b.stride(1), c.stride(0), c.stride(1),
+    )
+    return c
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, bias_shape):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+
+    def forward(self, x):
+        return fused_gemm_add_relu(x, self.weight, self.bias)
+'''
+
+Hardware:
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+Target:
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class Bottleneck(nn.Module):
+    expansion = 4
+
+    def __init__(self, in_channels, out_channels, stride=1, downsample=None):
+        """
+        :param in_channels: Number of input channels
+        :param out_channels: Number of output channels
+        :param stride: Stride for the first convolutional layer
+        :param downsample: Downsample layer for the shortcut connection
+        """
+        super(Bottleneck, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.conv3 = nn.Conv2d(out_channels, out_channels * self.expansion, kernel_size=1, bias=False)
+        self.bn3 = nn.BatchNorm2d(out_channels * self.expansion)
+        self.relu = nn.ReLU(inplace=True)
+        self.downsample = downsample
+        self.stride = stride
+
+    def forward(self, x):
+        """
+        :param x: Input tensor, shape (batch_size, in_channels, height, width)
+        :return: Output tensor, shape (batch_size, out_channels * expansion, height, width)
+        """
+        identity = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out = self.relu(out)
+
+        out = self.conv3(out)
+        out = self.bn3(out)
+
+        if self.downsample is not None:
+            identity = self.downsample(x)
+
+        out += identity
+        out = self.relu(out)
+
+        return out
+
+class Model(nn.Module):
+    def __init__(self, layers, num_classes=1000):
+        """
+        :param block: Type of block to use (BasicBlock or Bottleneck)
+        :param layers: List of integers specifying the number of blocks in each layer
+        :param num_classes: Number of output classes
+        """
+        super(Model, self).__init__()
+        self.in_channels = 64
+
+        self.conv1 = nn.Conv2d(3, self.in_channels, kernel_size=7, stride=2, padding=3, bias=False)
+        self.bn1 = nn.BatchNorm2d(self.in_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+
+        block = Bottleneck
+
+        self.layer1 = self._make_layer(block, 64, layers[0])
+        self.layer2 = self._make_layer(block, 128, layers[1], stride=2)
+        self.layer3 = self._make_layer(block, 256, layers[2], stride=2)
+        self.layer4 = self._make_layer(block, 512, layers[3], stride=2)
+
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(512 * block.expansion, num_classes)
+
+    def _make_layer(self, block, out_channels, blocks, stride=1):
+        downsample = None
+        if stride != 1 or self.in_channels != out_channels * block.expansion:
+            downsample = nn.Sequential(
+                nn.Conv2d(self.in_channels, out_channels * block.expansion, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_channels * block.expansion),
+            )
+
+        layers = []
+        layers.append(block(self.in_channels, out_channels, stride, downsample))
+        self.in_channels = out_channels * block.expansion
+        for _ in range(1, blocks):
+            layers.append(block(self.in_channels, out_channels))
+
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        """
+        :param x: Input tensor, shape (batch_size, 3, height, width)
+        :return: Output tensor, shape (batch_size, num_classes)
+        """
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.fc(x)
+
+        return x
+
+# Test code
+batch_size = 10
+height = 224
+width = 224
+layers = [3, 4, 23, 3]
+num_classes = 1000
+
+def get_inputs():
+    return [torch.rand(batch_size, 3, height, width)]
+
+def get_init_inputs():
+    return [layers, num_classes]

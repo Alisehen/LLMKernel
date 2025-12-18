@@ -1,0 +1,393 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+import math
+
+
+# =========================
+# Triton Kernels
+# =========================
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32}, num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_warps=8),
+    ],
+    key=['N', 'H', 'W', 'C_out'],
+)
+@triton.jit
+def conv3x3_relu_kernel(
+    x_ptr, w_ptr, b_ptr, y_ptr,
+    N, C_in, H, W, C_out,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_wo, stride_wc, stride_wh, stride_ww,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    BLOCK_M: tl.constexpr,  # tile over (N * H * W)
+    BLOCK_N: tl.constexpr,  # tile over C_out
+):
+    """
+    Fused 3x3 Conv2d (stride=1, padding=1, dilation=1, groups=1) + bias + ReLU
+    Layout: NCHW for input and output, OIHW for weights.
+    """
+
+    pid_m = tl.program_id(0)  # along N*H*W
+    pid_n = tl.program_id(1)  # along C_out
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # [BM]
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # [BN]
+
+    P = N * H * W
+
+    # Map flattened spatial index -> (n, h, w)
+    tmp = offs_m
+    w_idx = tmp % W
+    tmp = tmp // W
+    h_idx = tmp % H
+    n_idx = tmp // H
+
+    # Broadcast to 2D (BM, BN)
+    n = n_idx[:, None]
+    h = h_idx[:, None]
+    w = w_idx[:, None]
+    co = offs_n[None, :]
+
+    mask_m = offs_m < P        # [BM]
+    mask_n = offs_n < C_out    # [BN]
+
+    mask_x_base = mask_m[:, None]  # (BM, 1) for input loads
+    mask_w = mask_n[None, :]       # (1, BN) for weight loads
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Convolution sum over input channels and 3x3 kernel
+    for ci in range(0, C_in):
+        for kh in range(0, 3):
+            ih = h + kh - 1
+            in_h_ok = (ih >= 0) & (ih < H)
+            for kw in range(0, 3):
+                iw = w + kw - 1
+                in_w_ok = (iw >= 0) & (iw < W)
+
+                # valid input positions for this (kh, kw)
+                mask_x = mask_x_base & in_h_ok & in_w_ok  # (BM, 1)
+
+                in_ptrs = (
+                    x_ptr
+                    + n * stride_xn
+                    + ci * stride_xc
+                    + ih * stride_xh
+                    + iw * stride_xw
+                )
+                w_ptrs = (
+                    w_ptr
+                    + co * stride_wo
+                    + ci * stride_wc
+                    + kh * stride_wh
+                    + kw * stride_ww
+                )
+
+                x_vals = tl.load(in_ptrs, mask=mask_x, other=0.0)  # (BM, 1)
+                w_vals = tl.load(w_ptrs, mask=mask_w, other=0.0)  # (1, BN)
+
+                acc += x_vals * w_vals  # broadcast to (BM, BN)
+
+    # Add bias
+    bias = tl.load(b_ptr + offs_n, mask=mask_n, other=0.0)  # (BN,)
+    acc += bias[None, :]
+
+    # ReLU
+    acc = tl.maximum(acc, 0.0)
+
+    # Store output: y[n, co, h, w]
+    y_ptrs = (
+        y_ptr
+        + n * stride_yn
+        + co * stride_yc
+        + h * stride_yh
+        + w * stride_yw
+    )
+    mask_out = mask_x_base & mask_w  # (BM, BN) == valid (offs_m, offs_n)
+    tl.store(y_ptrs, acc, mask=mask_out)
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=8),
+    ],
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def linear_bias_kernel(
+    a_ptr, b_ptr, bias_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    HAS_RELU: tl.constexpr,
+    BLOCK_M: tl.constexpr,  # tile along M
+    BLOCK_N: tl.constexpr,  # tile along N
+    BLOCK_K: tl.constexpr,  # reduction tile
+):
+    """
+    Fused Linear (GEMM) + bias (+ optional ReLU).
+
+    Computes: C = A @ B + bias, where
+      A: [M, K]
+      B: [K, N]  (we pass weight^T to get this layout)
+      bias: [N]
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # [BM]
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # [BN]
+    offs_k = tl.arange(0, BLOCK_K)                    # [BK]
+
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k in range(0, K, BLOCK_K):
+        k_remaining = K - k
+
+        a = tl.load(
+            a_ptrs,
+            mask=(offs_m[:, None] < M) & (offs_k[None, :] < k_remaining),
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptrs,
+            mask=(offs_k[:, None] < k_remaining) & (offs_n[None, :] < N),
+            other=0.0,
+        )
+
+        acc += tl.dot(a, b, allow_tf32=True)
+
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Add bias
+    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc += bias[None, :]
+
+    # Optional ReLU
+    if HAS_RELU:
+        acc = tl.maximum(acc, 0.0)
+
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    tl.store(
+        c_ptrs,
+        acc,
+        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+    )
+
+
+# =========================
+# Python Wrappers
+# =========================
+
+def conv3x3_relu_triton(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    x:      [N, C_in, H, W]
+    weight: [C_out, C_in, 3, 3]
+    bias:   [C_out]
+    returns [N, C_out, H, W]
+    """
+    assert x.dim() == 4
+    assert weight.dim() == 4 and weight.shape[2] == 3 and weight.shape[3] == 3
+    assert bias.dim() == 1 and bias.shape[0] == weight.shape[0]
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+    assert x.dtype == weight.dtype == bias.dtype == torch.float32
+
+    N, C_in, H, W = x.shape
+    C_out = weight.shape[0]
+
+    y = torch.empty((N, C_out, H, W), device=x.device, dtype=x.dtype)
+
+    # Grid over flattened spatial positions (N*H*W) and output channels
+    def grid(meta):
+        return (
+            triton.cdiv(N * H * W, meta['BLOCK_M']),
+            triton.cdiv(C_out, meta['BLOCK_N']),
+        )
+
+    conv3x3_relu_kernel[grid](
+        x, weight, bias, y,
+        N, C_in, H, W, C_out,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        weight.stride(0), weight.stride(1), weight.stride(2), weight.stride(3),
+        y.stride(0), y.stride(1), y.stride(2), y.stride(3),
+    )
+
+    return y
+
+
+def linear_bias_triton(
+    x: torch.Tensor,  # [M, K]
+    weight: torch.Tensor,  # [N, K] (standard PyTorch Linear: out_features, in_features)
+    bias: torch.Tensor,    # [N]
+    relu: bool,
+) -> torch.Tensor:
+    """
+    Linear layer using Triton GEMM:
+        out = x @ weight.T + bias
+        optionally followed by ReLU.
+    """
+    assert x.dim() == 2
+    assert weight.dim() == 2
+    assert bias.dim() == 1
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+    assert x.dtype == weight.dtype == bias.dtype == torch.float32
+
+    M, K = x.shape
+    N = weight.shape[0]
+    assert weight.shape[1] == K
+    assert bias.shape[0] == N
+
+    # B is [K, N]
+    b = weight.t().contiguous()
+
+    out = torch.empty((M, N), device=x.device, dtype=x.dtype)
+
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta['BLOCK_M']),
+            triton.cdiv(N, meta['BLOCK_N']),
+        )
+
+    linear_bias_kernel[grid](
+        x, b, bias, out,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        b.stride(0), b.stride(1),
+        out.stride(0), out.stride(1),
+        HAS_RELU=relu,
+    )
+
+    return out
+
+
+# =========================
+# Modules using Triton ops
+# =========================
+
+class FusedConvReLU(nn.Module):
+    """
+    Conv2d (3x3, stride=1, padding=1, bias=True) fused with ReLU using Triton.
+    """
+
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+        # Match standard Conv2d weight/bias shapes
+        self.weight = nn.Parameter(torch.empty(out_channels, in_channels, 3, 3))
+        self.bias = nn.Parameter(torch.empty(out_channels))
+        # Initialize similarly to nn.Conv2d with ReLU
+        nn.init.kaiming_normal_(self.weight, mode='fan_out', nonlinearity='relu')
+        nn.init.constant_(self.bias, 0.0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return conv3x3_relu_triton(x, self.weight, self.bias)
+
+
+class FusedLinearReLU(nn.Module):
+    """
+    Linear layer fused with ReLU using Triton.
+    """
+
+    def __init__(self, in_features: int, out_features: int):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias = nn.Parameter(torch.empty(out_features))
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        fan_in = in_features
+        bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+        nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x is expected to be [batch, in_features]
+        return linear_bias_triton(x, self.weight, self.bias, relu=True)
+
+
+class LinearNoReLU(nn.Module):
+    """
+    Linear layer using Triton (no activation).
+    """
+
+    def __init__(self, in_features: int, out_features: int):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias = nn.Parameter(torch.empty(out_features))
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        fan_in = in_features
+        bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+        nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return linear_bias_triton(x, self.weight, self.bias, relu=False)
+
+
+# =========================
+# Optimized VGG16 Model
+# =========================
+
+class ModelNew(nn.Module):
+    def __init__(self, num_classes=1000):
+        """
+        VGG16-like model using fused Triton kernels for:
+          - Conv2d + ReLU (3x3, stride=1, padding=1)
+          - Linear + bias (+ optional ReLU)
+        """
+        super(ModelNew, self).__init__()
+
+        # VGG16 feature extractor with fused Conv+ReLU
+        self.features = nn.Sequential(
+            # Block 1
+            FusedConvReLU(3, 64),
+            FusedConvReLU(64, 64),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+
+            # Block 2
+            FusedConvReLU(64, 128),
+            FusedConvReLU(128, 128),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+
+            # Block 3
+            FusedConvReLU(128, 256),
+            FusedConvReLU(256, 256),
+            FusedConvReLU(256, 256),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+
+            # Block 4
+            FusedConvReLU(256, 512),
+            FusedConvReLU(512, 512),
+            FusedConvReLU(512, 512),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+
+            # Block 5
+            FusedConvReLU(512, 512),
+            FusedConvReLU(512, 512),
+            FusedConvReLU(512, 512),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+        )
+
+        # Classifier with fused Linear+ReLU
+        self.classifier = nn.Sequential(
+            FusedLinearReLU(512 * 7 * 7, 4096),
+            nn.Dropout(p=0.0),
+            FusedLinearReLU(4096, 4096),
+            nn.Dropout(p=0.0),
+            LinearNoReLU(4096, num_classes),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: [batch_size, 3, 224, 224]
+        returns: [batch_size, num_classes]
+        """
+        x = self.features(x)
+        x = torch.flatten(x, 1)
+        x = self.classifier(x)
+        return x

@@ -1,0 +1,5 @@
+{
+  "critical_issue": "tl.arange(0, HEAD_DIM) uses a non–power-of-two HEAD_DIM (e.g., 96), violating Triton’s requirement that arange’s range be a power of two.",
+  "why_it_matters": "Triton enforces arange length to be a power of two; when HEAD_DIM is 96, kernel compilation fails with `ValueError: arange's range must be a power of 2`.",
+  "minimal_fix_hint": "Decouple BLOCK_D from HEAD_DIM: use tl.arange(0, BLOCK_D) where BLOCK_D is power-of-two and mask indices >= HEAD_DIM."
+}

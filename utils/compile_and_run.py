@@ -53,7 +53,7 @@ def _capture_import(path: Path):
 
     Returns
     -------
-    (module, full_log : str)
+    (module, full_log : str, mod_name : str)
 
     Raises
     ------
@@ -109,7 +109,7 @@ def _capture_import(path: Path):
             os.close(old_stderr_fd)
 
     # ---------------- SUCCESS --------------------------------------------
-    return module, py_buf.getvalue() + subproc_log
+    return module, py_buf.getvalue() + subproc_log, mod_name
 
 
 # =========================== timing helpers ===============================
@@ -464,7 +464,11 @@ def compare_and_bench(
     if TORCH_DEVICE == "cuda":
         torch.cuda.set_device(dev)
         # Clear GPU cache before test to avoid OOM from previous runs
-        torch.cuda.empty_cache()
+        try:
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
 
     # 若需要通过环境变量控制 seed
     if seed is None:
@@ -472,8 +476,13 @@ def compare_and_bench(
         seed = int(env_seed) if env_seed is not None else None
 
     # ------------ 动态导入 ------------
-    ref_mod, _ = _capture_import(ref_py)
-    test_mod, _ = _capture_import(test_py)
+    ref_mod, _, ref_mod_name = _capture_import(ref_py)
+    test_mod, _, test_mod_name = _capture_import(test_py)
+
+    # 用于 finally 清理的变量
+    ref_model = None
+    test_model = None
+    inp = None
 
     RefModel   = getattr(ref_mod,  "Model",       None)
     get_inputs = getattr(ref_mod,  "get_inputs",  None)
@@ -657,6 +666,34 @@ def compare_and_bench(
         # 抛出完整 traceback（上层捕获）
         import traceback as _tb
         raise RuntimeError(_tb.format_exc()) from None
+
+    finally:
+        # ============ 内存清理 ============
+        # 1. 删除模型和输入
+        if ref_model is not None:
+            del ref_model
+        if test_model is not None:
+            del test_model
+        if inp is not None:
+            del inp
+
+        # 2. 从 sys.modules 移除导入的模块，避免累积
+        if ref_mod_name in sys.modules:
+            del sys.modules[ref_mod_name]
+        if test_mod_name in sys.modules:
+            del sys.modules[test_mod_name]
+
+        # 3. 强制垃圾回收
+        import gc
+        gc.collect()
+
+        # 4. 清理 GPU 缓存（忽略异步 CUDA 错误）
+        if TORCH_DEVICE == "cuda":
+            try:
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
 
     # ------------ 结果汇总 ------------
     result: Dict[str, Any] = {

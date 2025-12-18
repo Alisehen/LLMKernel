@@ -1,0 +1,353 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+import torch.nn.functional as F
+
+
+# -------------------------------
+# Triton Kernels
+# -------------------------------
+
+@triton.jit
+def global_avg_pool2d_kernel(
+    x_ptr, y_ptr,
+    N, C,
+    stride_n, stride_c, stride_h, stride_w,
+    out_stride_n, out_stride_c,
+    H: tl.constexpr,
+    W: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+):
+    """
+    x: [N, C, H, W]
+    y: [N, C]
+    Computes global average pooling over H, W.
+    """
+    pid_n = tl.program_id(0)  # batch index
+    pid_c = tl.program_id(1)  # channel block index
+
+    offs_c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
+    mask_c = offs_c < C
+
+    acc = tl.zeros((BLOCK_C,), dtype=tl.float32)
+
+    # Reduce over spatial dimensions
+    for h in range(0, H):
+        for w in range(0, W):
+            x_ptrs = (
+                x_ptr
+                + pid_n * stride_n
+                + offs_c * stride_c
+                + h * stride_h
+                + w * stride_w
+            )
+            vals = tl.load(x_ptrs, mask=mask_c, other=0.0)
+            acc += vals.to(tl.float32)
+
+    inv_hw = 1.0 / (H * W)
+    acc = acc * inv_hw
+
+    y_ptrs = y_ptr + pid_n * out_stride_n + offs_c * out_stride_c
+    tl.store(y_ptrs, acc, mask=mask_c)
+
+
+@triton.jit
+def linear_gemm_kernel(
+    a_ptr, b_ptr, bias_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """
+    C = A @ B + bias
+    A: [M, K]
+    B: [K, N]      (this is weight.T)
+    bias: [N]
+    C: [M, N]
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    k = 0
+    while k < K:
+        k_remaining = K - k
+        k_mask_row = offs_k[None, :] < k_remaining  # [1, BLOCK_K]
+
+        a = tl.load(
+            a_ptrs,
+            mask=(offs_m[:, None] < M) & k_mask_row,
+            other=0.0,
+        )
+
+        k_mask_col = k_mask_row.T  # [BLOCK_K, 1]
+        b = tl.load(
+            b_ptrs,
+            mask=k_mask_col & (offs_n[None, :] < N),
+            other=0.0,
+        )
+
+        acc += tl.dot(a, b, allow_tf32=True)
+
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+        k += BLOCK_K
+
+    # Add bias
+    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc += bias[None, :]
+
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    tl.store(
+        c_ptrs,
+        acc,
+        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+    )
+
+
+# -------------------------------
+# Wrapper Functions
+# -------------------------------
+
+def global_avg_pool2d_triton(x: torch.Tensor) -> torch.Tensor:
+    """
+    Replacement for:
+        F.adaptive_avg_pool2d(x, (1, 1)).view(x.size(0), -1)
+    Returns tensor of shape [N, C].
+    """
+    if (not x.is_cuda) or x.numel() == 0:
+        return F.adaptive_avg_pool2d(x, (1, 1)).view(x.size(0), -1)
+
+    assert x.dim() == 4, "Expected input of shape [N, C, H, W]"
+    N, C, H, W = x.shape
+
+    y = torch.empty((N, C), device=x.device, dtype=x.dtype)
+
+    stride_n, stride_c, stride_h, stride_w = x.stride()
+    out_stride_n, out_stride_c = y.stride()
+
+    BLOCK_C = 64
+
+    grid = (N, triton.cdiv(C, BLOCK_C))
+    global_avg_pool2d_kernel[grid](
+        x,
+        y,
+        N, C,
+        stride_n, stride_c, stride_h, stride_w,
+        out_stride_n, out_stride_c,
+        H=H,
+        W=W,
+        BLOCK_C=BLOCK_C,
+        num_warps=1,
+        num_stages=1,
+    )
+    return y
+
+
+def linear_triton(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    Triton implementation of nn.Linear:
+        out = x @ weight.T + bias
+    where:
+        x:      [M, K]
+        weight: [N, K]
+        bias:   [N]
+        out:    [M, N]
+    """
+    if (
+        (not x.is_cuda)
+        or (not weight.is_cuda)
+        or (bias is not None and (not bias.is_cuda))
+    ):
+        return F.linear(x, weight, bias)
+
+    assert x.dim() == 2, "x must be [M, K]"
+    assert weight.dim() == 2, "weight must be [N, K]"
+    M, K = x.shape
+    N, K_w = weight.shape
+    assert K == K_w, "Incompatible dimensions for linear layer"
+
+    if bias is None:
+        bias = torch.zeros(N, device=x.device, dtype=x.dtype)
+
+    c = torch.empty((M, N), device=x.device, dtype=x.dtype)
+
+    # B = weight.T with shape [K, N]
+    b = weight.t().contiguous()
+
+    stride_am, stride_ak = x.stride()
+    stride_bk, stride_bn = b.stride()
+    stride_cm, stride_cn = c.stride()
+
+    BLOCK_M = 64
+    BLOCK_N = 64
+    BLOCK_K = 32
+
+    grid = (
+        triton.cdiv(M, BLOCK_M),
+        triton.cdiv(N, BLOCK_N),
+    )
+
+    linear_gemm_kernel[grid](
+        x, b, bias, c,
+        M, N, K,
+        stride_am, stride_ak,
+        stride_bk, stride_bn,
+        stride_cm, stride_cn,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        num_warps=4,
+        num_stages=4,
+    )
+    return c
+
+
+# -------------------------------
+# Model Definition
+# -------------------------------
+
+class ModelNew(nn.Module):
+    class _DenseLayer(nn.Module):
+        def __init__(self, in_features: int, growth_rate: int, drop_rate: float = 0.0):
+            super().__init__()
+            self.bn = nn.BatchNorm2d(in_features)
+            self.relu = nn.ReLU(inplace=True)
+            self.conv = nn.Conv2d(
+                in_features,
+                growth_rate,
+                kernel_size=3,
+                padding=1,
+                bias=False,
+            )
+            self.drop = nn.Dropout(drop_rate) if drop_rate > 0.0 else nn.Identity()
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            out = self.bn(x)
+            out = self.relu(out)
+            out = self.conv(out)
+            out = self.drop(out)
+            return out
+
+    class _DenseBlock(nn.Module):
+        def __init__(
+            self,
+            num_layers: int,
+            num_input_features: int,
+            growth_rate: int,
+            drop_rate: float = 0.0,
+        ):
+            super().__init__()
+            layers = []
+            for i in range(num_layers):
+                in_features = num_input_features + i * growth_rate
+                layer = ModelNew._DenseLayer(
+                    in_features=in_features,
+                    growth_rate=growth_rate,
+                    drop_rate=drop_rate,
+                )
+                layers.append(layer)
+            self.layers = nn.ModuleList(layers)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            # Memory-efficient DenseNet-style concatenation:
+            # keep one tensor per feature-map, avoid storing
+            # full concatenated tensors at each iteration.
+            features = [x]
+            for layer in self.layers:
+                concatenated = torch.cat(features, dim=1)
+                new_feature = layer(concatenated)
+                features.append(new_feature)
+            return torch.cat(features, dim=1)
+
+    class _TransitionLayer(nn.Module):
+        def __init__(self, num_input_features: int, num_output_features: int):
+            super().__init__()
+            self.bn = nn.BatchNorm2d(num_input_features)
+            self.relu = nn.ReLU(inplace=True)
+            self.conv = nn.Conv2d(
+                num_input_features,
+                num_output_features,
+                kernel_size=1,
+                bias=False,
+            )
+            self.pool = nn.AvgPool2d(kernel_size=2, stride=2)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            x = self.bn(x)
+            x = self.relu(x)
+            x = self.conv(x)
+            x = self.pool(x)
+            return x
+
+    def __init__(self, growth_rate: int = 32, num_classes: int = 1000):
+        super(ModelNew, self).__init__()
+
+        # Initial convolution and pooling
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
+        )
+
+        # Dense blocks and transition layers (DenseNet-201 layout)
+        num_features = 64
+        block_layers = [6, 12, 48, 32]
+
+        self.dense_blocks = nn.ModuleList()
+        self.transition_layers = nn.ModuleList()
+
+        for i, num_layers in enumerate(block_layers):
+            block = ModelNew._DenseBlock(
+                num_layers=num_layers,
+                num_input_features=num_features,
+                growth_rate=growth_rate,
+                drop_rate=0.0,
+            )
+            self.dense_blocks.append(block)
+            num_features = num_features + num_layers * growth_rate
+
+            if i != len(block_layers) - 1:
+                out_features = num_features // 2
+                transition = ModelNew._TransitionLayer(
+                    num_input_features=num_features,
+                    num_output_features=out_features,
+                )
+                self.transition_layers.append(transition)
+                num_features = out_features
+
+        # Final batch norm and classifier (Triton-accelerated tail)
+        self.final_bn = nn.BatchNorm2d(num_features)
+        self.classifier = nn.Linear(num_features, num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.features(x)
+
+        for i, block in enumerate(self.dense_blocks):
+            x = block(x)
+            if i != len(self.dense_blocks) - 1:
+                x = self.transition_layers[i](x)
+
+        x = self.final_bn(x)
+        x = F.relu(x, inplace=True)
+
+        # Triton-accelerated global average pooling + linear layer
+        x = global_avg_pool2d_triton(x)  # [N, C]
+        x = linear_triton(x, self.classifier.weight, self.classifier.bias)  # [N, num_classes]
+        return x
+```

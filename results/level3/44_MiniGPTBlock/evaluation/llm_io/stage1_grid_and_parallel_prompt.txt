@@ -1,0 +1,244 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU
+GPU Name: 4090
+Architecture: Ada Lovelace
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+[OPTIMIZATION STAGE]f
+
+## Current Optimization Stage
+
+Focus: Grid layout & indexing for FUSED operations.
+
+⚠️ FUSION EXCLUSIONS (do NOT apply fusion rules to these):
+- Reduction ops (sum, mean, softmax along axis)
+- Atomic operations
+- Irregular/data-dependent access patterns
+- Cross-block dependencies
+
+Key Principle:
+- All fused ops share the SAME grid AND the SAME (offsets, mask) tuple
+- Grid covers OUTPUT tensor dimensions
+
+Hard Rules:
+- Every fused op MUST use identical offset calculation
+- Every fused op MUST use identical boundary mask
+- If broadcast needed: explicit `[None, :]` or `[:, None]`, NOT different offsets
+- Element-wise: 1D grid, single `offs = pid * BLOCK + tl.arange(0, BLOCK)`
+- Matmul fusion: 2D grid, `offs_m/offs_n` shared by bias add & activation
+
+Verification:
+- Check: all tl.load/tl.store use same `offsets` variable
+- Check: all masks derived from same boundary condition
+- If ANY op needs different indexing → do NOT fuse, split kernel
+
+
+
+[CURRENT CODE]
+```python
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+
+# -----------------------------
+# Triton kernel: NewGELU (BERT/GPT-style GELU)
+# -----------------------------
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8),
+    ],
+    key=['n_elements'],
+)
+@triton.jit
+def new_gelu_kernel(
+    x_ptr,  # *const T
+    y_ptr,  # *mut T
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < n_elements
+
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+
+    # Compute in fp32 for numerical stability
+    x_f = x.to(tl.float32)
+
+    # Constants for GELU
+    sqrt_2_over_pi = 0.7978845608028654  # sqrt(2/pi)
+    coeff = 0.044715
+
+    x3 = x_f * x_f * x_f
+    u = x_f + coeff * x3
+    v = sqrt_2_over_pi * u
+
+    # Numerically stable tanh(v) using:
+    # tanh(v) = sign(v) * (1 - exp(-2*abs(v))) / (1 + exp(-2*abs(v)))
+    a = tl.abs(v)
+    t = tl.exp(-2.0 * a)
+    num = 1.0 - t
+    den = 1.0 + t
+    base = num / den
+    sign = tl.where(v >= 0, 1.0, -1.0)
+    tanh_v = sign * base
+
+    y_f = 0.5 * x_f * (1.0 + tanh_v)
+
+    y = y_f.to(x.dtype)
+    tl.store(y_ptr + offs, y, mask=mask)
+
+
+def new_gelu_triton(x: torch.Tensor) -> torch.Tensor:
+    """
+    Triton implementation of the NewGELU activation:
+    0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    """
+    assert x.is_cuda, "new_gelu_triton expects a CUDA tensor"
+    # Work on a contiguous view for simpler indexing
+    x_contig = x.contiguous()
+    y = torch.empty_like(x_contig)
+
+    n_elements = x_contig.numel()
+    grid = lambda META: (triton.cdiv(n_elements, META['BLOCK_SIZE']),)
+
+    new_gelu_kernel[grid](
+        x_contig,
+        y,
+        n_elements,
+    )
+    # Reshape back to original shape (same as contiguous)
+    return y.view_as(x)
+
+
+# -----------------------------
+# Helper modules (copied structure)
+# -----------------------------
+
+class NewGELU_Triton(nn.Module):
+    """
+    Module wrapper around the Triton GELU kernel.
+    """
+    def __init__(self):
+        super(NewGELU_Triton, self).__init__()
+
+    def forward(self, x):
+        return new_gelu_triton(x)
+
+
+class CausalSelfAttention(nn.Module):
+    """
+    Same as in the original model, kept in PyTorch for this seed version.
+    """
+
+    def __init__(self, n_embd, n_head, attn_pdrop, resid_pdrop, max_seqlen):
+        super().__init__()
+        assert n_embd % n_head == 0
+        # key, query, value projections for all heads, but in a batch
+        self.c_attn = nn.Linear(n_embd, 3 * n_embd)
+        # output projection
+        self.c_proj = nn.Linear(n_embd, n_embd)
+        # regularization
+        self.attn_dropout = nn.Dropout(attn_pdrop)
+        self.resid_dropout = nn.Dropout(resid_pdrop)
+        # causal mask to ensure that attention is only applied to the left in the input sequence
+        self.register_buffer(
+            "bias",
+            torch.tril(torch.ones(max_seqlen, max_seqlen)).view(1, 1, max_seqlen, max_seqlen),
+        )
+        self.n_head = n_head
+        self.n_embd = n_embd
+
+    def forward(self, x):
+        B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
+
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+
+        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
+        att = F.softmax(att, dim=-1)
+        att = self.attn_dropout(att)
+        y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)  # re-assemble all head outputs side by side
+
+        # output projection
+        y = self.resid_dropout(self.c_proj(y))
+        return y
+
+
+# -----------------------------
+# Full block with Triton GELU
+# -----------------------------
+
+class ModelNew(nn.Module):
+    """Transformer block using Triton-accelerated NewGELU in the MLP."""
+
+    def __init__(self, n_embd, n_head, attn_pdrop, resid_pdrop, max_seqlen):
+        super().__init__()
+        self.ln_1 = nn.LayerNorm(n_embd)
+        self.attn = CausalSelfAttention(n_embd, n_head, attn_pdrop, resid_pdrop, max_seqlen)
+        self.ln_2 = nn.LayerNorm(n_embd)
+
+        # Preserve ModuleDict structure; only activation is replaced with Triton version
+        self.mlp = nn.ModuleDict(
+            dict(
+                c_fc=nn.Linear(n_embd, 4 * n_embd),
+                c_proj=nn.Linear(4 * n_embd, n_embd),
+                act=NewGELU_Triton(),
+                dropout=nn.Dropout(resid_pdrop),
+            )
+        )
+        m = self.mlp
+        # MLP forward: dropout(c_proj(GELU(c_fc(x))))
+        self.mlpf = lambda x: m.dropout(m.c_proj(m.act(m.c_fc(x))))
+
+    def forward(self, x):
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.mlpf(self.ln_2(x))
+        return x
+```
+
+[NCU PROFILING METRICS]
+No NCU metrics available (skipped for network-level model)
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+TRITON API CONSTRAINTS (CRITICAL):
+- Triton has NO: tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

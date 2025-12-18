@@ -1,0 +1,230 @@
+Fix the Triton kernel errors. Generate correct, high-performance code.
+
+Current Error Log:
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 538, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251215_151630_batch_range34to50_deepseek_deepseek/38_LSTMBidirectional/code/kernel_20251215_180829.py", line 137, in forward
+    return fused_gemm_last_step(out, self.weight, self.bias)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251215_151630_batch_range34to50_deepseek_deepseek/38_LSTMBidirectional/code/kernel_20251215_180829.py", line 108, in fused_gemm_last_step
+    fused_gemm_last_step_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 419, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 238, in run
+    benchmark()
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 227, in benchmark
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 227, in <dictcomp>
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 162, in _bench
+    return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/testing.py", line 149, in do_bench
+    fn()
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 148, in kernel_call
+    self.fn.run(
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 733, in run
+    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 861, in _do_compile
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 300, in compile
+    module = src.make_ir(target, options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 80, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 63:47:
+        x_block = tl.load(x_ptrs, mask=b_mask[:, None] & k_mask[None, :], other=0.0)
+
+        # Load block of weight [BLOCK_K, BLOCK_N]
+        w_ptrs = weight_ptr + (k + offs_k[:, None]) * stride_wk + offs_n[None, :] * stride_wn
+        w_block = tl.load(w_ptrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0)
+
+        # Accumulate matrix multiplication
+        acc += tl.dot(x_block, w_block, allow_tf32=True)
+
+    # Add bias
+    if bias_ptr is not None:
+        bias = tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0)
+                                               ^
+NameError('n_mask is not defined')
+
+Main Critical Problem Analysis:
+Problem Analysis (from expert diagnosis):
+critical_issue: n_mask variable defined inside K-loop but used outside for bias loading (line 63).
+why_it_matters: n_mask is out of scope when loading bias, causing NameError during kernel compilation.
+minimal_fix_hint: Move n_mask and b_mask definitions outside K-loop before the loop starts.
+
+Focus your fix on addressing the identified critical issue.
+
+
+Broken Code:
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=4),
+    ],
+    key=['M', 'N', 'K']
+)
+@triton.jit
+def fused_gemm_last_step_kernel(
+    # Input pointers
+    x_ptr,  # [B, T, K]
+    weight_ptr,  # [N, K]
+    bias_ptr,  # [N]
+    # Output pointer
+    out_ptr,  # [B, N]
+    # Shapes
+    B, T, K, N,
+    # Strides
+    stride_xb, stride_xt, stride_xk,
+    stride_wk, stride_wn,
+    stride_ob, stride_on,
+    # Block constants
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """
+    Fused kernel that:
+    1. Selects the last timestep from x[:, -1, :] (shape [B, K])
+    2. Performs matrix multiplication with weight [N, K]
+    3. Adds bias [N]
+    """
+    # Program IDs
+    pid_b = tl.program_id(0)  # Batch dimension
+    pid_n = tl.program_id(1)  # Output feature dimension
+    
+    # Offsets
+    offs_b = pid_b * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    
+    # Initialize accumulator
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    # Pointer to last timestep (x[:, -1, :])
+    # x_ptr + (T-1)*stride_xt gives the last timestep
+    last_timestep_offset = (T - 1) * stride_xt
+    
+    # Loop over K dimension
+    for k in range(0, K, BLOCK_K):
+        # Create masks
+        b_mask = offs_b < B
+        n_mask = offs_n < N
+        k_mask = offs_k < (K - k)
+        k_full_mask = offs_k < K
+        
+        # Load block of x [BLOCK_M, BLOCK_K]
+        x_ptrs = x_ptr + offs_b[:, None] * stride_xb + last_timestep_offset + \
+                (k + offs_k[None, :]) * stride_xk
+        x_block = tl.load(x_ptrs, mask=b_mask[:, None] & k_mask[None, :], other=0.0)
+        
+        # Load block of weight [BLOCK_K, BLOCK_N]
+        w_ptrs = weight_ptr + (k + offs_k[:, None]) * stride_wk + offs_n[None, :] * stride_wn
+        w_block = tl.load(w_ptrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0)
+        
+        # Accumulate matrix multiplication
+        acc += tl.dot(x_block, w_block, allow_tf32=True)
+    
+    # Add bias
+    if bias_ptr is not None:
+        bias = tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0)
+        acc += bias[None, :]
+    
+    # Store result
+    out_ptrs = out_ptr + offs_b[:, None] * stride_ob + offs_n[None, :] * stride_on
+    tl.store(out_ptrs, acc, mask=b_mask[:, None] & n_mask[None, :])
+
+
+def fused_gemm_last_step(x, weight, bias):
+    """
+    Fused operation: x[:, -1, :] @ weight.t() + bias
+    x: [B, T, K]
+    weight: [N, K]
+    bias: [N] or None
+    """
+    B, T, K = x.shape
+    N = weight.shape[0]
+    
+    # Output tensor
+    out = torch.empty((B, N), device=x.device, dtype=x.dtype)
+    
+    # Grid computation
+    grid = lambda META: (
+        triton.cdiv(B, META['BLOCK_M']),
+        triton.cdiv(N, META['BLOCK_N']),
+    )
+    
+    # Prepare weight for kernel (need K,N layout)
+    weight_t = weight.t().contiguous()
+    
+    fused_gemm_last_step_kernel[grid](
+        x, weight_t, bias, out,
+        B, T, K, N,
+        x.stride(0), x.stride(1), x.stride(2),
+        weight_t.stride(0), weight_t.stride(1),
+        out.stride(0), out.stride(1),
+    )
+    
+    return out
+
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers, output_size, dropout=0.0):
+        super(ModelNew, self).__init__()
+        # Keep LSTM as is (too complex to implement in Triton for now)
+        self.lstm = nn.LSTM(
+            input_size, hidden_size, num_layers, 
+            batch_first=True, dropout=dropout, bidirectional=True
+        )
+        
+        # Replace nn.Linear with parameters for fused kernel
+        self.weight = nn.Parameter(torch.randn(output_size, hidden_size * 2))
+        self.bias = nn.Parameter(torch.randn(output_size))
+    
+    def forward(self, x, h0, c0):
+        # LSTM forward (unchanged)
+        out, hn = self.lstm(x, (h0, c0))
+        
+        # Fused: take last timestep and linear transformation
+        return fused_gemm_last_step(out, self.weight, self.bias)
+```
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl, AND any other modules used (e.g., import math if using math.sqrt)
+   2. @triton.jit decorated kernel function(s) — NO continue/break/return inside loops (use masking)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels — THIS CLASS IS REQUIRED
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+3. Learn from previous repair attempts to avoid repeating the same mistakes
+4. Ensure ALL imports are included at the top (common mistake: forgetting `import math`)
+
+```python
+# <corrected code>
+```

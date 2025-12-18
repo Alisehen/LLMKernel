@@ -1,0 +1,5 @@
+{
+  "critical_issue": "Gate accumulators are initialized as shape (1, H) from bi[None, :] but updated with (BLOCK_B, H) dot products, changing their shape across the loop.",
+  "why_it_matters": "Triton requires loop-carried variables have a fixed type/shape; the (1,H) to (BLOCK_B,H) change triggers the compilation assertion about acc_i type inconsistency.",
+  "minimal_fix_hint": "Initialize acc_i, acc_f, acc_g, acc_o as (BLOCK_B, H) tensors (e.g., broadcast biases to batch dimension) so their shape matches the tl.dot outputs throughout the loop."
+}

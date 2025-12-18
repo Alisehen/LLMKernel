@@ -1,0 +1,412 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+# ------------------------------------------------------------
+# 1. Triton kernels
+# ------------------------------------------------------------
+
+DW_CONFIGS = [
+    triton.Config({'BLOCK_HW': 64}, num_warps=4, num_stages=2),
+    triton.Config({'BLOCK_HW': 128}, num_warps=4, num_stages=2),
+    triton.Config({'BLOCK_HW': 128}, num_warps=8, num_stages=2),
+    triton.Config({'BLOCK_HW': 256}, num_warps=8, num_stages=2),
+]
+
+
+@triton.autotune(configs=DW_CONFIGS, key=['H_out', 'W_out'])
+@triton.jit
+def depthwise_conv2d_kernel(
+    x_ptr,          # *f32, input:  (N, C, H_in, W_in)
+    w_ptr,          # *f32, weight: (C, 1, K, K)
+    y_ptr,          # *f32, output: (N, C, H_out, W_out)
+    N, C,
+    H_in, W_in,
+    H_out, W_out,
+    stride_h, stride_w,
+    pad_h, pad_w,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_wn, stride_wk1, stride_wk2,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    K: tl.constexpr,
+    BLOCK_HW: tl.constexpr,
+):
+    # Program ids:
+    #  - pid_nc over (N * C)
+    #  - pid_blk over flattened H_out * W_out tiles
+    pid_nc = tl.program_id(0)
+    pid_blk = tl.program_id(1)
+
+    offs_hw = pid_blk * BLOCK_HW + tl.arange(0, BLOCK_HW)
+    hw_mask = offs_hw < (H_out * W_out)
+
+    n = pid_nc // C
+    c = pid_nc % C
+
+    # (h_out, w_out) from flattened hw index
+    h_out = offs_hw // W_out
+    w_out = offs_hw % W_out
+
+    # Base pointers for the current (n, c) slice
+    x_base = x_ptr + n * stride_xn + c * stride_xc
+    y_base = y_ptr + n * stride_yn + c * stride_yc
+
+    # Accumulator stays in registers for full KxK
+    acc = tl.zeros((BLOCK_HW,), dtype=tl.float32)
+
+    # Unrolled depthwise KxK convolution
+    for kh in range(K):
+        # h_in shared across kw for given kh
+        h_in = h_out * stride_h - pad_h + kh
+        h_in_in_bounds = (h_in >= 0) & (h_in < H_in)
+
+        for kw in range(K):
+            w_in = w_out * stride_w - pad_w + kw
+
+            in_bounds = (
+                h_in_in_bounds &
+                (w_in >= 0) & (w_in < W_in) &
+                hw_mask
+            )
+
+            x_ptrs = x_base + h_in * stride_xh + w_in * stride_xw
+            x_vals = tl.load(x_ptrs, mask=in_bounds, other=0.0)
+
+            w_idx = c * stride_wn + kh * stride_wk1 + kw * stride_wk2
+            w_val = tl.load(w_ptr + w_idx)
+
+            acc += x_vals * w_val
+
+    # Single final store (no intermediate stores)
+    y_ptrs = y_base + h_out * stride_yh + w_out * stride_yw
+    tl.store(y_ptrs, acc, mask=hw_mask)
+
+
+@triton.autotune(configs=DW_CONFIGS, key=['H_out', 'W_out'])
+@triton.jit
+def depthwise_conv2d_bn_relu6_kernel(
+    x_ptr,          # *f32, input:  (N, C, H_in, W_in)
+    w_ptr,          # *f32, weight: (C, 1, K, K)
+    y_ptr,          # *f32, output: (N, C, H_out, W_out)
+    bn_weight_ptr,  # *f32, gamma: (C,)
+    bn_bias_ptr,    # *f32, beta:  (C,)
+    bn_mean_ptr,    # *f32, running_mean: (C,)
+    bn_var_ptr,     # *f32, running_var:  (C,)
+    eps,            # f32, batch-norm epsilon
+    N, C,
+    H_in, W_in,
+    H_out, W_out,
+    stride_h, stride_w,
+    pad_h, pad_w,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_wn, stride_wk1, stride_wk2,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    K: tl.constexpr,
+    BLOCK_HW: tl.constexpr,
+):
+    # Same tiling as conv-only kernel
+    pid_nc = tl.program_id(0)
+    pid_blk = tl.program_id(1)
+
+    offs_hw = pid_blk * BLOCK_HW + tl.arange(0, BLOCK_HW)
+    hw_mask = offs_hw < (H_out * W_out)
+
+    n = pid_nc // C
+    c = pid_nc % C
+
+    h_out = offs_hw // W_out
+    w_out = offs_hw % W_out
+
+    x_base = x_ptr + n * stride_xn + c * stride_xc
+    y_base = y_ptr + n * stride_yn + c * stride_yc
+
+    acc = tl.zeros((BLOCK_HW,), dtype=tl.float32)
+
+    # Depthwise KxK convolution
+    for kh in range(K):
+        h_in = h_out * stride_h - pad_h + kh
+        h_in_in_bounds = (h_in >= 0) & (h_in < H_in)
+
+        for kw in range(K):
+            w_in = w_out * stride_w - pad_w + kw
+
+            in_bounds = (
+                h_in_in_bounds &
+                (w_in >= 0) & (w_in < W_in) &
+                hw_mask
+            )
+
+            x_ptrs = x_base + h_in * stride_xh + w_in * stride_xw
+            x_vals = tl.load(x_ptrs, mask=in_bounds, other=0.0)
+
+            w_idx = c * stride_wn + kh * stride_wk1 + kw * stride_wk2
+            w_val = tl.load(w_ptr + w_idx)
+
+            acc += x_vals * w_val
+
+    # Per-channel BatchNorm parameters
+    gamma = tl.load(bn_weight_ptr + c)
+    beta = tl.load(bn_bias_ptr + c)
+    mean = tl.load(bn_mean_ptr + c)
+    var = tl.load(bn_var_ptr + c)
+
+    inv_std = 1.0 / tl.sqrt(var + eps)
+    scale = gamma * inv_std
+    shift = beta - mean * scale
+
+    # Fuse: BN + ReLU6 (all in registers, no intermediate stores)
+    y = acc * scale + shift
+    y = tl.maximum(y, 0.0)
+    y = tl.minimum(y, 6.0)
+
+    y_ptrs = y_base + h_out * stride_yh + w_out * stride_yw
+    tl.store(y_ptrs, y, mask=hw_mask)
+
+
+# ------------------------------------------------------------
+# 2. Wrapper functions
+# ------------------------------------------------------------
+
+def depthwise_conv2d_triton(x: torch.Tensor, weight: torch.Tensor, stride: int, padding: int):
+    """
+    Depthwise 2D convolution (groups = channels) implemented in Triton.
+    Conv-only, no BatchNorm / activation.
+    """
+    assert x.dim() == 4, "Input must be NCHW"
+    N, C, H_in, W_in = x.shape
+    K = weight.shape[-1]
+    groups = C
+
+    # Fallback for non-fp32 or non-CUDA tensors
+    if (x.device.type != "cuda") or (x.dtype != torch.float32) or (weight.dtype != torch.float32):
+        return torch.nn.functional.conv2d(
+            x, weight, bias=None, stride=stride, padding=padding, groups=groups
+        )
+
+    pad_h = pad_w = padding
+    stride_h = stride_w = stride
+
+    H_out = (H_in + 2 * pad_h - K) // stride_h + 1
+    W_out = (W_in + 2 * pad_w - K) // stride_w + 1
+
+    y = torch.empty((N, C, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    x_contig = x.contiguous()
+    w_contig = weight.contiguous()
+    y_contig = y  # already contiguous
+
+    stride_xn, stride_xc, stride_xh, stride_xw = x_contig.stride()
+    stride_wn, stride_w1, stride_wk1, stride_wk2 = w_contig.stride()
+    stride_yn, stride_yc, stride_yh, stride_yw = y_contig.stride()
+
+    grid = lambda META: (
+        N * C,
+        triton.cdiv(H_out * W_out, META['BLOCK_HW']),
+    )
+
+    depthwise_conv2d_kernel[grid](
+        x_contig, w_contig, y_contig,
+        N, C,
+        H_in, W_in,
+        H_out, W_out,
+        stride_h, stride_w,
+        pad_h, pad_w,
+        stride_xn, stride_xc, stride_xh, stride_xw,
+        stride_wn, stride_wk1, stride_wk2,
+        stride_yn, stride_yc, stride_yh, stride_yw,
+        K=K,
+    )
+    return y_contig
+
+
+def depthwise_conv2d_bn_relu6_triton(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bn_weight: torch.Tensor,
+    bn_bias: torch.Tensor,
+    bn_running_mean: torch.Tensor,
+    bn_running_var: torch.Tensor,
+    bn_eps: float,
+    stride: int,
+    padding: int,
+):
+    """
+    Fused depthwise conv + BatchNorm (eval-mode semantics) + ReLU6.
+    Uses BatchNorm running_mean / running_var, i.e. correct in eval() mode.
+    """
+    assert x.dim() == 4, "Input must be NCHW"
+    N, C, H_in, W_in = x.shape
+    K = weight.shape[-1]
+    groups = C
+
+    # Fallback for non-fp32 or non-CUDA tensors
+    if (x.device.type != "cuda") or (x.dtype != torch.float32) or (weight.dtype != torch.float32):
+        y = torch.nn.functional.conv2d(
+            x, weight, bias=None, stride=stride, padding=padding, groups=groups
+        )
+        # BN (eval) + ReLU6 on PyTorch
+        shape = (1, C, 1, 1)
+        gamma = bn_weight.view(shape)
+        beta = bn_bias.view(shape)
+        mean = bn_running_mean.view(shape)
+        var = bn_running_var.view(shape)
+        y = (y - mean) / torch.sqrt(var + bn_eps) * gamma + beta
+        y = torch.clamp(y, 0.0, 6.0)
+        return y
+
+    pad_h = pad_w = padding
+    stride_h = stride_w = stride
+
+    H_out = (H_in + 2 * pad_h - K) // stride_h + 1
+    W_out = (W_in + 2 * pad_w - K) // stride_w + 1
+
+    y = torch.empty((N, C, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    x_contig = x.contiguous()
+    w_contig = weight.contiguous()
+    y_contig = y  # already contiguous
+
+    # BN parameters as contiguous 1D [C]
+    gamma = bn_weight.contiguous()
+    beta = bn_bias.contiguous()
+    mean = bn_running_mean.contiguous()
+    var = bn_running_var.contiguous()
+
+    stride_xn, stride_xc, stride_xh, stride_xw = x_contig.stride()
+    stride_wn, stride_w1, stride_wk1, stride_wk2 = w_contig.stride()
+    stride_yn, stride_yc, stride_yh, stride_yw = y_contig.stride()
+
+    grid = lambda META: (
+        N * C,
+        triton.cdiv(H_out * W_out, META['BLOCK_HW']),
+    )
+
+    depthwise_conv2d_bn_relu6_kernel[grid](
+        x_contig, w_contig, y_contig,
+        gamma, beta, mean, var,
+        bn_eps,
+        N, C,
+        H_in, W_in,
+        H_out, W_out,
+        stride_h, stride_w,
+        pad_h, pad_w,
+        stride_xn, stride_xc, stride_xh, stride_xw,
+        stride_wn, stride_wk1, stride_wk2,
+        stride_yn, stride_yc, stride_yh, stride_yw,
+        K=K,
+    )
+    return y_contig
+
+
+# ------------------------------------------------------------
+# 3. Model definition
+# ------------------------------------------------------------
+
+class ModelNew(nn.Module):
+    """
+    MBConv block with Triton-accelerated depthwise convolution.
+
+    Training mode:
+      - depthwise conv in Triton (conv-only)
+      - BatchNorm & ReLU6 in PyTorch (preserves training semantics)
+
+    Eval mode:
+      - single fused Triton kernel: depthwise conv + BatchNorm (using running stats) + ReLU6
+      - eliminates intermediate global stores/loads between these ops
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size, stride, expand_ratio):
+        super(ModelNew, self).__init__()
+
+        self.use_residual = (stride == 1 and in_channels == out_channels)
+        hidden_dim = in_channels * expand_ratio
+        self.hidden_dim = hidden_dim
+        self.stride = stride
+        self.kernel_size = kernel_size
+        self.padding = (kernel_size - 1) // 2
+
+        # Expansion phase (1x1 conv + BN + ReLU6), if expand_ratio != 1
+        if expand_ratio != 1:
+            self.expand_conv = nn.Sequential(
+                nn.Conv2d(
+                    in_channels,
+                    hidden_dim,
+                    kernel_size=1,
+                    stride=1,
+                    padding=0,
+                    bias=False,
+                ),
+                nn.BatchNorm2d(hidden_dim),
+                nn.ReLU6(inplace=True),
+            )
+        else:
+            hidden_dim = in_channels
+            self.hidden_dim = hidden_dim
+
+        # Depthwise convolution parameters (groups = hidden_dim)
+        self.depthwise_conv_weight = nn.Parameter(
+            torch.empty(
+                hidden_dim,
+                1,
+                kernel_size,
+                kernel_size,
+            )
+        )
+        nn.init.kaiming_normal_(self.depthwise_conv_weight, mode='fan_out', nonlinearity='relu')
+        self.depthwise_bn = nn.BatchNorm2d(hidden_dim)
+        self.depthwise_relu = nn.ReLU6(inplace=True)
+
+        # Projection (1x1 conv + BN)
+        self.project_conv = nn.Conv2d(
+            hidden_dim,
+            out_channels,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+            bias=False,
+        )
+        self.project_bn = nn.BatchNorm2d(out_channels)
+
+    def forward(self, x):
+        identity = x
+
+        # Expansion
+        if hasattr(self, 'expand_conv'):
+            x = self.expand_conv(x)
+
+        # Depthwise convolution path
+        if self.training:
+            # Conv-only Triton kernel, BN + ReLU6 in PyTorch
+            x = depthwise_conv2d_triton(
+                x,
+                self.depthwise_conv_weight,
+                stride=self.stride,
+                padding=self.padding,
+            )
+            x = self.depthwise_bn(x)
+            x = self.depthwise_relu(x)
+        else:
+            # Fused conv + BN (eval semantics) + ReLU6 Triton kernel
+            x = depthwise_conv2d_bn_relu6_triton(
+                x,
+                self.depthwise_conv_weight,
+                self.depthwise_bn.weight,
+                self.depthwise_bn.bias,
+                self.depthwise_bn.running_mean,
+                self.depthwise_bn.running_var,
+                self.depthwise_bn.eps,
+                stride=self.stride,
+                padding=self.padding,
+            )
+
+        # Projection
+        x = self.project_conv(x)
+        x = self.project_bn(x)
+
+        # Residual connection
+        if self.use_residual:
+            x = x + identity
+
+        return x

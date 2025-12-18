@@ -1,0 +1,5 @@
+{
+  "critical_issue": "Mask for loading matrix B uses mismatched shapes (1,BLOCK_K) and (1,BLOCK_N), causing Triton broadcasting failure between BLOCK_K and BLOCK_N dimensions.",
+  "why_it_matters": "Triton requires masks to be broadcastable to the load tensor shape; incompatible 32 vs 64 dimensions make shape resolution fail, triggering the CompilationError before kernel generation.",
+  "minimal_fix_hint": "Redefine k_mask and its use so B’s load mask has shape (BLOCK_K, BLOCK_N), e.g., use 1D k_mask and broadcast separately along K and N axes."
+}

@@ -1,0 +1,240 @@
+
+Write a correct and reasonably fast Triton kernel to replace the given PyTorch operator.
+This is a SEED implementation: prioritize correctness and stable compilation.
+
+Rules:
+- Use `tl.program_id(axis)` (axis=0/1/2 only)
+- Use `tl.arange()` for block indices
+- Operate on blocks (no CUDA thread model)
+- No manual shared memory or synchronization
+
+Hard Constraints:
+- All BLOCK_* are `tl.constexpr` and powers of 2
+- `tl.arange(0, BLOCK)` requires BLOCK to be power-of-2
+- No dynamic `tl.reshape()` or view
+- `tl.load` / `tl.store`: scalar ptr → scalar, block ptr → block
+- No Python control flow on `tl.tensor` or BLOCK_*
+- Triton does NOT support `continue`, `break`, or `return` inside loops — use masking instead
+- Import ALL modules you use (e.g., `import math` if using `math.sqrt`)
+- Do NOT index tensors with loop variables: `tensor[:, i]` or `tensor[i, :]` where i is a loop var is INVALID
+- Triton has NO: tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+- @triton.autotune: use at most 2-3 configs to reduce compilation time
+
+## Full Network Optimization
+- Preserve model structure (helper classes, Sequential, ModuleList)
+- Fuse adjacent ops in forward() where beneficial
+
+Output Format (STRICT):
+1. Imports (torch, torch.nn, triton, triton.language, and any other needed modules like math)
+2. `@triton.jit` kernel(s)
+3. Wrapper function(s)
+4. `class ModelNew(nn.Module)` — this class is REQUIRED
+
+Do NOT include testing code or `if __name__ == "__main__"`.
+
+Example PyTorch:
+'''
+import torch
+import torch.nn as nn
+
+
+class Model(nn.Module):
+    """
+    Fusion example: Gemm + Add + ReLU
+    Three operations fused together.
+    """
+    def __init__(self, in_features, out_features, bias_shape):
+        super(Model, self).__init__()
+        self.gemm = nn.Linear(in_features, out_features)
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+
+    def forward(self, x):
+        x = self.gemm(x)
+        x = x + self.bias
+        x = torch.relu(x)
+        return x
+
+
+def get_inputs():
+    return [torch.randn(128, 512).cuda()]
+
+
+def get_init_inputs():
+    return [512, 512, (512,)]
+'''
+
+Example Triton:
+'''
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def fused_gemm_add_relu_kernel(
+    a_ptr, b_ptr, bias_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k in range(0, K, BLOCK_K):
+        a = tl.load(a_ptrs, mask=(offs_m[:, None] < M) & (offs_k[None, :] < K - k), other=0.0)
+        b = tl.load(b_ptrs, mask=(offs_k[:, None] < K - k) & (offs_n[None, :] < N), other=0.0)
+        acc += tl.dot(a, b, allow_tf32=True)
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Fused: add bias
+    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc += bias[None, :]
+
+    # Fused: ReLU
+    acc = tl.maximum(acc, 0.0)
+
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    tl.store(c_ptrs, acc, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+
+
+def fused_gemm_add_relu(x, weight, bias):
+    M, K = x.shape
+    N = weight.shape[0]
+    c = torch.empty((M, N), device=x.device, dtype=x.dtype)
+    b = weight.t().contiguous()
+    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']), triton.cdiv(N, META['BLOCK_N']))
+    fused_gemm_add_relu_kernel[grid](
+        x, b, bias, c, M, N, K,
+        x.stride(0), x.stride(1), b.stride(0), b.stride(1), c.stride(0), c.stride(1),
+    )
+    return c
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, bias_shape):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+
+    def forward(self, x):
+        return fused_gemm_add_relu(x, self.weight, self.bias)
+'''
+
+Hardware:
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+Target:
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from einops import rearrange
+
+class Model(nn.Module):
+    def __init__(self, batch_size, seq_length, n_heads, d_head, d_state, block_len=64):
+        """
+        Mamba Structured State Space model implementation for benchmarking.
+        
+        :param batch_size: Size of the batch
+        :param seq_length: Length of the input sequence
+        :param n_heads: Number of attention heads
+        :param d_head: Dimension of each head
+        :param d_state: Dimension of the state space
+        :param block_len: Length of each block for chunked computation
+        """
+        super(Model, self).__init__()
+        
+        assert seq_length % block_len == 0, "Sequence length must be divisible by block length"
+        
+        self.batch_size = batch_size
+        self.seq_length = seq_length
+        self.n_heads = n_heads
+        self.d_head = d_head
+        self.d_state = d_state
+        self.block_len = block_len
+        
+        # Initialize parameters
+        self.A = nn.Parameter(torch.randn(batch_size, seq_length, n_heads))
+        self.B = nn.Parameter(torch.randn(batch_size, seq_length, n_heads, d_state))
+        self.C = nn.Parameter(torch.randn(batch_size, seq_length, n_heads, d_state))
+        
+    def segsum(self, x):
+        """Naive segment sum calculation."""
+        T = x.size(-1)
+        x_cumsum = torch.cumsum(x, dim=-1)
+        x_segsum = x_cumsum[..., :, None] - x_cumsum[..., None, :]
+        mask = torch.tril(torch.ones(T, T, device=x.device, dtype=bool), diagonal=0)
+        x_segsum = x_segsum.masked_fill(~mask, -torch.inf)
+        return x_segsum
+    
+    def forward(self, X, initial_states=None):
+        """
+        Forward pass implementing the SSD operation.
+        
+        :param X: Input tensor of shape (batch, length, n_heads, d_head)
+        :param initial_states: Optional initial states
+        :return: Output tensor Y and final state
+        """
+        # Rearrange into blocks/chunks
+        X_blocks, A_blocks, B_blocks, C_blocks = [
+            rearrange(x, "b (c l) ... -> b c l ...", l=self.block_len)
+            for x in (X, self.A, self.B, self.C)
+        ]
+        
+        A_blocks = rearrange(A_blocks, "b c l h -> b h c l")
+        A_cumsum = torch.cumsum(A_blocks, dim=-1)
+        
+        # 1. Compute diagonal block outputs
+        L = torch.exp(self.segsum(A_blocks))
+        Y_diag = torch.einsum("bclhn,bcshn,bhcls,bcshp->bclhp", 
+                             C_blocks, B_blocks, L, X_blocks)
+        
+        # 2. Compute intra-chunk states
+        decay_states = torch.exp((A_cumsum[:, :, :, -1:] - A_cumsum))
+        states = torch.einsum("bclhn,bhcl,bclhp->bchpn", 
+                            B_blocks, decay_states, X_blocks)
+        
+        # 3. Compute inter-chunk recurrence
+        if initial_states is None:
+            initial_states = torch.zeros_like(states[:, :1])
+        states = torch.cat([initial_states, states], dim=1)
+        
+        decay_chunk = torch.exp(self.segsum(F.pad(A_cumsum[:, :, :, -1], (1, 0))))
+        new_states = torch.einsum("bhzc,bchpn->bzhpn", decay_chunk, states)
+        return new_states[:, -1]
+
+# Test parameters
+batch_size = 2048
+seq_length = 128
+n_heads = 8
+d_head = 64
+d_state = 16
+block_len = 64
+
+def get_inputs():
+    return [torch.rand(batch_size, seq_length, n_heads, d_head)]
+
+def get_init_inputs():
+    return [batch_size, seq_length, n_heads, d_head, d_state, block_len]

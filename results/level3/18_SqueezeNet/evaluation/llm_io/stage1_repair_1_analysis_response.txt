@@ -1,0 +1,5 @@
+{
+  "critical_issue": "Benchmark uses batch=64, 512x512 inputs on an almost-full 24GB GPU, so the reference conv2d allocation legitimately exceeds available memory.",
+  "why_it_matters": "The classifier conv2d output needs about 236MiB, but only 87MiB are free, so PyTorch cannot allocate the activation and raises CUDA out-of-memory.",
+  "minimal_fix_hint": "Reduce batch size or input resolution, or free other GPU allocations, so conv2d’s output tensor fits within available device memory."
+}

@@ -1,0 +1,304 @@
+You are a Triton kernel debugging expert. Analyze the error and identify the root cause.
+
+## ERROR LOG
+```
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 538, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251215_151559_batch_range2to16_deepseek_deepseek/2_ShallowWideMLP/code/kernel_20251215_151810.py", line 186, in forward
+    x = fused_linear_activation(x, layer.weight, layer.bias, activation='relu')
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251215_151559_batch_range2to16_deepseek_deepseek/2_ShallowWideMLP/code/kernel_20251215_151810.py", line 140, in fused_linear_activation
+    @triton.autotune(configs=configs, key=['M', 'N', 'K'])
+     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 435, in decorator
+    return Autotuner(fn, fn.arg_names, configs, key, reset_to_zero, restore_value, pre_hook=pre_hook,
+                         ^^^^^^^^^^^^
+AttributeError: 'function' object has no attribute 'arg_names'
+```
+
+## Expected Behavior (PyTorch Reference)
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class Model(nn.Module):
+    def __init__(self, input_size, hidden_layer_sizes, output_size):
+        """
+        :param input_size: The number of input features
+        :param hidden_layer_sizes: A list of ints containing the sizes of each hidden layer
+        :param output_size: The number of output features
+        """
+        super(Model, self).__init__()
+        
+        layers = []
+        current_input_size = input_size
+        
+        for hidden_size in hidden_layer_sizes:
+            layers.append(nn.Linear(current_input_size, hidden_size))
+            layers.append(nn.ReLU())
+            current_input_size = hidden_size
+        
+        layers.append(nn.Linear(current_input_size, output_size))
+        
+        self.network = nn.Sequential(*layers)
+    
+    def forward(self, x):
+        """
+        :param x: The input tensor, shape (batch_size, input_size)
+        :return: The output tensor, shape (batch_size, output_size)
+        """
+        return self.network(x)
+
+# Test code
+batch_size = 128
+input_size = 16384
+hidden_layer_sizes = [32768, 32768]
+output_size = 16384
+
+def get_inputs():
+    return [torch.rand(batch_size, input_size)]
+
+def get_init_inputs():
+    return [input_size, hidden_layer_sizes, output_size]
+```
+
+## Current Implementation (Broken Triton Kernel)
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+import math
+
+@triton.jit
+def fused_linear_relu_kernel(
+    # Pointers to matrices
+    a_ptr, b_ptr, bias_ptr, c_ptr,
+    # Matrix dimensions
+    M, N, K,
+    # Strides
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    # Activation type (0=none, 1=relu)
+    ACTIVATION: tl.constexpr,
+    # Tile sizes
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    # Use tensor cores
+    ALLOW_TF32: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    
+    # Create offsets for M and N dimensions
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    
+    # Create pointers for A and B blocks
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+    
+    # Initialize accumulator
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    # Main GEMM loop
+    for k in range(0, K, BLOCK_K):
+        # Load A and B blocks with boundary checking
+        a = tl.load(a_ptrs, 
+                   mask=(offs_m[:, None] < M) & (offs_k[None, :] < K - k), 
+                   other=0.0)
+        b = tl.load(b_ptrs,
+                   mask=(offs_k[:, None] < K - k) & (offs_n[None, :] < N),
+                   other=0.0)
+        
+        # Matrix multiply
+        acc += tl.dot(a, b, allow_tf32=ALLOW_TF32)
+        
+        # Move pointers to next K block
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+    
+    # Fused: add bias
+    if bias_ptr is not None:
+        bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+        acc += bias[None, :]
+    
+    # Fused: activation
+    if ACTIVATION == 1:  # ReLU
+        acc = tl.maximum(acc, 0.0)
+    
+    # Store result
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    tl.store(c_ptrs, acc, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+
+@triton.jit
+def linear_kernel(
+    a_ptr, b_ptr, bias_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    ALLOW_TF32: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+    
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    for k in range(0, K, BLOCK_K):
+        a = tl.load(a_ptrs, 
+                   mask=(offs_m[:, None] < M) & (offs_k[None, :] < K - k), 
+                   other=0.0)
+        b = tl.load(b_ptrs,
+                   mask=(offs_k[:, None] < K - k) & (offs_n[None, :] < N),
+                   other=0.0)
+        
+        acc += tl.dot(a, b, allow_tf32=ALLOW_TF32)
+        
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+    
+    if bias_ptr is not None:
+        bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+        acc += bias[None, :]
+    
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    tl.store(c_ptrs, acc, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+
+def fused_linear_activation(x, weight, bias=None, activation='none'):
+    M, K = x.shape
+    N = weight.shape[0]
+    
+    # Ensure contiguous memory layout
+    x = x.contiguous()
+    weight_t = weight.t().contiguous()
+    bias = bias.contiguous() if bias is not None else None
+    
+    # Allocate output
+    c = torch.empty((M, N), device=x.device, dtype=x.dtype)
+    
+    # Configuration
+    configs = [
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_stages=3, num_warps=8),
+    ]
+    
+    # Grid function
+    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']), triton.cdiv(N, META['BLOCK_N']))
+    
+    # Choose kernel based on activation
+    if activation == 'relu':
+        kernel = fused_linear_relu_kernel
+        activation_code = 1
+    else:
+        kernel = linear_kernel
+        activation_code = 0
+    
+    @triton.autotune(configs=configs, key=['M', 'N', 'K'])
+    def _kernel(grid, kernel, **kwargs):
+        kernel[grid](**kwargs)
+    
+    # Prepare arguments
+    bias_ptr = bias if bias is not None else None
+    
+    _kernel(grid, kernel,
+            a_ptr=x, b_ptr=weight_t, bias_ptr=bias_ptr, c_ptr=c,
+            M=M, N=N, K=K,
+            stride_am=x.stride(0), stride_ak=x.stride(1),
+            stride_bk=weight_t.stride(0), stride_bn=weight_t.stride(1),
+            stride_cm=c.stride(0), stride_cn=c.stride(1),
+            ACTIVATION=activation_code,
+            ALLOW_TF32=True)
+    
+    return c
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_layer_sizes, output_size):
+        super(ModelNew, self).__init__()
+        
+        self.layers = nn.ModuleList()
+        current_input_size = input_size
+        
+        # Create linear layers for hidden layers with ReLU
+        for hidden_size in hidden_layer_sizes:
+            self.layers.append(nn.Linear(current_input_size, hidden_size))
+            current_input_size = hidden_size
+        
+        # Output layer (no ReLU)
+        self.output_layer = nn.Linear(current_input_size, output_size)
+        
+        # Pre-transpose weights for Triton kernels (transposed in the kernel wrapper)
+        for layer in self.layers:
+            layer.weight.data = layer.weight.data.contiguous()
+            if layer.bias is not None:
+                layer.bias.data = layer.bias.data.contiguous()
+        
+        self.output_layer.weight.data = self.output_layer.weight.data.contiguous()
+        if self.output_layer.bias is not None:
+            self.output_layer.bias.data = self.output_layer.bias.data.contiguous()
+    
+    def forward(self, x):
+        # Hidden layers with fused linear+ReLU
+        for layer in self.layers:
+            x = fused_linear_activation(x, layer.weight, layer.bias, activation='relu')
+        
+        # Output layer (no activation)
+        x = fused_linear_activation(x, self.output_layer.weight, self.output_layer.bias, activation='none')
+        
+        return x
+```
+
+---
+
+## Your Task
+
+Identify the **single most critical issue** that causes the error above.
+
+### Analysis Guidelines
+
+1. **Focus on root cause**, not symptoms
+   - Bad: "Output is wrong"
+   - Good: "BLOCK_K loop missing, only processes first 32 elements of K dimension"
+
+2. **Be specific about WHAT and WHERE**
+   - Bad: "Memory access issue"
+   - Good: "Line 45: tl.atomic_add(c_block_ptr, acc) - atomic_add requires scalar pointer, not block_ptr"
+
+3. **Prioritize by impact**
+   - Correctness bugs > Performance issues > Style problems
+   - Algorithm errors > Implementation details
+
+### Output Format
+
+**CRITICAL: You MUST output ONLY valid JSON. No other text allowed.**
+
+```json
+{
+  "critical_issue": "<Concise description of THE root cause, max 30 words>",
+  "why_it_matters": "<Why this causes the observed error, max 35 words>",
+  "minimal_fix_hint": "<What needs to change (not how), max 30 words>"
+}
+```
+
+**Remember**: Output ONLY the JSON block. No explanations, no commentary, no additional text.

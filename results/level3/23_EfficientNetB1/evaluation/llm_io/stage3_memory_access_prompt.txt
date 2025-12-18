@@ -1,0 +1,452 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU
+GPU Name: 4090
+Architecture: Ada Lovelace
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+[OPTIMIZATION STAGE]f
+
+## Current Optimization Stage
+
+Focus: Memory pattern for fused operations.
+
+Key Principle:
+- Fusion benefit = eliminated INTERMEDIATE stores
+- Multiple input loads are OK; intermediate stores are NOT
+
+Rules:
+- ✅ Multiple tl.load() for different inputs (x, weight, bias) - OK
+- ❌ tl.store() for intermediate results - NEVER (this is what fusion eliminates)
+- ✅ Single tl.store() for final output - required
+
+Verification:
+- Count tl.store() calls: should equal number of OUTPUT tensors (usually 1)
+- Intermediate values: must stay in registers between ops
+- If you see store-then-load pattern for same data → BUG, refactor
+
+Multi-input Fusion Pattern:
+```
+x = tl.load(input_ptr + offs, mask=mask)
+w = tl.load(weight_ptr + ..., mask=...)  # OK: different input
+b = tl.load(bias_ptr + ..., mask=...)    # OK: different input
+y = op1(x, w)  # in registers
+z = op2(y, b)  # in registers
+tl.store(out_ptr + offs, z, mask=mask)   # single output store
+```
+
+num_stages: start with 2, only increase if memory stalls high AND registers OK
+
+
+
+[CURRENT CODE]
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+import math
+
+
+@triton.jit
+def fused_pointwise_conv_bn_relu6_kernel(
+    x_ptr,
+    w_ptr,
+    out_ptr,
+    bn_weight_ptr,
+    bn_bias_ptr,
+    bn_mean_ptr,
+    bn_var_ptr,
+    N, C_in, C_out, H, W,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_wn, stride_wc,
+    stride_on, stride_oc, stride_oh, stride_ow,
+    eps: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_C: tl.constexpr,
+    BLOCK_SIZE_HW: tl.constexpr,
+):
+    """Fused pointwise convolution + batch norm + ReLU6 kernel.
+    
+    Input shape: (N, C_in, H, W)
+    Weight shape: (C_out, C_in, 1, 1)
+    Output shape: (N, C_out, H, W)
+    """
+    pid_n = tl.program_id(0)  # batch dimension
+    pid_oc = tl.program_id(1)  # output channel dimension
+    pid_hw = tl.program_id(2)  # spatial dimension (combined H*W)
+    
+    # Create masks
+    n_mask = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N) < N
+    oc_mask = pid_oc * BLOCK_SIZE_C + tl.arange(0, BLOCK_SIZE_C) < C_out
+    hw_mask = pid_hw * BLOCK_SIZE_HW + tl.arange(0, BLOCK_SIZE_HW) < H * W
+    
+    # Compute spatial indices
+    spatial_offset = pid_hw * BLOCK_SIZE_HW + tl.arange(0, BLOCK_SIZE_HW)
+    h_idx = spatial_offset // W
+    w_idx = spatial_offset % W
+    h_mask = h_idx < H
+    w_mask = w_idx < W
+    spatial_mask = h_mask & w_mask & hw_mask
+    
+    # Initialize accumulator
+    acc = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_C, BLOCK_SIZE_HW), dtype=tl.float32)
+    
+    # Loop over input channels
+    for c_block in range(0, C_in, BLOCK_SIZE_C):
+        c_offs = c_block + tl.arange(0, BLOCK_SIZE_C)
+        c_mask = c_offs < C_in
+        
+        # Load input block
+        n_offs = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)[:, None, None]
+        h_offs = h_idx[None, None, :]
+        w_offs = w_idx[None, None, :]
+        c_offs_3d = c_offs[None, :, None]
+        
+        # Compute pointer offsets
+        x_offsets = (n_offs * stride_xn + 
+                    c_offs_3d * stride_xc + 
+                    h_offs * stride_xh + 
+                    w_offs * stride_xw)
+        
+        x = tl.load(x_ptr + x_offsets,
+                   mask=(n_mask[:, None, None] & c_mask[None, :, None] & spatial_mask[None, None, :]),
+                   other=0.0)
+        
+        # Load weight block with proper broadcasting dimensions
+        oc_offs = pid_oc * BLOCK_SIZE_C + tl.arange(0, BLOCK_SIZE_C)[None, :, None]
+        c_offs_weight = c_offs[:, None, None]
+        
+        w_offsets = oc_offs * stride_wn + c_offs_weight * stride_wc
+        w = tl.load(w_ptr + w_offsets,
+                   mask=(oc_mask[None, :, None] & c_mask[:, None, None]),
+                   other=0.0)
+        
+        # Reshape weight for proper broadcasting: (1, BLOCK_SIZE_C, BLOCK_SIZE_C, 1)
+        w_reshaped = w[None, :, :, :]  # Add batch dimension
+        
+        # Reshape x for broadcasting: (BLOCK_SIZE_N, 1, BLOCK_SIZE_C, BLOCK_SIZE_HW)
+        x_reshaped = x[:, None, :, :]
+        
+        # Multiply and sum over input channel dimension (axis=2)
+        prod = x_reshaped * w_reshaped
+        acc_block = tl.sum(prod, axis=2)
+        
+        # Accumulate
+        acc += acc_block
+    
+    # Load batch norm parameters
+    bn_weight = tl.load(bn_weight_ptr + tl.arange(0, BLOCK_SIZE_C)[None, :, None],
+                       mask=oc_mask[None, :, None], other=1.0)
+    bn_bias = tl.load(bn_bias_ptr + tl.arange(0, BLOCK_SIZE_C)[None, :, None],
+                     mask=oc_mask[None, :, None], other=0.0)
+    bn_mean = tl.load(bn_mean_ptr + tl.arange(0, BLOCK_SIZE_C)[None, :, None],
+                     mask=oc_mask[None, :, None], other=0.0)
+    bn_var = tl.load(bn_var_ptr + tl.arange(0, BLOCK_SIZE_C)[None, :, None],
+                    mask=oc_mask[None, :, None], other=1.0)
+    
+    # Apply batch norm: (x - mean) * (weight / sqrt(var + eps)) + bias
+    inv_std = bn_weight * tl.rsqrt(bn_var + eps)
+    normalized = (acc - bn_mean) * inv_std + bn_bias
+    
+    # Apply ReLU6: min(max(x, 0), 6)
+    activated = tl.minimum(tl.maximum(normalized, 0.0), 6.0)
+    
+    # Store output
+    n_offs_out = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)[:, None, None]
+    oc_offs_out = pid_oc * BLOCK_SIZE_C + tl.arange(0, BLOCK_SIZE_C)[None, :, None]
+    h_offs_out = h_idx[None, None, :]
+    w_offs_out = w_idx[None, None, :]
+    
+    out_offsets = (n_offs_out * stride_on +
+                  oc_offs_out * stride_oc +
+                  h_offs_out * stride_oh +
+                  w_offs_out * stride_ow)
+    
+    tl.store(out_ptr + out_offsets, activated,
+            mask=(n_mask[:, None, None] & oc_mask[None, :, None] & spatial_mask[None, None, :]))
+
+
+def fused_pointwise_conv_bn_relu6(x, weight, bn_weight, bn_bias, bn_mean, bn_var, eps=1e-5):
+    """Fused pointwise convolution, batch norm, and ReLU6."""
+    N, C_in, H, W = x.shape
+    C_out = weight.shape[0]
+    
+    # Ensure inputs are contiguous
+    x = x.contiguous()
+    weight = weight.contiguous()
+    
+    # Create output tensor
+    out = torch.empty((N, C_out, H, W), device=x.device, dtype=x.dtype)
+    
+    # Grid configuration
+    BLOCK_SIZE_N = 4 if N >= 4 else min(N, 1)
+    BLOCK_SIZE_C = 32 if C_out >= 32 else min(C_out, 16)
+    BLOCK_SIZE_HW = 64
+    
+    grid = (
+        triton.cdiv(N, BLOCK_SIZE_N),
+        triton.cdiv(C_out, BLOCK_SIZE_C),
+        triton.cdiv(H * W, BLOCK_SIZE_HW),
+    )
+    
+    # Launch kernel
+    fused_pointwise_conv_bn_relu6_kernel[grid](
+        x, weight, out,
+        bn_weight, bn_bias, bn_mean, bn_var,
+        N, C_in, C_out, H, W,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        weight.stride(0), weight.stride(1),
+        out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+        eps,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        BLOCK_SIZE_C=BLOCK_SIZE_C,
+        BLOCK_SIZE_HW=BLOCK_SIZE_HW,
+    )
+    
+    return out
+
+
+@triton.jit
+def fused_linear_bias_kernel(
+    x_ptr,
+    w_ptr,
+    b_ptr,
+    out_ptr,
+    M, N, K,
+    stride_xm, stride_xk,
+    stride_wk, stride_wn,
+    stride_bn,
+    stride_om, stride_on,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """Fused linear layer with bias addition."""
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    
+    # Pointers to input and weight
+    x_ptrs = x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk
+    w_ptrs = w_ptr + offs_k[:, None] * stride_wk + offs_n[None, :] * stride_wn
+    
+    # Initialize accumulator
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    # Accumulate over K dimension
+    for k in range(0, K, BLOCK_K):
+        # Load input and weight blocks
+        mask_x = (offs_m[:, None] < M) & (offs_k[None, :] < K - k)
+        mask_w = (offs_k[:, None] < K - k) & (offs_n[None, :] < N)
+        
+        x = tl.load(x_ptrs, mask=mask_x, other=0.0)
+        w = tl.load(w_ptrs, mask=mask_w, other=0.0)
+        
+        # Matrix multiplication
+        acc += tl.dot(x, w, allow_tf32=True)
+        
+        # Update pointers
+        x_ptrs += BLOCK_K * stride_xk
+        w_ptrs += BLOCK_K * stride_wk
+    
+    # Add bias
+    bias = tl.load(b_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc += bias[None, :]
+    
+    # Store result
+    out_ptrs = out_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
+    mask_out = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(out_ptrs, acc, mask=mask_out)
+
+
+def fused_linear_bias(x, weight, bias):
+    """Fused linear layer with bias."""
+    M, K = x.shape
+    N = weight.shape[0]
+    
+    # Ensure inputs are contiguous
+    x = x.contiguous()
+    weight = weight.contiguous().t()
+    bias = bias.contiguous()
+    
+    # Create output tensor
+    out = torch.empty((M, N), device=x.device, dtype=x.dtype)
+    
+    # Grid configuration
+    def grid(META):
+        return (
+            triton.cdiv(M, META['BLOCK_M']),
+            triton.cdiv(N, META['BLOCK_N']),
+        )
+    
+    # Launch kernel
+    fused_linear_bias_kernel[grid](
+        x, weight, bias, out,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        weight.stride(0), weight.stride(1),
+        bias.stride(0),
+        out.stride(0), out.stride(1),
+        BLOCK_M=64, BLOCK_N=64, BLOCK_K=32,
+    )
+    
+    return out
+
+
+class FusedMBConvBlock(nn.Module):
+    """Fused MBConv block with Triton optimizations."""
+    def __init__(self, in_channels, out_channels, stride, expand_ratio):
+        super(FusedMBConvBlock, self).__init__()
+        self.stride = stride
+        self.expand_ratio = expand_ratio
+        hidden_dim = round(in_channels * expand_ratio)
+        
+        # Expansion phase (fused: conv + bn + relu6)
+        self.expand_conv = nn.Conv2d(in_channels, hidden_dim, 
+                                    kernel_size=1, stride=1, padding=0, bias=False)
+        self.expand_bn = nn.BatchNorm2d(hidden_dim)
+        
+        # Depthwise convolution
+        self.depthwise_conv = nn.Conv2d(hidden_dim, hidden_dim,
+                                       kernel_size=3, stride=stride,
+                                       padding=1, groups=hidden_dim, bias=False)
+        self.depthwise_bn = nn.BatchNorm2d(hidden_dim)
+        
+        # Projection phase
+        self.project_conv = nn.Conv2d(hidden_dim, out_channels,
+                                     kernel_size=1, stride=1, padding=0, bias=False)
+        self.project_bn = nn.BatchNorm2d(out_channels)
+    
+    def forward(self, x):
+        # Fused expansion phase using Triton
+        if self.expand_ratio != 1:
+            x = fused_pointwise_conv_bn_relu6(
+                x,
+                self.expand_conv.weight,
+                self.expand_bn.weight,
+                self.expand_bn.bias,
+                self.expand_bn.running_mean,
+                self.expand_bn.running_var,
+                self.expand_bn.eps
+            )
+        
+        # Depthwise convolution (keep as PyTorch for now)
+        x = self.depthwise_conv(x)
+        x = self.depthwise_bn(x)
+        x = F.relu6(x, inplace=True)
+        
+        # Projection phase
+        x = self.project_conv(x)
+        x = self.project_bn(x)
+        
+        return x
+
+
+class ModelNew(nn.Module):
+    """EfficientNetB1 with Triton optimizations."""
+    def __init__(self, num_classes=1000):
+        super(ModelNew, self).__init__()
+        
+        # Initial convolutional layer
+        self.conv1 = nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(32)
+        
+        # MBConv blocks with Triton fusion
+        self.mbconv1 = FusedMBConvBlock(32, 16, 1, 1)
+        self.mbconv2 = FusedMBConvBlock(16, 24, 2, 6)
+        self.mbconv3 = FusedMBConvBlock(24, 40, 2, 6)
+        self.mbconv4 = FusedMBConvBlock(40, 80, 2, 6)
+        self.mbconv5 = FusedMBConvBlock(80, 112, 1, 6)
+        self.mbconv6 = FusedMBConvBlock(112, 192, 2, 6)
+        self.mbconv7 = FusedMBConvBlock(192, 320, 1, 6)
+        
+        # Final convolutional layer
+        self.conv2 = nn.Conv2d(320, 1280, kernel_size=1, stride=1, padding=0, bias=False)
+        self.bn2 = nn.BatchNorm2d(1280)
+        
+        # Fully connected layer (will use Triton kernel)
+        self.fc_weight = nn.Parameter(torch.randn(num_classes, 1280))
+        self.fc_bias = nn.Parameter(torch.randn(num_classes))
+        
+    def forward(self, x):
+        # Initial conv + bn + relu
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = F.relu(x, inplace=True)
+        
+        # MBConv blocks
+        x = self.mbconv1(x)
+        x = self.mbconv2(x)
+        x = self.mbconv3(x)
+        x = self.mbconv4(x)
+        x = self.mbconv5(x)
+        x = self.mbconv6(x)
+        x = self.mbconv7(x)
+        
+        # Final conv + bn + relu
+        x = self.conv2(x)
+        x = self.bn2(x)
+        x = F.relu(x, inplace=True)
+        
+        # Global pooling and flatten
+        x = F.adaptive_avg_pool2d(x, (1, 1))
+        x = torch.flatten(x, 1)
+        
+        # Final classification layer (fused linear + bias)
+        x = fused_linear_bias(x, self.fc_weight, self.fc_bias)
+        
+        return x
+```
+
+[NCU PROFILING METRICS]
+{
+  "fused_pointwise_conv_bn_relu6_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 13.68,
+    "launch__grid_size": 108,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 8.32,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 66.77,
+    "lts__t_sector_hit_rate.pct": 99.61
+  },
+  "fused_linear_bias_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 4.28,
+    "launch__grid_size": 16,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 8.33,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 19.6,
+    "lts__t_sector_hit_rate.pct": 16.83
+  }
+}
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+TRITON API CONSTRAINTS (CRITICAL):
+- Triton has NO: tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

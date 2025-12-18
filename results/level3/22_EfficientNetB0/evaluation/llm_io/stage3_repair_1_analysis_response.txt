@@ -1,0 +1,5 @@
+{
+  "critical_issue": "LinearTriton.reset_parameters passes a torch.Tensor (torch.sqrt(torch.tensor(5.0))) as `a` to nn.init.kaiming_uniform_, which expects a Python scalar.",
+  "why_it_matters": "calculate_gain checks `a`’s type; receiving a Tensor triggers ValueError(\"negative_slope ... not a valid number\"), preventing LinearTriton weight initialization and model construction.",
+  "minimal_fix_hint": "Pass a Python float instead, e.g., use math.sqrt(5.0) or float(torch.sqrt(torch.tensor(5.0))) or omit `a` if not needed."
+}

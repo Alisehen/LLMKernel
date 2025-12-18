@@ -1,0 +1,5 @@
+{
+  "critical_issue": "linear_matmul_bias_kernel misuses tl.multiple_of on index tensors (offs_m, offs_n, k_range) that are not guaranteed multiples of BLOCK_* sizes, causing undefined Triton behavior.",
+  "why_it_matters": "Incorrect alignment hints can make Triton miscompile memory access patterns, yielding corrupted matmul results and NaNs. These NaNs propagate through the network, so the final outputs differ and error metrics become NaN.",
+  "minimal_fix_hint": "Remove tl.multiple_of on offs_m, offs_n, k_range, or restrict it to actual stride/alignment values that are provably multiples of the specified block sizes."
+}

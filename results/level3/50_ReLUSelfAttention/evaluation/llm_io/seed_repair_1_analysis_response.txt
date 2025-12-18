@@ -1,0 +1,5 @@
+{
+  "critical_issue": "qk_relu_kernel uses the causal mask as the store mask, so masked/out-of-bounds positions are never written and keep uninitialized garbage instead of explicit zeros.",
+  "why_it_matters": "Uninitialized values (often NaNs or huge numbers) propagate through the attn_v matmul, causing large mismatches and NaNs in the final outputs, triggering the comparison failure.",
+  "minimal_fix_hint": "Always store to in-bounds positions; use an in-bounds mask for tl.store and ensure causal-masked elements are explicitly written as zero."
+}

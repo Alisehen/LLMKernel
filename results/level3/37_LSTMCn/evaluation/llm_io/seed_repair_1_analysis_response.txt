@@ -1,0 +1,5 @@
+{
+  "critical_issue": "ModelNew’s Triton LSTM layers use separate, independently initialized parameters instead of nn.LSTM’s fused weights; no weight mapping/sharing is implemented, so the models do not compute with identical parameters.",
+  "why_it_matters": "Reference and Triton models run different LSTM parameter values, so even with correct kernel math their final cell states diverge, producing the observed absolute/mean output errors well above the 0.1 tolerance.",
+  "minimal_fix_hint": "Add explicit mapping/sharing so LSTMLayerTriton weights and biases are derived from nn.LSTM’s weight_ih, weight_hh, bias_ih, bias_hh for every layer."
+}

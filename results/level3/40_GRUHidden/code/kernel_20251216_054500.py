@@ -1,0 +1,340 @@
+# Optimized Triton-based GRU with high-performance fused MatMul(+Bias) on RTX 4090
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+# -----------------------------------------------------------------------------
+# High-performance Fused MatMul + (optional) Bias
+#   C[M, N] = A[M, K] @ B[K, N] + bias[N]
+#
+# Design targets for RTX 4090 (Ada, SM 8.9):
+#   - Tensor-core friendly BLOCK_K (32) with tl.dot
+#   - FP32 accumulate, TF32 enabled for FP32 inputs
+#   - Minimal register pressure: masks are factorized, no intermediates stored
+#   - Exactly one tl.store() per output tensor (no intermediate global stores)
+# -----------------------------------------------------------------------------
+
+
+@triton.autotune(
+    configs=[
+        # Large, compute-heavy tiles for big matrices
+        triton.Config(
+            {
+                "BLOCK_M": 128,
+                "BLOCK_N": 128,
+                "BLOCK_K": 32,
+            },
+            num_stages=3,
+            num_warps=8,
+        ),
+        triton.Config(
+            {
+                "BLOCK_M": 64,
+                "BLOCK_N": 128,
+                "BLOCK_K": 32,
+            },
+            num_stages=2,
+            num_warps=4,
+        ),
+        triton.Config(
+            {
+                "BLOCK_M": 128,
+                "BLOCK_N": 64,
+                "BLOCK_K": 32,
+            },
+            num_stages=2,
+            num_warps=4,
+        ),
+        # Balanced tile, good fallback for many shapes
+        triton.Config(
+            {
+                "BLOCK_M": 64,
+                "BLOCK_N": 64,
+                "BLOCK_K": 32,
+            },
+            num_stages=2,
+            num_warps=4,
+        ),
+        # Skinnier on M: useful for small batch / seq
+        triton.Config(
+            {
+                "BLOCK_M": 32,
+                "BLOCK_N": 128,
+                "BLOCK_K": 32,
+            },
+            num_stages=2,
+            num_warps=2,
+        ),
+        # Skinnier on N: useful for small hidden
+        triton.Config(
+            {
+                "BLOCK_M": 128,
+                "BLOCK_N": 32,
+                "BLOCK_K": 32,
+            },
+            num_stages=2,
+            num_warps=2,
+        ),
+    ],
+    key=["M", "N", "K"],
+)
+@triton.jit
+def matmul_bias_kernel(
+    a_ptr, b_ptr, bias_ptr, c_ptr,          # pointers
+    M, N, K,                                # sizes
+    stride_am, stride_ak,                   # A strides
+    stride_bk, stride_bn,                   # B strides
+    stride_cm, stride_cn,                   # C strides
+    stride_bias,                            # bias stride (1D)
+    HAS_BIAS: tl.constexpr,                 # fuse bias add if True
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # Program IDs: 2D launch grid over (M, N)
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    # Offsets for this tile
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Factorized masks (saves registers vs full 2D mask)
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+
+    # Hints to the compiler for alignment / contiguity
+    tl.max_contiguous(offs_m, BLOCK_M)
+    tl.max_contiguous(offs_n, BLOCK_N)
+    tl.multiple_of(offs_k, BLOCK_K)
+
+    # FP32 accumulator; Tensor Cores (TF32) used for FP32 inputs
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Initial pointers for current K tile
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    k = 0
+    while k < K:
+        k_remaining = K - k
+        mask_k = offs_k < k_remaining
+
+        a_mask = mask_m[:, None] & mask_k[None, :]
+        b_mask = mask_k[:, None] & mask_n[None, :]
+
+        # Load A and B tiles (no intermediate stores)
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+        # Tensor-core friendly dot product
+        acc += tl.dot(a, b, allow_tf32=True)
+
+        # Advance along K
+        k += BLOCK_K
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Fused bias add: bias is [N], broadcast along M
+    if HAS_BIAS:
+        bias_ptrs = bias_ptr + offs_n * stride_bias
+        bias = tl.load(bias_ptrs, mask=mask_n, other=0.0)
+        acc += bias[None, :]
+
+    # Single global store for the final result tile (fusion requirement)
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    c_mask = mask_m[:, None] & mask_n[None, :]
+    tl.store(c_ptrs, acc, mask=c_mask)
+
+
+# -----------------------------------------------------------------------------
+# Python Wrappers for Triton MatMul(+Bias)
+# -----------------------------------------------------------------------------
+
+
+def _launch_triton_matmul_bias(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    bias: torch.Tensor | None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """
+    C = A @ B (+ bias), using optimized Triton kernel.
+    A: [M, K], B: [K, N], bias: [N] or None, C: [M, N]
+    """
+    assert a.ndim == 2 and b.ndim == 2
+    assert a.shape[1] == b.shape[0]
+    assert a.is_cuda and b.is_cuda
+
+    if bias is not None:
+        assert bias.is_cuda
+
+    # Ensure contiguous layout for best memory coalescing
+    if not a.is_contiguous():
+        a = a.contiguous()
+    if not b.is_contiguous():
+        b = b.contiguous()
+    if bias is not None and not bias.is_contiguous():
+        bias = bias.contiguous()
+
+    M, K = a.shape
+    Kb, N = b.shape
+    assert K == Kb
+
+    # Allocate / validate output
+    if out is None:
+        out = torch.empty((M, N), device=a.device, dtype=a.dtype)
+    else:
+        assert out.shape == (M, N)
+        assert out.device == a.device
+        assert out.dtype == a.dtype
+        if not out.is_contiguous():
+            raise ValueError("`out` must be contiguous")
+
+    # Bias handling
+    if bias is not None:
+        assert bias.ndim == 1 and bias.shape[0] == N
+        bias_ptr = bias
+        stride_bias = bias.stride(0)
+        has_bias = True
+    else:
+        bias_ptr = out  # dummy
+        stride_bias = 0
+        has_bias = False
+
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta["BLOCK_M"]),
+            triton.cdiv(N, meta["BLOCK_N"]),
+        )
+
+    matmul_bias_kernel[grid](
+        a, b, bias_ptr, out,
+        M, N, K,
+        a.stride(0), a.stride(1),
+        b.stride(0), b.stride(1),
+        out.stride(0), out.stride(1),
+        stride_bias,
+        HAS_BIAS=has_bias,
+    )
+
+    return out
+
+
+def triton_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    return _launch_triton_matmul_bias(a, b, bias=None, out=None)
+
+
+def triton_matmul_bias(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    bias: torch.Tensor | None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return _launch_triton_matmul_bias(a, b, bias=bias, out=out)
+
+
+# -----------------------------------------------------------------------------
+# GRU Model using optimized Triton matmul(+bias) for gate computations
+# -----------------------------------------------------------------------------
+
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers=3, bias=True, batch_first=False):
+        super(ModelNew, self).__init__()
+        # We reuse nn.GRU parameters for compatibility; forward is custom.
+        self.gru = nn.GRU(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            bias=bias,
+            batch_first=batch_first,
+        )
+
+    def forward(self, x: torch.Tensor, h0: torch.Tensor):
+        """
+        x:  (seq_len, batch, input_size) if batch_first=False
+            (batch, seq_len, input_size) if batch_first=True
+        h0: (num_layers, batch, hidden_size)
+        Returns:
+            h_n: (num_layers, batch, hidden_size)
+        """
+        batch_first = self.gru.batch_first
+        num_layers = self.gru.num_layers
+        hidden_size = self.gru.hidden_size
+        bias_flag = self.gru.bias
+
+        if batch_first:
+            x = x.transpose(0, 1).contiguous()  # (seq, batch, input)
+
+        seq_len, batch_size, input_size = x.shape
+        assert h0.shape == (num_layers, batch_size, hidden_size)
+
+        layer_input = x
+        h_n_list = []
+
+        for layer in range(num_layers):
+            weight_ih = getattr(self.gru, f"weight_ih_l{layer}")  # (3H, in_dim)
+            weight_hh = getattr(self.gru, f"weight_hh_l{layer}")  # (3H, H)
+
+            b_ih = getattr(self.gru, f"bias_ih_l{layer}") if bias_flag else None
+            b_hh = getattr(self.gru, f"bias_hh_l{layer}") if bias_flag else None
+
+            # Transpose once per forward for GEMM-friendly layout:
+            # x_t: (B, in_dim), W_ih_T: (in_dim, 3H) → gate_x: (B, 3H)
+            W_ih_T = weight_ih.transpose(0, 1).contiguous()
+            W_hh_T = weight_hh.transpose(0, 1).contiguous()
+
+            h_t = h0[layer]  # (batch, H)
+
+            # Allocate layer output and gate buffers once per layer
+            layer_output = torch.empty(
+                (seq_len, batch_size, hidden_size),
+                device=x.device,
+                dtype=x.dtype,
+            )
+
+            gate_x_buf = torch.empty(
+                (batch_size, 3 * hidden_size),
+                device=x.device,
+                dtype=x.dtype,
+            )
+            gate_h_buf = torch.empty_like(gate_x_buf)
+
+            for t in range(seq_len):
+                x_t = layer_input[t]  # (batch, in_dim)
+
+                # gate_x = x_t @ W_ih^T + b_ih
+                triton_matmul_bias(
+                    x_t, W_ih_T,
+                    bias=b_ih if bias_flag else None,
+                    out=gate_x_buf,
+                )
+
+                # gate_h = h_t @ W_hh^T + b_hh
+                triton_matmul_bias(
+                    h_t, W_hh_T,
+                    bias=b_hh if bias_flag else None,
+                    out=gate_h_buf,
+                )
+
+                # Split gates: [r, z, n]
+                i_r, i_z, i_n = gate_x_buf.chunk(3, dim=1)
+                h_r, h_z, h_n = gate_h_buf.chunk(3, dim=1)
+
+                r = torch.sigmoid(i_r + h_r)
+                z = torch.sigmoid(i_z + h_z)
+                n = torch.tanh(i_n + r * h_n)
+
+                h_t = (1.0 - z) * n + z * h_t
+                layer_output[t] = h_t
+
+            h_n_list.append(h_t)
+            layer_input = layer_output
+
+        h_n = torch.stack(h_n_list, dim=0)
+        return h_n

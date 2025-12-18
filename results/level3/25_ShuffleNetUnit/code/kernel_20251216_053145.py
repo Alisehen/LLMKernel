@@ -1,0 +1,187 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def channel_shuffle_kernel(
+    x_ptr,  # *const T
+    y_ptr,  # *mut T
+    B, C, H, W,
+    groups,
+    channels_per_group,
+    BLOCK_C: tl.constexpr,
+):
+    # Each program handles one (b, h, w) position across all channels
+    pid = tl.program_id(axis=0)
+
+    HW = H * W
+    b = pid // HW
+    hw = pid % HW
+    h = hw // W
+    w = hw % W
+
+    # Base index for (b, 0, h, w) in a contiguous NCHW tensor:
+    # idx = (((b * C + c) * H) + h) * W + w
+    # For c = 0:
+    base = (b * C * H + h) * W + w
+
+    # Loop over channel blocks
+    for c_base in range(0, C, BLOCK_C):
+        offs_c = c_base + tl.arange(0, BLOCK_C)
+        mask_c = offs_c < C
+
+        # Compute input indices for this block of channels
+        in_idx = base + offs_c * H * W
+        x_vals = tl.load(x_ptr + in_idx, mask=mask_c, other=0.0)
+
+        # Channel shuffle mapping:
+        # original: c = g * channels_per_group + k
+        # shuffled: c' = k * groups + g
+        g = offs_c // channels_per_group
+        k = offs_c % channels_per_group
+        new_c = k * groups + g
+
+        out_idx = base + new_c * H * W
+        tl.store(y_ptr + out_idx, x_vals, mask=mask_c)
+
+
+def channel_shuffle_triton(x: torch.Tensor, groups: int) -> torch.Tensor:
+    """
+    Triton implementation of channel shuffle.
+
+    x: (B, C, H, W) contiguous tensor
+    groups: number of channel groups
+    """
+    assert x.is_cuda, "Input must be on CUDA device"
+    assert x.is_contiguous(), "Input must be contiguous"
+    B, C, H, W = x.shape
+    assert C % groups == 0, "Channels must be divisible by groups"
+
+    y = torch.empty_like(x)
+    channels_per_group = C // groups
+
+    def grid(meta):
+        return (B * H * W,)
+
+    # BLOCK_C must be a power of 2
+    channel_shuffle_kernel[grid](
+        x,
+        y,
+        B,
+        C,
+        H,
+        W,
+        groups,
+        channels_per_group,
+        BLOCK_C=128,
+    )
+    return y
+
+
+class ChannelShuffleTriton(nn.Module):
+    def __init__(self, groups: int):
+        super().__init__()
+        self.groups = groups
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return channel_shuffle_triton(x, self.groups)
+
+
+class ModelNew(nn.Module):
+    """
+    ShuffleNet unit with Triton-accelerated ChannelShuffle.
+    Convolutions and batch norms remain as standard PyTorch modules
+    for robustness and correctness.
+    """
+
+    def __init__(self, in_channels, out_channels, groups=3):
+        """
+        :param in_channels: Number of input channels.
+        :param out_channels: Number of output channels.
+        :param groups: Number of groups for group convolution.
+        """
+        super(ModelNew, self).__init__()
+
+        # Ensure the output channels are divisible by groups as in the original
+        assert out_channels % 4 == 0
+        mid_channels = out_channels // 4
+
+        # First 1x1 group convolution
+        self.conv1 = nn.Conv2d(
+            in_channels,
+            mid_channels,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+            groups=groups,
+            bias=False,
+        )
+        self.bn1 = nn.BatchNorm2d(mid_channels)
+
+        # Depthwise 3x3 convolution
+        self.conv2 = nn.Conv2d(
+            mid_channels,
+            mid_channels,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            groups=mid_channels,
+            bias=False,
+        )
+        self.bn2 = nn.BatchNorm2d(mid_channels)
+
+        # Second 1x1 group convolution
+        self.conv3 = nn.Conv2d(
+            mid_channels,
+            out_channels,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+            groups=groups,
+            bias=False,
+        )
+        self.bn3 = nn.BatchNorm2d(out_channels)
+
+        # Triton-based shuffle operation
+        self.shuffle = ChannelShuffleTriton(groups)
+
+        # Shortcut connection if input and output channels are the same
+        if in_channels == out_channels:
+            self.shortcut = nn.Sequential()
+        else:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(
+                    in_channels,
+                    out_channels,
+                    kernel_size=1,
+                    stride=1,
+                    padding=0,
+                    bias=False,
+                ),
+                nn.BatchNorm2d(out_channels),
+            )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass for ShuffleNet unit.
+
+        :param x: Input tensor, shape (batch_size, in_channels, height, width)
+        :return: Output tensor, shape (batch_size, out_channels, height, width)
+        """
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = torch.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        out = self.shuffle(out)
+
+        out = self.conv3(out)
+        out = self.bn3(out)
+        out = torch.relu(out)
+
+        out = out + self.shortcut(x)
+        return out

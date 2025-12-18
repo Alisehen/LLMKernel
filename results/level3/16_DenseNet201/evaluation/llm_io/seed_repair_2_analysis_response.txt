@@ -1,0 +1,5 @@
+{
+  "critical_issue": "DenseBlock recomputes torch.cat(features, dim=1) inside each iteration instead of reusing x, creating extra large intermediate tensors and bloating GPU memory.",
+  "why_it_matters": "Every layer allocates a fresh full concatenation while autograd retains previous ones, so activations grow until a new torch.cat needs ~20MiB and hits CUDA OOM.",
+  "minimal_fix_hint": "Make _DenseBlock.forward match the reference: use new_feature = layer(x); features.append(new_feature); x = torch.cat(features, 1) each iteration."
+}

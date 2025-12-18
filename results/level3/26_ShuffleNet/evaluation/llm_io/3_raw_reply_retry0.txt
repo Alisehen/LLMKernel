@@ -1,0 +1,240 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+import torch.nn.functional as F
+
+
+@triton.jit
+def channel_shuffle_kernel(
+    x_ptr, y_ptr,
+    numel,
+    N: tl.constexpr,
+    C: tl.constexpr,
+    H: tl.constexpr,
+    W: tl.constexpr,
+    GROUPS: tl.constexpr,
+    CHANNELS_PER_GROUP: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Memory-optimized channel shuffle kernel.
+
+    - Single tl.store() for the final output only.
+    - All index transforms remain in registers.
+    - Shapes and groups are constexpr -> divisions become fast constant-division.
+    """
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < numel
+
+    # Precompute constants (compile-time with constexpr dims)
+    WH = H * W
+    CWH = C * WH
+
+    # Flat output index 'o' = (((n*C + c_out)*H + h)*W + w)
+    o = offs
+
+    # Decompose flat index into (n, c_out, hw) with minimal div/mod
+    n = o // CWH
+    rem = o - n * CWH
+    c_out = rem // WH
+    hw = rem - c_out * WH  # hw = h*W + w (no need to split further)
+
+    # Channel shuffle:
+    # c_out = idx * GROUPS + group
+    # idx   = c_out // GROUPS
+    # group = c_out % GROUPS
+    # c_in  = group * CHANNELS_PER_GROUP + idx
+    group = c_out % GROUPS
+    idx = c_out // GROUPS
+    c_in = group * CHANNELS_PER_GROUP + idx
+
+    # Input flat index: i = (((n*C + c_in)*H + h)*W + w)
+    # Using hw = h*W + w:
+    in_off = n * CWH + c_in * WH + hw
+
+    x_vals = tl.load(x_ptr + in_off, mask=mask, other=0.0)
+    tl.store(y_ptr + o, x_vals, mask=mask)
+
+
+def channel_shuffle_triton(x: torch.Tensor, groups: int) -> torch.Tensor:
+    """
+    High-performance Triton implementation of channel shuffle.
+    Input/Output: (N, C, H, W), with C % groups == 0.
+    """
+    assert x.is_cuda, "Triton channel_shuffle requires CUDA tensor"
+    x = x.contiguous()
+    N, C, H, W = x.shape
+    assert C % groups == 0
+    channels_per_group = C // groups
+
+    y = torch.empty_like(x)
+    numel = x.numel()
+
+    BLOCK_SIZE = 4096  # large tile for bandwidth; each CTA processes many elements
+
+    def grid(meta):
+        return (triton.cdiv(numel, meta["BLOCK_SIZE"]),)
+
+    channel_shuffle_kernel[grid](
+        x, y,
+        numel,
+        N=N,
+        C=C,
+        H=H,
+        W=W,
+        GROUPS=groups,
+        CHANNELS_PER_GROUP=channels_per_group,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=8,
+        num_stages=2,
+    )
+    return y
+
+
+class ChannelShuffleTriton(nn.Module):
+    def __init__(self, groups: int):
+        super(ChannelShuffleTriton, self).__init__()
+        self.groups = groups
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Fallback to native implementation on CPU or non-contiguous tensors
+        if (not x.is_cuda) or (not x.is_contiguous()):
+            batch_size, channels, height, width = x.size()
+            channels_per_group = channels // self.groups
+            x = x.view(batch_size, self.groups, channels_per_group, height, width)
+            x = x.transpose(1, 2).contiguous()
+            x = x.view(batch_size, -1, height, width)
+            return x
+        return channel_shuffle_triton(x, self.groups)
+
+
+class ShuffleNetUnitNew(nn.Module):
+    def __init__(self, in_channels, out_channels, groups=3):
+        """
+        ShuffleNet unit with Triton-accelerated channel shuffle.
+        """
+        super(ShuffleNetUnitNew, self).__init__()
+
+        assert out_channels % 4 == 0
+        mid_channels = out_channels // 4
+
+        # First 1x1 group convolution
+        self.conv1 = nn.Conv2d(
+            in_channels, mid_channels,
+            kernel_size=1, stride=1, padding=0,
+            groups=groups, bias=False
+        )
+        self.bn1 = nn.BatchNorm2d(mid_channels)
+
+        # Depthwise 3x3 convolution
+        self.conv2 = nn.Conv2d(
+            mid_channels, mid_channels,
+            kernel_size=3, stride=1, padding=1,
+            groups=mid_channels, bias=False
+        )
+        self.bn2 = nn.BatchNorm2d(mid_channels)
+
+        # Second 1x1 group convolution
+        self.conv3 = nn.Conv2d(
+            mid_channels, out_channels,
+            kernel_size=1, stride=1, padding=0,
+            groups=groups, bias=False
+        )
+        self.bn3 = nn.BatchNorm2d(out_channels)
+
+        # Triton-based shuffle
+        self.shuffle = ChannelShuffleTriton(groups)
+
+        # Shortcut connection
+        if in_channels == out_channels:
+            self.shortcut = nn.Sequential()
+        else:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(
+                    in_channels, out_channels,
+                    kernel_size=1, stride=1, padding=0, bias=False
+                ),
+                nn.BatchNorm2d(out_channels),
+            )
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out = self.shuffle(out)
+        out = F.relu(self.bn3(self.conv3(out)))
+        out += self.shortcut(x)
+        return out
+
+
+class ModelNew(nn.Module):
+    def __init__(
+        self,
+        num_classes=1000,
+        groups=3,
+        stages_repeats=[3, 7, 3],
+        stages_out_channels=[24, 240, 480, 960],
+    ):
+        """
+        ShuffleNet architecture with Triton-accelerated channel shuffle.
+        """
+        super(ModelNew, self).__init__()
+
+        self.conv1 = nn.Conv2d(
+            3, stages_out_channels[0],
+            kernel_size=3, stride=2, padding=1, bias=False
+        )
+        self.bn1 = nn.BatchNorm2d(stages_out_channels[0])
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+
+        self.stage2 = self._make_stage(
+            stages_out_channels[0],
+            stages_out_channels[1],
+            stages_repeats[0],
+            groups,
+        )
+        self.stage3 = self._make_stage(
+            stages_out_channels[1],
+            stages_out_channels[2],
+            stages_repeats[1],
+            groups,
+        )
+        self.stage4 = self._make_stage(
+            stages_out_channels[2],
+            stages_out_channels[3],
+            stages_repeats[2],
+            groups,
+        )
+
+        self.conv5 = nn.Conv2d(
+            stages_out_channels[3],
+            1024,
+            kernel_size=1, stride=1, padding=0, bias=False
+        )
+        self.bn5 = nn.BatchNorm2d(1024)
+
+        self.fc = nn.Linear(1024, num_classes)
+
+    def _make_stage(self, in_channels, out_channels, repeats, groups):
+        layers = []
+        layers.append(ShuffleNetUnitNew(in_channels, out_channels, groups))
+        for _ in range(1, repeats):
+            layers.append(ShuffleNetUnitNew(out_channels, out_channels, groups))
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = self.maxpool(x)
+
+        x = self.stage2(x)
+        x = self.stage3(x)
+        x = self.stage4(x)
+
+        x = F.relu(self.bn5(self.conv5(x)))
+        x = F.adaptive_avg_pool2d(x, (1, 1))
+        x = x.view(x.size(0), -1)
+        x = self.fc(x)
+        return x
+```

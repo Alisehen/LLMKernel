@@ -1,0 +1,110 @@
+# Kernel Benchmark Summary
+| 算子 | best_score | 状态 |
+| 1 | 2.02 | ✅ |
+| 2_Standard_matrix_multiplication | 1.35 | ✅ |
+| 3_Batched_matrix_multiplication | 1.39 | ✅ |
+| 4_Matrix_vector_multiplication | 1.01 | ✅ |
+| 5_Matrix_scalar_multiplication | 0.6795 | ✅ |
+| 6_Matmul_with_large_K_dimension | 0.8 | ✅ |
+| 7_Matmul_with_small_K_dimension | 0.6530 | ✅ |
+| 8_Matmul_with_irregular_shapes | 1.1953 | ✅ |
+| 9_Tall_skinny_matrix_multiplication | 0.6211 | ✅ |
+| 10_3D_tensor_matrix_multiplication | 2.19 | ✅ |
+| 11 | 2.08 | ✅ |
+| 12_Matmul_with_diagonal_matrices | 21 | ✅ |
+| 13_Matmul_for_symmetric_matrices | 1.4650 | ✅ |
+| 14_Matmul_for_upper_triangular_matrices | 0.6193 | ✅ |
+| 15_Matmul_for_lower_triangular_matrices | 3.8533 | ✅ |
+| 16_Matmul_with_transposed_A | 1.1314 | ✅ |
+| 17_Matmul_with_transposed_B | 1.9308 | ✅ |
+| 18_Matmul_with_transposed_both | 1.3344 | ✅ |
+| 19_ReLU | 0.6770 | ✅ |
+| 20_LeakyReLU | 0.6780 | ✅ |
+| 21_Sigmoid | 0.6777 | ✅ |
+| 22_Tanh | 0.6768 | ✅ |
+| 23_Softmax | 0.7967 | ✅ |
+| 24_LogSoftmax | 0.7990 | ✅ |
+| 25_Swish | 1.6864 | ✅ |
+| 26_GELU | 0.6776 | ✅ |
+| 27_SELU | 0.6774 | ✅ |
+| 28_HardSigmoid | 0.6776 | ✅ |
+| 29_Softplus | 0.6770 | ✅ |
+| 30_Softsign | 2.6923 | ✅ |
+| 31 | 0.68 | ✅ |
+| 32 | 2.04 | ✅ |
+| 33 | 2.09 | ✅ |
+| 34 | 1.02 | ✅ |
+| 35 | 1.01 | ✅ |
+| 36 | 1.6 | ✅ |
+| 37 | 0.76 | ✅ |
+| 38 | 1.87 | ✅ |
+| 39 | 0.67 | ✅ |
+| 40_LayerNorm | 2.7676 | ✅ |
+| 41_Max_Pooling_1D | 1.3799 | ✅ |
+| 42_Max_Pooling_2D | 1.3770 | ✅ |
+| 43_Max_Pooling_3D | 1.37 | ✅ |
+| 44 | 0.88 | ✅ |
+| 45_Average_Pooling_2D | 1.08 | ✅ |
+| 46_Average_Pooling_3D | 0.9 | ✅ |
+
+| 47_Sum_reduction_over_a_dimension | 0 | ✅ |
+
+| 48_Mean_reduction_over_a_dimension | 3.4170 | ✅ |
+
+| 49_Max_reduction_over_a_dimension | 0 | ✅ |
+
+| 50_conv_standard_2D_square_input_square_kernel | 1.23 | ✅ |
+| 51_Argmax_over_a_dimension | 1.1 | ✅ |
+| 52_Argmin_over_a_dimension | 1.04 | ✅ |
+| 53_Min_reduction_over_a_dimension | 1.1 | ✅ |
+| 54_conv_standard_3D_square_input_square_kernel | 0.82 | ✅ |
+| 55_conv_standard_2D_asymmetric_input_square_kernel | 0.5 | ✅ |
+
+| 56_conv_standard_2D_asymmetric_input_asymmetric_kernel | 0 | ✅ |
+| 57_conv_transposed_2D_square_input_square_kernel | 0.42 | ✅ |
+| 58_conv_transposed_3D_asymmetric_input_asymmetric_kernel | 0.5 | ✅ |
+
+| 59_conv_standard_3D_asymmetric_input_square_kernel | 1.6 | ✅ |
+| 60_conv_standard_3D_square_input_asymmetric_kernel | 0.78 | ✅ |
+| 61_conv_transposed_3D_square_input_square_kernel | 1.2 | ✅ |
+
+| 62_conv_standard_2D_square_input_asymmetric_kernel | 0.5 | ✅ |
+
+| 63_conv_standard_2D_square_input_square_kernel | 0.7 | ✅ |
+| 64_conv_transposed_1D | 1.2577 | ✅ |
+| 65_conv_transposed_2D_square_input_asymmetric_kernel | 1.248 | ✅ |
+| 66_conv_standard_3D_asymmetric_input_asymmetric_kernel | 0.68 | ✅ |
+| 67_conv_standard_1D | 1.01 | ✅ |
+| 68_conv_transposed_3D_square_input_asymmetric_kernel | 0.26 | ✅ |
+| 69_conv_transposed_2D_asymmetric_input_asymmetric_kernel | 0.82 | ✅ |
+| 70_conv_transposed_3D_asymmetric_input_square_kernel | 0.75 | ✅ |
+| 71_conv_transposed_2D_asymmetric_input_square_kernel | 0.3726 | ✅ |
+| 72_conv_transposed_3D_asymmetric_strided_padded_grouped | 1.0611 | ✅ |
+| 73_conv_transposed_3D_asymmetric_square_strided_padded_grouped | 0.1 | ✅ |
+| 74_conv_transposed_1D_dilated | 5.9281 | ✅ |
+| 75_conv_transposed_2D_asymmetric_strided_grouped_padded_dilated | 1.0148 | ✅ |
+| 76_conv_standard_1D_dilated_strided | 2.35 |  ✅ |
+| 77_conv_transposed_3D_square_padded_dilated_strided | 0.88 | ✅ |
+| 78_conv_transposed_2D_asymmetric_padded | 0.2267 | ✅ |
+| 79_conv_transposed_1D_asymmetric_padded_strided_dilated | 0.7817 | ✅ |
+| 80_conv_standard_2D_square_asymmetric_dilated_padded | 2.3758 | ✅ |
+| 81_conv_transposed_2D_asymmetric_square_dilated_padded_strided | 0.48 | ✅ |
+| 82_conv_depthwise_2D_square_square | 1.1703 | ✅ |
+| 83_conv_depthwise_2D_square_asymmetric | 1.3139 | ✅ |
+| 84_conv_depthwise_2D_asymmetric_square | 1.0911 | ✅ |
+| 85_conv_depthwise_2D_asymmetric_asymmetric | 1.1866 | ✅ |
+| 86_conv_depthwise_separable_2D | 0.7980 | ✅ |
+| 87_conv_pointwise_2D | 1.33 | ✅ |
+| 88_MinGPTNewGelu | 6.0525 | ✅ |
+| 89_cumsum | 0.8239 | ✅ |
+| 90_cumprod | 0.3438 | ✅ |
+| 91_cumsum_reverse | 0.84 | ✅ |
+| 92_cumsum_exclusive | 0.88 | ✅ |
+| 93_masked_cumsum | 0.2359 | ✅ |
+| 94_MSELoss | 3.0658 | ✅ |
+| 95_CrossEntropyLoss | 2.9129 | ✅ |
+| 96_HuberLoss_score | 2.55 |
+| 97_ScaledDotProductAttention | 1.52 | ✅ |
+| 98_KLDivLoss | 5.5710 | ✅ |
+| 99_TripletMarginLoss | 4.0741 | ✅ |
+| 100_HingeLoss | 6.96 | ✅ |

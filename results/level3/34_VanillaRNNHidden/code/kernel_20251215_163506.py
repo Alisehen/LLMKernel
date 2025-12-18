@@ -1,0 +1,223 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def fused_i2h_tanh_kernel(
+    x_ptr, h_prev_ptr, w_i2h_ptr, b_i2h_ptr, h_next_ptr,
+    batch_size, input_size, hidden_size,
+    stride_x_batch, stride_x_feat,
+    stride_h_batch, stride_h_feat,
+    stride_w_hidden, stride_w_feat,
+    stride_b,
+    BLOCK_BATCH: tl.constexpr, BLOCK_HIDDEN: tl.constexpr, BLOCK_FEAT: tl.constexpr,
+):
+    pid_batch = tl.program_id(0)
+    pid_hidden = tl.program_id(1)
+    
+    batch_offsets = pid_batch * BLOCK_BATCH + tl.arange(0, BLOCK_BATCH)
+    hidden_offsets = pid_hidden * BLOCK_HIDDEN + tl.arange(0, BLOCK_HIDDEN)
+    
+    acc = tl.zeros((BLOCK_BATCH, BLOCK_HIDDEN), dtype=tl.float32)
+    
+    total_features = input_size + hidden_size
+    
+    # Pre-compute masks for better instruction scheduling
+    batch_mask = batch_offsets < batch_size
+    hidden_mask = hidden_offsets < hidden_size
+    
+    for k in range(0, total_features, BLOCK_FEAT):
+        k_offsets = k + tl.arange(0, BLOCK_FEAT)
+        feat_mask = k_offsets < total_features
+        
+        # Load weight block
+        w_mask = hidden_mask[:, None] & feat_mask[None, :]
+        w_ptrs = w_i2h_ptr + hidden_offsets[:, None] * stride_w_hidden + k_offsets[None, :] * stride_w_feat
+        w_block = tl.load(w_ptrs, mask=w_mask, other=0.0)
+        
+        # Efficiently load combined input features
+        data_block = tl.zeros((BLOCK_BATCH, BLOCK_FEAT), dtype=tl.float32)
+        
+        # Input features (first input_size columns)
+        input_feat_mask = batch_mask[:, None] & (k_offsets[None, :] < input_size)
+        input_data_ptrs = x_ptr + batch_offsets[:, None] * stride_x_batch + k_offsets[None, :] * stride_x_feat
+        input_data = tl.load(input_data_ptrs, mask=input_feat_mask, other=0.0)
+        data_block = tl.where(k_offsets[None, :] < input_size, input_data, data_block)
+        
+        # Hidden features (remaining columns)
+        hidden_k_offsets = k_offsets - input_size
+        hidden_feat_mask = batch_mask[:, None] & (k_offsets[None, :] >= input_size) & (hidden_k_offsets[None, :] < hidden_size)
+        hidden_data_ptrs = h_prev_ptr + batch_offsets[:, None] * stride_h_batch + hidden_k_offsets[None, :] * stride_h_feat
+        hidden_data = tl.load(hidden_data_ptrs, mask=hidden_feat_mask, other=0.0)
+        data_block = tl.where((k_offsets[None, :] >= input_size) & (hidden_k_offsets[None, :] < hidden_size), hidden_data, data_block)
+        
+        acc += tl.dot(data_block, w_block.T, allow_tf32=True)
+    
+    # Add bias
+    bias = tl.load(b_i2h_ptr + hidden_offsets, mask=hidden_mask, other=0.0)
+    acc += bias[None, :]
+    
+    # Fast tanh with improved numerical stability
+    acc_clipped = tl.minimum(tl.maximum(acc, -9.0), 9.0)
+    exp_2x = tl.exp(2.0 * acc_clipped)
+    result = (exp_2x - 1.0) / (exp_2x + 1.0)
+    
+    # Store result
+    h_next_ptrs = h_next_ptr + batch_offsets[:, None] * stride_h_batch + hidden_offsets[None, :] * stride_h_feat
+    store_mask = batch_mask[:, None] & hidden_mask[None, :]
+    tl.store(h_next_ptrs, result, mask=store_mask)
+
+@triton.jit
+def fused_h2o_kernel(
+    h_ptr, w_h2o_ptr, b_h2o_ptr, o_ptr,
+    batch_size, hidden_size, output_size,
+    stride_h_batch, stride_h_feat,
+    stride_w_output, stride_w_feat,
+    stride_b,
+    stride_o_batch, stride_o_feat,
+    BLOCK_BATCH: tl.constexpr, BLOCK_OUTPUT: tl.constexpr, BLOCK_HIDDEN: tl.constexpr,
+):
+    pid_batch = tl.program_id(0)
+    pid_output = tl.program_id(1)
+    
+    batch_offsets = pid_batch * BLOCK_BATCH + tl.arange(0, BLOCK_BATCH)
+    output_offsets = pid_output * BLOCK_OUTPUT + tl.arange(0, BLOCK_OUTPUT)
+    
+    acc = tl.zeros((BLOCK_BATCH, BLOCK_OUTPUT), dtype=tl.float32)
+    
+    # Pre-compute masks
+    batch_mask = batch_offsets < batch_size
+    output_mask = output_offsets < output_size
+    
+    for k in range(0, hidden_size, BLOCK_HIDDEN):
+        k_offsets = k + tl.arange(0, BLOCK_HIDDEN)
+        hidden_mask = k_offsets < hidden_size
+        
+        # Load hidden block
+        h_mask = batch_mask[:, None] & hidden_mask[None, :]
+        h_ptrs = h_ptr + batch_offsets[:, None] * stride_h_batch + k_offsets[None, :] * stride_h_feat
+        h_block = tl.load(h_ptrs, mask=h_mask, other=0.0)
+        
+        # Load weight block
+        w_mask = output_mask[:, None] & hidden_mask[None, :]
+        w_ptrs = w_h2o_ptr + output_offsets[:, None] * stride_w_output + k_offsets[None, :] * stride_w_feat
+        w_block = tl.load(w_ptrs, mask=w_mask, other=0.0)
+        
+        acc += tl.dot(h_block, w_block.T, allow_tf32=True)
+    
+    # Add bias
+    bias = tl.load(b_h2o_ptr + output_offsets, mask=output_mask, other=0.0)
+    acc += bias[None, :]
+    
+    # Store output
+    o_ptrs = o_ptr + batch_offsets[:, None] * stride_o_batch + output_offsets[None, :] * stride_o_feat
+    store_mask = batch_mask[:, None] & output_mask[None, :]
+    tl.store(o_ptrs, acc, mask=store_mask)
+
+def fused_i2h_tanh(x, h_prev, weight_i2h, bias_i2h):
+    batch_size, input_size = x.shape
+    hidden_size = weight_i2h.shape[0]
+    
+    h_next = torch.empty((batch_size, hidden_size), device=x.device, dtype=x.dtype)
+    
+    # Optimized configuration based on profiling
+    configs = [
+        {'BLOCK_BATCH': 32, 'BLOCK_HIDDEN': 64, 'BLOCK_FEAT': 64, 'num_warps': 4, 'num_stages': 2},
+        {'BLOCK_BATCH': 16, 'BLOCK_HIDDEN': 128, 'BLOCK_FEAT': 64, 'num_warps': 8, 'num_stages': 2},
+        {'BLOCK_BATCH': 32, 'BLOCK_HIDDEN': 128, 'BLOCK_FEAT': 64, 'num_warps': 8, 'num_stages': 3},
+    ]
+    
+    grid = lambda META: (
+        triton.cdiv(batch_size, META['BLOCK_BATCH']),
+        triton.cdiv(hidden_size, META['BLOCK_HIDDEN'])
+    )
+    
+    # Use autotune with minimal overhead
+    best_config = configs[0]
+    if batch_size >= 32 and hidden_size >= 128:
+        best_config = configs[2]  # Higher occupancy for larger problems
+    elif batch_size * hidden_size >= 4096:
+        best_config = configs[1]
+    
+    fused_i2h_tanh_kernel[grid](
+        x, h_prev, weight_i2h, bias_i2h, h_next,
+        batch_size, input_size, hidden_size,
+        x.stride(0), x.stride(1),
+        h_prev.stride(0), h_prev.stride(1),
+        weight_i2h.stride(0), weight_i2h.stride(1),
+        bias_i2h.stride(0),
+        BLOCK_BATCH=best_config['BLOCK_BATCH'],
+        BLOCK_HIDDEN=best_config['BLOCK_HIDDEN'],
+        BLOCK_FEAT=best_config['BLOCK_FEAT'],
+        num_warps=best_config['num_warps'],
+        num_stages=best_config['num_stages']
+    )
+    
+    return h_next
+
+def fused_h2o(h, weight_h2o, bias_h2o):
+    batch_size, hidden_size = h.shape
+    output_size = weight_h2o.shape[0]
+    
+    output = torch.empty((batch_size, output_size), device=h.device, dtype=h.dtype)
+    
+    # Optimized configuration for matmul
+    configs = [
+        {'BLOCK_BATCH': 32, 'BLOCK_OUTPUT': 64, 'BLOCK_HIDDEN': 64, 'num_warps': 8, 'num_stages': 3},
+        {'BLOCK_BATCH': 64, 'BLOCK_OUTPUT': 32, 'BLOCK_HIDDEN': 64, 'num_warps': 4, 'num_stages': 2},
+        {'BLOCK_BATCH': 32, 'BLOCK_OUTPUT': 128, 'BLOCK_HIDDEN': 64, 'num_warps': 8, 'num_stages': 2},
+    ]
+    
+    grid = lambda META: (
+        triton.cdiv(batch_size, META['BLOCK_BATCH']),
+        triton.cdiv(output_size, META['BLOCK_OUTPUT'])
+    )
+    
+    # Select best config based on problem size
+    best_config = configs[0]
+    if batch_size >= 64 and output_size >= 64:
+        best_config = configs[1]  # Better for larger batches
+    elif output_size >= 128:
+        best_config = configs[2]  # Better for larger outputs
+    
+    fused_h2o_kernel[grid](
+        h, weight_h2o, bias_h2o, output,
+        batch_size, hidden_size, output_size,
+        h.stride(0), h.stride(1),
+        weight_h2o.stride(0), weight_h2o.stride(1),
+        bias_h2o.stride(0),
+        output.stride(0), output.stride(1),
+        BLOCK_BATCH=best_config['BLOCK_BATCH'],
+        BLOCK_OUTPUT=best_config['BLOCK_OUTPUT'],
+        BLOCK_HIDDEN=best_config['BLOCK_HIDDEN'],
+        num_warps=best_config['num_warps'],
+        num_stages=best_config['num_stages']
+    )
+    
+    return output
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size: int, hidden_size: int, output_size: int):
+        super(ModelNew, self).__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.output_size = output_size
+        
+        self.weight_i2h = nn.Parameter(torch.randn(hidden_size, input_size + hidden_size))
+        self.bias_i2h = nn.Parameter(torch.randn(hidden_size))
+        self.weight_h2o = nn.Parameter(torch.randn(output_size, hidden_size))
+        self.bias_h2o = nn.Parameter(torch.randn(output_size))
+    
+    def forward(self, x: torch.Tensor, h0: torch.Tensor) -> torch.Tensor:
+        seq_len, batch_size, _ = x.size()
+        hidden = h0.to(x.device)
+        outputs = []
+        
+        for t in range(seq_len):
+            x_t = x[t]
+            hidden = fused_i2h_tanh(x_t, hidden, self.weight_i2h, self.bias_i2h)
+            output_t = fused_h2o(hidden, self.weight_h2o, self.bias_h2o)
+            outputs.append(output_t)
+        
+        return torch.stack(outputs, dim=0)

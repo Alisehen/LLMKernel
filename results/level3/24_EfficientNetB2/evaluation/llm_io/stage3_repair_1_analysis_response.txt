@@ -1,0 +1,5 @@
+{
+  "critical_issue": "Launch grid ignores GROUP_M while kernel uses grouped pid mapping, so many (m, n) tiles are never computed, leaving output entries uninitialized.",
+  "why_it_matters": "Uninitialized regions of y contain arbitrary values (often NaNs). When compared with the PyTorch reference, these NaNs propagate into max/mean absolute error, yielding max_abs_err=nan and mean_abs_err=nan.",
+  "minimal_fix_hint": "Adjust grid(...) so total programs match grouping logic (e.g., num_groups * num_pid_in_group), or remove GROUP_M-based pid remapping and use a simple 2D tiling of M and N."
+}

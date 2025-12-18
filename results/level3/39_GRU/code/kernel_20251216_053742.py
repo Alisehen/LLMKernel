@@ -1,0 +1,230 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+# -----------------------------
+# Fused GRU nonlinearity kernel
+# -----------------------------
+# Computes one GRU time-step for all batch elements and hidden units:
+#   r = sigmoid(x_r + h_r)
+#   z = sigmoid(x_z + h_z)
+#   n = tanh(x_n + r * h_n)
+#   h_new = (1 - z) * n + z * h_prev
+#
+# Inputs:
+#   x_gates: [B, 3H] (x_t @ W_ih^T + b_ih),  gate order [r, z, n]
+#   h_gates: [B, 3H] (h_{t-1} @ W_hh^T + b_hh), gate order [r, z, n]
+#   h_prev:  [B, H]
+# Output:
+#   h_new:   [B, H]
+#
+# Memory / fusion constraints:
+#   - Only one tl.store(): final h_new
+#   - No intermediate global stores
+#   - All intermediates stay in registers
+#
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_H': 64}, num_warps=2, num_stages=2),
+        triton.Config({'BLOCK_H': 128}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_H': 256}, num_warps=8, num_stages=2),
+    ],
+    key=['H'],
+)
+@triton.jit
+def gru_step_kernel(
+    x_gates_ptr,  # [B, 3H]
+    h_gates_ptr,  # [B, 3H]
+    h_prev_ptr,   # [B, H]
+    h_new_ptr,    # [B, H]
+    B, H,
+    stride_xb, stride_xh,
+    stride_hgb, stride_hgh,
+    stride_hpb, stride_hph,
+    stride_hnb, stride_hnh,
+    BLOCK_H: tl.constexpr,
+):
+    pid_b = tl.program_id(0)          # batch index
+    pid_h_block = tl.program_id(1)    # hidden-dim tile index
+
+    offs_b = pid_b
+    offs_h = pid_h_block * BLOCK_H + tl.arange(0, BLOCK_H)
+
+    # Bounds mask for hidden units
+    mask = (offs_b < B) & (offs_h < H)
+
+    # Precompute per-row base pointers
+    x_row_ptr = x_gates_ptr + offs_b * stride_xb
+    h_row_ptr = h_gates_ptr + offs_b * stride_hgb
+    hp_row_ptr = h_prev_ptr + offs_b * stride_hpb
+    hn_row_ptr = h_new_ptr + offs_b * stride_hnb
+
+    # Common offsets for the three gates
+    offs_h_x = offs_h * stride_xh
+    offs_h_hg = offs_h * stride_hgh
+    offs_h_hp = offs_h * stride_hph
+    offs_h_hn = offs_h * stride_hnh
+
+    # Gate offsets in the [3H] dimension
+    gate1_off_x = H * stride_xh
+    gate2_off_x = 2 * H * stride_xh
+    gate1_off_hg = H * stride_hgh
+    gate2_off_hg = 2 * H * stride_hgh
+
+    # 1) Reset gate r = sigmoid(x_r + h_r)
+    x_r = tl.load(x_row_ptr + offs_h_x, mask=mask, other=0.0)
+    h_r = tl.load(h_row_ptr + offs_h_hg, mask=mask, other=0.0)
+    r_pre = x_r + h_r
+    r = 1.0 / (1.0 + tl.exp(-r_pre))
+
+    # 2) Update gate z = sigmoid(x_z + h_z)
+    x_z = tl.load(x_row_ptr + offs_h_x + gate1_off_x, mask=mask, other=0.0)
+    h_z = tl.load(h_row_ptr + offs_h_hg + gate1_off_hg, mask=mask, other=0.0)
+    z_pre = x_z + h_z
+    z = 1.0 / (1.0 + tl.exp(-z_pre))
+
+    # 3) Candidate gate n = tanh(x_n + r * h_n)
+    x_n = tl.load(x_row_ptr + offs_h_x + gate2_off_x, mask=mask, other=0.0)
+    h_n = tl.load(h_row_ptr + offs_h_hg + gate2_off_hg, mask=mask, other=0.0)
+    n_pre = x_n + r * h_n
+
+    # tanh using exp: tanh(x) = (1 - e^{-2x}) / (1 + e^{-2x})
+    t = tl.exp(-2.0 * n_pre)
+    n = (1.0 - t) / (1.0 + t)
+
+    # 4) Final hidden state h_t = (1 - z) * n + z * h_{t-1}
+    h_prev = tl.load(hp_row_ptr + offs_h_hp, mask=mask, other=0.0)
+    h_new = (1.0 - z) * n + z * h_prev
+
+    # Single store for final output
+    tl.store(hn_row_ptr + offs_h_hn, h_new, mask=mask)
+
+
+# ------------------------------
+# Wrapper for kernel launch
+# ------------------------------
+def gru_step_triton(x_gates: torch.Tensor,
+                    h_gates: torch.Tensor,
+                    h_prev: torch.Tensor) -> torch.Tensor:
+    """
+    Single GRU step for one layer over all batch elements, using the
+    fused Triton kernel for gate nonlinearities and hidden update.
+
+    x_gates: [B, 3H] = x_t @ W_ih^T + b_ih, gate order [r, z, n]
+    h_gates: [B, 3H] = h_{t-1} @ W_hh^T + b_hh, gate order [r, z, n]
+    h_prev:  [B, H]
+    returns: [B, H] (new hidden state)
+    """
+    assert x_gates.is_cuda and h_gates.is_cuda and h_prev.is_cuda
+    B, threeH = x_gates.shape
+    H = threeH // 3
+
+    # Allocate output
+    h_new = torch.empty((B, H), device=x_gates.device, dtype=x_gates.dtype)
+
+    def grid(meta):
+        return (B, triton.cdiv(H, meta['BLOCK_H']))
+
+    gru_step_kernel[grid](
+        x_gates, h_gates, h_prev, h_new,
+        B, H,
+        x_gates.stride(0), x_gates.stride(1),
+        h_gates.stride(0), h_gates.stride(1),
+        h_prev.stride(0), h_prev.stride(1),
+        h_new.stride(0), h_new.stride(1),
+    )
+    return h_new
+
+
+# ------------------------------
+# PyTorch GRU module wrapper
+# ------------------------------
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers=3, bias=True, batch_first=False):
+        """
+        Custom GRU implementation using Triton for the nonlinear gated update.
+
+        This module reuses an internal nn.GRU (`self.gru`) so that its
+        parameters (names, shapes, and layout) exactly match a standard nn.GRU.
+        This allows state_dict loading/sharing with a reference model.
+        """
+        super(ModelNew, self).__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.bias = bias
+        self.batch_first = batch_first
+
+        self.gru = nn.GRU(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            bias=bias,
+            batch_first=batch_first,
+            bidirectional=False,
+        )
+
+    def forward(self, x, h0):
+        """
+        x:  [seq_len, batch_size, input_size] if batch_first=False
+            [batch_size, seq_len, input_size] if batch_first=True
+        h0: [num_layers, batch_size, hidden_size]
+        Returns: output sequence (same layout as input, last dim = hidden_size)
+        """
+        if self.batch_first:
+            # (batch, seq, feat) -> (seq, batch, feat)
+            x = x.transpose(0, 1)
+
+        seq_len, batch_size, _ = x.shape
+        device = x.device
+        dtype = x.dtype
+
+        if h0 is None:
+            h_prev_layers = [
+                torch.zeros(batch_size, self.hidden_size, device=device, dtype=dtype)
+                for _ in range(self.num_layers)
+            ]
+        else:
+            assert h0.shape[0] == self.num_layers
+            assert h0.shape[1] == batch_size
+            assert h0.shape[2] == self.hidden_size
+            h_prev_layers = [h0[layer] for layer in range(self.num_layers)]
+
+        outputs = []
+
+        # Iterate over time steps
+        for t in range(seq_len):
+            layer_input = x[t]  # [B, input_size or hidden_size]
+
+            # Iterate over layers
+            for layer in range(self.num_layers):
+                # Fetch weights/biases from internal nn.GRU
+                W_ih = getattr(self.gru, f"weight_ih_l{layer}")
+                W_hh = getattr(self.gru, f"weight_hh_l{layer}")
+                b_ih = getattr(self.gru, f"bias_ih_l{layer}") if self.bias else None
+                b_hh = getattr(self.gru, f"bias_hh_l{layer}") if self.bias else None
+
+                # Linear projections: [B, 3H], gate order [r, z, n]
+                x_gates = nn.functional.linear(layer_input, W_ih, b_ih)
+                h_gates = nn.functional.linear(h_prev_layers[layer], W_hh, b_hh)
+
+                # Fused Triton kernel for gated update
+                h_new = gru_step_triton(x_gates, h_gates, h_prev_layers[layer])
+
+                h_prev_layers[layer] = h_new
+                layer_input = h_new  # input to next layer
+
+            outputs.append(layer_input)  # top layer output at this time step
+
+        # Stack over time: [seq_len, batch, hidden]
+        output = torch.stack(outputs, dim=0)
+
+        if self.batch_first:
+            # (seq, batch, feat) -> (batch, seq, feat)
+            output = output.transpose(0, 1)
+
+        # Match reference nn.GRU: return only output, not final hidden state
+        return output

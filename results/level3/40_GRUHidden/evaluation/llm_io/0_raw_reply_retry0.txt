@@ -1,0 +1,244 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+# ---------------------------------------------------------------------------
+# Triton MatMul Kernel: C[M, N] = A[M, K] @ B[K, N]
+# ---------------------------------------------------------------------------
+
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32},
+            num_stages=2,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"BLOCK_M": 32, "BLOCK_N": 128, "BLOCK_K": 32},
+            num_stages=2,
+            num_warps=4,
+        ),
+    ],
+    key=["M", "N", "K"],
+)
+@triton.jit
+def matmul_kernel(
+    a_ptr, b_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    # Program IDs
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    # Offsets for C tile
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Pointers for A and B tiles
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    # Accumulator
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Loop over K dimension
+    for k in range(0, K, BLOCK_K):
+        k_remaining = K - k
+        a_mask = (offs_m[:, None] < M) & (offs_k[None, :] < k_remaining)
+        b_mask = (offs_k[:, None] < k_remaining) & (offs_n[None, :] < N)
+
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+        acc += tl.dot(a, b, allow_tf32=True)
+
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Write back
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+
+    # Cast accumulator back to input dtype (assume A's dtype == C's dtype)
+    c = acc
+    tl.store(c_ptrs, c, mask=c_mask)
+
+
+# ---------------------------------------------------------------------------
+# Python Wrapper for Triton MatMul
+# ---------------------------------------------------------------------------
+
+def triton_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """
+    Compute C = A @ B using Triton.
+    A: [M, K]
+    B: [K, N]
+    Returns C: [M, N]
+    """
+    assert a.ndim == 2 and b.ndim == 2, "triton_matmul only supports 2D tensors"
+    assert a.shape[1] == b.shape[0], "Incompatible matmul shapes"
+
+    # Ensure CUDA tensors
+    if not a.is_cuda or not b.is_cuda:
+        raise ValueError("triton_matmul expects CUDA tensors")
+
+    # Ensure contiguous for simple stride handling
+    if not a.is_contiguous():
+        a = a.contiguous()
+    if not b.is_contiguous():
+        b = b.contiguous()
+
+    M, K = a.shape
+    Kb, N = b.shape
+    assert K == Kb
+
+    c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_M"]),
+        triton.cdiv(N, META["BLOCK_N"]),
+    )
+
+    matmul_kernel[grid](
+        a, b, c,
+        M, N, K,
+        a.stride(0), a.stride(1),
+        b.stride(0), b.stride(1),
+        c.stride(0), c.stride(1),
+    )
+
+    return c
+
+
+# ---------------------------------------------------------------------------
+# Model with GRU implemented using Triton matmul
+# ---------------------------------------------------------------------------
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers=3, bias=True, batch_first=False):
+        """
+        Custom GRU-like model using Triton matmul for gate computations.
+        API matches the original Model.
+        """
+        super(ModelNew, self).__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.bias = bias
+        self.batch_first = batch_first
+
+        # Parameters follow GRU-style layout, but we store weights as [in_dim, 3*hidden_size]
+        # so we can directly do x @ W_ih and h @ W_hh.
+        self.W_ih = nn.ParameterList()
+        self.W_hh = nn.ParameterList()
+        if bias:
+            self.b_ih = nn.ParameterList()
+            self.b_hh = nn.ParameterList()
+        else:
+            self.b_ih = None
+            self.b_hh = None
+
+        for layer in range(num_layers):
+            in_dim = input_size if layer == 0 else hidden_size
+
+            W_ih_l = nn.Parameter(torch.empty(in_dim, 3 * hidden_size))
+            W_hh_l = nn.Parameter(torch.empty(hidden_size, 3 * hidden_size))
+            self.W_ih.append(W_ih_l)
+            self.W_hh.append(W_hh_l)
+
+            if bias:
+                b_ih_l = nn.Parameter(torch.empty(3 * hidden_size))
+                b_hh_l = nn.Parameter(torch.empty(3 * hidden_size))
+                self.b_ih.append(b_ih_l)
+                self.b_hh.append(b_hh_l)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        # Simple initialization; not strictly matching PyTorch's GRU but adequate for seed
+        for layer in range(self.num_layers):
+            nn.init.xavier_uniform_(self.W_ih[layer])
+            nn.init.orthogonal_(self.W_hh[layer])
+            if self.bias:
+                nn.init.zeros_(self.b_ih[layer])
+                nn.init.zeros_(self.b_hh[layer])
+
+    def forward(self, x: torch.Tensor, h0: torch.Tensor):
+        """
+        x: (seq_len, batch, input_size) if batch_first=False
+           (batch, seq_len, input_size) if batch_first=True
+        h0: (num_layers, batch, hidden_size)
+        Returns:
+            h_n: (num_layers, batch, hidden_size)
+        """
+        if self.batch_first:
+            # Convert to (seq, batch, feature) for internal processing
+            x = x.transpose(0, 1).contiguous()
+
+        seq_len, batch_size, _ = x.shape
+        assert h0.shape[0] == self.num_layers
+        assert h0.shape[1] == batch_size
+        assert h0.shape[2] == self.hidden_size
+
+        # Current input to the current layer (sequence)
+        layer_input = x
+        h_n_list = []
+
+        for layer in range(self.num_layers):
+            W_ih = self.W_ih[layer]
+            W_hh = self.W_hh[layer]
+            b_ih = self.b_ih[layer] if self.bias else None
+            b_hh = self.b_hh[layer] if self.bias else None
+
+            # Hidden state for this layer at time t
+            h_t = h0[layer]  # (batch, hidden_size)
+
+            # Output sequence of this layer
+            layer_output = torch.empty(
+                (seq_len, batch_size, self.hidden_size),
+                device=x.device,
+                dtype=x.dtype,
+            )
+
+            for t in range(seq_len):
+                x_t = layer_input[t]  # (batch, input_dim)
+                # Ensure 2D tensors for matmul
+                x_t_mat = x_t.view(batch_size, -1)
+                h_t_mat = h_t.view(batch_size, self.hidden_size)
+
+                # gate_x = x_t @ W_ih  -> (batch, 3*hidden_size)
+                gate_x = triton_matmul(x_t_mat, W_ih)
+                if b_ih is not None:
+                    gate_x = gate_x + b_ih
+
+                # gate_h = h_t @ W_hh  -> (batch, 3*hidden_size)
+                gate_h = triton_matmul(h_t_mat, W_hh)
+                if b_hh is not None:
+                    gate_h = gate_h + b_hh
+
+                i_r, i_z, i_n = gate_x.chunk(3, dim=1)
+                h_r, h_z, h_n = gate_h.chunk(3, dim=1)
+
+                r = torch.sigmoid(i_r + h_r)
+                z = torch.sigmoid(i_z + h_z)
+                n = torch.tanh(i_n + r * h_n)
+
+                h_t = (1.0 - z) * n + z * h_t
+
+                layer_output[t] = h_t
+
+            h_n_list.append(h_t)
+            layer_input = layer_output  # output of this layer is input to next
+
+        # Stack final hidden states from all layers
+        h_n = torch.stack(h_n_list, dim=0)  # (num_layers, batch, hidden_size)
+        return h_n
+```

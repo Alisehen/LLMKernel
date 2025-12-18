@@ -1,0 +1,345 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU
+GPU Name: 4090
+Architecture: Ada Lovelace
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+[OPTIMIZATION STAGE]f
+
+## Current Optimization Stage
+
+Focus: Grid layout & indexing for FUSED operations.
+
+⚠️ FUSION EXCLUSIONS (do NOT apply fusion rules to these):
+- Reduction ops (sum, mean, softmax along axis)
+- Atomic operations
+- Irregular/data-dependent access patterns
+- Cross-block dependencies
+
+Key Principle:
+- All fused ops share the SAME grid AND the SAME (offsets, mask) tuple
+- Grid covers OUTPUT tensor dimensions
+
+Hard Rules:
+- Every fused op MUST use identical offset calculation
+- Every fused op MUST use identical boundary mask
+- If broadcast needed: explicit `[None, :]` or `[:, None]`, NOT different offsets
+- Element-wise: 1D grid, single `offs = pid * BLOCK + tl.arange(0, BLOCK)`
+- Matmul fusion: 2D grid, `offs_m/offs_n` shared by bias add & activation
+
+Verification:
+- Check: all tl.load/tl.store use same `offsets` variable
+- Check: all masks derived from same boundary condition
+- If ANY op needs different indexing → do NOT fuse, split kernel
+
+
+
+[CURRENT CODE]
+```python
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {'BLOCK_M': 128, 'BLOCK_N': 32, 'BLOCK_K': 32},
+            num_warps=4,
+        ),
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32},
+            num_warps=4,
+        ),
+    ],
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def matmul_kernel(
+    a_ptr, b_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """
+    Computes C = A @ B
+    A: (M, K)
+    B: (K, N)
+    C: (M, N)
+    All in row-major with given strides.
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k in range(0, K, BLOCK_K):
+        k_remaining = K - k
+        a_mask = (offs_m[:, None] < M) & (offs_k[None, :] < k_remaining)
+        b_mask = (offs_k[:, None] < k_remaining) & (offs_n[None, :] < N)
+
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+        acc += tl.dot(a, b, allow_tf32=True)
+
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, acc, mask=c_mask)
+
+
+@triton.jit
+def batched_matmul_kernel(
+    a_ptr, b_ptr, c_ptr,
+    B, M, N, K,
+    stride_ab, stride_am, stride_ak,
+    stride_bb, stride_bk, stride_bn,
+    stride_cb, stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """
+    Batched matmul:
+      For each batch b: C[b] = A[b] @ B[b]
+    A: (B, M, K)
+    B: (B, K, N)
+    C: (B, M, N)
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    pid_b = tl.program_id(2)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    a_batch_ptr = a_ptr + pid_b * stride_ab
+    b_batch_ptr = b_ptr + pid_b * stride_bb
+    c_batch_ptr = c_ptr + pid_b * stride_cb
+
+    a_ptrs = a_batch_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_batch_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k in range(0, K, BLOCK_K):
+        k_remaining = K - k
+        a_mask = (offs_m[:, None] < M) & (offs_k[None, :] < k_remaining)
+        b_mask = (offs_k[:, None] < k_remaining) & (offs_n[None, :] < N)
+
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+        acc += tl.dot(a, b, allow_tf32=True)
+
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    c_ptrs = c_batch_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, acc, mask=c_mask)
+
+
+def triton_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """
+    Compute a @ b using Triton.
+    a: (M, K)
+    b: (K, N)
+    returns: (M, N)
+    """
+    assert a.ndim == 2 and b.ndim == 2, "triton_matmul expects 2D tensors"
+    M, K = a.shape
+    K2, N = b.shape
+    assert K == K2, "Incompatible matmul shapes"
+
+    c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+
+    grid = lambda META: (
+        triton.cdiv(M, META['BLOCK_M']),
+        triton.cdiv(N, META['BLOCK_N']),
+    )
+
+    matmul_kernel[grid](
+        a, b, c,
+        M, N, K,
+        a.stride(0), a.stride(1),
+        b.stride(0), b.stride(1),
+        c.stride(0), c.stride(1),
+    )
+    return c
+
+
+def triton_batched_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """
+    Batched matmul using Triton.
+    a: (B, M, K)
+    b: (B, K, N)
+    returns: (B, M, N)
+    """
+    assert a.ndim == 3 and b.ndim == 3, "triton_batched_matmul expects 3D tensors"
+    B, M, K = a.shape
+    B2, K2, N = b.shape
+    assert B == B2 and K == K2, "Incompatible batched matmul shapes"
+
+    c = torch.empty((B, M, N), device=a.device, dtype=a.dtype)
+
+    grid = lambda META: (
+        triton.cdiv(M, META['BLOCK_M']),
+        triton.cdiv(N, META['BLOCK_N']),
+        B,
+    )
+
+    batched_matmul_kernel[grid](
+        a, b, c,
+        B, M, N, K,
+        a.stride(0), a.stride(1), a.stride(2),
+        b.stride(0), b.stride(1), b.stride(2),
+        c.stride(0), c.stride(1), c.stride(2),
+        BLOCK_M=32,
+        BLOCK_N=64,
+        BLOCK_K=32,
+    )
+    return c
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized version of the NetVLAD-like module.
+
+    Heavy matrix multiplications are offloaded to Triton kernels:
+      - assignment = x @ clusters
+      - vlad = assignment^T @ x (batched)
+    The rest of the logic (BatchNorm, softmax, reductions, normalizations)
+    is kept in PyTorch for correctness and training compatibility.
+    """
+
+    def __init__(self, cluster_size, feature_size, ghost_clusters):
+        super(ModelNew, self).__init__()
+
+        self.feature_size = feature_size
+        self.cluster_size = cluster_size
+        self.ghost_clusters = ghost_clusters
+
+        init_sc = 1.0 / math.sqrt(feature_size)
+        clusters = cluster_size + ghost_clusters
+
+        # The `clusters` weights are the `(w,b)` in the paper
+        self.clusters = nn.Parameter(init_sc * torch.randn(feature_size, clusters))
+        self.batch_norm = nn.BatchNorm1d(clusters)
+        # The `clusters2` weights are the visual words `c_k` in the paper
+        self.clusters2 = nn.Parameter(init_sc * torch.randn(1, feature_size, cluster_size))
+        self.out_dim = self.cluster_size * feature_size
+
+    def forward(self, x, mask=None):
+        """
+        Args:
+            x (torch.Tensor): B x N x D
+
+        Returns:
+            (torch.Tensor): B x (D * K)
+        """
+        B, max_sample, D = x.shape
+        assert D == self.feature_size, "Input feature_size mismatch"
+
+        # B x N x D -> (B*N) x D
+        x_flat = x.view(-1, self.feature_size)
+
+        if x_flat.device != self.clusters.device:
+            msg = f"x.device {x_flat.device} != cluster.device {self.clusters.device}"
+            raise ValueError(msg)
+
+        # (BN x D) x (D x (K+G)) -> BN x (K+G)
+        assignment = triton_matmul(x_flat, self.clusters)
+
+        # BatchNorm1d over the (K+G) features
+        assignment = self.batch_norm(assignment)
+
+        # Softmax over cluster dimension
+        assignment = F.softmax(assignment, dim=1)  # BN x (K+G)
+
+        # Remove ghost clusters: BN x (K+G) -> BN x K
+        assignment = assignment[:, :self.cluster_size]
+
+        # BN x K -> B x N x K
+        assignment_3d = assignment.view(B, max_sample, self.cluster_size)
+
+        # B x N x K -> B x 1 x K
+        a_sum = torch.sum(assignment_3d, dim=1, keepdim=True)
+
+        # B x 1 x K * 1 x D x K -> B x D x K (broadcast over batch and N)
+        a = a_sum * self.clusters2
+
+        # B x N x K -> B x K x N (then make contiguous for efficient Triton access)
+        assignment_trans = assignment_3d.transpose(1, 2).contiguous()  # B x K x N
+
+        # BN x D -> B x N x D
+        x_3d = x_flat.view(B, max_sample, self.feature_size)  # B x N x D
+
+        # (B x K x N) x (B x N x D) -> B x K x D via Triton batched matmul
+        vlad = triton_batched_matmul(assignment_trans, x_3d)  # B x K x D
+
+        # B x K x D -> B x D x K
+        vlad = vlad.transpose(1, 2)  # B x D x K
+
+        # Residuals: subtract cluster centers
+        vlad = vlad - a  # B x D x K
+
+        # L2 intra norm over feature dimension (dim=1)
+        vlad = F.normalize(vlad)
+
+        # Flatten to B x (D*K)
+        vlad = vlad.reshape(-1, self.cluster_size * self.feature_size)
+
+        # Global L2 norm over descriptor dimension (dim=1)
+        vlad = F.normalize(vlad)
+
+        return vlad
+```
+
+[NCU PROFILING METRICS]
+No NCU metrics available (skipped for network-level model)
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+TRITON API CONSTRAINTS (CRITICAL):
+- Triton has NO: tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

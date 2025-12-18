@@ -1,0 +1,5 @@
+{
+  "critical_issue": "Store mask in linear_bias_kernel uses offs_n[:, None] instead of offs_n[None, :], creating incompatible 128x1 and 64x1 shapes.",
+  "why_it_matters": "Triton cannot broadcast these mismatched dimensions when combining masks, triggering the make_shape_compatible ValueError during compilation.",
+  "minimal_fix_hint": "Change the store mask to use offs_n[None, :] so the mask is (BLOCK_M, BLOCK_N)."
+}

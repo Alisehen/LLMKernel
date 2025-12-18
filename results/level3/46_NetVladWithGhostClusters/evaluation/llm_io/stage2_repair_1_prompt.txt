@@ -1,0 +1,470 @@
+Fix the Triton kernel errors. Generate correct, high-performance code.
+
+Current Error Log:
+Traceback (most recent call last):
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 43, in wrapper
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 2865, in multiple_of
+    return _semantic.multiple_of(input, values)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/semantic.py", line 1780, in multiple_of
+    raise ValueError("Shape of input to multiple_of does not match the length of values")
+ValueError: Shape of input to multiple_of does not match the length of values
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 538, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251216_085416_batch_range45to50_openai_deepseek/46_NetVladWithGhostClusters/code/kernel_20251216_090447.py", line 329, in forward
+    assignment = triton_linear(x_flat, self.clusters)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251216_085416_batch_range45to50_openai_deepseek/46_NetVladWithGhostClusters/code/kernel_20251216_090447.py", line 121, in triton_linear
+    _linear_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 419, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 238, in run
+    benchmark()
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 227, in benchmark
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 227, in <dictcomp>
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 162, in _bench
+    return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/testing.py", line 149, in do_bench
+    fn()
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 148, in kernel_call
+    self.fn.run(
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 733, in run
+    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 861, in _do_compile
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 300, in compile
+    module = src.make_ir(target, options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 80, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 43:4:
+    if (pid_m >= grid_m) | (pid_n >= grid_n):
+        return
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    # Alignment / contiguity hints (inputs are made contiguous in the wrapper)
+    tl.multiple_of(a_ptrs, 16)
+    ^
+Shape of input to multiple_of does not match the length of values
+
+Main Critical Problem Analysis:
+Problem Analysis (from expert diagnosis):
+critical_issue: tl.multiple_of is applied to 2D pointer tensors (a_ptrs/b_ptrs) with a scalar 16, violating its shape-vs-values requirement.
+why_it_matters: multiple_of expects the length of `values` to match the tensor’s rank; passing a scalar for a 2D tensor triggers the shape mismatch compilation error.
+minimal_fix_hint: Only call multiple_of on 1D/ scalar index or stride tensors, or pass per-dimension values matching the tensor rank, or remove these hints.
+
+Focus your fix on addressing the identified critical issue.
+
+
+Broken Code:
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32, "GROUP_M": 8},
+            num_warps=4,
+            num_stages=3,
+        ),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 32, "BLOCK_K": 32, "GROUP_M": 8},
+            num_warps=4,
+            num_stages=3,
+        ),
+        triton.Config(
+            {"BLOCK_M": 32, "BLOCK_N": 64, "BLOCK_K": 32, "GROUP_M": 8},
+            num_warps=4,
+            num_stages=2,
+        ),
+    ],
+    key=["M", "N", "K"],
+)
+@triton.jit
+def _linear_kernel(
+    a_ptr,  # [M, K]
+    b_ptr,  # [K, N]
+    c_ptr,  # [M, N]
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    # Program id and block swizzling along M for better L2 reuse
+    pid = tl.program_id(0)
+    grid_m = tl.cdiv(M, BLOCK_M)
+    grid_n = tl.cdiv(N, BLOCK_N)
+
+    group_size_m = GROUP_M
+    num_pid_in_group = group_size_m * grid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * group_size_m
+    pid_in_group = pid % num_pid_in_group
+    pid_m = first_pid_m + (pid_in_group % group_size_m)
+    pid_n = pid_in_group // group_size_m
+
+    if (pid_m >= grid_m) | (pid_n >= grid_n):
+        return
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    # Alignment / contiguity hints (inputs are made contiguous in the wrapper)
+    tl.multiple_of(a_ptrs, 16)
+    tl.multiple_of(b_ptrs, 16)
+    tl.max_contiguous(a_ptrs, BLOCK_K)
+    tl.max_contiguous(b_ptrs, BLOCK_N)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k in range(0, K, BLOCK_K):
+        k_mask_a = (offs_k[None, :] + k) < K
+        k_mask_b = (offs_k[:, None] + k) < K
+
+        a = tl.load(
+            a_ptrs,
+            mask=(offs_m[:, None] < M) & k_mask_a,
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptrs,
+            mask=k_mask_b & (offs_n[None, :] < N),
+            other=0.0,
+        )
+        acc += tl.dot(a, b, allow_tf32=True)
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    c = acc.to(tl.float32)
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    tl.store(c_ptrs, c, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+
+
+def triton_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """
+    x: [M, K]
+    weight: [K, N]
+    returns: [M, N]
+    """
+    assert x.is_cuda and weight.is_cuda, "Inputs must be CUDA tensors"
+    assert x.dtype == weight.dtype == torch.float32, "Only float32 supported for now"
+
+    x = x.contiguous()
+    w = weight.contiguous()
+
+    M, K = x.shape
+    K_w, N = w.shape
+    assert K_w == K, "Incompatible dimensions for matmul"
+
+    c = torch.empty((M, N), device=x.device, dtype=x.dtype)
+
+    def grid(meta):
+        return (triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]),)
+
+    _linear_kernel[grid](
+        x,
+        w,
+        c,
+        M,
+        N,
+        K,
+        x.stride(0),
+        x.stride(1),
+        w.stride(0),
+        w.stride(1),
+        c.stride(0),
+        c.stride(1),
+    )
+
+    return c
+
+
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32, "GROUP_M": 8},
+            num_warps=4,
+            num_stages=3,
+        ),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 32, "BLOCK_K": 32, "GROUP_M": 8},
+            num_warps=4,
+            num_stages=3,
+        ),
+        triton.Config(
+            {"BLOCK_M": 32, "BLOCK_N": 64, "BLOCK_K": 32, "GROUP_M": 8},
+            num_warps=4,
+            num_stages=2,
+        ),
+    ],
+    key=["B", "M", "N", "K"],
+)
+@triton.jit
+def _batched_matmul_kernel(
+    a_ptr,  # [B, M, K]
+    b_ptr,  # [B, K, N]
+    c_ptr,  # [B, M, N]
+    B,
+    M,
+    N,
+    K,
+    stride_ab,
+    stride_am,
+    stride_ak,
+    stride_bb,
+    stride_bk,
+    stride_bn,
+    stride_cb,
+    stride_cm,
+    stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    pid_b = tl.program_id(0)
+    pid = tl.program_id(1)
+
+    if pid_b >= B:
+        return
+
+    grid_m = tl.cdiv(M, BLOCK_M)
+    grid_n = tl.cdiv(N, BLOCK_N)
+
+    group_size_m = GROUP_M
+    num_pid_in_group = group_size_m * grid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * group_size_m
+    pid_in_group = pid % num_pid_in_group
+    pid_m = first_pid_m + (pid_in_group % group_size_m)
+    pid_n = pid_in_group // group_size_m
+
+    if (pid_m >= grid_m) | (pid_n >= grid_n):
+        return
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    a_batch_ptr = a_ptr + pid_b * stride_ab
+    b_batch_ptr = b_ptr + pid_b * stride_bb
+    c_batch_ptr = c_ptr + pid_b * stride_cb
+
+    a_ptrs = a_batch_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_batch_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    tl.multiple_of(a_ptrs, 16)
+    tl.multiple_of(b_ptrs, 16)
+    tl.max_contiguous(a_ptrs, BLOCK_K)
+    tl.max_contiguous(b_ptrs, BLOCK_N)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k in range(0, K, BLOCK_K):
+        k_mask_a = (offs_k[None, :] + k) < K
+        k_mask_b = (offs_k[:, None] + k) < K
+
+        a = tl.load(
+            a_ptrs,
+            mask=(offs_m[:, None] < M) & k_mask_a,
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptrs,
+            mask=k_mask_b & (offs_n[None, :] < N),
+            other=0.0,
+        )
+        acc += tl.dot(a, b, allow_tf32=True)
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    c = acc.to(tl.float32)
+    c_ptrs = c_batch_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    tl.store(c_ptrs, c, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+
+
+def triton_batched_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """
+    a: [B, M, K]
+    b: [B, K, N]
+    returns: [B, M, N]
+    """
+    assert a.is_cuda and b.is_cuda, "Inputs must be CUDA tensors"
+    assert a.dtype == b.dtype == torch.float32, "Only float32 supported for now"
+
+    a = a.contiguous()
+    b = b.contiguous()
+
+    B, M, K = a.shape
+    B_b, K_b, N = b.shape
+    assert B_b == B and K_b == K, "Incompatible dimensions for batched matmul"
+
+    c = torch.empty((B, M, N), device=a.device, dtype=a.dtype)
+
+    def grid(meta):
+        return (
+            B,
+            triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]),
+        )
+
+    _batched_matmul_kernel[grid](
+        a,
+        b,
+        c,
+        B,
+        M,
+        N,
+        K,
+        a.stride(0),
+        a.stride(1),
+        a.stride(2),
+        b.stride(0),
+        b.stride(1),
+        b.stride(2),
+        c.stride(0),
+        c.stride(1),
+        c.stride(2),
+    )
+
+    return c
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-accelerated version of the NetVLAD-like module.
+    Uses optimized Triton GEMMs and keeps normalization ops in PyTorch.
+    """
+
+    def __init__(self, cluster_size, feature_size, ghost_clusters):
+        super(ModelNew, self).__init__()
+
+        self.feature_size = feature_size
+        self.cluster_size = cluster_size
+        self.ghost_clusters = ghost_clusters
+
+        init_sc = 1.0 / (feature_size ** 0.5)
+        clusters = cluster_size + ghost_clusters
+
+        # (w, b) in the paper
+        self.clusters = nn.Parameter(init_sc * torch.randn(feature_size, clusters))
+        self.batch_norm = nn.BatchNorm1d(clusters)
+        # visual words c_k
+        self.clusters2 = nn.Parameter(
+            init_sc * torch.randn(1, feature_size, cluster_size)
+        )
+        self.out_dim = self.cluster_size * feature_size
+
+    def forward(self, x, mask=None):
+        """
+        x: B x N x D
+        returns: B x (D*K)
+        """
+        B, max_sample, D = x.shape
+        assert D == self.feature_size
+
+        x_flat = x.view(-1, self.feature_size).contiguous()  # BN x D
+
+        if x_flat.device != self.clusters.device:
+            msg = f"x.device {x_flat.device} != cluster.device {self.clusters.device}"
+            raise ValueError(msg)
+
+        # BN x (K+G) using Triton GEMM
+        assignment = triton_linear(x_flat, self.clusters)
+
+        # BatchNorm over feature dimension (clusters)
+        assignment = self.batch_norm(assignment)
+
+        # Softmax over clusters (K+G)
+        assignment = nn.functional.softmax(assignment, dim=1)  # BN x (K+G)
+
+        # Remove ghost clusters
+        assignment = assignment[:, : self.cluster_size]  # BN x K
+
+        # BN x K -> B x N x K
+        assignment = assignment.view(B, max_sample, self.cluster_size)
+
+        # Sum over N
+        a_sum = assignment.sum(dim=1, keepdim=True)  # B x 1 x K
+        a = a_sum * self.clusters2  # (B x 1 x K) * (1 x D x K) -> B x D x K
+
+        # Prepare for batched GEMM: (B,K,N) x (B,N,D) -> (B,K,D)
+        assignment_t = assignment.transpose(1, 2).contiguous()  # B x K x N
+        x_reshaped = x.view(B, max_sample, self.feature_size).contiguous()  # B x N x D
+
+        # Triton batched matmul
+        vlad = triton_batched_matmul(assignment_t, x_reshaped)  # B x K x D
+        vlad = vlad.transpose(1, 2)  # B x D x K
+
+        vlad = vlad - a  # B x D x K
+
+        # L2 intra norm over feature dimension D
+        vlad = nn.functional.normalize(vlad, p=2.0, dim=1)
+
+        # Flatten + L2 norm over descriptor dimension
+        vlad = vlad.reshape(B, self.cluster_size * self.feature_size)
+        vlad = nn.functional.normalize(vlad, p=2.0, dim=1)
+
+        return vlad
+```
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl, AND any other modules used (e.g., import math if using math.sqrt)
+   2. @triton.jit decorated kernel function(s) — NO continue/break/return inside loops (use masking)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels — THIS CLASS IS REQUIRED
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+3. Learn from previous repair attempts to avoid repeating the same mistakes
+4. Ensure ALL imports are included at the top (common mistake: forgetting `import math`)
+
+```python
+# <corrected code>
+```

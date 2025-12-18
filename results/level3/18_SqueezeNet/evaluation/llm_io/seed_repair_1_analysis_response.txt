@@ -1,0 +1,5 @@
+{
+  "critical_issue": "The reference PyTorch SqueezeNet (not ModelNew) runs in full autograd on 64×3×512×512 input, exhausting GPU memory before any Triton kernel is invoked.",
+  "why_it_matters": "torch.conv2d in the reference classifier must store huge activations and gradients, so a single forward exceeds available VRAM and throws CUDA out-of-memory, blocking benchmarking of your Triton model.",
+  "minimal_fix_hint": "Benchmark the reference model in eval()/no_grad() or reduce batch/shape so its forward pass fits into GPU memory."
+}

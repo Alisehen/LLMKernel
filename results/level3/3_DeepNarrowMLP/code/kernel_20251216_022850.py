@@ -1,0 +1,239 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        # Main high-throughput config (good balance of reuse vs registers)
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32},
+            num_warps=4,
+            num_stages=4,
+        ),
+        # Skewed tiles for tall / wide matrices
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 32, "BLOCK_K": 32},
+            num_warps=4,
+            num_stages=4,
+        ),
+        # Small fallback tile for register-heavy scenarios
+        triton.Config(
+            {"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_K": 32},
+            num_warps=2,
+            num_stages=3,
+        ),
+    ],
+    key=["M", "N", "K"],
+)
+@triton.jit
+def linear_bias_relu_kernel(
+    a_ptr,       # [M, K]  (row-major)
+    b_ptr,       # [N, K]  (row-major, PyTorch Linear.weight)
+    bias_ptr,    # [N]
+    c_ptr,       # [M, N]
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    stride_am,
+    stride_ak,
+    stride_bn,   # weight.stride(0) (along N / out_features)
+    stride_bk,   # weight.stride(1) (along K / in_features)
+    stride_cm,
+    stride_cn,
+    APPLY_RELU: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # 2D program id for output tile [BLOCK_M, BLOCK_N]
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    # Offsets into M, N, K
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Hints to compiler for better vectorization
+    tl.max_contiguous(offs_m, BLOCK_M)
+    tl.max_contiguous(offs_n, BLOCK_N)
+    tl.multiple_of(offs_k, BLOCK_K)
+
+    # 1D masks for output bounds
+    mask_m_1d = offs_m < M
+    mask_n_1d = offs_n < N
+
+    # Base pointers for first K tile
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    # B is [N, K] but we load as [K, N] tile for tl.dot
+    b_ptrs = b_ptr + offs_n[None, :] * stride_bn + offs_k[:, None] * stride_bk
+
+    # FP32 accumulator (Tensor Cores with TF32 when possible)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    k_iter = 0
+    while k_iter < K:
+        k_remaining = K - k_iter
+
+        # Masks along K dimension; recompute cheap comparisons instead of
+        # storing full 2D masks to keep register usage lower.
+        k_mask_row = offs_k[None, :] < k_remaining  # for A
+        k_mask_col = offs_k[:, None] < k_remaining  # for B
+
+        # Final masks: broadcast 1D output bounds with K masks
+        a = tl.load(
+            a_ptrs,
+            mask=(mask_m_1d[:, None] & k_mask_row),
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptrs,
+            mask=(k_mask_col & mask_n_1d[None, :]),
+            other=0.0,
+        )
+
+        acc += tl.dot(a, b, out_dtype=tl.float32, allow_tf32=True)
+
+        # Advance to next K-tile
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+        k_iter += BLOCK_K
+
+    # Bias add
+    bias = tl.load(bias_ptr + offs_n, mask=mask_n_1d, other=0.0)
+    acc += bias[None, :]
+
+    # Optional ReLU (keep this fused, it's more expensive than basic arith)
+    if APPLY_RELU:
+        acc = tl.maximum(acc, 0.0)
+
+    # Store
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    c_mask = mask_m_1d[:, None] & mask_n_1d[None, :]
+    tl.store(c_ptrs, acc, mask=c_mask)
+
+
+def _run_linear_bias_relu(x, weight, bias, apply_relu: bool):
+    """
+    x:      [M, K]
+    weight: [N, K] (nn.Linear.weight, row-major)
+    bias:   [N]
+    """
+    if not x.is_cuda:
+        out = torch.nn.functional.linear(x, weight, bias)
+        if apply_relu:
+            out = torch.nn.functional.relu(out)
+        return out
+
+    # Ensure contiguous for optimal memory access
+    if not x.is_contiguous():
+        x = x.contiguous()
+    if not weight.is_contiguous():
+        weight = weight.contiguous()
+    if bias is not None and not bias.is_contiguous():
+        bias = bias.contiguous()
+
+    M, K = x.shape
+    N = weight.shape[0]
+    assert K == weight.shape[1], "Incompatible shapes for x and weight"
+
+    # Output
+    c = torch.empty((M, N), device=x.device, dtype=x.dtype)
+
+    # Strides (row-major)
+    stride_am = x.stride(0)
+    stride_ak = x.stride(1)
+    stride_bn = weight.stride(0)
+    stride_bk = weight.stride(1)
+    stride_cm = c.stride(0)
+    stride_cn = c.stride(1)
+
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta["BLOCK_M"]),
+            triton.cdiv(N, meta["BLOCK_N"]),
+        )
+
+    linear_bias_relu_kernel[grid](
+        x,
+        weight,
+        bias,
+        c,
+        M,
+        N,
+        K,
+        stride_am,
+        stride_ak,
+        stride_bn,
+        stride_bk,
+        stride_cm,
+        stride_cn,
+        APPLY_RELU=apply_relu,
+    )
+    return c
+
+
+def fused_linear_relu(x, weight, bias):
+    return _run_linear_bias_relu(x, weight, bias, apply_relu=True)
+
+
+def fused_linear(x, weight, bias):
+    return _run_linear_bias_relu(x, weight, bias, apply_relu=False)
+
+
+class TritonLinear(nn.Module):
+    """
+    Drop-in replacement for nn.Linear that uses a fused Triton kernel.
+    Optionally applies ReLU inside the kernel.
+    """
+
+    def __init__(self, in_features, out_features, apply_relu: bool):
+        super().__init__()
+        self.linear = nn.Linear(in_features, out_features)
+        self.apply_relu = apply_relu
+
+    @property
+    def weight(self):
+        return self.linear.weight
+
+    @property
+    def bias(self):
+        return self.linear.bias
+
+    def forward(self, x):
+        if self.apply_relu:
+            return fused_linear_relu(x, self.weight, self.bias)
+        else:
+            return fused_linear(x, self.weight, self.bias)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_layer_sizes, output_size):
+        """
+        :param input_size: The number of input features
+        :param hidden_layer_sizes: A list of ints containing the sizes of each hidden layer
+        :param output_size: The number of output features
+        """
+        super(ModelNew, self).__init__()
+
+        layers = []
+        current_input_size = input_size
+
+        # Hidden layers: Linear + ReLU fused
+        for hidden_size in hidden_layer_sizes:
+            layers.append(TritonLinear(current_input_size, hidden_size, apply_relu=True))
+            current_input_size = hidden_size
+
+        # Output layer: Linear only
+        layers.append(TritonLinear(current_input_size, output_size, apply_relu=False))
+
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, x):
+        """
+        :param x: The input tensor, shape (batch_size, input_size)
+        :return: The output tensor, shape (batch_size, output_size)
+        """
+        return self.network(x)

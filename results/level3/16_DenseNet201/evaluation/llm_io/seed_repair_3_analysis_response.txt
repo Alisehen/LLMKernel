@@ -1,0 +1,5 @@
+{
+  "critical_issue": "DenseBlock forward stores all previous feature maps in a list and re-concatenates them each layer, causing runaway activation memory growth and CUDA OOM.",
+  "why_it_matters": "All intermediate feature tensors remain referenced and their concatenated copies are also kept for autograd, so memory scales badly with layers and channels, exhausting GPU memory at batch normalization.",
+  "minimal_fix_hint": "Stop accumulating features in a list; instead iteratively update x with x = torch.cat([x, new_feature], 1) and avoid storing all prior feature maps."
+}

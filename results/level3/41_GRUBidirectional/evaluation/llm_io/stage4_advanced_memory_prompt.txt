@@ -1,0 +1,646 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU
+GPU Name: 4090
+Architecture: Ada Lovelace
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+[OPTIMIZATION STAGE]f
+
+## Current Optimization Stage
+
+Focus: Fine-tuning fused kernel parameters.
+
+Params:
+- num_warps ∈ {4, 8}
+- num_stages ∈ {2, 3}
+
+Conditional Rules (NOT one-size-fits-all):
+
+IF register pressure LOW (regs < 96, no spill):
+  - Try num_warps=8 for compute-bound fusion
+  - num_stages=3 may help hide latency
+
+IF register pressure HIGH (regs > 128 or occupancy_limit_registers):
+  - Use num_warps=4 (fewer warps = more registers per warp)
+  - Keep num_stages=2 (higher stages need more registers)
+
+IF multi-input fusion (3+ distinct loads):
+  - num_stages=2 preferred (each stage buffers all inputs)
+  - num_warps=4 often better than 8
+
+Autotune:
+- Max 2-3 configs to reduce compilation time
+- Always include conservative baseline (num_warps=4, num_stages=2)
+- Test before/after: revert if gain < 2%
+
+
+
+[CURRENT CODE]
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+# ----------------------------
+# Low-level math helpers
+# ----------------------------
+
+@triton.jit
+def _sigmoid(x):
+    # sigmoid(x) = 1 / (1 + exp(-x))
+    return 1.0 / (1.0 + tl.exp(-x))
+
+
+@triton.jit
+def _tanh_from_sigmoid(x):
+    # tanh(x) = 2 * sigmoid(2x) - 1
+    return 2.0 * _sigmoid(2.0 * x) - 1.0
+
+
+# ----------------------------
+# Matmul + Bias kernel (A @ B + bias)
+# A: (M, K), B: (K, N), bias: (N,), C: (M, N)
+# Optimized for Ada (RTX 4090) with 1D grouped grid and tensor cores
+# ----------------------------
+
+@triton.autotune(
+    configs=[
+        # Large tiles for big GEMMs
+        triton.Config(
+            {
+                "BLOCK_M": 128,
+                "BLOCK_N": 256,
+                "BLOCK_K": 64,
+                "GROUP_M": 8,
+            },
+            num_stages=3,
+            num_warps=8,
+        ),
+        triton.Config(
+            {
+                "BLOCK_M": 256,
+                "BLOCK_N": 128,
+                "BLOCK_K": 64,
+                "GROUP_M": 8,
+            },
+            num_stages=3,
+            num_warps=8,
+        ),
+        triton.Config(
+            {
+                "BLOCK_M": 128,
+                "BLOCK_N": 128,
+                "BLOCK_K": 64,
+                "GROUP_M": 8,
+            },
+            num_stages=2,
+            num_warps=4,
+        ),
+        # Medium tiles
+        triton.Config(
+            {
+                "BLOCK_M": 64,
+                "BLOCK_N": 256,
+                "BLOCK_K": 64,
+                "GROUP_M": 8,
+            },
+            num_stages=2,
+            num_warps=4,
+        ),
+        triton.Config(
+            {
+                "BLOCK_M": 256,
+                "BLOCK_N": 64,
+                "BLOCK_K": 64,
+                "GROUP_M": 8,
+            },
+            num_stages=2,
+            num_warps=4,
+        ),
+        triton.Config(
+            {
+                "BLOCK_M": 64,
+                "BLOCK_N": 128,
+                "BLOCK_K": 64,
+                "GROUP_M": 8,
+            },
+            num_stages=2,
+            num_warps=4,
+        ),
+        # Smaller tiles for skinny / small problems
+        triton.Config(
+            {
+                "BLOCK_M": 64,
+                "BLOCK_N": 64,
+                "BLOCK_K": 32,
+                "GROUP_M": 8,
+            },
+            num_stages=2,
+            num_warps=4,
+        ),
+        triton.Config(
+            {
+                "BLOCK_M": 32,
+                "BLOCK_N": 128,
+                "BLOCK_K": 32,
+                "GROUP_M": 8,
+            },
+            num_stages=2,
+            num_warps=4,
+        ),
+        triton.Config(
+            {
+                "BLOCK_M": 128,
+                "BLOCK_N": 32,
+                "BLOCK_K": 32,
+                "GROUP_M": 8,
+            },
+            num_stages=2,
+            num_warps=4,
+        ),
+    ],
+    key=["M", "N", "K"],
+)
+@triton.jit
+def linear_bias_kernel(
+    a_ptr,  # *const A, shape (M, K)
+    b_ptr,  # *const B, shape (K, N)
+    bias_ptr,  # *const bias, shape (N,)
+    c_ptr,  # *C, shape (M, N)
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    OUT_TYPE: tl.constexpr,  # 0: fp16, 1: bf16, 2: fp32
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    """
+    Compute C = A @ B + bias
+    Fully fused matmul + bias in a single kernel.
+    - Single global store (C) per element.
+    - No intermediate stores: accumulation & bias add stay in registers.
+    Grid: 1D over tiles of C, grouped along M for better L2 reuse.
+    """
+    pid = tl.program_id(0)
+
+    # Number of program ids along M and N
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    num_pid = num_pid_m * num_pid_n
+
+    # Group PIDs along M to maximize L2 reuse of A
+    group_size = GROUP_M
+    group_id = pid // (group_size * num_pid_n)
+    first_pid_m = group_id * group_size
+    group_size_m = tl.minimum(num_pid_m - first_pid_m, group_size)
+    pid_in_group = pid % (group_size * num_pid_n)
+    pid_m = first_pid_m + (pid_in_group % group_size_m)
+    pid_n = pid_in_group // group_size_m
+
+    # If pid is out of range (can happen for last group), exit early
+    if pid_m >= num_pid_m or pid_n >= num_pid_n:
+        return
+
+    # Tile offsets
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Masks
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+
+    # Pointers to the first A and B tiles for this program
+    a_ptrs = a_ptr + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
+
+    # FP32 accumulation (tensor cores will still be used for fp16/bf16 inputs)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Main K loop
+    k_iter = 0
+    while k_iter < K:
+        k_mask = k_iter + offs_k < K
+
+        a = tl.load(
+            a_ptrs,
+            mask=mask_m[:, None] & k_mask[None, :],
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptrs,
+            mask=k_mask[:, None] & mask_n[None, :],
+            other=0.0,
+        )
+
+        acc += tl.dot(a, b, out_dtype=tl.float32, allow_tf32=True)
+
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+        k_iter += BLOCK_K
+
+    # Bias add (in-register)
+    bias = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0)
+    acc += bias[None, :]
+
+    # Cast accumulator to output dtype (branch resolved at compile-time)
+    if OUT_TYPE == 0:
+        acc_out = acc.to(tl.float16)
+    elif OUT_TYPE == 1:
+        acc_out = acc.to(tl.bfloat16)
+    else:
+        acc_out = acc  # fp32
+
+    # Store result: single write per element, no intermediates
+    c_ptrs = c_ptr + (offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn)
+    tl.store(c_ptrs, acc_out, mask=mask_m[:, None] & mask_n[None, :])
+
+
+# ----------------------------
+# GRU elementwise gate kernel
+# r = sigmoid(i_r + h_r)
+# z = sigmoid(i_z + h_z)
+# n = tanh(i_n + r * h_n)
+# h_new = (1 - z) * n + z * h_prev
+#
+# gates_x, gates_h: (B, 3H)
+# h_prev, out_t: (B, H)
+#
+# NOTE: Fully fused, single output tensor:
+#   - No intermediate global stores for h_new.
+#   - h_new is written directly into out_t.
+#   - Next time-step reuses out_t as h_prev.
+# ----------------------------
+
+@triton.jit
+def gru_gates_kernel(
+    gates_x_ptr,  # (B, 3H)
+    gates_h_ptr,  # (B, 3H)
+    h_prev_ptr,   # (B, H)
+    out_ptr,      # (B, H)  - also used as h_new
+    B, H,
+    stride_gx_b, stride_gx_c,
+    stride_gh_b, stride_gh_c,
+    stride_hp_b, stride_hp_c,
+    stride_out_b, stride_out_c,
+    BLOCK: tl.constexpr,
+):
+    """
+    Elementwise GRU cell update kernel.
+    All fused ops share the same 1D offsets/mask.
+    Single final store into out_ptr.
+    Grid: 1D over elements of (B, H) flattened.
+    """
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    total = B * H
+    mask = offs < total
+
+    # Map 1D offsets -> (b, h)
+    b_idx = offs // H
+    h_idx = offs % H
+
+    # Column indices for each gate slice
+    col_r = h_idx
+    col_z = h_idx + H
+    col_n = h_idx + 2 * H
+
+    # Gate pointers
+    gx_ir_ptrs = gates_x_ptr + b_idx * stride_gx_b + col_r * stride_gx_c
+    gx_iz_ptrs = gates_x_ptr + b_idx * stride_gx_b + col_z * stride_gx_c
+    gx_in_ptrs = gates_x_ptr + b_idx * stride_gx_b + col_n * stride_gx_c
+
+    gh_hr_ptrs = gates_h_ptr + b_idx * stride_gh_b + col_r * stride_gh_c
+    gh_hz_ptrs = gates_h_ptr + b_idx * stride_gh_b + col_z * stride_gh_c
+    gh_hn_ptrs = gates_h_ptr + b_idx * stride_gh_b + col_n * stride_gh_c
+
+    # h_prev / out pointers
+    hp_ptrs = h_prev_ptr + b_idx * stride_hp_b + h_idx * stride_hp_c
+    out_h_ptrs = out_ptr + b_idx * stride_out_b + h_idx * stride_out_c
+
+    # Loads
+    i_r = tl.load(gx_ir_ptrs, mask=mask, other=0.0)
+    i_z = tl.load(gx_iz_ptrs, mask=mask, other=0.0)
+    i_n = tl.load(gx_in_ptrs, mask=mask, other=0.0)
+
+    h_r = tl.load(gh_hr_ptrs, mask=mask, other=0.0)
+    h_z = tl.load(gh_hz_ptrs, mask=mask, other=0.0)
+    h_n = tl.load(gh_hn_ptrs, mask=mask, other=0.0)
+
+    h_prev = tl.load(hp_ptrs, mask=mask, other=0.0)
+
+    # Fused gate computations (all in-register)
+    r = _sigmoid(i_r + h_r)
+    z = _sigmoid(i_z + h_z)
+    n = _tanh_from_sigmoid(i_n + r * h_n)
+    h_new = (1.0 - z) * n + z * h_prev
+
+    # Single final store: h_new -> out_ptr
+    tl.store(out_h_ptrs, h_new, mask=mask)
+
+
+# ----------------------------
+# Wrapper: matmul + bias
+# ----------------------------
+
+def linear_triton(x: torch.Tensor, weight_t: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    Compute y = x @ weight + bias using an optimized Triton kernel.
+    x:        (M, K)
+    weight_t: (K, N)  -- transposed weight
+    bias:     (N,)
+    Returns y: (M, N)
+    """
+    assert x.is_cuda and weight_t.is_cuda and bias.is_cuda
+    assert x.dtype == weight_t.dtype == bias.dtype
+
+    M, K = x.shape
+    K_w, N = weight_t.shape
+    assert K_w == K
+
+    y = torch.empty((M, N), device=x.device, dtype=x.dtype)
+
+    stride_am, stride_ak = x.stride()
+    stride_bk, stride_bn = weight_t.stride()
+    stride_cm, stride_cn = y.stride()
+
+    if x.dtype == torch.float16:
+        out_type = 0
+    elif x.dtype == torch.bfloat16:
+        out_type = 1
+    elif x.dtype == torch.float32:
+        out_type = 2
+    else:
+        raise TypeError(f"Unsupported dtype for linear_triton: {x.dtype}")
+
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]),
+        )
+
+    linear_bias_kernel[grid](
+        x,
+        weight_t,
+        bias,
+        y,
+        M,
+        N,
+        K,
+        stride_am,
+        stride_ak,
+        stride_bk,
+        stride_bn,
+        stride_cm,
+        stride_cn,
+        OUT_TYPE=out_type,
+    )
+    return y
+
+
+# ----------------------------
+# Wrapper: GRU gates elementwise (no extra work buffer)
+# ----------------------------
+
+def gru_cell_triton(
+    gates_x: torch.Tensor,  # (B, 3H)
+    gates_h: torch.Tensor,  # (B, 3H)
+    h_prev: torch.Tensor,   # (B, H)
+    out_t: torch.Tensor,    # (B, H) slice of output[t], also h_new
+) -> torch.Tensor:
+    """
+    Fused elementwise GRU cell using Triton.
+    Outputs h_new directly into out_t; no intermediate buffer.
+
+    All tensors must be CUDA and same dtype.
+    """
+    assert gates_x.is_cuda and gates_h.is_cuda and h_prev.is_cuda
+    assert out_t.is_cuda
+    assert gates_x.dtype == gates_h.dtype == h_prev.dtype == out_t.dtype
+
+    B, threeH = gates_x.shape
+    B2, H = h_prev.shape
+    assert B == B2 and threeH == 3 * H
+    assert gates_h.shape == gates_x.shape
+    assert out_t.shape == h_prev.shape
+
+    stride_gx_b, stride_gx_c = gates_x.stride()
+    stride_gh_b, stride_gh_c = gates_h.stride()
+    stride_hp_b, stride_hp_c = h_prev.stride()
+    stride_out_b, stride_out_c = out_t.stride()
+
+    total = B * H
+    BLOCK = 256
+    grid = (triton.cdiv(total, BLOCK),)
+
+    gru_gates_kernel[grid](
+        gates_x,
+        gates_h,
+        h_prev,
+        out_t,
+        B,
+        H,
+        stride_gx_b,
+        stride_gx_c,
+        stride_gh_b,
+        stride_gh_c,
+        stride_hp_b,
+        stride_hp_c,
+        stride_out_b,
+        stride_out_c,
+        BLOCK=BLOCK,
+    )
+
+    # out_t now contains h_new, and is used as next h_prev
+    return out_t
+
+
+# ----------------------------
+# High-level GRU layer & network forward
+# ----------------------------
+
+def gru_layer_triton(
+    x: torch.Tensor,          # (seq_len, batch, input_size_or_2H)
+    h0: torch.Tensor,         # (batch, hidden_size)
+    w_ih_t: torch.Tensor,     # (input_size_or_2H, 3*hidden_size)  transposed
+    b_ih: torch.Tensor,       # (3*hidden_size,)
+    w_hh_t: torch.Tensor,     # (hidden_size, 3*hidden_size)       transposed
+    b_hh: torch.Tensor,       # (3*hidden_size,)
+    reverse: bool,
+) -> (torch.Tensor, torch.Tensor):
+    """
+    Single GRU layer for one direction, using Triton for both
+    linear parts and gate elementwise computations.
+
+    Memory pattern:
+      - GEMMs: fused matmul + bias (no intermediate outputs).
+      - GRU cell: single store of h_new directly into output[t].
+    """
+    seq_len, batch_size, _ = x.shape
+    hidden_size = h0.shape[1]
+    device = x.device
+    dtype = x.dtype
+
+    output = torch.empty((seq_len, batch_size, hidden_size), device=device, dtype=dtype)
+
+    # Current hidden state
+    h_t = h0.contiguous()
+
+    if reverse:
+        time_range = range(seq_len - 1, -1, -1)
+    else:
+        time_range = range(seq_len)
+
+    for t in time_range:
+        x_t = x[t]  # (batch, input_size_or_2H)
+
+        # GEMMs on x_t and h_t (fused with bias inside kernel)
+        gates_x = linear_triton(x_t, w_ih_t, b_ih)  # (batch, 3H)
+        gates_h = linear_triton(h_t, w_hh_t, b_hh)  # (batch, 3H)
+
+        # Fused GRU gate + hidden update: write directly into output[t]
+        out_t_slice = output[t]  # (batch, H), contiguous view
+        h_t = gru_cell_triton(gates_x, gates_h, h_t, out_t_slice)
+
+    # Final hidden is last written h_t
+    return output, h_t
+
+
+def gru_triton_forward(
+    x: torch.Tensor,
+    h0: torch.Tensor,
+    gru_module: nn.GRU,
+) -> (torch.Tensor, torch.Tensor):
+    """
+    Multi-layer (possibly bidirectional) GRU forward using Triton
+    for all linear and GRU-cell elementwise operations.
+    x: (seq_len, batch, input_size) if not batch_first
+       or (batch, seq_len, input_size) if batch_first
+    h0: (num_layers * num_directions, batch, hidden_size)
+    """
+    batch_first = getattr(gru_module, "batch_first", False)
+    if batch_first:
+        x = x.transpose(0, 1)  # (seq, batch, feat)
+
+    seq_len, batch_size, _ = x.shape
+    num_layers = gru_module.num_layers
+    hidden_size = gru_module.hidden_size
+    num_directions = 2 if gru_module.bidirectional else 1
+    use_bias = gru_module.bias
+
+    assert h0.shape[0] == num_layers * num_directions
+    assert h0.shape[1] == batch_size
+    assert h0.shape[2] == hidden_size
+
+    current_input = x
+    h_n_list = []
+
+    for layer in range(num_layers):
+        layer_outputs = []
+
+        for direction in range(num_directions):
+            suffix = "" if direction == 0 else "_reverse"
+            reverse = direction == 1
+
+            w_ih = getattr(gru_module, f"weight_ih_l{layer}{suffix}")
+            w_hh = getattr(gru_module, f"weight_hh_l{layer}{suffix}")
+
+            if use_bias:
+                b_ih = getattr(gru_module, f"bias_ih_l{layer}{suffix}")
+                b_hh = getattr(gru_module, f"bias_hh_l{layer}{suffix}")
+            else:
+                b_ih = torch.zeros(
+                    3 * hidden_size, device=current_input.device, dtype=current_input.dtype
+                )
+                b_hh = torch.zeros(
+                    3 * hidden_size, device=current_input.device, dtype=current_input.dtype
+                )
+
+            # Transpose weights once per forward pass for Triton kernel
+            w_ih_t = w_ih.transpose(0, 1).contiguous()  # (input_size, 3H)
+            w_hh_t = w_hh.transpose(0, 1).contiguous()  # (H, 3H)
+
+            h0_ld = h0[layer * num_directions + direction]  # (batch, H)
+
+            out_dir, h_n_dir = gru_layer_triton(
+                current_input, h0_ld, w_ih_t, b_ih, w_hh_t, b_hh, reverse
+            )
+            layer_outputs.append(out_dir)
+            h_n_list.append(h_n_dir.unsqueeze(0))
+
+        if num_directions == 1:
+            current_input = layer_outputs[0]
+        else:
+            # Concatenate directions on feature dim
+            current_input = torch.cat(layer_outputs, dim=2)
+
+    output = current_input
+    h_n = torch.cat(h_n_list, dim=0)  # (num_layers * num_directions, batch, H)
+
+    if batch_first:
+        output = output.transpose(0, 1)  # back to (batch, seq, feat)
+
+    return output, h_n
+
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers=3, bias=True, batch_first=False):
+        """
+        GRU model using Triton-accelerated kernels for GEMM and GRU cell math.
+        Optimized for:
+          - Fused matmul + bias (single output store).
+          - Fused GRU gates + update (single output store).
+        """
+        super(ModelNew, self).__init__()
+        self.gru = nn.GRU(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            bias=bias,
+            batch_first=batch_first,
+            dropout=0.0,
+            bidirectional=True,
+        )
+
+    def forward(self, x, h0):
+        output, _ = gru_triton_forward(x, h0, self.gru)
+        return output
+```
+
+[NCU PROFILING METRICS]
+No NCU metrics available (skipped for network-level model)
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+TRITON API CONSTRAINTS (CRITICAL):
+- Triton has NO: tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

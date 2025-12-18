@@ -1,0 +1,228 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU
+GPU Name: 4090
+Architecture: Ada Lovelace
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+[OPTIMIZATION STAGE]f
+
+## Current Optimization Stage
+
+Focus: Fine-tuning fused kernel parameters.
+
+Params:
+- num_warps ∈ {4, 8}
+- num_stages ∈ {2, 3}
+
+Conditional Rules (NOT one-size-fits-all):
+
+IF register pressure LOW (regs < 96, no spill):
+  - Try num_warps=8 for compute-bound fusion
+  - num_stages=3 may help hide latency
+
+IF register pressure HIGH (regs > 128 or occupancy_limit_registers):
+  - Use num_warps=4 (fewer warps = more registers per warp)
+  - Keep num_stages=2 (higher stages need more registers)
+
+IF multi-input fusion (3+ distinct loads):
+  - num_stages=2 preferred (each stage buffers all inputs)
+  - num_warps=4 often better than 8
+
+Autotune:
+- Max 2-3 configs to reduce compilation time
+- Always include conservative baseline (num_warps=4, num_stages=2)
+- Test before/after: revert if gain < 2%
+
+
+
+[CURRENT CODE]
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.autotune(
+    configs=[
+        # Optimized for Ada Lovelace with high occupancy
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_stages=2, num_warps=8),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 32}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=3, num_warps=8),
+        # Tensor-core optimized (multiples of 16)
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_stages=2, num_warps=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_stages=2, num_warps=4),
+        # High thread count for better occupancy
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 128}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=3, num_warps=8),
+    ],
+    key=['M', 'N', 'K']
+)
+@triton.jit
+def linear_activation_kernel(
+    a_ptr, b_ptr, bias_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bn, stride_bk,
+    stride_cm, stride_cn,
+    ACTIVATION: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    ALLOW_TF32: tl.constexpr,
+):
+    # 2D grid for matrix multiplication
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    
+    # Offsets for the current tile
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    
+    # Pointers to A and B tiles
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_n[:, None] * stride_bn + offs_k[None, :] * stride_bk
+    
+    # Initialize accumulator
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    # Main matmul loop with K-tiling
+    for k in range(0, K, BLOCK_K):
+        k_remaining = K - k
+        a_mask = (offs_m[:, None] < M) & (offs_k[None, :] < k_remaining)
+        b_mask = (offs_n[:, None] < N) & (offs_k[None, :] < k_remaining)
+        
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+        
+        acc += tl.dot(a, tl.trans(b), allow_tf32=ALLOW_TF32)
+        
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+    
+    # Fused bias addition
+    if bias_ptr is not None:
+        bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+        acc += bias[None, :]
+    
+    # Fused activation (using only allowed operations)
+    if ACTIVATION == 1:  # ReLU
+        acc = tl.maximum(acc, 0.0)
+    elif ACTIVATION == 2:  # GELU approximation (tanh-free)
+        # x * sigmoid(1.702 * x) approximation
+        x = acc
+        sigmoid_x = 1.0 / (1.0 + tl.exp(-1.702 * x))
+        acc = x * sigmoid_x
+    elif ACTIVATION == 3:  # SiLU (Swish)
+        x = acc
+        sigmoid_x = 1.0 / (1.0 + tl.exp(-x))
+        acc = x * sigmoid_x
+    
+    # Store final output
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, acc, mask=c_mask)
+
+def fused_linear_activation(x, weight, bias=None, activation='none'):
+    M, K = x.shape
+    N = weight.shape[0]
+    
+    # Ensure contiguous memory layout
+    x = x.contiguous()
+    weight = weight.contiguous()
+    
+    # Pre-allocate output tensor
+    c = torch.empty((M, N), device=x.device, dtype=x.dtype)
+    
+    # Grid covers output dimensions (M, N)
+    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']), triton.cdiv(N, META['BLOCK_N']))
+    
+    # Map activation string to kernel constant
+    if activation == 'relu':
+        ACTIVATION = 1
+    elif activation == 'gelu':
+        ACTIVATION = 2
+    elif activation == 'silu':
+        ACTIVATION = 3
+    else:
+        ACTIVATION = 0
+    
+    # Launch kernel with correct strides
+    linear_activation_kernel[grid](
+        x, weight, bias, c,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        weight.stride(0), weight.stride(1),
+        c.stride(0), c.stride(1),
+        ACTIVATION=ACTIVATION,
+        ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32
+    )
+    
+    return c
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_layer_sizes, output_size, activation='relu'):
+        super(ModelNew, self).__init__()
+        
+        self.layers = nn.ModuleList()
+        current_input_size = input_size
+        
+        for hidden_size in hidden_layer_sizes:
+            self.layers.append(nn.Linear(current_input_size, hidden_size))
+            current_input_size = hidden_size
+        
+        self.output_layer = nn.Linear(current_input_size, output_size)
+        self.activation = activation
+    
+    def forward(self, x):
+        # Hidden layers with activation
+        for layer in self.layers:
+            x = fused_linear_activation(x, layer.weight, layer.bias, activation=self.activation)
+        
+        # Output layer without activation
+        x = fused_linear_activation(x, self.output_layer.weight, self.output_layer.bias, activation='none')
+        
+        return x
+```
+
+[NCU PROFILING METRICS]
+{
+  "linear_activation_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 36.49,
+    "launch__grid_size": 128,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 16.67,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 37.57,
+    "lts__t_sector_hit_rate.pct": 49.73
+  }
+}
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+TRITON API CONSTRAINTS (CRITICAL):
+- Triton has NO: tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

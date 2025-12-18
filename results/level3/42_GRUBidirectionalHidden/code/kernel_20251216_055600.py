@@ -1,0 +1,345 @@
+import math
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {
+                "BLOCK_M": 64,
+                "BLOCK_N": 64,
+                "BLOCK_K": 32,
+            },
+            num_stages=2,
+            num_warps=4,
+        ),
+        triton.Config(
+            {
+                "BLOCK_M": 128,
+                "BLOCK_N": 64,
+                "BLOCK_K": 32,
+            },
+            num_stages=2,
+            num_warps=8,
+        ),
+    ],
+    key=["M", "N", "K"],
+)
+@triton.jit
+def _linear_gemm_bias_kernel(
+    a_ptr,  # [M, K]
+    b_ptr,  # [K, N] as viewed (original weight is [N, K])
+    bias_ptr,  # [N]
+    c_ptr,  # [M, N]
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """
+    Compute C = A @ B + bias
+    A: [M, K]
+    B: [K, N]
+    bias: [N]
+    C: [M, N]
+    """
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Pointers for the first K-tile
+    a_ptrs = a_ptr + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Loop over K dimension
+    for k in range(0, K, BLOCK_K):
+        # 1D mask for the current K-tile
+        k_offsets = k + offs_k                      # [BLOCK_K]
+        k_mask = k_offsets < K                      # [BLOCK_K]
+
+        # Load A tile: [BLOCK_M, BLOCK_K]
+        a = tl.load(
+            a_ptrs,
+            mask=(offs_m[:, None] < M) & k_mask[None, :],
+            other=0.0,
+        )
+        # Load B tile: [BLOCK_K, BLOCK_N]
+        b = tl.load(
+            b_ptrs,
+            mask=k_mask[:, None] & (offs_n[None, :] < N),
+            other=0.0,
+        )
+        acc += tl.dot(a, b, allow_tf32=True)
+
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Add bias
+    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc += bias[None, :]
+
+    # Store result
+    c_ptrs = c_ptr + (offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn)
+    tl.store(
+        c_ptrs,
+        acc,
+        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+    )
+
+
+def linear_triton(input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    Triton-accelerated replacement for torch.nn.functional.linear:
+
+        out = input @ weight.T + bias
+
+    input:  [M, K]
+    weight: [N, K]
+    bias:   [N]
+    out:    [M, N]
+    """
+    assert input.ndim == 2, "linear_triton expects 2D input"
+    assert weight.ndim == 2, "linear_triton expects 2D weight"
+    assert bias is not None and bias.ndim == 1, "linear_triton expects 1D bias"
+
+    M, K = input.shape
+    N, K_w = weight.shape
+    assert K == K_w, "Input and weight dimensions must match"
+
+    # Ensure correct device / dtype
+    assert input.device == weight.device == bias.device, "All tensors must be on the same device"
+    assert input.is_cuda, "Tensors must be CUDA tensors for Triton kernels"
+
+    out = torch.empty((M, N), device=input.device, dtype=input.dtype)
+
+    # View weight as [K, N] in the kernel by swapping strides
+    stride_am, stride_ak = input.stride()          # [M, K]
+    stride_wn, stride_wk = weight.stride()         # [N, K]
+    stride_bk = stride_wk                          # along K
+    stride_bn = stride_wn                          # along N
+
+    stride_cm, stride_cn = out.stride()            # [M, N]
+
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_M"]),
+        triton.cdiv(N, META["BLOCK_N"]),
+    )
+
+    _linear_gemm_bias_kernel[grid](
+        input,
+        weight,
+        bias,
+        out,
+        M,
+        N,
+        K,
+        stride_am,
+        stride_ak,
+        stride_bk,
+        stride_bn,
+        stride_cm,
+        stride_cn,
+    )
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-accelerated GRU implementation (bidirectional, multi-layer) that matches the
+    semantics of the original Model using nn.GRU, but performs the heavy linear
+    operations via a custom Triton GEMM + bias kernel.
+    """
+
+    def __init__(self, input_size, hidden_size, num_layers=3, bias=True, batch_first=False):
+        super(ModelNew, self).__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.bias_flag = bias
+        self.batch_first = batch_first
+
+        # Bidirectional GRU
+        self.num_directions = 2
+
+        # Weights for each (layer, direction) pair are flattened into lists
+        self.weight_ih = nn.ParameterList()
+        self.weight_hh = nn.ParameterList()
+        if self.bias_flag:
+            self.bias_ih = nn.ParameterList()
+            self.bias_hh = nn.ParameterList()
+        else:
+            self.bias_ih = None
+            self.bias_hh = None
+
+        for layer in range(self.num_layers):
+            if layer == 0:
+                layer_input_size = self.input_size
+            else:
+                # Next layers take concatenated outputs of both directions
+                layer_input_size = self.hidden_size * self.num_directions
+
+            for _direction in range(self.num_directions):
+                # weight_ih: [3 * hidden_size, layer_input_size]
+                w_ih = nn.Parameter(torch.empty(3 * hidden_size, layer_input_size))
+                # weight_hh: [3 * hidden_size, hidden_size]
+                w_hh = nn.Parameter(torch.empty(3 * hidden_size, hidden_size))
+                self.weight_ih.append(w_ih)
+                self.weight_hh.append(w_hh)
+
+                if self.bias_flag:
+                    b_ih = nn.Parameter(torch.empty(3 * hidden_size))
+                    b_hh = nn.Parameter(torch.empty(3 * hidden_size))
+                    self.bias_ih.append(b_ih)
+                    self.bias_hh.append(b_hh)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        # Match PyTorch GRU initialization (approximately)
+        stdv = 1.0 / math.sqrt(self.hidden_size)
+        for p in self.parameters():
+            if p.data.ndimension() > 1:
+                nn.init.uniform_(p.data, -stdv, stdv)
+            else:
+                nn.init.uniform_(p.data, -stdv, stdv)
+
+    def _layer_direction_params(self, layer: int, direction: int):
+        idx = layer * self.num_directions + direction
+        w_ih = self.weight_ih[idx]
+        w_hh = self.weight_hh[idx]
+        if self.bias_flag:
+            b_ih = self.bias_ih[idx]
+            b_hh = self.bias_hh[idx]
+        else:
+            b_ih = None
+            b_hh = None
+        return w_ih, w_hh, b_ih, b_hh
+
+    def _gru_cell(self, x_t, h_prev, w_ih, w_hh, b_ih, b_hh):
+        """
+        Single GRU cell step using PyTorch equations (matching nn.GRU),
+        with gate linear parts computed via Triton.
+        x_t:   [B, input_size]
+        h_prev:[B, hidden_size]
+        Returns h_t: [B, hidden_size]
+        """
+        # gates from input: [B, 3*H]
+        gates_x = linear_triton(
+            x_t,
+            w_ih,
+            b_ih if b_ih is not None else torch.zeros(
+                3 * self.hidden_size, device=x_t.device, dtype=x_t.dtype
+            ),
+        )
+        # gates from hidden: [B, 3*H]
+        gates_h = linear_triton(
+            h_prev,
+            w_hh,
+            b_hh if b_hh is not None else torch.zeros(
+                3 * self.hidden_size, device=h_prev.device, dtype=h_prev.dtype
+            ),
+        )
+
+        i_r, i_z, i_n = gates_x.chunk(3, dim=1)
+        h_r, h_z, h_n = gates_h.chunk(3, dim=1)
+
+        resetgate = torch.sigmoid(i_r + h_r)
+        updategate = torch.sigmoid(i_z + h_z)
+        newgate = torch.tanh(i_n + resetgate * h_n)
+
+        h_t = newgate + updategate * (h_prev - newgate)
+        return h_t
+
+    def forward(self, x, h0):
+        """
+        x:  (seq_len, batch, input_size) if batch_first=False,
+            (batch, seq_len, input_size) if batch_first=True
+        h0: (num_layers * num_directions, batch, hidden_size)
+
+        Returns:
+            h_n: (num_layers * num_directions, batch, hidden_size)
+        """
+        # Arrange input as (seq_len, batch, input_size)
+        if self.batch_first:
+            x = x.transpose(0, 1)
+        x = x.contiguous()
+
+        seq_len, batch_size, _ = x.shape
+        device = x.device
+        dtype = x.dtype
+
+        if h0 is None:
+            h_prev_all = torch.zeros(
+                self.num_layers * self.num_directions,
+                batch_size,
+                self.hidden_size,
+                device=device,
+                dtype=dtype,
+            )
+        else:
+            h_prev_all = h0
+
+        # Output hidden states for all layers and directions
+        h_n = torch.empty(
+            self.num_layers * self.num_directions,
+            batch_size,
+            self.hidden_size,
+            device=device,
+            dtype=dtype,
+        )
+
+        prev_layer_output = x  # [seq_len, batch, current_feature_size]
+
+        for layer in range(self.num_layers):
+            if layer == 0:
+                layer_input_size = self.input_size
+            else:
+                layer_input_size = self.hidden_size * self.num_directions
+
+            layer_outputs = []
+
+            for direction in range(self.num_directions):
+                if direction == 0:
+                    time_indices = range(seq_len)
+                else:
+                    time_indices = range(seq_len - 1, -1, -1)
+
+                w_ih, w_hh, b_ih, b_hh = self._layer_direction_params(layer, direction)
+                hx = h_prev_all[layer * self.num_directions + direction]
+
+                outputs_dir = []
+
+                for t in time_indices:
+                    x_t = prev_layer_output[t]  # [batch, layer_input_size]
+                    hx = self._gru_cell(x_t, hx, w_ih, w_hh, b_ih, b_hh)
+                    outputs_dir.append(hx)
+
+                # Final hidden for this (layer, direction)
+                h_n[layer * self.num_directions + direction] = hx
+
+                # Stack outputs and align time order to [0..seq_len-1]
+                outputs_dir = torch.stack(outputs_dir, dim=0)  # [seq_len, batch, hidden]
+                if direction == 1:
+                    # Reverse to match original time order
+                    outputs_dir = torch.flip(outputs_dir, dims=[0])
+
+                layer_outputs.append(outputs_dir)
+
+            # Concatenate directions along feature dim: [seq_len, batch, hidden * num_directions]
+            if self.num_directions == 1:
+                prev_layer_output = layer_outputs[0]
+            else:
+                prev_layer_output = torch.cat(layer_outputs, dim=2)
+
+        return h_n

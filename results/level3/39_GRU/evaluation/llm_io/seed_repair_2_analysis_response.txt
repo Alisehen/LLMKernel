@@ -1,0 +1,5 @@
+{
+  "critical_issue": "GRU gate indexing/order is wrong: kernel assumes [z, r, n] while PyTorch GRU weights are laid out as [r, z, n].",
+  "why_it_matters": "When sharing/copying weights from the reference GRU, reset and update gates are swapped, so all gate computations use mismatched parameters, producing significantly different hidden states and outputs.",
+  "minimal_fix_hint": "Align gate layout with PyTorch by treating the first H slice as r, second as z, third as n in both weights and Triton indexing."
+}

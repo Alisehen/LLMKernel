@@ -1,0 +1,139 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        # Optimized for Ada Lovelace: maximize occupancy with 1024 threads
+        triton.Config({'BLOCK_SIZE': 256, 'BLOCK_K': 64}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 512, 'BLOCK_K': 64}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 1024, 'BLOCK_K': 64}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 256, 'BLOCK_K': 128}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 512, 'BLOCK_K': 128}, num_warps=8, num_stages=3),
+    ],
+    key=['B', 'N', 'K']
+)
+@triton.jit
+def fused_gemm_last_step_kernel(
+    # Input pointers
+    x_ptr,  # [B, T, K]
+    weight_ptr,  # [N, K] (transposed: K, N layout)
+    bias_ptr,  # [N] or None
+    # Output pointer
+    out_ptr,  # [B, N]
+    # Shapes
+    B, T, K, N,
+    # Strides
+    stride_xb, stride_xt, stride_xk,
+    stride_wk, stride_wn,
+    stride_ob, stride_on,
+    # Block constants
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """
+    Optimized fused kernel for Ada Lovelace (RTX 4090).
+    1. Flattened 1D grid covering B × N elements
+    2. Optimized memory access patterns for tensor cores
+    3. Precomputed last timestep offset
+    """
+    # Flattened 1D grid: each block processes BLOCK_SIZE output elements
+    pid = tl.program_id(0)
+    
+    # Calculate output position (b, n) from flattened ID
+    b_idx = pid // N
+    n_idx = pid % N
+    
+    # Create masks for boundaries
+    b_mask = b_idx < B
+    n_mask = n_idx < N
+    
+    # Only process valid elements
+    if not (b_mask and n_mask):
+        return
+    
+    # Precompute last timestep offset
+    last_timestep_offset = (T - 1) * stride_xt + b_idx * stride_xb
+    
+    # Initialize accumulator
+    acc = 0.0
+    
+    # Blocked K dimension for tensor core efficiency
+    for k_start in range(0, K, BLOCK_K):
+        # Create K mask
+        k_offsets = tl.arange(0, BLOCK_K)
+        k_mask = k_offsets < (K - k_start)
+        
+        # Load x: [BLOCK_K]
+        x_ptrs = x_ptr + last_timestep_offset + (k_start + k_offsets) * stride_xk
+        x_block = tl.load(x_ptrs, mask=k_mask, other=0.0)
+        
+        # Load weight: [BLOCK_K]
+        w_ptrs = weight_ptr + (k_start + k_offsets) * stride_wk + n_idx * stride_wn
+        w_block = tl.load(w_ptrs, mask=k_mask, other=0.0)
+        
+        # Accumulate dot product
+        acc += tl.sum(x_block * w_block)
+    
+    # Add bias if provided
+    if bias_ptr is not None:
+        bias = tl.load(bias_ptr + n_idx)
+        acc += bias
+    
+    # Store result
+    out_ptr = out_ptr + b_idx * stride_ob + n_idx * stride_on
+    tl.store(out_ptr, acc)
+
+
+def fused_gemm_last_step(x, weight, bias):
+    """
+    Fused operation: x[:, -1, :] @ weight.t() + bias
+    Optimized for Ada Lovelace architecture.
+    """
+    B, T, K = x.shape
+    N = weight.shape[0]
+    
+    # Output tensor
+    out = torch.empty((B, N), device=x.device, dtype=x.dtype)
+    
+    # Flattened grid: total elements = B × N
+    total_elements = B * N
+    
+    # Prepare weight for kernel (need K,N layout for efficient access)
+    weight_t = weight.t().contiguous()
+    
+    # Launch kernel with 1D grid
+    grid = lambda META: (triton.cdiv(total_elements, META['BLOCK_SIZE']),)
+    
+    fused_gemm_last_step_kernel[grid](
+        x, weight_t, bias, out,
+        B, T, K, N,
+        x.stride(0), x.stride(1), x.stride(2),
+        weight_t.stride(0), weight_t.stride(1),
+        out.stride(0), out.stride(1),
+    )
+    
+    return out
+
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers, output_size, dropout=0.0):
+        super(ModelNew, self).__init__()
+        # LSTM remains unchanged
+        self.lstm = nn.LSTM(
+            input_size, hidden_size, num_layers,
+            batch_first=True, dropout=dropout, bidirectional=True
+        )
+        
+        # Parameters for fused kernel
+        self.weight = nn.Parameter(torch.randn(output_size, hidden_size * 2))
+        self.bias = nn.Parameter(torch.randn(output_size))
+    
+    def forward(self, x, h0, c0):
+        # LSTM forward (unchanged)
+        out, hn = self.lstm(x, (h0, c0))
+        
+        # Fused: take last timestep and linear transformation
+        return fused_gemm_last_step(out, self.weight, self.bias)

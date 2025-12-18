@@ -1,0 +1,5 @@
+{
+  "critical_issue": "matmul_bias_kernel’s 1D GROUP_M swizzling miscomputes pid_m/pid_n when num_pid_m < GROUP_M, leaving many output tiles of C never computed.",
+  "why_it_matters": "Unwritten regions of C remain uninitialized torch.empty values (often NaNs/garbage), propagate through BatchNorm/Linear, and cause NaN outputs, making results diverge completely from the PyTorch reference.",
+  "minimal_fix_hint": "Correct the program_id-to-(pid_m,pid_n) mapping or grid size so every C tile is covered exactly once, including tail cases where num_pid_m < or not divisible by GROUP_M."
+}

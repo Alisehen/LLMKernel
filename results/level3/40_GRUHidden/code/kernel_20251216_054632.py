@@ -1,0 +1,263 @@
+# <complete ModelNew code with optimized Triton kernels>
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32},
+            num_warps=8,
+            num_stages=3,
+        ),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+        triton.Config(
+            {"BLOCK_M": 32, "BLOCK_N": 64, "BLOCK_K": 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+    ],
+    key=["M", "N", "K"],
+)
+@triton.jit
+def matmul_bias_kernel(
+    a_ptr, b_ptr, bias_ptr, c_ptr,          # pointers
+    M, N, K,                                # sizes
+    stride_am, stride_ak,                   # A strides
+    stride_bk, stride_bn,                   # B strides
+    stride_cm, stride_cn,                   # C strides
+    stride_bias,                            # bias stride (1D)
+    HAS_BIAS: tl.constexpr,                 # fuse bias add if True
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    k = 0
+    while k < K:
+        k_remaining = K - k
+        mask_k = offs_k < k_remaining
+
+        a_mask = mask_m[:, None] & mask_k[None, :]
+        b_mask = mask_k[:, None] & mask_n[None, :]
+
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+        acc += tl.dot(a, b, allow_tf32=True)
+
+        k += BLOCK_K
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    if HAS_BIAS:
+        bias_ptrs = bias_ptr + offs_n * stride_bias
+        bias = tl.load(bias_ptrs, mask=mask_n, other=0.0)
+        acc += bias[None, :]
+
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    c_mask = mask_m[:, None] & mask_n[None, :]
+    tl.store(c_ptrs, acc, mask=c_mask)
+
+
+def _launch_triton_matmul_bias(a: torch.Tensor,
+                               b: torch.Tensor,
+                               bias: torch.Tensor | None,
+                               out: torch.Tensor | None = None) -> torch.Tensor:
+    """
+    C = A @ B (+ bias), using optimized Triton kernel.
+    A: [M, K], B: [K, N], bias: [N] or None, C: [M, N]
+    """
+    assert a.ndim == 2 and b.ndim == 2, "matmul expects 2D tensors"
+    assert a.shape[1] == b.shape[0], "Incompatible matmul shapes"
+    assert a.is_cuda and b.is_cuda, "Inputs must be CUDA tensors"
+    if bias is not None:
+        assert bias.is_cuda, "Bias must be CUDA tensor"
+
+    if not a.is_contiguous():
+        a = a.contiguous()
+    if not b.is_contiguous():
+        b = b.contiguous()
+    if bias is not None and not bias.is_contiguous():
+        bias = bias.contiguous()
+
+    M, K = a.shape
+    Kb, N = b.shape
+    assert K == Kb
+
+    if out is None:
+        out = torch.empty((M, N), device=a.device, dtype=a.dtype)
+    else:
+        assert out.shape == (M, N)
+        assert out.device == a.device
+        assert out.dtype == a.dtype
+        if not out.is_contiguous():
+            raise ValueError("`out` must be contiguous")
+
+    if bias is not None:
+        assert bias.ndim == 1 and bias.shape[0] == N
+        bias_ptr = bias
+        stride_bias = bias.stride(0)
+        has_bias = True
+    else:
+        bias_ptr = out
+        stride_bias = 0
+        has_bias = False
+
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta["BLOCK_M"]),
+            triton.cdiv(N, meta["BLOCK_N"]),
+        )
+
+    matmul_bias_kernel[grid](
+        a, b, bias_ptr, out,
+        M, N, K,
+        a.stride(0), a.stride(1),
+        b.stride(0), b.stride(1),
+        out.stride(0), out.stride(1),
+        stride_bias,
+        HAS_BIAS=has_bias,
+    )
+
+    return out
+
+
+def triton_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    return _launch_triton_matmul_bias(a, b, bias=None, out=None)
+
+
+def triton_matmul_bias(a: torch.Tensor,
+                       b: torch.Tensor,
+                       bias: torch.Tensor | None,
+                       out: torch.Tensor | None = None) -> torch.Tensor:
+    return _launch_triton_matmul_bias(a, b, bias=bias, out=out)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers=3, bias=True, batch_first=False):
+        """
+        Custom GRU model using Triton matmul for gate computations.
+        Parameters mirror nn.GRU so that state_dicts are compatible.
+        """
+        super(ModelNew, self).__init__()
+        self.gru = nn.GRU(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            bias=bias,
+            batch_first=batch_first,
+        )
+
+    def forward(self, x: torch.Tensor, h0: torch.Tensor):
+        """
+        x: (seq_len, batch, input_size) if batch_first=False
+           (batch, seq_len, input_size) if batch_first=True
+        h0: (num_layers, batch, hidden_size)
+
+        Returns:
+            h_n: (num_layers, batch, hidden_size)
+        """
+        batch_first = self.gru.batch_first
+        num_layers = self.gru.num_layers
+        hidden_size = self.gru.hidden_size
+        bias_flag = self.gru.bias
+
+        if batch_first:
+            x = x.transpose(0, 1).contiguous()  # (seq, batch, input)
+
+        seq_len, batch_size, _ = x.shape
+        assert h0.shape[0] == num_layers
+        assert h0.shape[1] == batch_size
+        assert h0.shape[2] == hidden_size
+
+        layer_input = x
+        h_n_list = []
+
+        for layer in range(num_layers):
+            # Determine current input feature dim for this layer (fixes reshape bug)
+            in_dim = layer_input.shape[-1]
+
+            # GRU parameter layout
+            weight_ih = getattr(self.gru, f"weight_ih_l{layer}")  # (3H, in_dim)
+            weight_hh = getattr(self.gru, f"weight_hh_l{layer}")  # (3H, H)
+
+            b_ih = getattr(self.gru, f"bias_ih_l{layer}") if bias_flag else None  # (3H,)
+            b_hh = getattr(self.gru, f"bias_hh_l{layer}") if bias_flag else None  # (3H,)
+
+            # Sanity check to ensure shapes line up
+            assert weight_ih.shape[1] == in_dim
+
+            # Transpose weights (for x @ W^T layout)
+            W_ih_T = weight_ih.transpose(0, 1).contiguous()  # (in_dim, 3H)
+            W_hh_T = weight_hh.transpose(0, 1).contiguous()  # (H, 3H)
+
+            h_t = h0[layer]  # (batch, H)
+
+            layer_output = torch.empty(
+                (seq_len, batch_size, hidden_size),
+                device=x.device,
+                dtype=x.dtype,
+            )
+
+            gate_h_buf = torch.empty(
+                (batch_size, 3 * hidden_size),
+                device=x.device,
+                dtype=x.dtype,
+            )
+
+            # Precompute all input-side gates for this layer.
+            # Use in_dim (current feature size), not the original input_size.
+            x_flat = layer_input.reshape(seq_len * batch_size, in_dim)
+            gate_x_all = triton_matmul_bias(
+                x_flat,
+                W_ih_T,
+                bias=b_ih if bias_flag else None,
+                out=None,
+            ).reshape(seq_len, batch_size, 3 * hidden_size)
+
+            for t in range(seq_len):
+                x_t_gates = gate_x_all[t]  # (batch, 3H)
+
+                triton_matmul_bias(
+                    h_t,
+                    W_hh_T,
+                    bias=b_hh if bias_flag else None,
+                    out=gate_h_buf,
+                )
+
+                i_r, i_z, i_n = x_t_gates.chunk(3, dim=1)
+                h_r, h_z, h_n = gate_h_buf.chunk(3, dim=1)
+
+                r = torch.sigmoid(i_r + h_r)
+                z = torch.sigmoid(i_z + h_z)
+                n = torch.tanh(i_n + r * h_n)
+
+                h_t = (1.0 - z) * n + z * h_t
+                layer_output[t] = h_t
+
+            h_n_list.append(h_t)
+            layer_input = layer_output
+
+        h_n = torch.stack(h_n_list, dim=0)  # (num_layers, batch, hidden_size)
+        return h_n

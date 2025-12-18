@@ -1,0 +1,5 @@
+{
+  "critical_issue": "ModelNew owns independent GRU parameters instead of sharing/loading the reference nn.GRU weights, so the two models run with different weights.",
+  "why_it_matters": "Different parameters make all gate computations differ, so hidden states diverge significantly and the final h_n cannot match within the specified atol/rtol.",
+  "minimal_fix_hint": "Make ModelNew reuse the exact nn.GRU parameters (matching names/layout and loading state_dict or directly wrapping the original GRU weights)."
+}

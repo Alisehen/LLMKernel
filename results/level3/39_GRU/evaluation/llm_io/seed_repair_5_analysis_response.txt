@@ -1,0 +1,5 @@
+{
+  "critical_issue": "ModelNew redefines its own GRU parameters instead of sharing nn.GRU’s parameters, so its weights/biases don’t match the reference model.",
+  "why_it_matters": "The benchmark compares outputs assuming identical parameters; with independently initialized GRUs, the two models compute different functions, causing large numerical discrepancies and failing the closeness check.",
+  "minimal_fix_hint": "Reuse an nn.GRU module or mirror its parameter names/layout so ModelNew can load the reference GRU’s state_dict exactly."
+}

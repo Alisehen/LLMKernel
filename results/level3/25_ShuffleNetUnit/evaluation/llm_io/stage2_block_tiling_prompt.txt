@@ -1,0 +1,265 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU
+GPU Name: 4090
+Architecture: Ada Lovelace
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+[OPTIMIZATION STAGE]f
+
+## Current Optimization Stage
+
+Focus: BLOCK_SIZE with register pressure awareness.
+
+Key Principle:
+- Fusion increases register usage (intermediates stay in registers)
+- Spill to local memory kills fusion benefit
+
+Register Pressure Signals (from NCU):
+- launch__registers_per_thread > 128 → likely spilling
+- launch__occupancy_limit_registers < other limits → register-bound
+
+Rules:
+- Start conservative: BLOCK_SIZE ∈ {256, 512} for element-wise
+- For matmul fusion: BLOCK_M/N ∈ {32, 64}, BLOCK_K ∈ {32}
+- If registers > 128: reduce BLOCK_* by half
+- Trade-off: recompute cheap ops (e.g., x*0.5) vs store intermediate
+
+When to Recompute vs Keep:
+- Keep: expensive ops (exp, log, div, sqrt)
+- Recompute: cheap ops (add, mul, max) if register pressure high
+- Example: `y = relu(x); z = y * scale` → keep y
+- Example: `y = x * 0.5; z = y + bias` → can recompute y if needed
+
+Autotune:
+- 2-3 BLOCK_SIZE configs, always include smaller fallback
+
+
+
+[CURRENT CODE]
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_HW": 128}, num_warps=2, num_stages=1),
+        triton.Config({"BLOCK_HW": 256}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_HW": 512}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_HW": 1024}, num_warps=8, num_stages=1),
+    ],
+    key=["HW"],
+)
+@triton.jit
+def channel_shuffle_kernel(
+    x_ptr,  # *const T
+    y_ptr,  # *mut T
+    B,
+    C,
+    HW,
+    groups,
+    channels_per_group,
+    BLOCK_HW: tl.constexpr,
+):
+    """
+    Highly optimized channel shuffle kernel.
+
+    Grid:
+      axis 0: B * C  (each program = one (b, c) channel map)
+      axis 1: ceil_div(HW, BLOCK_HW)  (each program processes a tile in HW)
+
+    For each (b, c), we compute new_c once and copy the spatial tile [hw] contiguously:
+        y[b, new_c, hw] = x[b, c, hw]
+    """
+
+    pid_bc = tl.program_id(axis=0)  # index over (b, c)
+    pid_tile = tl.program_id(axis=1)  # index over tiles of HW
+
+    # Derive batch and channel index from pid_bc
+    b = pid_bc // C
+    c = pid_bc % C
+
+    # Compute shuffle mapping:
+    #   original: c = g * channels_per_group + k
+    #   shuffled: c' = k * groups + g
+    g = c // channels_per_group
+    k = c % channels_per_group
+    new_c = k * groups + g
+
+    # Base pointers (flattened NCHW -> [B*C, HW])
+    base_x = pid_bc * HW
+    base_y = (b * C + new_c) * HW
+
+    # Offsets within spatial HW dimension for this tile
+    offs_hw = pid_tile * BLOCK_HW + tl.arange(0, BLOCK_HW)
+    mask = offs_hw < HW
+
+    # Coalesced load/store along HW
+    x_vals = tl.load(x_ptr + base_x + offs_hw, mask=mask, other=0.0)
+    tl.store(y_ptr + base_y + offs_hw, x_vals, mask=mask)
+
+
+def channel_shuffle_triton(x: torch.Tensor, groups: int) -> torch.Tensor:
+    """
+    Triton implementation of channel shuffle.
+
+    x: (B, C, H, W) contiguous tensor on CUDA
+    groups: number of channel groups
+    """
+    assert x.is_cuda, "Input must be on CUDA device"
+    assert x.is_contiguous(), "Input must be contiguous"
+    B, C, H, W = x.shape
+    assert C % groups == 0, "Channels must be divisible by groups"
+
+    HW = H * W
+    y = torch.empty_like(x)
+    channels_per_group = C // groups
+
+    def grid(meta):
+        return (B * C, triton.cdiv(HW, meta["BLOCK_HW"]))
+
+    channel_shuffle_kernel[grid](
+        x,
+        y,
+        B,
+        C,
+        HW,
+        groups,
+        channels_per_group,
+    )
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    ShuffleNet unit with Triton-accelerated ChannelShuffle.
+    Convolutions and batch norms remain as standard PyTorch modules
+    for robustness and correctness.
+    """
+
+    def __init__(self, in_channels, out_channels, groups=3):
+        """
+        :param in_channels: Number of input channels.
+        :param out_channels: Number of output channels.
+        :param groups: Number of groups for group convolution.
+        """
+        super(ModelNew, self).__init__()
+
+        # Ensure the output channels are divisible by groups as in the original
+        assert out_channels % 4 == 0
+        mid_channels = out_channels // 4
+
+        self.groups = groups
+
+        # First 1x1 group convolution
+        self.conv1 = nn.Conv2d(
+            in_channels,
+            mid_channels,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+            groups=groups,
+            bias=False,
+        )
+        self.bn1 = nn.BatchNorm2d(mid_channels)
+
+        # Depthwise 3x3 convolution
+        self.conv2 = nn.Conv2d(
+            mid_channels,
+            mid_channels,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            groups=mid_channels,
+            bias=False,
+        )
+        self.bn2 = nn.BatchNorm2d(mid_channels)
+
+        # Second 1x1 group convolution
+        self.conv3 = nn.Conv2d(
+            mid_channels,
+            out_channels,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+            groups=groups,
+            bias=False,
+        )
+        self.bn3 = nn.BatchNorm2d(out_channels)
+
+        # Shortcut connection if input and output channels are the same
+        if in_channels == out_channels:
+            self.shortcut = nn.Sequential()
+        else:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(
+                    in_channels,
+                    out_channels,
+                    kernel_size=1,
+                    stride=1,
+                    padding=0,
+                    bias=False,
+                ),
+                nn.BatchNorm2d(out_channels),
+            )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass for ShuffleNet unit.
+
+        :param x: Input tensor, shape (batch_size, in_channels, height, width)
+        :return: Output tensor, shape (batch_size, out_channels, height, width)
+        """
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = torch.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        # Triton-accelerated channel shuffle (fully coalesced HW access)
+        out = channel_shuffle_triton(out, self.groups)
+
+        out = self.conv3(out)
+        out = self.bn3(out)
+        out = torch.relu(out)
+
+        out = out + self.shortcut(x)
+        return out
+```
+
+[NCU PROFILING METRICS]
+No NCU metrics available (skipped for network-level model)
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+TRITON API CONSTRAINTS (CRITICAL):
+- Triton has NO: tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

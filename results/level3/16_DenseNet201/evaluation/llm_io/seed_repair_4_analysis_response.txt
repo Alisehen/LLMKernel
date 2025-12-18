@@ -1,0 +1,5 @@
+{
+  "critical_issue": "Dense block forward repeatedly concatenates growing feature map (`x = torch.cat((x, new_feature), 1)`), causing quadratic activation memory growth and exhausting GPU memory.",
+  "why_it_matters": "Each concat allocates a new large tensor while autograd keeps references to all previous ones, so memory accumulates across 6/12/48/32-layer dense blocks until CUDA OOM.",
+  "minimal_fix_hint": "Change dense block to avoid repeated full concatenations, e.g., use a preallocated tensor or checkpointing/memory-efficient DenseNet implementation to cap activation memory."
+}

@@ -1,0 +1,5 @@
+{
+  "critical_issue": "GPU memory is nearly exhausted by this and other processes; only ~15MiB free when torch.roll needs 20MiB, causing OOM unrelated to the Triton kernel implementation.",
+  "why_it_matters": "The allocation failure happens in the reference PyTorch Swin block during torch.roll because the allocator cannot find a 20MiB contiguous chunk; TritonLinear hasn’t even been invoked, so changing the kernel won’t fix it.",
+  "minimal_fix_hint": "Release GPU memory from other jobs or lower this job’s usage (smaller batch/model, checkpointing) so that at least 20–30MiB contiguous memory is available before running the benchmark."
+}

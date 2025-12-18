@@ -1,0 +1,260 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU
+GPU Name: 4090
+Architecture: Ada Lovelace
+• Compute Capability: 8.9
+• Number of SMs: 128
+• Memory Bandwidth: 1008 GB/s
+• TF32 Tensor Core TFLOPS: 82.6 with dense
+• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
+• FP16 Tensor Core TFLOPS: 165.2 with dense
+• Maximum number of registers per thread: 255
+• Maximum threads per block: 1024
+• Maximum threads per SM: 1536
+• Warp size: 32
+• Maximum concurrent warps per SM: 48
+• Shared memory capacity per SM: 100 KB
+• Maximum shared memory per thread block: 99 KB
+• L2 cache (global, all SM shared): 72 MB
+
+[OPTIMIZATION STAGE]f
+
+## Current Optimization Stage
+
+Focus: Grid layout & indexing for FUSED operations.
+
+⚠️ FUSION EXCLUSIONS (do NOT apply fusion rules to these):
+- Reduction ops (sum, mean, softmax along axis)
+- Atomic operations
+- Irregular/data-dependent access patterns
+- Cross-block dependencies
+
+Key Principle:
+- All fused ops share the SAME grid AND the SAME (offsets, mask) tuple
+- Grid covers OUTPUT tensor dimensions
+
+Hard Rules:
+- Every fused op MUST use identical offset calculation
+- Every fused op MUST use identical boundary mask
+- If broadcast needed: explicit `[None, :]` or `[:, None]`, NOT different offsets
+- Element-wise: 1D grid, single `offs = pid * BLOCK + tl.arange(0, BLOCK)`
+- Matmul fusion: 2D grid, `offs_m/offs_n` shared by bias add & activation
+
+Verification:
+- Check: all tl.load/tl.store use same `offsets` variable
+- Check: all masks derived from same boundary condition
+- If ANY op needs different indexing → do NOT fuse, split kernel
+
+
+
+[CURRENT CODE]
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def channel_shuffle_kernel(
+    x_ptr,  # *const T
+    y_ptr,  # *mut T
+    B, C, H, W,
+    groups,
+    channels_per_group,
+    BLOCK_C: tl.constexpr,
+):
+    # Each program handles one (b, h, w) position across all channels
+    pid = tl.program_id(axis=0)
+
+    HW = H * W
+    b = pid // HW
+    hw = pid % HW
+    h = hw // W
+    w = hw % W
+
+    # Base index for (b, 0, h, w) in a contiguous NCHW tensor:
+    # idx = (((b * C + c) * H) + h) * W + w
+    # For c = 0:
+    base = (b * C * H + h) * W + w
+
+    # Loop over channel blocks
+    for c_base in range(0, C, BLOCK_C):
+        offs_c = c_base + tl.arange(0, BLOCK_C)
+        mask_c = offs_c < C
+
+        # Compute input indices for this block of channels
+        in_idx = base + offs_c * H * W
+        x_vals = tl.load(x_ptr + in_idx, mask=mask_c, other=0.0)
+
+        # Channel shuffle mapping:
+        # original: c = g * channels_per_group + k
+        # shuffled: c' = k * groups + g
+        g = offs_c // channels_per_group
+        k = offs_c % channels_per_group
+        new_c = k * groups + g
+
+        out_idx = base + new_c * H * W
+        tl.store(y_ptr + out_idx, x_vals, mask=mask_c)
+
+
+def channel_shuffle_triton(x: torch.Tensor, groups: int) -> torch.Tensor:
+    """
+    Triton implementation of channel shuffle.
+
+    x: (B, C, H, W) contiguous tensor
+    groups: number of channel groups
+    """
+    assert x.is_cuda, "Input must be on CUDA device"
+    assert x.is_contiguous(), "Input must be contiguous"
+    B, C, H, W = x.shape
+    assert C % groups == 0, "Channels must be divisible by groups"
+
+    y = torch.empty_like(x)
+    channels_per_group = C // groups
+
+    def grid(meta):
+        return (B * H * W,)
+
+    # BLOCK_C must be a power of 2
+    channel_shuffle_kernel[grid](
+        x,
+        y,
+        B,
+        C,
+        H,
+        W,
+        groups,
+        channels_per_group,
+        BLOCK_C=128,
+    )
+    return y
+
+
+class ChannelShuffleTriton(nn.Module):
+    def __init__(self, groups: int):
+        super().__init__()
+        self.groups = groups
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return channel_shuffle_triton(x, self.groups)
+
+
+class ModelNew(nn.Module):
+    """
+    ShuffleNet unit with Triton-accelerated ChannelShuffle.
+    Convolutions and batch norms remain as standard PyTorch modules
+    for robustness and correctness.
+    """
+
+    def __init__(self, in_channels, out_channels, groups=3):
+        """
+        :param in_channels: Number of input channels.
+        :param out_channels: Number of output channels.
+        :param groups: Number of groups for group convolution.
+        """
+        super(ModelNew, self).__init__()
+
+        # Ensure the output channels are divisible by groups as in the original
+        assert out_channels % 4 == 0
+        mid_channels = out_channels // 4
+
+        # First 1x1 group convolution
+        self.conv1 = nn.Conv2d(
+            in_channels,
+            mid_channels,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+            groups=groups,
+            bias=False,
+        )
+        self.bn1 = nn.BatchNorm2d(mid_channels)
+
+        # Depthwise 3x3 convolution
+        self.conv2 = nn.Conv2d(
+            mid_channels,
+            mid_channels,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            groups=mid_channels,
+            bias=False,
+        )
+        self.bn2 = nn.BatchNorm2d(mid_channels)
+
+        # Second 1x1 group convolution
+        self.conv3 = nn.Conv2d(
+            mid_channels,
+            out_channels,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+            groups=groups,
+            bias=False,
+        )
+        self.bn3 = nn.BatchNorm2d(out_channels)
+
+        # Triton-based shuffle operation
+        self.shuffle = ChannelShuffleTriton(groups)
+
+        # Shortcut connection if input and output channels are the same
+        if in_channels == out_channels:
+            self.shortcut = nn.Sequential()
+        else:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(
+                    in_channels,
+                    out_channels,
+                    kernel_size=1,
+                    stride=1,
+                    padding=0,
+                    bias=False,
+                ),
+                nn.BatchNorm2d(out_channels),
+            )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass for ShuffleNet unit.
+
+        :param x: Input tensor, shape (batch_size, in_channels, height, width)
+        :return: Output tensor, shape (batch_size, out_channels, height, width)
+        """
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = torch.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        out = self.shuffle(out)
+
+        out = self.conv3(out)
+        out = self.bn3(out)
+        out = torch.relu(out)
+
+        out = out + self.shortcut(x)
+        return out
+```
+
+[NCU PROFILING METRICS]
+No NCU metrics available (skipped for network-level model)
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+TRITON API CONSTRAINTS (CRITICAL):
+- Triton has NO: tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl
+   2. @triton.jit decorated kernel function(s)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

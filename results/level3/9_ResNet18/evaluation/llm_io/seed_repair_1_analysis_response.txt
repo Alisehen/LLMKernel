@@ -1,0 +1,5 @@
+{
+  "critical_issue": "In linear_gemm_bias_kernel, using tl.load(a_ptr, mask=0).dtype inside acc.to(...) is invalid in Triton.",
+  "why_it_matters": "Mask must be a boolean tensor, and dtypes can’t be retrieved dynamically in kernels, so the parser fails during ast_to_ttir, causing the compile-time parsing error.",
+  "minimal_fix_hint": "Avoid dynamic dtype retrieval; cast with a constexpr type (e.g., tl.float16) or remove this cast if unnecessary."
+}

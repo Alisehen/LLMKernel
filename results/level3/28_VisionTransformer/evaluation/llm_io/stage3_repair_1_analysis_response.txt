@@ -1,0 +1,5 @@
+{
+  "critical_issue": "ModelNew builds nn.TransformerEncoder with batch_first=True while the reference uses default batch_first=False, so the same [B, S, D] tensor is interpreted with different batch/sequence dimensions.",
+  "why_it_matters": "This changes how self-attention groups tokens versus batches, producing entirely different hidden states even if all other layers and weights match, leading to large numerical discrepancies beyond the allowed tolerance in the output comparison.",
+  "minimal_fix_hint": "Construct ModelNew’s TransformerEncoder with batch_first=False (like the reference) or adjust input/outputs to consistently use the same batch/sequence layout so both models perform identical attention operations."
+}

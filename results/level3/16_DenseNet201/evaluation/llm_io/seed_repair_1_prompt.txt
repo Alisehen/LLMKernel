@@ -1,0 +1,414 @@
+Fix the Triton kernel errors. Generate correct, high-performance code.
+
+Current Error Log:
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 538, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251216_051542_batch_range2to17_openai_deepseek/16_DenseNet201/code/kernel_20251216_060551.py", line 327, in forward
+    x = block(x)
+        ^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251216_051542_batch_range2to17_openai_deepseek/16_DenseNet201/code/kernel_20251216_060551.py", line 247, in forward
+    new_feature = layer(x)
+                  ^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/container.py", line 250, in forward
+    input = module(input)
+            ^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/batchnorm.py", line 193, in forward
+    return F.batch_norm(
+           ^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/functional.py", line 2813, in batch_norm
+    return torch.batch_norm(
+           ^^^^^^^^^^^^^^^^^
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 20.00 MiB. GPU 0 has a total capacity of 23.52 GiB of which 1.56 MiB is free. Process 902887 has 20.25 GiB memory in use. Including non-PyTorch memory, this process has 3.25 GiB memory in use. Of the allocated memory 2.69 GiB is allocated by PyTorch, and 85.49 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+
+Main Critical Problem Analysis:
+Problem Analysis (from expert diagnosis):
+critical_issue: GPU out-of-memory: DenseNet201 forward exhausts device memory before Triton kernels run, error raised when BatchNorm2d tries allocating 20 MiB activation.
+why_it_matters: Insufficient free GPU memory, not a Triton kernel bug, prevents BatchNorm2d from allocating its output tensor, so the entire forward pass fails before completion.
+minimal_fix_hint: Decrease memory usage: lower batch size or input resolution, terminate other GPU workloads, or run inference under torch.no_grad to avoid saving gradients.
+
+Focus your fix on addressing the identified critical issue.
+
+
+Broken Code:
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+
+# -------------------------------
+# 1. Triton Kernels
+# -------------------------------
+
+@triton.jit
+def global_avg_pool2d_kernel(
+    x_ptr, y_ptr,
+    N, C, H, W,
+    stride_n, stride_c, stride_h, stride_w,
+    out_stride_n, out_stride_c,
+    BLOCK_C: tl.constexpr,
+):
+    """
+    x: [N, C, H, W]
+    y: [N, C]  (already flattened pooled output)
+    """
+    pid_n = tl.program_id(0)  # batch index
+    pid_c = tl.program_id(1)  # channel block index
+
+    offs_c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
+    mask_c = offs_c < C
+
+    # Accumulator for spatial sum
+    acc = tl.zeros((BLOCK_C,), dtype=tl.float32)
+
+    # Reduce over H, W for each (n, c)
+    # H and W are python integers, so this is legal control flow
+    for h in range(0, H):
+        for w in range(0, W):
+            x_ptrs = (
+                x_ptr
+                + pid_n * stride_n
+                + offs_c * stride_c
+                + h * stride_h
+                + w * stride_w
+            )
+            vals = tl.load(x_ptrs, mask=mask_c, other=0.0)
+            acc += vals
+
+    inv_hw = 1.0 / (H * W)
+    acc = acc * inv_hw
+
+    y_ptrs = y_ptr + pid_n * out_stride_n + offs_c * out_stride_c
+    tl.store(y_ptrs, acc, mask=mask_c)
+
+
+@triton.jit
+def linear_gemm_kernel(
+    a_ptr, b_ptr, bias_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """
+    C = A @ B + bias
+    A: [M, K]
+    B: [K, N]      (this is weight.T)
+    bias: [N]
+    C: [M, N]
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Create pointers for this block
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    k = 0
+    while k < K:
+        k_remaining = K - k
+        k_mask = offs_k[None, :] < k_remaining
+
+        a = tl.load(
+            a_ptrs,
+            mask=(offs_m[:, None] < M) & k_mask,
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptrs,
+            mask=k_mask.T & (offs_n[None, :] < N),
+            other=0.0,
+        )
+        acc += tl.dot(a, b, allow_tf32=True)
+
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+        k += BLOCK_K
+
+    # Add bias
+    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc += bias[None, :]
+
+    # Store result
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    tl.store(
+        c_ptrs,
+        acc,
+        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+    )
+
+
+# -------------------------------
+# 2. Wrapper Functions
+# -------------------------------
+
+def global_avg_pool2d_triton(x: torch.Tensor) -> torch.Tensor:
+    """
+    Replacement for:
+        F.adaptive_avg_pool2d(x, (1, 1)).view(x.size(0), -1)
+    Returns tensor of shape [N, C].
+    """
+    if (not x.is_cuda) or x.numel() == 0:
+        # Safe fallback for CPU / empty tensors
+        return F.adaptive_avg_pool2d(x, (1, 1)).view(x.size(0), -1)
+
+    assert x.dim() == 4, "Expected input of shape [N, C, H, W]"
+    N, C, H, W = x.shape
+
+    # Allocate output [N, C]
+    y = torch.empty((N, C), device=x.device, dtype=x.dtype)
+
+    stride_n, stride_c, stride_h, stride_w = x.stride()
+    out_stride_n, out_stride_c = y.stride()
+
+    BLOCK_C = 64  # power of 2
+
+    grid = (N, triton.cdiv(C, BLOCK_C))
+    global_avg_pool2d_kernel[grid](
+        x,
+        y,
+        N, C, H, W,
+        stride_n, stride_c, stride_h, stride_w,
+        out_stride_n, out_stride_c,
+        BLOCK_C=BLOCK_C,
+    )
+    return y
+
+
+def linear_triton(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    Triton implementation of nn.Linear:
+        out = x @ weight.T + bias
+    where:
+        x:      [M, K]
+        weight: [N, K]
+        bias:   [N]
+        out:    [M, N]
+    """
+    if (not x.is_cuda) or (not weight.is_cuda) or (bias is not None and (not bias.is_cuda)):
+        # Fallback to PyTorch for non-CUDA tensors
+        return F.linear(x, weight, bias)
+
+    assert x.dim() == 2, "x must be [M, K]"
+    assert weight.dim() == 2, "weight must be [N, K]"
+    M, K = x.shape
+    N, K_w = weight.shape
+    assert K == K_w, "Incompatible dimensions for linear layer"
+
+    if bias is None:
+        bias = torch.zeros(N, device=x.device, dtype=x.dtype)
+
+    # Prepare output
+    c = torch.empty((M, N), device=x.device, dtype=x.dtype)
+
+    # B = weight.T with shape [K, N]
+    b = weight.t().contiguous()
+
+    # Strides
+    stride_am, stride_ak = x.stride()
+    stride_bk, stride_bn = b.stride()
+    stride_cm, stride_cn = c.stride()
+
+    BLOCK_M = 64
+    BLOCK_N = 64
+    BLOCK_K = 32
+
+    grid = (
+        triton.cdiv(M, BLOCK_M),
+        triton.cdiv(N, BLOCK_N),
+    )
+
+    linear_gemm_kernel[grid](
+        x, b, bias, c,
+        M, N, K,
+        stride_am, stride_ak,
+        stride_bk, stride_bn,
+        stride_cm, stride_cn,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+    )
+    return c
+
+
+# -------------------------------
+# 3. Helper Modules (Structure Preservation)
+# -------------------------------
+
+class DenseBlock(nn.Module):
+    def __init__(self, num_layers: int, num_input_features: int, growth_rate: int):
+        """
+        :param num_layers: The number of layers in the dense block
+        :param num_input_features: The number of input feature maps
+        :param growth_rate: The growth rate for the dense block (new features added per layer)
+        """
+        super(DenseBlock, self).__init__()
+        layers = []
+        for i in range(num_layers):
+            layers.append(self._make_layer(num_input_features + i * growth_rate, growth_rate))
+        self.layers = nn.ModuleList(layers)
+
+    def _make_layer(self, in_features: int, growth_rate: int):
+        """
+        Creates a single layer with BatchNorm, ReLU, Conv2D, and Dropout.
+        """
+        return nn.Sequential(
+            nn.BatchNorm2d(in_features),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_features, growth_rate, kernel_size=3, padding=1, bias=False),
+            nn.Dropout(0.0)
+        )
+
+    def forward(self, x):
+        """
+        :param x: Input tensor of shape (batch_size, num_input_features, height, width)
+        :return: Concatenated output tensor with shape (batch_size, num_output_features, height, width)
+        """
+        features = [x]
+        for layer in self.layers:
+            new_feature = layer(x)
+            features.append(new_feature)
+            x = torch.cat(features, 1)  # Concatenate along channel axis
+        return x
+
+
+class TransitionLayer(nn.Module):
+    def __init__(self, num_input_features: int, num_output_features: int):
+        """
+        :param num_input_features: The number of input feature maps
+        :param num_output_features: The number of output feature maps
+        """
+        super(TransitionLayer, self).__init__()
+        self.transition = nn.Sequential(
+            nn.BatchNorm2d(num_input_features),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(num_input_features, num_output_features, kernel_size=1, bias=False),
+            nn.AvgPool2d(kernel_size=2, stride=2)
+        )
+
+    def forward(self, x):
+        """
+        :param x: Input tensor of shape (batch_size, num_input_features, height, width)
+        :return: Downsampled tensor with reduced number of feature maps
+        """
+        return self.transition(x)
+
+
+# -------------------------------
+# 4. ModelNew with Triton-accelerated tail
+# -------------------------------
+
+class ModelNew(nn.Module):
+    def __init__(self, growth_rate: int = 32, num_classes: int = 1000):
+        """
+        :param growth_rate: The growth rate of the DenseNet (new features added per layer)
+        :param num_classes: The number of output classes for classification
+        """
+        super(ModelNew, self).__init__()
+
+        # Initial convolution and pooling
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        )
+
+        # Dense blocks and transition layers (DenseNet-201 layout)
+        num_features = 64
+        block_layers = [6, 12, 48, 32]
+
+        self.dense_blocks = nn.ModuleList()
+        self.transition_layers = nn.ModuleList()
+
+        for i, num_layers in enumerate(block_layers):
+            block = DenseBlock(num_layers=num_layers, num_input_features=num_features, growth_rate=growth_rate)
+            self.dense_blocks.append(block)
+            num_features = num_features + num_layers * growth_rate
+
+            if i != len(block_layers) - 1:
+                transition = TransitionLayer(
+                    num_input_features=num_features,
+                    num_output_features=num_features // 2
+                )
+                self.transition_layers.append(transition)
+                num_features = num_features // 2
+
+        # Final batch norm and classifier (we will replace the tail with Triton)
+        self.final_bn = nn.BatchNorm2d(num_features)
+        self.classifier = nn.Linear(num_features, num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        :param x: Input tensor of shape (batch_size, 3, height, width)
+        :return: Output tensor of shape (batch_size, num_classes)
+        """
+        x = self.features(x)
+
+        for i, block in enumerate(self.dense_blocks):
+            x = block(x)
+            if i != len(self.dense_blocks) - 1:
+                x = self.transition_layers[i](x)
+
+        x = self.final_bn(x)
+        x = F.relu(x, inplace=True)
+
+        # Triton-accelerated global average pooling + linear layer
+        x = global_avg_pool2d_triton(x)  # [N, C]
+        x = linear_triton(x, self.classifier.weight, self.classifier.bias)  # [N, num_classes]
+        return x
+```
+
+OUTPUT RULES (STRICT):
+1. Follow this exact order:
+   1. Imports: torch, torch.nn, triton, triton.language as tl, AND any other modules used (e.g., import math if using math.sqrt)
+   2. @triton.jit decorated kernel function(s) — NO continue/break/return inside loops (use masking)
+   3. Wrapper function(s) for grid calculation and kernel launch
+   4. class ModelNew(nn.Module) that calls your kernels — THIS CLASS IS REQUIRED
+2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+3. Learn from previous repair attempts to avoid repeating the same mistakes
+4. Ensure ALL imports are included at the top (common mistake: forgetting `import math`)
+
+```python
+# <corrected code>
+```

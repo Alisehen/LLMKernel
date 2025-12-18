@@ -1,0 +1,256 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        # Conservative baseline: low register pressure, good for general shapes
+        triton.Config(
+            {'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+        # Higher parallelism for more compute-bound regimes
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 64},
+            num_warps=8,
+            num_stages=2,
+        ),
+        # Alternative aspect ratio for tall / skinny tiles
+        triton.Config(
+            {'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 64},
+            num_warps=4,
+            num_stages=2,
+        ),
+    ],
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def linear_gemm_bias_relu_kernel(
+    x_ptr,  # (M, K)
+    w_ptr,  # (K, N) row-major
+    b_ptr,  # (N,) or dummy if HAS_BIAS=False
+    y_ptr,  # (M, N)
+    M, N, K,
+    stride_xm, stride_xk,
+    stride_wk, stride_wn,
+    stride_ym, stride_yn,
+    RELU: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    OUT_DTYPE: tl.constexpr,  # tl.float16 / tl.bfloat16 / tl.float32
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+
+    x_ptrs = x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk
+    w_ptrs = w_ptr + offs_k[:, None] * stride_wk + offs_n[None, :] * stride_wn
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    k = 0
+    while k < K:
+        k_mask = (k + offs_k) < K
+
+        x_mask = mask_m[:, None] & k_mask[None, :]
+        w_mask = k_mask[:, None] & mask_n[None, :]
+
+        x_block = tl.load(x_ptrs, mask=x_mask, other=0.0)
+        w_block = tl.load(w_ptrs, mask=w_mask, other=0.0)
+
+        acc += tl.dot(x_block, w_block, allow_tf32=True)
+
+        x_ptrs += BLOCK_K * stride_xk
+        w_ptrs += BLOCK_K * stride_wk
+        k += BLOCK_K
+
+    if HAS_BIAS:
+        bias = tl.load(b_ptr + offs_n, mask=mask_n, other=0.0)
+        acc += bias[None, :]
+
+    if RELU:
+        acc = tl.maximum(acc, 0.0)
+
+    out = acc.to(OUT_DTYPE)
+
+    y_ptrs = y_ptr + offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn
+    y_mask = mask_m[:, None] & mask_n[None, :]
+    tl.store(y_ptrs, out, mask=y_mask)
+
+
+def fused_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None, relu: bool):
+    """
+    Fused Linear (GEMM + bias + optional ReLU) implemented with Triton.
+    x      : (M, K)
+    weight : (K, N)  (row-major: in_features x out_features)
+    bias   : (N,) or None
+    return : (M, N)
+    """
+    assert x.is_cuda and weight.is_cuda
+    if bias is not None:
+        assert bias.is_cuda
+    assert x.dtype == weight.dtype
+    if bias is not None:
+        assert bias.dtype == x.dtype
+
+    x_contig = x.contiguous()
+    w_contig = weight.contiguous()
+    b_contig = bias.contiguous() if bias is not None else None
+
+    M, K = x_contig.shape
+    K_w, N = w_contig.shape
+    assert K_w == K, "Weight shape must be (in_features, out_features) == (K, N)"
+
+    y = torch.empty((M, N), device=x.device, dtype=x.dtype)
+
+    if x.dtype == torch.float16:
+        out_dtype = tl.float16
+    elif x.dtype == torch.bfloat16:
+        out_dtype = tl.bfloat16
+    elif x.dtype == torch.float32:
+        out_dtype = tl.float32
+    else:
+        raise TypeError(f"Unsupported dtype for fused_linear: {x.dtype}")
+
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta['BLOCK_M']),
+            triton.cdiv(N, meta['BLOCK_N']),
+        )
+
+    linear_gemm_bias_relu_kernel[grid](
+        x_contig,
+        w_contig,
+        b_contig if b_contig is not None else x_contig,  # dummy pointer if no bias
+        y,
+        M,
+        N,
+        K,
+        x_contig.stride(0),
+        x_contig.stride(1),
+        w_contig.stride(0),
+        w_contig.stride(1),
+        y.stride(0),
+        y.stride(1),
+        RELU=relu,
+        HAS_BIAS=(b_contig is not None),
+        OUT_DTYPE=out_dtype,
+    )
+    return y
+
+
+class _FusedLinearBase(nn.Module):
+    """
+    Linear layer with weight stored as (in_features, out_features) to maximize GEMM performance.
+    """
+
+    def __init__(self, in_features: int, out_features: int, bias: bool = True):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+
+        self.weight = nn.Parameter(torch.empty(in_features, out_features))
+        self.bias = nn.Parameter(torch.empty(out_features)) if bias else None
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        fan_in = self.in_features
+        bound = 1 / (fan_in**0.5) if fan_in > 0 else 0.0
+        nn.init.kaiming_uniform_(self.weight.T, a=math.sqrt(5))
+        if self.bias is not None:
+            nn.init.uniform_(self.bias, -bound, bound)
+
+
+class FusedLinearReLU(_FusedLinearBase):
+    def __init__(self, in_features: int, out_features: int, bias: bool = True):
+        super().__init__(in_features, out_features, bias=bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return fused_linear(x, self.weight, self.bias, relu=True)
+
+
+class FusedLinear(_FusedLinearBase):
+    def __init__(self, in_features: int, out_features: int, bias: bool = True):
+        super().__init__(in_features, out_features, bias=bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return fused_linear(x, self.weight, self.bias, relu=False)
+
+
+import math
+
+
+class ModelNew(nn.Module):
+    def __init__(self, num_classes=1000):
+        super(ModelNew, self).__init__()
+
+        self.features = nn.Sequential(
+            # Block 1
+            nn.Conv2d(3, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            # Block 2
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 128, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            # Block 3
+            nn.Conv2d(128, 256, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 256, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 256, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 256, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            # Block 4
+            nn.Conv2d(256, 512, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 512, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 512, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 512, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            # Block 5
+            nn.Conv2d(512, 512, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 512, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 512, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 512, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+        )
+
+        self.classifier = nn.Sequential(
+            FusedLinearReLU(512 * 7 * 7, 4096),
+            nn.Dropout(p=0.0),
+            FusedLinearReLU(4096, 4096),
+            nn.Dropout(p=0.0),
+            FusedLinear(4096, num_classes),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.features(x)
+        x = torch.flatten(x, 1)
+        x = self.classifier(x)
+        return x

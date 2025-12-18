@@ -1,0 +1,5 @@
+{
+  "critical_issue": "The Triton kernel assumes gate layout [r, z, n], but the GRU weights/x_gates/h_gates from PyTorch use a different gate ordering, so r/z/n slices are misinterpreted.",
+  "why_it_matters": "Using the wrong slice for each gate makes reset, update, and candidate activations incorrect at every time step, so all hidden states diverge from the PyTorch GRU, causing large output mismatches.",
+  "minimal_fix_hint": "Change how x_gates/h_gates are sliced so their indices match PyTorch’s actual GRU gate order (reorder or swap the r and z gate segments)."
+}

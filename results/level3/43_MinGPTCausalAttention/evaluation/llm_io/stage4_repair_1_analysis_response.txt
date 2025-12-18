@@ -1,0 +1,5 @@
+{
+  "critical_issue": "tl.arange(0, HEAD_DIM) is called with HEAD_DIM=96, which is not a power-of-two constant as required by Triton.",
+  "why_it_matters": "Triton’s tl.arange semantic implementation only accepts power-of-two ranges; passing 96 triggers the ValueError and prevents the kernel from compiling and running.",
+  "minimal_fix_hint": "Introduce a power-of-two BLOCK_D for tl.arange and use a mask to limit to HEAD_DIM elements instead of arange(0, HEAD_DIM)."
+}

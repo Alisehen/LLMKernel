@@ -1,0 +1,5 @@
+{
+  "critical_issue": "Reshape in forward() always uses initial input_size, ignoring changed feature size after first GRU layer.",
+  "why_it_matters": "For higher layers, layer_input has hidden_size features, so total elements mismatch the requested (seq_len*batch_size, input_size) shape, triggering the invalid reshape runtime error.",
+  "minimal_fix_hint": "Before reshaping, derive in_dim = layer_input.shape[-1] and use it instead of the original input_size."
+}
