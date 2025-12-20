@@ -6,6 +6,7 @@ import random
 import time
 import json
 import csv
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Any
@@ -24,6 +25,21 @@ from prompts.optimization import build_optimization_prompt
 from prompts.judger_repair import build_correctness_prompts
 from prompts.judger_optimization import build_judger_optimization_prompts
 _INVOCATION_SPLITTER = "Invoked with:"
+
+
+# ---------------------- Beam Search Data Structure -----------------
+@dataclass
+class BeamCandidate:
+    """A candidate in beam search, holding kernel and its evaluation results."""
+    kernel: Any  # KernelIndividual
+    score: float = float("-inf")
+    metrics_df: Any = None  # pandas DataFrame with NCU metrics
+    ncu_block: str = ""  # NCU metrics formatted for prompt
+    runnable: bool = False
+
+    def __lt__(self, other):
+        """For sorting: higher score = better."""
+        return self.score < other.score
 
 def _sanitize_error_message(exc: Exception) -> str:
     """Strip pybind's large‑tensor printouts and keep only the key error text."""
@@ -68,6 +84,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--num_steps", type=int, default=4, help="Number of optimization steps (stages)")
     p.add_argument("--max_repair_attempts", type=int, default=3, help="Max repair attempts per failure")
 
+    # Beam search parameters
+    p.add_argument("--beam_width", type=int, default=1, help="Beam width for seed and stages (1=greedy, 2=beam search with 2+2 strategy)")
+    p.add_argument("--beam_temperature", type=float, default=0.5, help="Temperature for beam search diversity (default 0.5)")
+
     # Fusion operator flag
     p.add_argument("--fusion", action="store_true", help="Enable fusion operator mode (for level2 multi-op kernels)")
 
@@ -80,16 +100,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 
 # ---------------------- optimization stages configuration -----------------
-# Four-stage progressive optimization strategy (ordered by dependency):
+# Three-stage progressive optimization strategy (ordered by dependency):
 # 1. Grid & Parallel: Configure work distribution across SMs
 # 2. Block Tiling: Determine BLOCK_M/N/K (affects all subsequent optimizations)
-# 3. Memory Access: Optimize L2 cache based on block configuration
-# 4. Advanced Memory: Fine-tune cache policies and instruction-level optimizations
+# 3. Memory & Tuning: Optimize memory access and fine-tune num_stages/num_warps
 OPTIMIZATION_STAGES = [
     {"name": "grid_and_parallel", "description": "Optimize grid layout and parallel work distribution across SMs."},
     {"name": "block_tiling", "description": "Tune BLOCK_M/N/K sizes for optimal register/memory balance."},
-    {"name": "memory_access", "description": "Optimize L2 cache utilization and memory access patterns."},
-    {"name": "advanced_memory", "description": "Fine-tune cache policies and instruction-level optimizations."},
+    {"name": "memory_and_tuning", "description": "Optimize memory access patterns and fine-tune num_stages/num_warps."},
 ]
 
 # ---------------------- early exit criteria per stage -----------------
@@ -112,24 +130,16 @@ STAGE_EXIT_CRITERIA = {
         "operator": "and",
         "description": "Warp occupancy already decent (>60%), block config is reasonable"
     },
-    "memory_access": {
-        # Stage 3: Skip if memory stalls are low (latency already hidden)
-        "metrics": ["smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct"],
-        "thresholds": [15.0],  # Stalls < 15% means memory latency is well hidden
-        "comparisons": ["<="],
-        "operator": "and",
-        "description": "Memory stalls already low (<15%), memory access is efficient"
-    },
-    "advanced_memory": {
-        # Stage 4: Skip if both L2 cache and memory stalls are good
+    "memory_and_tuning": {
+        # Stage 3: Skip if both memory stalls are low AND L2 cache is good
         "metrics": [
-            "lts__t_sector_hit_rate.pct",
-            "smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct"
+            "smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct",
+            "lts__t_sector_hit_rate.pct"
         ],
-        "thresholds": [90.0, 10.0],  # L2 > 90% AND stalls < 10%
-        "comparisons": [">=", "<="],
+        "thresholds": [10.0, 85.0],  # Stalls < 10% AND L2 > 85%
+        "comparisons": ["<=", ">="],
         "operator": "and",  # Both must be met
-        "description": "Memory system already optimal (L2 >90% and stalls <10%)"
+        "description": "Memory system already optimal (stalls <10% and L2 >85%)"
     }
 }
 
@@ -209,15 +219,18 @@ def _make_llm_caller(args):
         log_path: Optional[Path] = None,
         call_type: str = "unknown",
         round_idx: int = -1,
+        temperature_override: Optional[float] = None,  # For beam search diversity
     ) -> str:
         sp = default_system_prompt if sys_prompt is None else sys_prompt
+        # Use override temperature if provided (for beam search), otherwise use args.temperature
+        temp = temperature_override if temperature_override is not None else args.temperature
         res = query_server(
             prompt=prompt,
             system_prompt=sp,
             server_type=args.server_type,
             model_name=args.model_name,
-        max_tokens=args.max_tokens,
-            temperature=args.temperature,
+            max_tokens=args.max_tokens,
+            temperature=temp,
             top_p=args.top_p,
             server_address=args.server_address,
             server_port=args.server_port,
@@ -241,6 +254,7 @@ def _llm_to_kernel(
     log_path: Optional[Path] = None,
     call_type: str = "unknown",
     max_retries: int = 1,  # Retry once on truncation
+    temperature_override: Optional[float] = None,  # For beam search diversity
 ) -> KernelIndividual:
     """LLM → code → save → KernelIndividual (no evaluation)."""
 
@@ -258,6 +272,7 @@ def _llm_to_kernel(
             log_path=log_path,
             call_type=f"{call_type}_retry{retry_idx}" if retry_idx > 0 else call_type,
             round_idx=round_idx * 100 + retry_idx,
+            temperature_override=temperature_override,
         )
 
         reply_file = io_dir / f"{round_idx}_raw_reply_retry{retry_idx}.txt"
@@ -605,6 +620,111 @@ def _should_skip_stage(stage_name: str, metrics_df) -> tuple[bool, str]:
     return (False, "")
 
 
+# ---------------------- Beam Search Helper Functions -------------------
+def _profile_kernel_ncu(
+    kernel: Any,
+    test_kernel_path: Path,
+    bench_script: str,
+    task_path: Path,
+    device_idx: int,
+    model_type: str,
+    proc_id: int,
+) -> tuple[Any, str]:
+    """Profile a kernel with NCU and return (metrics_df, metrics_block)."""
+    # Write kernel to test file
+    with open(test_kernel_path, "w") as f:
+        f.write(kernel.code)
+
+    kernel_names = extract_cuda_kernel_names(test_kernel_path)
+
+    metrics_block = "No NCU metrics available"
+    metrics_df = None
+
+    if model_type != MODEL_NETWORK:
+        try:
+            csv_path = profile_bench(
+                bench_py=bench_script,
+                out_csv=f"ncu_temp_{proc_id}.csv",
+                device_idx=device_idx,
+                ref_file=str(task_path),
+                test_file=str(test_kernel_path.name),
+            )
+            metrics_df = load_ncu_metrics(
+                csv_path, extra_keep=("Kernel Name",),
+                name_list=kernel_names, select="last"
+            )
+            metrics_block = metrics_to_prompt(metrics_df)
+        except Exception as e:
+            print(f"\033[93mWarning: NCU profiling failed: {e}\033[0m")
+
+    return metrics_df, metrics_block
+
+
+def _optimize_stage_single(
+    base_kernel: Any,
+    stage_idx: int,
+    stage_name: str,
+    stage_description: str,
+    ncu_block: str,
+    args,
+    call_llm,
+    code_dir: Path,
+    io_dir: Path,
+    log_path: Path,
+    stage_round: int,
+    temperature: Optional[float] = None,
+    beam_idx: int = 0,
+) -> Any:
+    """Generate a single optimized kernel for a stage.
+
+    Args:
+        base_kernel: The kernel to optimize from
+        stage_idx: Stage index (0-3)
+        stage_name: Stage name
+        stage_description: Stage description
+        ncu_block: NCU metrics formatted as string
+        args: CLI arguments
+        call_llm: LLM caller function
+        code_dir: Directory to save kernel code
+        io_dir: Directory to save prompts/responses
+        log_path: Path to usage log
+        stage_round: Current round number
+        temperature: Temperature override for LLM (for beam search diversity)
+        beam_idx: Beam candidate index (for logging)
+
+    Returns:
+        KernelIndividual: The optimized kernel (not yet benchmarked)
+    """
+    opt_prompt = build_optimization_prompt(
+        arch_path=base_kernel.code_path,
+        gpu_name=args.gpu,
+        ncu_metrics=ncu_block,
+        history_block=None,
+        stage_name=stage_name,
+        stage_description=stage_description,
+        failure_analysis="",
+        fusion=args.fusion,
+        model=args.model,
+    )
+
+    # Save prompt with beam index if using beam search
+    suffix = f"_beam{beam_idx}" if beam_idx > 0 else ""
+    prompt_file = io_dir / f"stage{stage_idx + 1}_{stage_name}{suffix}_prompt.txt"
+    prompt_file.write_text(opt_prompt, encoding="utf-8")
+
+    call_type = f"stage{stage_idx + 1}_{stage_name}"
+    if beam_idx > 0:
+        call_type += f"_beam{beam_idx}"
+
+    kernel = _llm_to_kernel(
+        opt_prompt, code_dir, call_llm, io_dir, stage_round,
+        log_path=log_path, call_type=call_type,
+        temperature_override=temperature,
+    )
+
+    return kernel
+
+
 # ---------------------- task helpers -------------------
 def _natural_sort_key(path: Path) -> tuple:
     """Extract leading number from filename for natural sorting (e.g., 2_xxx < 10_xxx < 31_xxx)."""
@@ -712,9 +832,31 @@ def _append_usage_totals(log_path: Path) -> Dict[str, int]:
     return totals
 
 
+# --------------------- Tee Logger for Console + File -----------------
+class TeeLogger:
+    """Write to both console and file simultaneously."""
+    def __init__(self, file_path: Path, stream):
+        self.file = open(file_path, "w", encoding="utf-8")
+        self.stream = stream
+        self.encoding = getattr(stream, 'encoding', 'utf-8')
+
+    def write(self, message):
+        self.stream.write(message)
+        self.file.write(message)
+        self.file.flush()
+
+    def flush(self):
+        self.stream.flush()
+        self.file.flush()
+
+    def close(self):
+        self.file.close()
+
+
 # --------------------- single-task run -----------------
 def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
     import os
+    import sys
 
     # Use PID to ensure unique temporary files when running multiple processes
     proc_id = os.getpid()
@@ -734,6 +876,15 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
     io_dir.mkdir(parents=True, exist_ok=True)
     log_path = task_root / "usage.csv"
 
+    # === Setup console log file ===
+    console_log_path = task_root / "console.log"
+    old_stdout = sys.stdout
+    old_stderr = sys.stderr
+    tee_stdout = TeeLogger(console_log_path, old_stdout)
+    tee_stderr = TeeLogger(task_root / "console_stderr.log", old_stderr)
+    sys.stdout = tee_stdout
+    sys.stderr = tee_stderr
+
     # === Create test kernel file path (ref uses task_path directly) ===
     root_dir = Path(__file__).resolve().parent
     test_kernel = root_dir / f"test_kernel_{proc_id}.py"
@@ -748,14 +899,22 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
     err_flags: List[bool] = []
     last_score_for_curve = 0.0  # default baseline for plotting on early failures
 
-    # ====== Step 1: Generate Seed Program (outside loop) ======
+    # ====== Step 1: Generate Seed Program ======
+    beam_width = args.beam_width
+    beam_temp = args.beam_temperature
+    pytorch_baseline_ms = None
+
     print("[Seed] Generating the initial kernel ...")
     seed_prompt = build_seed_prompt(arch_path=task_path, gpu_name=args.gpu, fusion=args.fusion, model=args.model)
     prompt_file = io_dir / "seed_prompt.txt"
     prompt_file.write_text(seed_prompt, encoding="utf-8")
-    current_kernel = _llm_to_kernel(seed_prompt, code_dir, call_llm, io_dir,
-                                    0, log_path=log_path, call_type="seed")
-    # First benchmark: cache PyTorch baseline for future comparisons
+
+    current_kernel = _llm_to_kernel(
+        seed_prompt, code_dir, call_llm, io_dir,
+        0, log_path=log_path, call_type="seed",
+    )
+
+    # Benchmark seed
     pytorch_baseline_ms = _bench_and_score(
         current_kernel,
         ref_py=task_path,
@@ -766,12 +925,12 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
         rtol=args.rtol,
         phase="seed",
         metrics_dir=eval_dir,
-        cached_baseline_ms=None,  # No cache yet, will return baseline for caching
+        cached_baseline_ms=None,
     )
 
-    # Record seed score
     runnable = bool(getattr(current_kernel, "metrics", {}).get("runnable", False))
     this_score = current_kernel.score if (current_kernel.score is not None and runnable) else None
+
     if this_score is not None:
         last_score_for_curve = this_score
         scores.append(this_score)
@@ -780,74 +939,40 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
         best_kernel = current_kernel
         with open(test_kernel, "w") as f:
             f.write(best_kernel.code)
-
-        # Early stopping: if score < 0.1, stop the task (DISABLED)
-        # if this_score < 0.1:
-        #     print(f"\n[EARLY STOP] Score {this_score:.4f} < 0.1 after seed generation. Stopping task.")
-        #     # Plot and save results before stopping
-        #     fig_path = fig_dir / f"{task_path.stem}_score.png"
-        #     _plot_scores(fig_path, scores, err_flags, title=f"{task_path.stem} (best={best_score:.4f}, early stopped)")
-        #     print(f"[{task_path.name}] Figure saved to: {fig_path}")
-        #     usage_totals = _append_usage_totals(log_path)
-        #     return {
-        #         "task": str(task_path),
-        #         "best_score": float(best_score),
-        #         "best_runnable": True,
-        #         "task_dir": str(task_root),
-        #         "figure": str(fig_path),
-        #         "input_tokens_sum": usage_totals["input_tokens"],
-        #         "output_tokens_sum": usage_totals["output_tokens"],
-        #         "total_tokens_sum": usage_totals["total_tokens"],
-        #         "early_stopped": True,
-        #         "early_stop_reason": f"Score {this_score:.4f} < 0.1 after seed"
-        #     }
+        print(f"[Seed] Score: {this_score:.4f} ✓")
     else:
         scores.append(0.0)
         err_flags.append(True)
+        print("[Seed] Failed, will attempt repair...")
 
-    # ====== Step 2: Repair seed if not runnable (max 3 attempts) ======
+    # ====== Step 2: Repair seed if not runnable ======
     repair_attempt = 0
-    max_repair = 5
-    error_history_list = []  # Track previous repair attempts
+    max_repair = 3
+    error_history_list = []
     while not runnable and repair_attempt < max_repair:
         repair_attempt += 1
         print(f"[Seed Repair {repair_attempt}/{max_repair}] Repairing seed kernel...")
         error_log = _last_n_lines(getattr(current_kernel, "metrics", {}).get("message", ""))
-
-        # Use error history from PREVIOUS attempts (not including current)
         error_history = "\n\n".join(error_history_list[-3:]) if error_history_list else ""
 
-        # ====== Phase 1: Analyze the problem using judger_repair ======
-        print(f"[Seed Repair {repair_attempt}/{max_repair}] Phase 1: Analyzing error...")
+        # Analyze error
         analysis_prompt = build_correctness_prompts(
             error_log=error_log,
             arch_path=task_path,
             cuda_code=current_kernel.code,
         )
-        analysis_prompt_file = io_dir / f"seed_repair_{repair_attempt}_analysis_prompt.txt"
-        analysis_prompt_file.write_text(analysis_prompt, encoding="utf-8")
-
         analysis_response = call_llm(
-            analysis_prompt,
-            sys_prompt=None,
-            log_path=log_path,
+            analysis_prompt, sys_prompt=None, log_path=log_path,
             call_type="seed_repair_analysis",
             round_idx=repair_attempt * 1000,
         )
-        analysis_file = io_dir / f"seed_repair_{repair_attempt}_analysis_response.txt"
-        analysis_file.write_text(analysis_response, encoding="utf-8")
-
-        # Parse JSON response
         problem_dict = None
         try:
             problem_dict = extract_json(analysis_response)
-            print(f"[Seed Repair {repair_attempt}/{max_repair}] Analysis: {problem_dict.get('critical_issue', 'N/A')}")
-        except Exception as e:
-            print(f"[Seed Repair {repair_attempt}/{max_repair}] Warning: Failed to parse analysis JSON: {e}")
-            problem_dict = None
+        except Exception:
+            pass
 
-        # ====== Phase 2: Generate repair based on analysis ======
-        print(f"[Seed Repair {repair_attempt}/{max_repair}] Phase 2: Generating fix...")
+        # Generate repair
         repair_prompt = build_error_prompt(
             old_code=current_kernel.code,
             error_log=error_log,
@@ -856,11 +981,12 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
             error_history=error_history,
             arch_path=task_path,
         )
-        prompt_file = io_dir / f"seed_repair_{repair_attempt}_prompt.txt"
-        prompt_file.write_text(repair_prompt, encoding="utf-8")
-        current_kernel = _llm_to_kernel(repair_prompt, code_dir, call_llm, io_dir,
-                                        repair_attempt, log_path=log_path, call_type="seed_repair")
-        # Use cached baseline if available, otherwise cache new baseline
+        current_kernel = _llm_to_kernel(
+            repair_prompt, code_dir, call_llm, io_dir,
+            repair_attempt, log_path=log_path,
+            call_type="seed_repair",
+        )
+
         baseline_result = _bench_and_score(
             current_kernel,
             ref_py=task_path,
@@ -871,49 +997,27 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
             rtol=args.rtol,
             phase="seed_repair",
             metrics_dir=eval_dir,
-            cached_baseline_ms=pytorch_baseline_ms if pytorch_baseline_ms else None,
+            cached_baseline_ms=pytorch_baseline_ms,
         )
-        # Update cached baseline if this was the first successful run
         if pytorch_baseline_ms is None and baseline_result is not None:
             pytorch_baseline_ms = baseline_result
 
         runnable = bool(getattr(current_kernel, "metrics", {}).get("runnable", False))
         this_score = current_kernel.score if (current_kernel.score is not None and runnable) else None
+
         if this_score is not None:
             last_score_for_curve = this_score
             scores.append(this_score)
             err_flags.append(False)
-            # Only update best if this score is better
             if this_score > best_score:
                 best_score = this_score
                 best_kernel = current_kernel
                 with open(test_kernel, "w") as f:
                     f.write(best_kernel.code)
-
-            # Early stopping: if score < 0.1 after repair, stop the task (DISABLED)
-            # if this_score < 0.1:
-            #     print(f"\n[EARLY STOP] Score {this_score:.4f} < 0.1 after seed repair. Stopping task.")
-            #     # Plot and save results before stopping
-            #     fig_path = fig_dir / f"{task_path.stem}_score.png"
-            #     _plot_scores(fig_path, scores, err_flags, title=f"{task_path.stem} (best={best_score:.4f}, early stopped)")
-            #     print(f"[{task_path.name}] Figure saved to: {fig_path}")
-            #     usage_totals = _append_usage_totals(log_path)
-            #     return {
-            #         "task": str(task_path),
-            #         "best_score": float(best_score),
-            #         "best_runnable": True,
-            #         "task_dir": str(task_root),
-            #         "figure": str(fig_path),
-            #         "input_tokens_sum": usage_totals["input_tokens"],
-            #         "output_tokens_sum": usage_totals["output_tokens"],
-            #         "total_tokens_sum": usage_totals["total_tokens"],
-            #         "early_stopped": True,
-            #         "early_stop_reason": f"Score {this_score:.4f} < 0.1 after seed repair"
-            #     }
+            print(f"[Seed Repair] Score: {this_score:.4f} ✓")
         else:
             scores.append(last_score_for_curve)
             err_flags.append(True)
-            # Add current error to history for next repair attempt (keep last 5 lines)
             if error_log.strip():
                 error_lines = error_log.splitlines()
                 last_lines = "\n".join(error_lines[-5:]) if len(error_lines) > 5 else error_log
@@ -922,260 +1026,248 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
     if not runnable:
         print(f"[ERROR] Failed to repair seed kernel after {max_repair} attempts. Stopping.")
     else:
-        # ====== Step 3: Four-stage Optimization Loop ======
-        print("\n[Optimization] Starting 4-stage optimization process...")
+        # ====== Step 3: Three-stage Optimization Loop ======
+        # Strategy: Stage 2+2
+        # - Stage 1: Generate beam_width candidates from seed
+        # - Stage 2: Each base generates 1 candidate (2+2 strategy)
+        # - Stage 3: Greedy (only best 1)
+
+        if beam_width > 1:
+            print(f"\n[Optimization] Starting 3-stage optimization with Beam Search...")
+            print(f"  - Stage 1: seed → {beam_width} candidates")
+            print(f"  - Stage 2: each base → 1 candidate (2+2 strategy)")
+            print(f"  - Stage 3: greedy (k=1)")
+        else:
+            print("\n[Optimization] Starting 3-stage optimization (greedy)...")
+
         stage_round = 0
-        previous_stage_score = best_score  # Track score before each stage
-        score_history = [best_score]  # Track scores from all stages for early stopping
+        score_history = [best_score]
+
+        # Initialize beam with the seed kernel
+        beam: List[BeamCandidate] = [BeamCandidate(
+            kernel=best_kernel,
+            score=best_score,
+            runnable=True,
+        )]
+
+        # Setup bench script once
+        bench_template_source = root_dir / "bench_ref_inputs_template.py"
+        bench_script = root_dir / f"bench_ref_inputs_{proc_id}.py"
+        if not bench_script.exists() or proc_id != 0:
+            import shutil
+            if bench_template_source.exists():
+                shutil.copy(bench_template_source, bench_script)
+            else:
+                raise FileNotFoundError(f"Bench template not found: {bench_template_source}")
 
         for stage_idx in range(len(OPTIMIZATION_STAGES)):
             stage = OPTIMIZATION_STAGES[stage_idx]
             stage_name = stage["name"]
             stage_description = stage["description"]
 
+            # Determine if this stage uses beam search (stages 0,1) or greedy (stage 2)
+            # With 3 stages: stage 0,1 = beam, stage 2 = greedy
+            use_beam = (stage_idx < 2) and (beam_width > 1)
+
             print(f"\n{'='*80}")
-            print(f"[Stage {stage_idx + 1}/{len(OPTIMIZATION_STAGES)}] {stage_name}")
+            mode_str = f"beam({len(beam)}→{len(beam)})" if use_beam else "greedy"
+            print(f"[Stage {stage_idx + 1}/{len(OPTIMIZATION_STAGES)}] {stage_name} [{mode_str}]")
             print(f"Description: {stage_description}")
+            print(f"Current beam size: {len(beam)}, best score: {best_score:.4f}")
             print(f"{'='*80}")
 
-            # Check if optimization is needed based on performance gain from previous stage
-            print(f"Current best: {best_score:.4f}")
+            # Filter beam to only runnable candidates
+            beam = [c for c in beam if c.runnable]
+            if not beam:
+                print(f"[ERROR] No runnable candidates in beam at stage {stage_idx + 1}. Stopping.")
+                break
 
-            # ====== Early Stopping Check ======
-            # Check if we should stop optimization early based on score history
+            # For greedy stage (stage 2), only keep the best candidate
+            if not use_beam:
+                beam = [max(beam)]  # Keep only the best
+                print(f"[Stage {stage_idx + 1}] Greedy mode: using best candidate (score={beam[0].score:.4f})")
 
-            # Record the score before this stage starts
-            score_before_stage = best_score
+            # Profile all candidates in beam to get NCU metrics
+            print(f"[Stage {stage_idx + 1}] Profiling {len(beam)} candidate(s)...")
+            for candidate in beam:
+                if candidate.ncu_block:  # Already profiled
+                    continue
+                metrics_df, metrics_block = _profile_kernel_ncu(
+                    candidate.kernel, test_kernel, f"bench_ref_inputs_{proc_id}.py",
+                    task_path, args.device, args.model, proc_id
+                )
+                candidate.metrics_df = metrics_df
+                candidate.ncu_block = metrics_block
 
-            # Check if best_kernel is available and runnable
-            if best_kernel is None:
-                print(f"[ERROR] No best kernel available for stage {stage_idx + 1}. Skipping.")
-                continue
-
-            is_runnable = bool(getattr(best_kernel, "metrics", {}).get("runnable", False))
-            if not is_runnable:
-                print(f"[ERROR] Best kernel is not runnable at stage {stage_idx + 1}. Skipping.")
-                continue
-
-            # Perform optimization for this stage (single optimization with full NCU profiling)
-            stage_round += 1
-            print(f"[Stage {stage_idx + 1}] Optimizing {stage_name}...")
-
-            # Step 1: Profile the current best_kernel to get NCU metrics
-            with open(test_kernel, "w") as f:
-                f.write(best_kernel.code)
-
-            # Create bench script for this process (copy from template)
-            # Always use bench_ref_inputs_template.py as source to avoid missing file issues
-            bench_template_source = root_dir / "bench_ref_inputs_template.py"
-            bench_script = root_dir / f"bench_ref_inputs_{proc_id}.py"
-
-            # Copy template to process-specific bench script if it doesn't exist or if using non-zero proc_id
-            if not bench_script.exists() or proc_id != 0:
-                import shutil
-                if bench_template_source.exists():
-                    shutil.copy(bench_template_source, bench_script)
-                else:
-                    raise FileNotFoundError(f"Bench template not found: {bench_template_source}")
-
-            kernel_names = extract_cuda_kernel_names(test_kernel)
-            print(f"Detected kernel names: {kernel_names}")
-
-            # Try to collect NCU metrics (may fail if kernel has compilation errors)
-            # Skip NCU profiling for network-level models (too slow for complex networks)
-            metrics_block = "No NCU metrics available (skipped for network-level model)"
-            metrics_df = None
-            if args.model != MODEL_NETWORK:
-                try:
-                    csv_path = profile_bench(
-                        bench_py=f"bench_ref_inputs_{proc_id}.py",
-                        out_csv=f"ncu_temp_{proc_id}.csv",
-                        device_idx=args.device,
-                        ref_file=str(task_path),  # Use original task file, consistent with _bench_and_score
-                        test_file=f"test_kernel_{proc_id}.py")
-                    metrics_df = load_ncu_metrics(csv_path, extra_keep=("Kernel Name",),
-                                                  name_list=kernel_names, select="last")
-                    metrics_block = metrics_to_prompt(metrics_df)
-                except (ValueError, FileNotFoundError, Exception) as e:
-                    print(f"\033[93mWarning: NCU profiling failed: {e}\033[0m")
-                    print(f"Continuing optimization without NCU metrics...")
-            else:
-                print(f"[Stage {stage_idx + 1}] Skipping NCU profiling for network-level model (too slow)")
-
-            # Check if stage should be skipped based on metrics
-            if metrics_df is not None:
-                should_skip, skip_reason = _should_skip_stage(stage_name, metrics_df)
+            # Check if stage should be skipped (use first candidate's metrics)
+            if beam[0].metrics_df is not None:
+                should_skip, skip_reason = _should_skip_stage(stage_name, beam[0].metrics_df)
                 if should_skip:
                     print(f"\n⏩ [Stage {stage_idx + 1}] SKIPPED: {skip_reason}")
-                    print(f"   Current metrics already meet optimization goals for this stage.")
                     print(f"   Proceeding to next stage...\n")
                     continue
 
-            # Step 2: Build optimization prompt with NCU metrics and stage description
-            # history_block = _build_history_block(code_dir, keep_last=0)
-            opt_prompt = build_optimization_prompt(
-                arch_path=best_kernel.code_path,  # type: ignore[union-attr]
-                gpu_name=args.gpu,
-                ncu_metrics=metrics_block,  # Now contains actual profiling data
-                history_block=None,#history_block,
-                stage_name=stage_name,
-                stage_description=stage_description,
-                failure_analysis="",
-                fusion=args.fusion,
-                model=args.model,
-            )
-            prompt_file = io_dir / f"stage{stage_idx + 1}_{stage_name}_prompt.txt"
-            prompt_file.write_text(opt_prompt, encoding="utf-8")
+            # Generate new candidates from each beam candidate
+            new_candidates: List[BeamCandidate] = []
+            stage_round += 1
 
-            # Step 3: Generate optimized kernel
-            current_kernel = _llm_to_kernel(opt_prompt, code_dir, call_llm, io_dir, stage_round,
-                                            log_path=log_path, call_type=f"stage{stage_idx + 1}_{stage_name}")
-            # Use cached PyTorch baseline for consistent comparison
-            _bench_and_score(
-                current_kernel,
-                ref_py=task_path,
-                device_idx=args.device,
-                warmup=args.warmup,
-                repeat=args.repeat,
-                tol=args.tol,
-                rtol=args.rtol,
-                phase=f"stage{stage_idx + 1}_{stage_name}",
-                metrics_dir=eval_dir,
-                cached_baseline_ms=pytorch_baseline_ms,  # Use cached baseline
-            )
+            for beam_idx, base_candidate in enumerate(beam):
+                # 2+2 Strategy: Each base generates 1 candidate
+                # Diversity already comes from seed beam, not from multiple samples per base
+                n_samples = 1
 
-            # Step 4: Check if optimization succeeded
-            runnable = bool(getattr(current_kernel, "metrics", {}).get("runnable", False))
-            this_score = current_kernel.score if (current_kernel.score is not None and runnable) else None
+                for sample_idx in range(n_samples):
+                    # Use higher temperature for diversity in beam search (after first sample)
+                    temp = beam_temp if (use_beam and sample_idx > 0) else None
+                    combined_idx = beam_idx * n_samples + sample_idx
 
-            # Step 5: If optimization failed, try repair (max 2 attempts)
-            if not runnable:
-                print(f"[Stage {stage_idx + 1}] Optimization failed, attempting repair...")
-                repair_attempt = 0
-                max_repair = 1
-                stage_error_history_list = []  # Track previous repair attempts in this stage
-                while not runnable and repair_attempt < max_repair:
-                    repair_attempt += 1
-                    stage_round += 1
-                    print(f"[Stage {stage_idx + 1} Repair {repair_attempt}/{max_repair}]")
-                    error_log = _last_n_lines(getattr(current_kernel, "metrics", {}).get("message", ""))
+                    print(f"[Stage {stage_idx + 1}] Generating candidate {combined_idx + 1}/{len(beam) * n_samples}...")
 
-                    # Use error history from PREVIOUS attempts (not including current)
-                    stage_error_history = "\n\n".join(stage_error_history_list[-3:]) if stage_error_history_list else ""
-
-                    # ====== Phase 1: Analyze the problem using judger_repair ======
-                    print(f"[Stage {stage_idx + 1} Repair {repair_attempt}/{max_repair}] Phase 1: Analyzing error...")
-                    analysis_prompt = build_correctness_prompts(
-                        error_log=error_log,
-                        arch_path=task_path,
-                        cuda_code=current_kernel.code,
-                    )
-                    analysis_prompt_file = io_dir / f"stage{stage_idx + 1}_repair_{repair_attempt}_analysis_prompt.txt"
-                    analysis_prompt_file.write_text(analysis_prompt, encoding="utf-8")
-
-                    analysis_response = call_llm(
-                        analysis_prompt,
-                        sys_prompt=None,
+                    # Generate optimized kernel
+                    new_kernel = _optimize_stage_single(
+                        base_kernel=base_candidate.kernel,
+                        stage_idx=stage_idx,
+                        stage_name=stage_name,
+                        stage_description=stage_description,
+                        ncu_block=base_candidate.ncu_block,
+                        args=args,
+                        call_llm=call_llm,
+                        code_dir=code_dir,
+                        io_dir=io_dir,
                         log_path=log_path,
-                        call_type=f"stage{stage_idx + 1}_repair_analysis",
-                        round_idx=stage_round * 1000,
+                        stage_round=stage_round + combined_idx,
+                        temperature=temp,
+                        beam_idx=combined_idx,
                     )
-                    analysis_file = io_dir / f"stage{stage_idx + 1}_repair_{repair_attempt}_analysis_response.txt"
-                    analysis_file.write_text(analysis_response, encoding="utf-8")
 
-                    # Parse JSON response
-                    problem_dict = None
-                    try:
-                        problem_dict = extract_json(analysis_response)
-                        print(f"[Stage {stage_idx + 1} Repair {repair_attempt}/{max_repair}] Analysis: {problem_dict.get('critical_issue', 'N/A')}")
-                    except Exception as e:
-                        print(f"[Stage {stage_idx + 1} Repair {repair_attempt}/{max_repair}] Warning: Failed to parse analysis JSON: {e}")
-                        problem_dict = None
-
-                    # ====== Phase 2: Generate repair based on analysis ======
-                    print(f"[Stage {stage_idx + 1} Repair {repair_attempt}/{max_repair}] Phase 2: Generating fix...")
-                    repair_prompt = build_error_prompt(
-                        old_code=current_kernel.code,
-                        error_log=error_log,
-                        problem=problem_dict,
-                        gpu_name=args.gpu,
-                        error_history=stage_error_history,
-                        arch_path=task_path,
-                    )
-                    prompt_file = io_dir / f"stage{stage_idx + 1}_repair_{repair_attempt}_prompt.txt"
-                    prompt_file.write_text(repair_prompt, encoding="utf-8")
-                    current_kernel = _llm_to_kernel(repair_prompt, code_dir, call_llm, io_dir,
-                                                    stage_round, log_path=log_path, call_type=f"stage{stage_idx + 1}_repair")
-                    # Use cached PyTorch baseline for consistent comparison
+                    # Benchmark the new kernel
                     _bench_and_score(
-                        current_kernel,
+                        new_kernel,
                         ref_py=task_path,
                         device_idx=args.device,
                         warmup=args.warmup,
                         repeat=args.repeat,
                         tol=args.tol,
                         rtol=args.rtol,
-                        phase=f"stage{stage_idx + 1}_repair",
+                        phase=f"stage{stage_idx + 1}_{stage_name}_beam{combined_idx}",
                         metrics_dir=eval_dir,
-                        cached_baseline_ms=pytorch_baseline_ms,  # Use cached baseline
+                        cached_baseline_ms=pytorch_baseline_ms,
                     )
 
-                    runnable = bool(getattr(current_kernel, "metrics", {}).get("runnable", False))
-                    this_score = current_kernel.score if (current_kernel.score is not None and runnable) else None
-                    if this_score is not None:
-                        last_score_for_curve = this_score
-                        scores.append(this_score)
+                    # Check if optimization succeeded
+                    is_runnable = bool(getattr(new_kernel, "metrics", {}).get("runnable", False))
+                    new_score = new_kernel.score if (new_kernel.score is not None and is_runnable) else float("-inf")
+
+                    # If optimization failed, try repair (max 1 attempt per candidate)
+                    if not is_runnable:
+                        print(f"  Candidate {combined_idx + 1}: failed, attempting repair...")
+                        error_log = _last_n_lines(getattr(new_kernel, "metrics", {}).get("message", ""))
+
+                        # Phase 1: Analyze the problem
+                        analysis_prompt = build_correctness_prompts(
+                            error_log=error_log,
+                            arch_path=task_path,
+                            cuda_code=new_kernel.code,
+                        )
+                        analysis_response = call_llm(
+                            analysis_prompt,
+                            sys_prompt=None,
+                            log_path=log_path,
+                            call_type=f"stage{stage_idx + 1}_repair_analysis_beam{combined_idx}",
+                            round_idx=(stage_round + combined_idx) * 1000,
+                        )
+
+                        # Parse JSON response
+                        problem_dict = None
+                        try:
+                            problem_dict = extract_json(analysis_response)
+                        except Exception:
+                            pass
+
+                        # Phase 2: Generate repair
+                        repair_prompt = build_error_prompt(
+                            old_code=new_kernel.code,
+                            error_log=error_log,
+                            problem=problem_dict,
+                            gpu_name=args.gpu,
+                            error_history="",
+                            arch_path=task_path,
+                        )
+                        repair_suffix = f"_beam{combined_idx}" if combined_idx > 0 else ""
+                        prompt_file = io_dir / f"stage{stage_idx + 1}_repair{repair_suffix}_prompt.txt"
+                        prompt_file.write_text(repair_prompt, encoding="utf-8")
+
+                        new_kernel = _llm_to_kernel(
+                            repair_prompt, code_dir, call_llm, io_dir,
+                            stage_round + combined_idx + 100,
+                            log_path=log_path,
+                            call_type=f"stage{stage_idx + 1}_repair_beam{combined_idx}",
+                        )
+
+                        # Re-benchmark repaired kernel
+                        _bench_and_score(
+                            new_kernel,
+                            ref_py=task_path,
+                            device_idx=args.device,
+                            warmup=args.warmup,
+                            repeat=args.repeat,
+                            tol=args.tol,
+                            rtol=args.rtol,
+                            phase=f"stage{stage_idx + 1}_{stage_name}_repair_beam{combined_idx}",
+                            metrics_dir=eval_dir,
+                            cached_baseline_ms=pytorch_baseline_ms,
+                        )
+
+                        is_runnable = bool(getattr(new_kernel, "metrics", {}).get("runnable", False))
+                        new_score = new_kernel.score if (new_kernel.score is not None and is_runnable) else float("-inf")
+
+                    # Only add to candidates if runnable (skip failed ones)
+                    if is_runnable:
+                        new_candidates.append(BeamCandidate(
+                            kernel=new_kernel,
+                            score=new_score,
+                            runnable=True,
+                            ncu_block="",  # Will be profiled in next stage if needed
+                        ))
+                        last_score_for_curve = new_score
+                        scores.append(new_score)
                         err_flags.append(False)
-                        if this_score > best_score:
-                            best_score = this_score
-                            best_kernel = current_kernel
-                            with open(test_kernel, "w") as f:
-                                f.write(best_kernel.code)
-                            print(f"[Stage {stage_idx + 1} Repair] New best score: {best_score:.4f}")
+                        print(f"  Candidate {combined_idx + 1}: score={new_score:.4f} ✓")
                     else:
                         scores.append(last_score_for_curve)
                         err_flags.append(True)
-                        # Add current error to history for next repair attempt (keep last 5 lines)
-                        if error_log.strip():
-                            error_lines = error_log.splitlines()
-                            last_lines = "\n".join(error_lines[-5:]) if len(error_lines) > 5 else error_log
-                            stage_error_history_list.append(f"Attempt {repair_attempt}:\n{last_lines}")
+                        print(f"  Candidate {combined_idx + 1}: failed (after repair attempt) ✗")
 
-                if not runnable:
-                    print(f"[Stage {stage_idx + 1}] Failed to repair after {max_repair} attempts. Keeping best_kernel unchanged.")
-                    # Don't update best_kernel, keep the previous one
-                    previous_stage_score = score_before_stage
-                    continue
-                else:
-                    # Repair succeeded, skip Step 6 (already handled in repair loop)
-                    print(f"[Stage {stage_idx + 1}] Repair succeeded.")
-                    previous_stage_score = score_before_stage
-                    continue
+            # Select top-k candidates for next stage
+            # Include previous beam candidates to allow "no improvement" path
+            all_candidates = new_candidates + beam
+            all_candidates = [c for c in all_candidates if c.runnable]
 
-            # Step 6: Update best_kernel if improved (only for optimization, not repair)
-            if this_score is not None:
-                last_score_for_curve = this_score
-                scores.append(this_score)
-                err_flags.append(False)
-                if this_score > best_score:
-                    best_score = this_score
-                    best_kernel = current_kernel
-                    with open(test_kernel, "w") as f:
-                        f.write(best_kernel.code)
-                    print(f"[Stage {stage_idx + 1}] New best score: {best_score:.4f} (improved from {score_before_stage:.4f})")
-                else:
-                    print(f"[Stage {stage_idx + 1}] Score: {this_score:.4f} (not better than best: {best_score:.4f})")
-                    print(f"[Stage {stage_idx + 1}] Keeping previous best_kernel")
+            if not all_candidates:
+                print(f"[Stage {stage_idx + 1}] All candidates failed. Keeping previous beam.")
+                continue
+
+            # Sort by score (descending) and keep top-k
+            # For beam stages (0,1): keep beam_width candidates
+            # For greedy stage (2): keep 1 candidate
+            all_candidates.sort(reverse=True)
+            keep_k = beam_width if use_beam else 1
+            beam = all_candidates[:keep_k]
+
+            # Update global best
+            if beam[0].score > best_score:
+                best_score = beam[0].score
+                best_kernel = beam[0].kernel
+                with open(test_kernel, "w") as f:
+                    f.write(best_kernel.code)
+                print(f"[Stage {stage_idx + 1}] ★ New best score: {best_score:.4f}")
             else:
-                scores.append(last_score_for_curve)
-                err_flags.append(True)
-                print(f"[Stage {stage_idx + 1}] Optimization produced non-runnable kernel. Keeping best_kernel unchanged.")
+                print(f"[Stage {stage_idx + 1}] Best in beam: {beam[0].score:.4f} (global best: {best_score:.4f})")
 
-            # Update score_history for early stopping check
+            # Log beam status
+            print(f"[Stage {stage_idx + 1}] Beam after selection: {[f'{c.score:.4f}' for c in beam]}")
+
             score_history.append(best_score)
-
-            # Update previous_stage_score for next iteration
-            previous_stage_score = score_before_stage
 
     # plot per-task curve
     fig_path = fig_dir / f"{task_path.stem}_score.png"
@@ -1183,6 +1275,13 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
     print(f"[{task_path.name}] Figure saved to: {fig_path}")
 
     usage_totals = _append_usage_totals(log_path)
+
+    # === Restore stdout/stderr and close log files ===
+    sys.stdout = old_stdout
+    sys.stderr = old_stderr
+    tee_stdout.close()
+    tee_stderr.close()
+    print(f"[{task_path.name}] Console log saved to: {console_log_path}")
 
     return {
         "task": str(task_path),

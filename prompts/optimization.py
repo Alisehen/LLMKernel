@@ -98,39 +98,30 @@ Autotune:
 - Autotune ONLY on @triton.jit kernel
 """,
 
-    "memory_access": """
-Focus: Memory efficiency & latency hiding.
+    "memory_and_tuning": """
+Focus: Memory optimization and final parameter tuning.
 
 Metrics:
 - dram__throughput.avg.pct_of_peak_sustained_elapsed
 - lts__t_sector_hit_rate.pct
 - smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct (<20%)
+- sm__warps_active.avg.pct_of_peak_sustained_active
+
+Parameters to tune:
+- num_stages ∈ {2, 3, 4}
+- num_warps ∈ {4, 8} (based on occupancy)
 
 Rules:
-- Increase num_stages only if memory stalls are high
-- Do not rewrite access patterns without metric evidence
-- Larger BLOCK_K improves reuse but increases register pressure
-
-Autotune:
-- Max 2-3 configs (e.g., num_stages ∈ {2,3})
-""",
-
-    "advanced_memory": """
-Focus: Final micro-tuning.
-
-Params:
-- num_warps ∈ {2,4,8,16}
-- num_stages ∈ {2,3,4}
-
-Rules:
+- Increase num_stages only if memory stalls > 20%
 - Change num_warps only if occupancy suggests it
-- Change num_stages by ±1 only
-- Do NOT modify grid or BLOCK sizes
+- Larger BLOCK_K improves reuse but increases register pressure
+- Do NOT modify grid or BLOCK sizes (fixed in earlier stages)
+- Do not rewrite access patterns without metric evidence
 
 Autotune:
-- Max 2-3 configs to reduce compilation time
-- Always include original config
-- Revert if gain <1–2% or unstable
+- Max 3-4 configs combining num_stages and num_warps
+- Always include original config as baseline
+- Revert if gain < 2% or unstable
 """
 }
 
@@ -188,14 +179,14 @@ Autotune:
 - 2-3 BLOCK_SIZE configs, always include smaller fallback
 """,
 
-    "memory_access": """
-Focus: Memory pattern for fused operations.
+    "memory_and_tuning": """
+Focus: Memory pattern and parameter tuning for fused operations.
 
 Key Principle:
 - Fusion benefit = eliminated INTERMEDIATE stores
 - Multiple input loads are OK; intermediate stores are NOT
 
-Rules:
+Memory Rules:
 - ✅ Multiple tl.load() for different inputs (x, weight, bias) - OK
 - ❌ tl.store() for intermediate results - NEVER (this is what fusion eliminates)
 - ✅ Single tl.store() for final output - required
@@ -205,27 +196,11 @@ Verification:
 - Intermediate values: must stay in registers between ops
 - If you see store-then-load pattern for same data → BUG, refactor
 
-Multi-input Fusion Pattern:
-```
-x = tl.load(input_ptr + offs, mask=mask)
-w = tl.load(weight_ptr + ..., mask=...)  # OK: different input
-b = tl.load(bias_ptr + ..., mask=...)    # OK: different input
-y = op1(x, w)  # in registers
-z = op2(y, b)  # in registers
-tl.store(out_ptr + offs, z, mask=mask)   # single output store
-```
-
-num_stages: start with 2, only increase if memory stalls high AND registers OK
-""",
-
-    "advanced_memory": """
-Focus: Fine-tuning fused kernel parameters.
-
-Params:
+Parameters to tune:
 - num_warps ∈ {4, 8}
 - num_stages ∈ {2, 3}
 
-Conditional Rules (NOT one-size-fits-all):
+Conditional Tuning Rules:
 
 IF register pressure LOW (regs < 96, no spill):
   - Try num_warps=8 for compute-bound fusion
@@ -240,9 +215,9 @@ IF multi-input fusion (3+ distinct loads):
   - num_warps=4 often better than 8
 
 Autotune:
-- Max 2-3 configs to reduce compilation time
+- Max 3-4 configs combining num_stages and num_warps
 - Always include conservative baseline (num_warps=4, num_stages=2)
-- Test before/after: revert if gain < 2%
+- Revert if gain < 2%
 """
 }
 
@@ -376,12 +351,10 @@ def get_stage_ncu_metrics(stage_name: str) -> list[str]:
             "launch__registers_per_thread",
             "launch__shared_mem_per_block_static",
         ],
-        "memory_access": [
+        "memory_and_tuning": [
             "smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct",
             "l1tex__t_sector_hit_rate.pct",
             "smsp__sass_average_data_bytes_per_sector_mem_global_op_st.pct",
-        ],
-        "advanced_memory": [
             "smsp__warp_issue_stalled_short_scoreboard_per_warp_active.pct",
             "smsp__warp_issue_stalled_barrier_per_warp_active.pct",
             "sm__inst_executed_pipe_tensor.avg.pct_of_peak_sustained_active",
