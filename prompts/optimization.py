@@ -12,12 +12,9 @@ from prompts.generate_custom_cuda import _load_gpu_spec, MODEL_SINGLE, MODEL_FUS
 _OPTIMIZATION_PROMPT_TEMPLATE = Template("""\
 You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
 
-# Target GPU
-GPU Name: $gpu_name
-Architecture: $gpu_arch
-$gpu_items
+# Target GPU: $gpu_name
 
-[OPTIMIZATION STAGE]f
+[OPTIMIZATION STAGE]
 $STAGE_CONTEXT
 
 [CURRENT CODE]
@@ -30,16 +27,25 @@ $NCU_METRICS
 
 **Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
 
-TRITON API CONSTRAINTS (CRITICAL):
-- Triton has NO: tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+## CRITICAL — Code MUST compile and run:
+1. EVERY kernel function MUST have `@triton.jit` decorator
+2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+3. BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+4. `tl.program_id(axis)` only supports axis = 0, 1, 2
+5. No `continue`, `break`, `return` inside loops — use masking
+6. No tensor indexing with loop vars: `x[:, i]` is INVALID
+7. mask shape MUST match data shape in tl.load/tl.store
 
-OUTPUT RULES (STRICT):
-1. Follow this exact order:
-   1. Imports: torch, torch.nn, triton, triton.language as tl
-   2. @triton.jit decorated kernel function(s)
-   3. Wrapper function(s) for grid calculation and kernel launch
-   4. class ModelNew(nn.Module) that calls your kernels
-2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+## Missing Triton Functions (implement manually):
+- tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+## OUTPUT FORMAT (STRICT):
+1. Imports: torch, torch.nn, triton, triton.language as tl
+2. @triton.jit decorated kernel function(s)
+3. Wrapper function(s) for grid calculation and kernel launch
+4. class ModelNew(nn.Module) that calls your kernels
+
+Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
 
 ```python
 # <optimized Triton code>
@@ -230,23 +236,19 @@ def build_optimization_prompt(
     gpu_name: Optional[str] = None,
     *,
     ncu_metrics: str = "",
-    history_block: str = "",
     stage_name: str = "",
     stage_description: str = "",
-    failure_analysis: str = "",
     fusion: bool = False,
     model: str = MODEL_SINGLE,
 ) -> str:
-    """Build single-phase optimization prompt with NCU metrics.
+    """Build optimization prompt with NCU metrics.
 
     Args:
         arch_path: Path to kernel code to optimize
         gpu_name: Target GPU name
         ncu_metrics: NCU profiling metrics (JSON format)
-        history_block: Previous kernel attempts
         stage_name: Current optimization stage
         stage_description: Stage description
-        failure_analysis: Analysis of previous failures
         fusion: Whether this is a fusion operator (multi-op kernel)
         model: Model type - "single" (level1), "fusion" (level2), or "network" (level3)
     """
@@ -263,11 +265,8 @@ def build_optimization_prompt(
         raise KeyError(f"{gpu_name} not present in GPU_SPEC_INFO")
 
     info = gpu_info[gpu_name]
-    gpu_arch = info.get("GPU Architecture", "Unknown")
-    gpu_items = "\n".join(f"• {k}: {v}" for k, v in info.items() if k != "GPU Architecture")
 
     arch_src = Path(arch_path).read_text().strip()
-    hist = history_block or "(None)\n"
 
     # Determine effective model type (fusion param for backward compatibility)
     effective_model = model
@@ -291,31 +290,18 @@ def build_optimization_prompt(
 {focus}
 """
 
-    # Build failure analysis
-    failure_context = ""
-    if failure_analysis:
-        failure_context = f"""
-## Previous Attempt Failed
-{failure_analysis}
-
-**Your Task**: Generate a **different** approach within {stage_description} scope.
-- Do NOT repeat the failed strategy
-- Try alternative parameters or implementation within this stage
-- Ensure the fix addresses the root cause identified above
-"""
-
-    # Format NCU metrics
-    ncu_section = ncu_metrics if ncu_metrics else "No NCU metrics available"
+    # Format NCU metrics - only show GPU hardware info when NCU metrics unavailable
+    if ncu_metrics:
+        ncu_section = ncu_metrics
+    else:
+        gpu_items = "\n".join(f"• {k}: {v}" for k, v in info.items() if k != "GPU Architecture")
+        ncu_section = f"No NCU metrics available.\n\nGPU Hardware Info:\n{gpu_items}"
 
     return _OPTIMIZATION_PROMPT_TEMPLATE.substitute(
         gpu_name=gpu_name,
-        gpu_arch=gpu_arch,
-        gpu_items=gpu_items,
         arch_src=arch_src,
-        history_block=hist,
         STAGE_CONTEXT=stage_context,
         NCU_METRICS=ncu_section,
-        FAILURE_ANALYSIS=failure_context,
     )
 
 

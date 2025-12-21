@@ -1,4 +1,3 @@
-```python
 import torch
 import torch.nn as nn
 import triton
@@ -148,4 +147,3 @@ class ModelNew(nn.Module):
             x = torch.sum(x, dim=self.sum_dim)
 
         return x
-```

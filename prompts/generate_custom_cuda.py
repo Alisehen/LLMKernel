@@ -54,16 +54,6 @@ MODEL_FUSION = "fusion"      # level2: fused operators
 MODEL_NETWORK = "network"    # level3: full network architecture
 
 # ---------------------------------------------------------------------------
-# ConvTranspose guidance - use PyTorch native
-# ---------------------------------------------------------------------------
-CONV_TRANSPOSE_GUIDANCE = """
-## ConvTranspose - Use PyTorch Native (CRITICAL)
-
-**DO NOT** implement ConvTranspose1d/2d/3d in Triton. The index mapping is complex and error-prone.
-Use PyTorch's native `nn.ConvTranspose2d` and only fuse the subsequent simple operations in Triton.
-"""
-
-# ---------------------------------------------------------------------------
 # Fusion-specific guidance for Conv operations
 # ---------------------------------------------------------------------------
 FUSION_CONV_GUIDANCE = """
@@ -133,34 +123,43 @@ NETWORK_GUIDANCE = """
 test = Template(
     dedent(
         """
-Write a correct and reasonably fast Triton kernel to replace the given PyTorch operator.
-This is a SEED implementation: prioritize correctness and stable compilation.
+Write high-performance Triton kernels to replace PyTorch operators.
+Generate the FASTEST kernel while maintaining correctness.
 
-Rules:
-- Use `tl.program_id(axis)` (axis=0/1/2 only)
-- Use `tl.arange()` for block indices
-- Operate on blocks (no CUDA thread model)
-- No manual shared memory or synchronization
+## CRITICAL — These cause 60%+ of failures:
+1. EVERY kernel function MUST have `@triton.jit` decorator — MANDATORY
+2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+3. BLOCK sizes MUST be power-of-2 constexpr: 16, 32, 64, 128, 256
+4. `tl.program_id(axis)` only supports axis = 0, 1, 2 (max 3D grid)
 
-Hard Constraints:
-- All BLOCK_* are `tl.constexpr` and powers of 2
-- `tl.arange(0, BLOCK)` requires BLOCK to be power-of-2
-- No dynamic `tl.reshape()` or view
-- `tl.load` / `tl.store`: scalar ptr → scalar, block ptr → block
-- No Python control flow on `tl.tensor` or BLOCK_*
-- Triton does NOT support `continue`, `break`, or `return` inside loops — use masking instead
-- Import ALL modules you use (e.g., `import math` if using `math.sqrt`)
-- Do NOT index tensors with loop variables: `tensor[:, i]` or `tensor[i, :]` where i is a loop var is INVALID
-- Triton has NO: tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
-- @triton.autotune: use at most 2-3 configs to reduce compilation time
+## Triton Syntax Rules:
+- For matmul/conv/linear ops, prefer `tl.dot(a, b, allow_tf32=True)` over element-wise multiply-add
+- No `continue`, `break`, `return` inside loops — use masking instead
+- No tensor indexing with loop vars: `x[:, i]` or `x[i, :]` is INVALID
+- No tuple unpacking inside kernel: `a, b = tl.load(...)` is INVALID
+- No nested functions inside @triton.jit
+- No Python control flow on tl.tensor or BLOCK_* values
+- No dynamic `tl.reshape()` or view operations
+
+## Missing Triton Functions (implement manually):
+- tl.tanh → `(tl.exp(2*x) - 1) / (tl.exp(2*x) + 1)`
+- tl.sigmoid → `1 / (1 + tl.exp(-x))`
+- tl.gelu, tl.silu, tl.softmax, tl.mish → implement from definition
+
+## Load/Store Rules:
+- Pointer + scalar offset → scalar value
+- Pointer + block offset (via tl.arange) → block of values
+- mask shape MUST match data shape exactly
+
+## Output Format (STRICT):
+1. Imports: `import torch, torch.nn as nn, triton, triton.language as tl` (and math if needed)
+2. `@triton.jit` kernel(s) — MUST have this decorator
+3. Wrapper function with grid calculation
+4. `class ModelNew(nn.Module)` — REQUIRED
+
+Do NOT include: testing code, `if __name__ == "__main__"`, get_inputs, get_init_inputs
+
 $fusion_guidance
-Output Format (STRICT):
-1. Imports (torch, torch.nn, triton, triton.language, and any other needed modules like math)
-2. `@triton.jit` kernel(s)
-3. Wrapper function(s)
-4. `class ModelNew(nn.Module)` — this class is REQUIRED
-
-Do NOT include testing code or `if __name__ == "__main__"`.
 
 Example PyTorch:
 '''
@@ -172,64 +171,13 @@ Example Triton:
 $few_new
 '''
 
-Hardware:
-$arch_src
-
 Target:
 ```python
 $kernel_src
 """
     )
 )
-TEMPLATE = Template(
-    dedent(
-        """
-Task
-----
-Generate **hand‑written CUDA kernels** that replace *all* PyTorch operator(s)
-inside the original `class Model` (shown later).  You may fuse multiple
-operators into a single kernel if that yields better performance.  Leave any
-non‑replaced parts of the model unchanged.
 
-OUTPUT RULES (STRICT) ────────────────────────────────────────────────
-1. Inside the block, follow **exactly** this order:
-   1. Imports – `torch`, `torch.nn`, `load_inline`.
-   2. `source` – triple‑quoted CUDA string(s) (kernel + host wrapper).
-   3. `cpp_src` – prototypes for *all* kernels you expose.
-   4. **One** `load_inline` call per kernel group.
-   5. `class ModelNew(nn.Module)` – mirrors original inputs/outputs but calls
-      your CUDA kernels.
-2. **Do NOT include** testing code, `if __name__ == "__main__"`, or extra prose.
-
-
-Few‑shot example (reference only – do **not** echo):
-**Original**
-```python
-$few_base
-```
-**Optimised**
-```python
-$few_new
-```
-
-Target architecture (to optimise):
-```python
-$arch_src
-```
-
-Optimize the architecture named Model with custom CUDA operators! Name your optimized
-output architecture ModelNew. Output the new code in codeblocks. Please generate real
-code, NOT pseudocode, make sure the code compiles and is fully functional. Just output
-the new model code, no other text, and NO testing code!
-
-Example:
-```python
-# <complete ModelNew code>
-```
-# ==========================================================
-"""
-    )
-)
 default_system_prompt = """\
 You are an expert in high-performance GPU kernel optimization with Triton.
 
@@ -240,7 +188,6 @@ Output format:
 # <complete ModelNew code with optimized Triton kernels>
 ```
 """
-
 # ---------------------------------------------------------------------------
 # GPU spec loader
 # ---------------------------------------------------------------------------
@@ -316,11 +263,7 @@ def build_seed_prompt(
         fusion_guidance = NETWORK_GUIDANCE
     elif effective_model == MODEL_FUSION:
         # Level 2: Fused operators
-        if has_conv_transpose:
-            few_base = FEWSHOT_CONVTRANSPOSE_BASE.read_text().strip()
-            few_new = FEWSHOT_CONVTRANSPOSE_NEW_TRITON.read_text().strip()
-            fusion_guidance = CONV_TRANSPOSE_GUIDANCE
-        elif "conv" in str(arch_path).lower():
+        if "conv" in str(arch_path).lower():
             few_base = FEWSHOT_FUSION_BASE.read_text().strip()
             few_new = FEWSHOT_FUSION_NEW_TRITON.read_text().strip()
             fusion_guidance = FUSION_CONV_GUIDANCE

@@ -1,92 +1,70 @@
-You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+Fix the Triton kernel errors. Generate correct code.
 
-# Target GPU: 4090
+## ERROR LOG
+```
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 644, in compare_and_bench
+    raise ValueError(
+ValueError: Outputs are not close (atol=0.1, rtol=0.1). max_abs_err=1.213e+03, mean_abs_err=1.209e+03
+```
 
-[OPTIMIZATION STAGE]
-
-## Current Optimization Stage
-
-Focus: Grid layout & parallelism.
-
-Metrics:
-- sm__throughput.avg.pct_of_peak_sustained_elapsed (>60%)
-- launch__grid_size
-
-Rules:
-- 1D: (cdiv(N, BLOCK))
-- 2D: (cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))
-- 3D: (batch, cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))
-- >3D: flatten ONLY independent dims
-- Prefer batch / head / expert / group parallelism before shrinking BLOCK
-- For grouped operations: ensure group dimension is in grid (e.g., program_id(2) for groups)
-- Change grid only if SM utilization is clearly low
-
-Safety:
-- Max 3 grid dims, static rank
-- grid=(G0,G1,G2) must match tl.program_id(0/1/2)
-- For grouped ops: verify group indexing is correct
-- If unsure about correctness, do NOT change grid
-
-Autotune:
-- Autotune either BLOCK_* OR (num_warps, num_stages)
-- If autotuning BLOCK_*, use grid=lambda META: (...)
-- Never redefine BLOCK_* in both kernel and launch
-- Max 2-3 configs to reduce compilation time
-
-
-
-[CURRENT CODE]
+## Broken Code
 ```python
-import torch, torch.nn as nn, triton, triton.language as tl
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_C": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_C": 256}, num_warps=4, num_stages=2),
+    ],
+    key=["C"],
+)
 @triton.jit
 def bias_add_sum_kernel(
-    x_ptr,           # *f32, shape [B, C]
-    bias_ptr,        # *f32, shape [C]
-    out_ptr,         # *f32, shape [B]
-    B,               # int32
-    C,               # int32
-    stride_x_batch,  # int32
-    stride_x_channel,# int32
-    stride_bias,     # int32
-    stride_out_batch,# int32
+    x_ptr,             # *f32, shape [B, C]
+    out_ptr,           # *f32, shape [B]
+    B,                 # int32
+    C,                 # int32
+    stride_x_batch,    # int32
+    stride_x_channel,  # int32
+    stride_out_batch,  # int32
     BLOCK_C: tl.constexpr,
 ):
-    pid_b = tl.program_id(axis=0)  # batch index
-    pid_blk = tl.program_id(axis=1)  # channel block index
+    # program ids
+    pid_b = tl.program_id(axis=0)   # batch index
+    pid_blk = tl.program_id(axis=1) # channel block index
 
+    # compute channel offsets for this block
     block_start = pid_blk * BLOCK_C
     offs_c = block_start + tl.arange(0, BLOCK_C)
 
     # masks
-    mask_valid_b = pid_b < B
+    mask_b = pid_b < B
     mask_c = offs_c < C
-    mask_x = mask_c & mask_valid_b
+    mask = mask_b & mask_c
 
-    # base pointers
+    # base pointer for this batch
     x_batch_ptr = x_ptr + pid_b * stride_x_batch
 
-    # load x and bias
+    # load x-values
     x_vals = tl.load(
         x_batch_ptr + offs_c * stride_x_channel,
-        mask=mask_x,
-        other=0.0,
-    )
-    bias_vals = tl.load(
-        bias_ptr + offs_c * stride_bias,
-        mask=mask_c,
+        mask=mask,
         other=0.0,
     )
 
-    vals = x_vals + bias_vals
-    partial = tl.sum(vals, axis=0)
+    # partial reduction over this channel block
+    partial = tl.sum(x_vals, axis=0)
 
     # accumulate into output with atomic add
     tl.atomic_add(
         out_ptr + pid_b * stride_out_batch,
         partial,
-        mask=mask_valid_b,
+        mask=mask_b,
     )
 
 
@@ -105,34 +83,39 @@ def triton_bias_add_sum(x: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
     assert D == 1 and H == 1 and W == 1, "triton_bias_add_sum expects D=H=W=1"
     assert bias.shape[0] == C, "Bias channels must match x channels"
 
+    # Flatten spatial dims
     x2 = x.contiguous().view(B, C)
     bias2 = bias.contiguous().view(C)
 
+    # Output buffer initialized to 0 for atomic-add accumulation
     out = torch.zeros(B, device=x.device, dtype=x.dtype)
 
+    # Strides
     stride_x_batch, stride_x_channel = x2.stride()
-    stride_bias = bias2.stride()[0]
     stride_out_batch = out.stride()[0]
 
-    BLOCK_C = 128  # power-of-2 block size
+    # Precompute sum of bias once (instead of loading bias per batch in the kernel)
+    # sum_c (x[b,c] + bias[c]) = sum_c x[b,c] + sum_c bias[c]
+    bias_sum = bias2.sum()
 
+    # 2D grid over (batch, channel-blocks)
     grid = lambda meta: (
-        max(1, B),
-        triton.cdiv(C, meta["BLOCK_C"]),
+        triton.cdiv(B, 1),                  # along batch (BLOCK_B = 1)
+        triton.cdiv(C, meta["BLOCK_C"]),   # along channels
     )
 
     bias_add_sum_kernel[grid](
         x2,
-        bias2,
         out,
         B,
         C,
         stride_x_batch,
         stride_x_channel,
-        stride_bias,
         stride_out_batch,
-        BLOCK_C=BLOCK_C,
     )
+
+    # Add bias_sum to each batch element
+    out += bias_sum
 
     return out.view(B, 1, 1, 1)
 
@@ -178,13 +161,8 @@ class ModelNew(nn.Module):
         return x
 ```
 
-[NCU PROFILING METRICS]
-No NCU metrics available
-
-**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
-
-## CRITICAL — Code MUST compile and run:
-1. EVERY kernel function MUST have `@triton.jit` decorator
+## CRITICAL — These cause 60%+ of failures:
+1. EVERY kernel function MUST have `@triton.jit` decorator — MANDATORY
 2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
 3. BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
 4. `tl.program_id(axis)` only supports axis = 0, 1, 2
@@ -196,13 +174,13 @@ No NCU metrics available
 - tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
 
 ## OUTPUT FORMAT (STRICT):
-1. Imports: torch, torch.nn, triton, triton.language as tl
+1. Imports: torch, torch.nn, triton, triton.language as tl (and math if needed)
 2. @triton.jit decorated kernel function(s)
 3. Wrapper function(s) for grid calculation and kernel launch
-4. class ModelNew(nn.Module) that calls your kernels
+4. class ModelNew(nn.Module) — REQUIRED
 
 Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
 
 ```python
-# <optimized Triton code>
+# <corrected code>
 ```

@@ -6,7 +6,7 @@ Adds GPU hardware context and architecture source for better fixes.
 """
 from __future__ import annotations
 from pathlib import Path
-from typing import Optional, Mapping, Any
+from typing import Optional, Any
 from string import Template
 
 # Project roots (adjust if your tree differs)
@@ -17,28 +17,37 @@ HW_FILE = ROOT / "prompts/hardware/gpu_specs.py"
 from prompts.generate_custom_cuda import _load_gpu_spec  # noqa: E402
 
 COMPILE_ERROR = Template(
-    """Fix the Triton kernel errors. Generate correct, high-performance code.
+    """Fix the Triton kernel errors. Generate correct code.
 
-Current Error Log:
+## ERROR LOG
+```
 $ERROR_LOG
-
-Main Critical Problem Analysis:
-$PROBLEM_ANALYSIS
-
-Broken Code:
+```
+$ERROR_HISTORY
+## Broken Code
 ```python
 $OLD_CODE
 ```
 
-OUTPUT RULES (STRICT):
-1. Follow this exact order:
-   1. Imports: torch, torch.nn, triton, triton.language as tl, AND any other modules used (e.g., import math if using math.sqrt)
-   2. @triton.jit decorated kernel function(s) — NO continue/break/return inside loops (use masking)
-   3. Wrapper function(s) for grid calculation and kernel launch
-   4. class ModelNew(nn.Module) that calls your kernels — THIS CLASS IS REQUIRED
-2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
-3. Learn from previous repair attempts to avoid repeating the same mistakes
-4. Ensure ALL imports are included at the top (common mistake: forgetting `import math`)
+## CRITICAL — These cause 60%+ of failures:
+1. EVERY kernel function MUST have `@triton.jit` decorator — MANDATORY
+2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+3. BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+4. `tl.program_id(axis)` only supports axis = 0, 1, 2
+5. No `continue`, `break`, `return` inside loops — use masking
+6. No tensor indexing with loop vars: `x[:, i]` is INVALID
+7. mask shape MUST match data shape in tl.load/tl.store
+
+## Missing Triton Functions (implement manually):
+- tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+## OUTPUT FORMAT (STRICT):
+1. Imports: torch, torch.nn, triton, triton.language as tl (and math if needed)
+2. @triton.jit decorated kernel function(s)
+3. Wrapper function(s) for grid calculation and kernel launch
+4. class ModelNew(nn.Module) — REQUIRED
+
+Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
 
 ```python
 # <corrected code>
@@ -46,26 +55,6 @@ OUTPUT RULES (STRICT):
 """
 )
 
-def _escape_template(s: str) -> str:
-    return s.replace("$", "$$")
-
-def _sanitize_text(s: str) -> str:
-    return s.replace("```", "`")
-
-def _format_problem(problem: Optional[Any]) -> str:
-    import json
-    if problem is None or problem == "":
-        return "No prior critical problem provided."
-    if isinstance(problem, Mapping):
-        # Prefer to concatenate the three key fields into a concise description; otherwise fall back to JSON
-        ci  = str(problem.get("critical_issue", "")).strip()
-        wim = str(problem.get("why_it_matters", "")).strip()
-        mfh = str(problem.get("minimal_fix_hint", "")).strip()
-        if ci or wim or mfh:
-            return f"critical_issue: {ci}\nwhy_it_matters: {wim}\nminimal_fix_hint: {mfh}"
-        return json.dumps(problem, ensure_ascii=False, indent=2)
-    # For other types, simply convert to string
-    return str(problem)
 
 def build_error_prompt(
     *,
@@ -77,7 +66,7 @@ def build_error_prompt(
     arch_path: Optional[Path] = None,
 ) -> str:
     """
-    Build the error-repair prompt with GPU context + architecture source.
+    Build the error-repair prompt with error history.
 
     Parameters
     ----------
@@ -86,14 +75,13 @@ def build_error_prompt(
     error_log : str
         The compiler/runtime error text to show under ERROR LOG.
     problem : Optional[Any]
-        The problem analysis from previous step.
+        Deprecated, kept for backward compatibility. Ignored.
     gpu_name : Optional[str]
         Human-readable GPU name key to lookup in gpu_specs.
-        If None, attempts torch.cuda.get_device_name(0).
     error_history : str
-        History of previous repair attempts and their outcomes.
+        History of previous repair attempts (concise summaries).
     arch_path : Optional[Path]
-        Path to the reference PyTorch implementation file to display.
+        Path to reference PyTorch implementation (currently unused).
 
     Returns
     -------
@@ -126,33 +114,18 @@ def build_error_prompt(
     else:
         pytorch_code = "# PyTorch reference code not provided"
 
-    # Format error history if provided
+    # Format error history if provided (concise format to avoid repeating mistakes)
     history_section = ""
     if error_history and error_history.strip():
-        history_section = f"""Previous Repair Attempts (avoid repeating these errors):
+        history_section = f"""
+## Previous Failed Attempts (DO NOT repeat these mistakes):
 {error_history.strip()}
 
 """
-    else:
-        history_section = "None\n"
-
-    # Format problem analysis if provided
-    problem_section = ""
-    if problem is not None and problem != "":
-        formatted_problem = _format_problem(problem)
-        problem_section = f"""Problem Analysis (from expert diagnosis):
-{formatted_problem}
-
-Focus your fix on addressing the identified critical issue.
-"""
-    else:
-        problem_section = ""
 
     # Substitute all fields
     return COMPILE_ERROR.substitute(
         ERROR_HISTORY=history_section,
-        PROBLEM_ANALYSIS=problem_section,
-        PYTORCH_CODE=pytorch_code,
         ERROR_LOG=error_log.strip(),
         OLD_CODE=old_code.strip(),
     )

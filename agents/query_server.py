@@ -365,6 +365,8 @@ def query_server(
                     temperature=0.1,
                 )
             else:
+                temperature=1
+                max_tokens=8192
                 response = client.chat.completions.create(
                     model=model,
                     messages=messages,

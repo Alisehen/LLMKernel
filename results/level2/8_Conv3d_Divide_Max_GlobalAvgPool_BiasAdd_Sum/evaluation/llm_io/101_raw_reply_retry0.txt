@@ -14,8 +14,9 @@ import triton.language as tl
 )
 @triton.jit
 def bias_add_sum_kernel(
-    x_ptr,             # *f32, shape [B, C]
-    out_ptr,           # *f32, shape [B]
+    x_ptr,             # *f32 / *f16, shape [B, C]
+    bias_ptr,          # *f32 / *f16, shape [C]
+    out_ptr,           # *f32 / *f16, shape [B]
     B,                 # int32
     C,                 # int32
     stride_x_batch,    # int32
@@ -46,8 +47,18 @@ def bias_add_sum_kernel(
         other=0.0,
     )
 
+    # load bias-values (independent of batch)
+    bias_vals = tl.load(
+        bias_ptr + offs_c,
+        mask=mask_c,
+        other=0.0,
+    )
+
+    # add bias
+    y_vals = x_vals + bias_vals
+
     # partial reduction over this channel block
-    partial = tl.sum(x_vals, axis=0)
+    partial = tl.sum(y_vals, axis=0)
 
     # accumulate into output with atomic add
     tl.atomic_add(
@@ -83,18 +94,15 @@ def triton_bias_add_sum(x: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
     stride_x_batch, stride_x_channel = x2.stride()
     stride_out_batch = out.stride()[0]
 
-    # Precompute sum of bias once (instead of loading bias per batch in the kernel)
-    # sum_c (x[b,c] + bias[c]) = sum_c x[b,c] + sum_c bias[c]
-    bias_sum = bias2.sum()
-
     # 2D grid over (batch, channel-blocks)
     grid = lambda meta: (
-        triton.cdiv(B, 1),                  # along batch (BLOCK_B = 1)
+        triton.cdiv(B, 1),                 # along batch (BLOCK_B = 1)
         triton.cdiv(C, meta["BLOCK_C"]),   # along channels
     )
 
     bias_add_sum_kernel[grid](
         x2,
+        bias2,
         out,
         B,
         C,
@@ -102,9 +110,6 @@ def triton_bias_add_sum(x: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
         stride_x_channel,
         stride_out_batch,
     )
-
-    # Add bias_sum to each batch element
-    out += bias_sum
 
     return out.view(B, 1, 1, 1)
 

@@ -1,45 +1,73 @@
-You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+Fix the Triton kernel errors. Generate correct code.
 
-# Target GPU: 4090
+## ERROR LOG
+```
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 554, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251221_114357_batch_range7to9_openai_deepseek/8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum/code/kernel_20251221_122324.py", line 162, in forward
+    x = triton_bias_add_sum(x, self.bias)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251221_114357_batch_range7to9_openai_deepseek/8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum/code/kernel_20251221_122324.py", line 113, in triton_bias_add_sum
+    bias_add_sum_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 419, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 238, in run
+    benchmark()
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 227, in benchmark
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 227, in <dictcomp>
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 137, in _bench
+    raise ValueError(f"Conflicting meta-parameters: {', '.join(conflicts)}."
+ValueError: Conflicting meta-parameters: BLOCK_C. Make sure that you don't re-define auto-tuned symbols.
+```
 
-[OPTIMIZATION STAGE]
-
-## Current Optimization Stage
-
-Focus: Grid layout & parallelism.
-
-Metrics:
-- sm__throughput.avg.pct_of_peak_sustained_elapsed (>60%)
-- launch__grid_size
-
-Rules:
-- 1D: (cdiv(N, BLOCK))
-- 2D: (cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))
-- 3D: (batch, cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))
-- >3D: flatten ONLY independent dims
-- Prefer batch / head / expert / group parallelism before shrinking BLOCK
-- For grouped operations: ensure group dimension is in grid (e.g., program_id(2) for groups)
-- Change grid only if SM utilization is clearly low
-
-Safety:
-- Max 3 grid dims, static rank
-- grid=(G0,G1,G2) must match tl.program_id(0/1/2)
-- For grouped ops: verify group indexing is correct
-- If unsure about correctness, do NOT change grid
-
-Autotune:
-- Autotune either BLOCK_* OR (num_warps, num_stages)
-- If autotuning BLOCK_*, use grid=lambda META: (...)
-- Never redefine BLOCK_* in both kernel and launch
-- Max 2-3 configs to reduce compilation time
-
-
-
-[CURRENT CODE]
+## Broken Code
 ```python
-import torch, torch.nn as nn, triton, triton.language as tl
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
 
 
+@triton.autotune(
+    configs=[
+        # Baseline config (matches typical Triton defaults, kept for safety)
+        triton.Config(
+            {"BLOCK_C": 128},
+            num_warps=4,
+            num_stages=2,
+        ),
+        # More aggressive pipelining for hiding memory latency
+        triton.Config(
+            {"BLOCK_C": 128},
+            num_warps=4,
+            num_stages=3,
+        ),
+        # Higher warp count for better occupancy on 4090 if register pressure allows
+        triton.Config(
+            {"BLOCK_C": 128},
+            num_warps=8,
+            num_stages=2,
+        ),
+    ],
+    # Channel dimension is what matters for this kernel's performance
+    key=["C"],
+)
 @triton.jit
 def bias_add_sum_kernel(
     x_ptr,           # *f32, shape [B, C]
@@ -53,8 +81,8 @@ def bias_add_sum_kernel(
     stride_out_batch,# int32
     BLOCK_C: tl.constexpr,
 ):
-    pid_b = tl.program_id(axis=0)  # batch index
-    pid_blk = tl.program_id(axis=1)  # channel block index
+    pid_b = tl.program_id(axis=0)   # batch index
+    pid_blk = tl.program_id(axis=1) # channel block index
 
     block_start = pid_blk * BLOCK_C
     offs_c = block_start + tl.arange(0, BLOCK_C)
@@ -114,8 +142,9 @@ def triton_bias_add_sum(x: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
     stride_bias = bias2.stride()[0]
     stride_out_batch = out.stride()[0]
 
-    BLOCK_C = 128  # power-of-2 block size
+    BLOCK_C = 128  # fixed, power-of-2 block size (do not change)
 
+    # Grid is fixed by earlier stages: 1D over batch, 1D over channel blocks
     grid = lambda meta: (
         max(1, B),
         triton.cdiv(C, meta["BLOCK_C"]),
@@ -178,13 +207,8 @@ class ModelNew(nn.Module):
         return x
 ```
 
-[NCU PROFILING METRICS]
-No NCU metrics available
-
-**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
-
-## CRITICAL — Code MUST compile and run:
-1. EVERY kernel function MUST have `@triton.jit` decorator
+## CRITICAL — These cause 60%+ of failures:
+1. EVERY kernel function MUST have `@triton.jit` decorator — MANDATORY
 2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
 3. BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
 4. `tl.program_id(axis)` only supports axis = 0, 1, 2
@@ -196,13 +220,13 @@ No NCU metrics available
 - tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
 
 ## OUTPUT FORMAT (STRICT):
-1. Imports: torch, torch.nn, triton, triton.language as tl
+1. Imports: torch, torch.nn, triton, triton.language as tl (and math if needed)
 2. @triton.jit decorated kernel function(s)
 3. Wrapper function(s) for grid calculation and kernel launch
-4. class ModelNew(nn.Module) that calls your kernels
+4. class ModelNew(nn.Module) — REQUIRED
 
 Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
 
 ```python
-# <optimized Triton code>
+# <corrected code>
 ```

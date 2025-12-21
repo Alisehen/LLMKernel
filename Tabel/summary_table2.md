@@ -61,9 +61,7 @@
 | 59_conv_standard_3D_asymmetric_input_square_kernel | 0.78 | ✅ |
 | 60_conv_standard_3D_square_input_asymmetric_kernel | 1.59 | ✅ |
 | 61_conv_transposed_3D_square_input_square_kernel | 1.05 | ✅ |
-
 | 62_conv_standard_2D_square_input_asymmetric_kernel | 1.6 | ✅ |
-
 | 63_conv_standard_2D_square_input_square_kernel | 1.55 | ✅ |
 | 64_conv_transposed_1D | 1.02 | ✅ |
 | 65_conv_transposed_2D_square_input_asymmetric_kernel | 0.71 | ✅ |

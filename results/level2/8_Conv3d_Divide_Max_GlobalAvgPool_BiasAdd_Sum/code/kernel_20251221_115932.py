@@ -1,42 +1,3 @@
-You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
-
-# Target GPU: 4090
-
-[OPTIMIZATION STAGE]
-
-## Current Optimization Stage
-
-Focus: Grid layout & parallelism.
-
-Metrics:
-- sm__throughput.avg.pct_of_peak_sustained_elapsed (>60%)
-- launch__grid_size
-
-Rules:
-- 1D: (cdiv(N, BLOCK))
-- 2D: (cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))
-- 3D: (batch, cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))
-- >3D: flatten ONLY independent dims
-- Prefer batch / head / expert / group parallelism before shrinking BLOCK
-- For grouped operations: ensure group dimension is in grid (e.g., program_id(2) for groups)
-- Change grid only if SM utilization is clearly low
-
-Safety:
-- Max 3 grid dims, static rank
-- grid=(G0,G1,G2) must match tl.program_id(0/1/2)
-- For grouped ops: verify group indexing is correct
-- If unsure about correctness, do NOT change grid
-
-Autotune:
-- Autotune either BLOCK_* OR (num_warps, num_stages)
-- If autotuning BLOCK_*, use grid=lambda META: (...)
-- Never redefine BLOCK_* in both kernel and launch
-- Max 2-3 configs to reduce compilation time
-
-
-
-[CURRENT CODE]
-```python
 import torch, torch.nn as nn, triton, triton.language as tl
 
 
@@ -176,33 +137,3 @@ class ModelNew(nn.Module):
             x = torch.sum(x, dim=self.sum_dim)
 
         return x
-```
-
-[NCU PROFILING METRICS]
-No NCU metrics available
-
-**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
-
-## CRITICAL — Code MUST compile and run:
-1. EVERY kernel function MUST have `@triton.jit` decorator
-2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
-3. BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
-4. `tl.program_id(axis)` only supports axis = 0, 1, 2
-5. No `continue`, `break`, `return` inside loops — use masking
-6. No tensor indexing with loop vars: `x[:, i]` is INVALID
-7. mask shape MUST match data shape in tl.load/tl.store
-
-## Missing Triton Functions (implement manually):
-- tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
-
-## OUTPUT FORMAT (STRICT):
-1. Imports: torch, torch.nn, triton, triton.language as tl
-2. @triton.jit decorated kernel function(s)
-3. Wrapper function(s) for grid calculation and kernel launch
-4. class ModelNew(nn.Module) that calls your kernels
-
-Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
-
-```python
-# <optimized Triton code>
-```

@@ -6,32 +6,29 @@ You are a Triton kernel optimization specialist. Generate the FASTEST possible k
 
 ## Current Optimization Stage
 
-Focus: Grid layout & parallelism.
+Focus: Memory optimization and final parameter tuning.
 
 Metrics:
-- sm__throughput.avg.pct_of_peak_sustained_elapsed (>60%)
-- launch__grid_size
+- dram__throughput.avg.pct_of_peak_sustained_elapsed
+- lts__t_sector_hit_rate.pct
+- smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct (<20%)
+- sm__warps_active.avg.pct_of_peak_sustained_active
+
+Parameters to tune:
+- num_stages ∈ {2, 3, 4}
+- num_warps ∈ {4, 8} (based on occupancy)
 
 Rules:
-- 1D: (cdiv(N, BLOCK))
-- 2D: (cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))
-- 3D: (batch, cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))
-- >3D: flatten ONLY independent dims
-- Prefer batch / head / expert / group parallelism before shrinking BLOCK
-- For grouped operations: ensure group dimension is in grid (e.g., program_id(2) for groups)
-- Change grid only if SM utilization is clearly low
-
-Safety:
-- Max 3 grid dims, static rank
-- grid=(G0,G1,G2) must match tl.program_id(0/1/2)
-- For grouped ops: verify group indexing is correct
-- If unsure about correctness, do NOT change grid
+- Increase num_stages only if memory stalls > 20%
+- Change num_warps only if occupancy suggests it
+- Larger BLOCK_K improves reuse but increases register pressure
+- Do NOT modify grid or BLOCK sizes (fixed in earlier stages)
+- Do not rewrite access patterns without metric evidence
 
 Autotune:
-- Autotune either BLOCK_* OR (num_warps, num_stages)
-- If autotuning BLOCK_*, use grid=lambda META: (...)
-- Never redefine BLOCK_* in both kernel and launch
-- Max 2-3 configs to reduce compilation time
+- Max 3-4 configs combining num_stages and num_warps
+- Always include original config as baseline
+- Revert if gain < 2% or unstable
 
 
 
