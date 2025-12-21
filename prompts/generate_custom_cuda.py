@@ -181,55 +181,7 @@ $kernel_src
 """
     )
 )
-TEMPLATE = Template(
-    dedent(
-        """
-Task
-----
-Generate **hand‑written CUDA kernels** that replace *all* PyTorch operator(s)
-inside the original `class Model` (shown later).  You may fuse multiple
-operators into a single kernel if that yields better performance.  Leave any
-non‑replaced parts of the model unchanged.
 
-OUTPUT RULES (STRICT) ────────────────────────────────────────────────
-1. Inside the block, follow **exactly** this order:
-   1. Imports – `torch`, `torch.nn`, `load_inline`.
-   2. `source` – triple‑quoted CUDA string(s) (kernel + host wrapper).
-   3. `cpp_src` – prototypes for *all* kernels you expose.
-   4. **One** `load_inline` call per kernel group.
-   5. `class ModelNew(nn.Module)` – mirrors original inputs/outputs but calls
-      your CUDA kernels.
-2. **Do NOT include** testing code, `if __name__ == "__main__"`, or extra prose.
-
-
-Few‑shot example (reference only – do **not** echo):
-**Original**
-```python
-$few_base
-```
-**Optimised**
-```python
-$few_new
-```
-
-Target architecture (to optimise):
-```python
-$arch_src
-```
-
-Optimize the architecture named Model with custom CUDA operators! Name your optimized
-output architecture ModelNew. Output the new code in codeblocks. Please generate real
-code, NOT pseudocode, make sure the code compiles and is fully functional. Just output
-the new model code, no other text, and NO testing code!
-
-Example:
-```python
-# <complete ModelNew code>
-```
-# ==========================================================
-"""
-    )
-)
 default_system_prompt = """\
 You are an expert in high-performance GPU kernel optimization with Triton.
 
@@ -319,7 +271,7 @@ def build_seed_prompt(
         if has_conv_transpose:
             few_base = FEWSHOT_CONVTRANSPOSE_BASE.read_text().strip()
             few_new = FEWSHOT_CONVTRANSPOSE_NEW_TRITON.read_text().strip()
-            fusion_guidance = CONV_TRANSPOSE_GUIDANCE
+            fusion_guidance = ""
         elif "conv" in str(arch_path).lower():
             few_base = FEWSHOT_FUSION_BASE.read_text().strip()
             few_new = FEWSHOT_FUSION_NEW_TRITON.read_text().strip()

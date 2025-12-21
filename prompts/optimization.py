@@ -17,7 +17,7 @@ GPU Name: $gpu_name
 Architecture: $gpu_arch
 $gpu_items
 
-[OPTIMIZATION STAGE]f
+[OPTIMIZATION STAGE]
 $STAGE_CONTEXT
 
 [CURRENT CODE]
