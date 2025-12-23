@@ -66,28 +66,53 @@ $performance_section
 2. **Performance Diagnosis**: Use metrics/latency to identify bottleneck type
 3. **Root Cause**: Combine code + performance to find the core issue
 
-## Optimization Categories (pick ONE):
+## Optimization Categories (pick ONE if worth optimizing):
 
 ### 1. Operator Fusion
 Fuse consecutive ops into fewer kernels to reduce memory traffic and launch overhead.
 
 ### 2. Algorithm Replacement
-Replace naive algorithm with optimized variant (Flash Attention, Winograd, etc.).
+Replace naive algorithm with optimized variant.
+- For Attention: Flash Attention, online softmax
+- For Convolution: Winograd, im2col
+- **For RNN/GRU/LSTM**: Persistent kernel with HYBRID computation
+  - **CRITICAL**: Use hybrid approach for best performance:
+    * Precompute input-side gates ONCE (outside kernel): `gates_x = (T*B, In) @ W_ih`
+    * Persistent kernel (inside): only recurrent-side: `for t: gates_h = h @ W_hh`
+  - Time loop `for t in range(T)` must be inside kernel, NOT in Python
+  - Launch kernel once per layer, not once per timestep
+  - Expected speedup: 10-100x (vs per-timestep launches)
 
 ### 3. Kernel Launch Reduction
 Combine multiple small kernels to reduce overhead.
+- **For RNN/GRU/LSTM**: See "Algorithm Replacement" above for persistent kernel approach
 
 ### 4. Memory Layout Optimization
 Use in-place operations, buffer reuse, or better layouts.
+
+## Should We Optimize?
+
+Before proposing optimization, determine if it's worthwhile:
+- **Not worth optimizing** if:
+  - Code is already near-optimal (expected speedup < 10%)
+  - Bottleneck cannot be addressed (hardware limited, already optimal algorithm)
+  - Optimization would add significant complexity with minimal gain
+
+- **Worth optimizing** if:
+  - Clear algorithmic inefficiency exists (multiple kernels, suboptimal algorithm)
+  - Expected speedup >= 20%
+  - Concrete optimization path available
 
 ## Output (JSON)
 
 ```json
 {
-  "bottleneck": "<Root cause in 1-2 sentences>",
-  "optimisation method": "<Specific optimization in 1-2 sentences>",
-  "modification plan": "<Implementation steps in 2-3 sentences>",
-  "expected_speedup": "<e.g., '30-40%'>"
+  "worth_optimizing": "yes/no",
+  "reason": "<Why worth or not worth optimizing, 1 sentence>",
+  "bottleneck": "<Root cause in 1-2 sentences, empty if not worth optimizing>",
+  "optimisation method": "<Specific optimization in 1-2 sentences, empty if not worth optimizing>",
+  "modification plan": "<Implementation steps in 2-3 sentences, empty if not worth optimizing>",
+  "expected_speedup": "<e.g., '30-40%', empty if not worth optimizing>"
 }
 ```
 

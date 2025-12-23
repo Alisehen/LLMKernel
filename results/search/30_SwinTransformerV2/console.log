@@ -1,0 +1,99 @@
+[Seed] Generating seed kernel...
+[Seed 1/2] Generating...
+[92mFinish reason: stop[0m
+Usage: In=7432, Out=18421, Total=25853
+[seed_0] score=1.0054 (baseline=15.9671ms)
+[seed_0] metrics saved to: /home/hyc/LLMKernel/run/20251223_073605_30_SwinTransformerV2_openai_deepseek/30_SwinTransformerV2/evaluation/eval_0000.json
+[Seed 1] Final score: 1.0054 ✓
+[Seed] Early stop: seed 1 already beats PyTorch (1.0054 >= 1.0)
+[Seed] Skipping remaining 1 seed(s)
+[Seed] Will proceed to algorithm analysis to attempt further optimization
+
+================================================================================
+[Hybrid Strategy] Analyzing all seeds for algorithmic optimization...
+[Hybrid Strategy] - 1 seed(s) with score >= 1.0 (further optimization)
+================================================================================
+
+[Hybrid] Seed 1: score=1.0054 >= 1.0
+[Hybrid] Attempting algorithm analysis for further optimization...
+[Hybrid] Requesting LLM analysis for seed 1...
+[92mFinish reason: stop[0m
+Usage: In=13999, Out=1570, Total=15569
+[Hybrid] Worth optimizing: yes
+[Hybrid] Reason: The attention block still materializes the full N×N attention matrix and launches multiple kernels per block, leaving a clear opportunity for an online/Flash-style fused attention kernel that cuts memory traffic and launch overhead.
+[Hybrid] Analysis complete for seed 1, generating optimized kernel...
+[Hybrid] Bottleneck: WindowAttention currently does: separate QKV projection, cosine-similarity matmu...
+[Hybrid] Optimization: Replace the current attention sequence with a FlashAttention-style fused Triton ...
+[Hybrid] Expected speedup: Approximately 2–3× speedup for the attention sub-kernel and on the order of 10–20% end-to-end, depending on batch size and depth, due to reduced memory traffic and fewer kernel launches.
+[92mFinish reason: stop[0m
+Usage: In=14441, Out=21061, Total=35502
+[algorithm_optimized_seed0] score=1.2161 (baseline=15.9671ms)
+[algorithm_optimized_seed0] metrics saved to: /home/hyc/LLMKernel/run/20251223_073605_30_SwinTransformerV2_openai_deepseek/30_SwinTransformerV2/evaluation/eval_0001.json
+[Hybrid] ✓ Rescue successful: 1.0054 → 1.2161
+
+================================================================================
+[Hybrid] Candidate Selection
+================================================================================
+[Hybrid] Total candidates: 2
+  [1] seed 1: 1.0054
+  [2] algo-optimized (from seed 1): 1.2161
+
+[Hybrid] ★ Selected best candidate: score=1.2161
+
+[Optimization] Starting 3-stage optimization...
+
+================================================================================
+[Stage 1/3] grid_and_parallel
+Description: Optimize grid layout and parallel work distribution across SMs.
+Current candidates: 1, best score: 1.2161
+================================================================================
+[Stage 1] Profiling best candidate...
+[Stage 1] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=10079, Out=14794, Total=24873
+[stage1_grid_and_parallel] score=1.1603 (baseline=15.9671ms)
+[stage1_grid_and_parallel] metrics saved to: /home/hyc/LLMKernel/run/20251223_073605_30_SwinTransformerV2_openai_deepseek/30_SwinTransformerV2/evaluation/eval_0002.json
+  Optimized kernel score: 1.1603 ✓
+[Stage 1] Current: 1.1603 (global best: 1.2161)
+
+================================================================================
+[Stage 2/3] block_tiling
+Description: Tune BLOCK_M/N/K sizes for optimal register/memory balance.
+Current candidates: 1, best score: 1.2161
+================================================================================
+[Stage 2] Profiling best candidate...
+[Stage 2] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=10429, Out=15138, Total=25567
+[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 644, in compare_and_bench
+    raise ValueError(
+ValueError: Outputs are not close (atol=1, rtol=1). max_abs_err=nan, mean_abs_err=nan
+
+[stage2_block_tiling] failed. See metrics.message for details.
+[stage2_block_tiling] metrics saved to: /home/hyc/LLMKernel/run/20251223_073605_30_SwinTransformerV2_openai_deepseek/30_SwinTransformerV2/evaluation/eval_0003.json
+  Optimization failed, attempting repair...
+[92mFinish reason: stop[0m
+Usage: In=10349, Out=16036, Total=26385
+[stage2_block_tiling_repair] score=1.1275 (baseline=15.9671ms)
+[stage2_block_tiling_repair] metrics saved to: /home/hyc/LLMKernel/run/20251223_073605_30_SwinTransformerV2_openai_deepseek/30_SwinTransformerV2/evaluation/eval_0004.json
+  Optimized kernel score: 1.1275 ✓
+[Stage 2] Current: 1.1275 (global best: 1.2161)
+
+================================================================================
+[Stage 3/3] memory_and_tuning
+Description: Optimize memory access patterns and fine-tune num_stages/num_warps.
+Current candidates: 1, best score: 1.2161
+================================================================================
+[Stage 3] Profiling best candidate...
+[Stage 3] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=10654, Out=12877, Total=23531
+[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 644, in compare_and_bench
+    raise ValueError(
+ValueError: Outputs are not close (atol=1, rtol=1). max_abs_err=nan, mean_abs_err=nan
+
+[stage3_memory_and_tuning] failed. See metrics.message for details.
+[stage3_memory_and_tuning] metrics saved to: /home/hyc/LLMKernel/run/20251223_073605_30_SwinTransformerV2_openai_deepseek/30_SwinTransformerV2/evaluation/eval_0005.json
+  Optimization failed, attempting repair...

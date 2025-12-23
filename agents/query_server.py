@@ -386,6 +386,16 @@ def query_server(
                 print(f"Error: {error_msg}")
                 print(f"Returning truncation notice instead of crashing...")
                 return "[ERROR: Input prompt exceeded model context length. Please reduce prompt size.]"
+
+            # Print detailed error info before re-raising
+            print(f"\n❌ LLM API Error ({server_type})")
+            print(f"Error type: {type(e).__name__}")
+            print(f"Error message: {error_msg}")
+
+            # Print traceback for debugging
+            import traceback
+            traceback.print_exc()
+
             raise
         outputs = []
         for choice in response.choices:

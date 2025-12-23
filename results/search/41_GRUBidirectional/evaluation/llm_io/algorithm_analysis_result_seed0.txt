@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The GRU spends most of its time in thousands of tiny recurrent matmuls launched from Python, which is far from the fused, persistent-kernel strategy used by cuDNN.",
+  "bottleneck": "Each timestep calls `triton_linear` separately for the recurrent term (`h_t @ W_hh`) in both directions and all layers, leading to ~6k Triton GEMM launches plus separate pointwise ops. This per-timestep launch pattern is dominated by kernel launch overhead and poor data reuse, not raw FLOPs.",
+  "optimisation method": "Replace the per-timestep recurrent computation with a persistent GRU kernel per (layer, direction) that contains the time loop inside the Triton kernel: it consumes precomputed input-side gates `gi` and iterates over t, computing `h_t @ W_hh` and all gate updates in registers/shared memory in a single launch.",
+  "modification plan": "Keep the existing batched input-side projection (`gi_f_flat` / `gi_b_flat`) as is, but write one Triton kernel `gru_layer_kernel` that takes `(gi, W_hh, b_hh, h0)` and outputs the full `(seq_len, batch, hidden)` for a single direction and layer. Inside the kernel, assign each program to a block of batch elements and hidden units, load `W_hh` once into a cache-friendly layout, then run `for t in range(seq_len):` to compute `gh_t = h @ W_hh + b_hh`, fuse the gate ops (sigmoid/tanh, elementwise updates), and write `h_t` to the output buffer. Launch this kernel once per direction per layer (4*num_layers launches total) instead of once per timestep, and reuse on both forward/backward streams.",
+  "expected_speedup": "5-10x vs the current Triton implementation (bringing it close to or faster than the PyTorch/cuDNN baseline for this configuration)."
+}

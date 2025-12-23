@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The Triton version is ~48% slower than the PyTorch baseline, and a clear source of overhead is repeatedly materializing Conv outputs to memory before BatchNorm and ReLU.",
+  "bottleneck": "Each bottleneck block executes Conv2d → BatchNorm2d → ReLU as separate kernels, so every convolution result is written to and read from global memory multiple times, and you pay extra kernel-launch overhead on top of a not-yet-best-in-class Triton conv.",
+  "optimisation method": "Fuse Conv2d + BatchNorm + ReLU into a single Triton kernel (and optionally fold BatchNorm into Conv weights/bias at inference), so that convolution, affine BN transform, and activation are applied while data stays in registers/shared memory, with only the final activated output written to global memory.",
+  "modification plan": "Introduce a fused TritonConvBNReLU module that takes Conv weights and precomputed BN scale/shift (gamma, beta, running_mean, running_var) and applies y = ReLU(Conv(x, W, b_bn)) in one Triton kernel, writing only the final y to memory. During inference, fold BN into Conv by precomputing fused weights and biases (W_fused, b_fused) per layer and have the kernel apply Conv + ReLU directly; during training, either implement BN in-kernel (using per-channel stats over N·H·W) or at least fuse Conv + affine BN + ReLU using running_mean/var. Replace BottleneckNew’s conv+bn+relu sequences (and the initial stem) with this fused op, keeping the residual add as a separate small op if needed.",
+  "expected_speedup": "20-40%"
+}

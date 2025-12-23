@@ -1,0 +1,442 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def matmul_bias_kernel(
+    a_ptr, b_ptr, bias_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """
+    Compute C = A @ B + bias
+    A: (M, K)
+    B: (K, N)
+    bias: (N,)
+    C: (M, N)
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k0 in range(0, K, BLOCK_K):
+        k_ids = k0 + offs_k
+
+        a_ptrs = a_ptr + offs_m[:, None] * stride_am + k_ids[None, :] * stride_ak
+        b_ptrs = b_ptr + k_ids[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+        a = tl.load(
+            a_ptrs,
+            mask=(offs_m[:, None] < M) & (k_ids[None, :] < K),
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptrs,
+            mask=(k_ids[:, None] < K) & (offs_n[None, :] < N),
+            other=0.0,
+        )
+
+        a = a.to(tl.float32)
+        b = b.to(tl.float32)
+        acc += tl.dot(a, b, allow_tf32=True)
+
+    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    bias = bias.to(tl.float32)
+    acc = acc + bias[None, :]
+
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    tl.store(
+        c_ptrs,
+        acc,
+        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+    )
+
+
+def matmul_bias(a: torch.Tensor, w: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    Wrapper for matmul_bias_kernel.
+    a: (M, K)
+    w: (K, N)
+    bias: (N,)
+    returns c: (M, N)
+    """
+    assert a.is_cuda and w.is_cuda and bias.is_cuda, "Inputs must be CUDA tensors"
+    assert a.dtype == torch.float32 and w.dtype == torch.float32 and bias.dtype == torch.float32
+
+    a_contig = a.contiguous()
+    w_contig = w.contiguous()
+    bias_contig = bias.contiguous()
+
+    M, K = a_contig.shape
+    Kw, N = w_contig.shape
+    assert Kw == K, "Incompatible matmul dimensions"
+    assert bias_contig.numel() == N
+
+    c = torch.empty((M, N), device=a_contig.device, dtype=torch.float32)
+
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_M"]),
+        triton.cdiv(N, META["BLOCK_N"]),
+    )
+
+    matmul_bias_kernel[grid](
+        a_contig, w_contig, bias_contig, c,
+        M, N, K,
+        a_contig.stride(0), a_contig.stride(1),
+        w_contig.stride(0), w_contig.stride(1),
+        c.stride(0), c.stride(1),
+        BLOCK_M=64, BLOCK_N=64, BLOCK_K=32,
+        num_warps=4,
+    )
+    return c
+
+
+@triton.jit
+def gru_step_kernel(
+    h_prev_ptr,
+    ig_r_ptr, ig_z_ptr, ig_n_ptr,
+    w_r_ptr, w_z_ptr, w_n_ptr,
+    b_r_ptr, b_z_ptr, b_n_ptr,
+    h_next_ptr,
+    M, N, K,
+    stride_hm, stride_hk,
+    stride_igm, stride_ign,
+    stride_wk, stride_wn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """
+    One GRU timestep for a single layer & direction.
+
+    h_prev: (M, N)  -- batch_size x hidden_size
+    ig_r, ig_z, ig_n: (M, N)  -- input pre-activations for gates (already with b_ih)
+    w_r, w_z, w_n: (K, N)  -- recurrent weights for each gate
+    b_r, b_z, b_n: (N,)  -- recurrent biases for each gate
+    h_next: (M, N)
+    M: batch_size, N: hidden_size, K: hidden_size
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    acc_r = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc_z = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc_n = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k0 in range(0, K, BLOCK_K):
+        k_ids = k0 + offs_k
+
+        a_ptrs = h_prev_ptr + offs_m[:, None] * stride_hm + k_ids[None, :] * stride_hk
+        a = tl.load(
+            a_ptrs,
+            mask=(offs_m[:, None] < M) & (k_ids[None, :] < K),
+            other=0.0,
+        )
+        a = a.to(tl.float32)
+
+        w_r_ptrs = w_r_ptr + k_ids[:, None] * stride_wk + offs_n[None, :] * stride_wn
+        w_z_ptrs = w_z_ptr + k_ids[:, None] * stride_wk + offs_n[None, :] * stride_wn
+        w_n_ptrs = w_n_ptr + k_ids[:, None] * stride_wk + offs_n[None, :] * stride_wn
+
+        w_r = tl.load(
+            w_r_ptrs,
+            mask=(k_ids[:, None] < K) & (offs_n[None, :] < N),
+            other=0.0,
+        )
+        w_z = tl.load(
+            w_z_ptrs,
+            mask=(k_ids[:, None] < K) & (offs_n[None, :] < N),
+            other=0.0,
+        )
+        w_n = tl.load(
+            w_n_ptrs,
+            mask=(k_ids[:, None] < K) & (offs_n[None, :] < N),
+            other=0.0,
+        )
+
+        w_r = w_r.to(tl.float32)
+        w_z = w_z.to(tl.float32)
+        w_n = w_n.to(tl.float32)
+
+        acc_r += tl.dot(a, w_r, allow_tf32=True)
+        acc_z += tl.dot(a, w_z, allow_tf32=True)
+        acc_n += tl.dot(a, w_n, allow_tf32=True)
+
+    mask_mn = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+
+    ig_r = tl.load(
+        ig_r_ptr + offs_m[:, None] * stride_igm + offs_n[None, :] * stride_ign,
+        mask=mask_mn,
+        other=0.0,
+    )
+    ig_z = tl.load(
+        ig_z_ptr + offs_m[:, None] * stride_igm + offs_n[None, :] * stride_ign,
+        mask=mask_mn,
+        other=0.0,
+    )
+    ig_n = tl.load(
+        ig_n_ptr + offs_m[:, None] * stride_igm + offs_n[None, :] * stride_ign,
+        mask=mask_mn,
+        other=0.0,
+    )
+
+    ig_r = ig_r.to(tl.float32)
+    ig_z = ig_z.to(tl.float32)
+    ig_n = ig_n.to(tl.float32)
+
+    b_r = tl.load(b_r_ptr + offs_n, mask=offs_n < N, other=0.0).to(tl.float32)
+    b_z = tl.load(b_z_ptr + offs_n, mask=offs_n < N, other=0.0).to(tl.float32)
+    b_n = tl.load(b_n_ptr + offs_n, mask=offs_n < N, other=0.0).to(tl.float32)
+
+    pre_r = ig_r + acc_r + b_r[None, :]
+    pre_z = ig_z + acc_z + b_z[None, :]
+
+    r = 1.0 / (1.0 + tl.exp(-pre_r))
+    z = 1.0 / (1.0 + tl.exp(-pre_z))
+
+    h_n_lin = acc_n + b_n[None, :]
+    pre_n = ig_n + r * h_n_lin
+
+    e2x = tl.exp(2.0 * pre_n)
+    n_tilde = (e2x - 1.0) / (e2x + 1.0)
+
+    h_prev_tile = tl.load(
+        h_prev_ptr + offs_m[:, None] * stride_hm + offs_n[None, :] * stride_hk,
+        mask=mask_mn,
+        other=0.0,
+    )
+    h_prev_tile = h_prev_tile.to(tl.float32)
+
+    h_new = (1.0 - z) * n_tilde + z * h_prev_tile
+
+    tl.store(
+        h_next_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn,
+        h_new,
+        mask=mask_mn,
+    )
+
+
+def gru_step_triton(
+    h_prev: torch.Tensor,
+    ig_r: torch.Tensor,
+    ig_z: torch.Tensor,
+    ig_n: torch.Tensor,
+    w_hh: torch.Tensor,
+    b_hh: torch.Tensor,
+) -> torch.Tensor:
+    """
+    h_prev: (B, H)
+    ig_r, ig_z, ig_n: (B, H)
+    w_hh: (3, H, H)
+    b_hh: (3, H)
+    returns h_next: (B, H)
+    """
+    assert h_prev.is_cuda, "h_prev must be CUDA tensor"
+    assert h_prev.dtype == torch.float32
+    assert w_hh.is_cuda and b_hh.is_cuda
+
+    B, H = h_prev.shape
+    assert ig_r.shape == (B, H)
+    assert ig_z.shape == (B, H)
+    assert ig_n.shape == (B, H)
+    assert w_hh.shape == (3, H, H)
+    assert b_hh.shape == (3, H)
+
+    h_prev_c = h_prev.contiguous()
+    ig_r_c = ig_r.contiguous()
+    ig_z_c = ig_z.contiguous()
+    ig_n_c = ig_n.contiguous()
+
+    w_r = w_hh[0].contiguous()
+    w_z = w_hh[1].contiguous()
+    w_n = w_hh[2].contiguous()
+
+    b_r = b_hh[0].contiguous()
+    b_z = b_hh[1].contiguous()
+    b_n = b_hh[2].contiguous()
+
+    h_next = torch.empty_like(h_prev_c, dtype=torch.float32)
+
+    M = B
+    N = H
+    K = H
+
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_M"]),
+        triton.cdiv(N, META["BLOCK_N"]),
+    )
+
+    gru_step_kernel[grid](
+        h_prev_c,
+        ig_r_c, ig_z_c, ig_n_c,
+        w_r, w_z, w_n,
+        b_r, b_z, b_n,
+        h_next,
+        M, N, K,
+        h_prev_c.stride(0), h_prev_c.stride(1),
+        ig_r_c.stride(0), ig_r_c.stride(1),
+        w_r.stride(0), w_r.stride(1),
+        h_next.stride(0), h_next.stride(1),
+        BLOCK_M=16, BLOCK_N=64, BLOCK_K=32,
+        num_warps=4,
+    )
+
+    return h_next
+
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers=3, bias=True, batch_first=False):
+        super(ModelNew, self).__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.bias = bias
+        self.batch_first = batch_first
+        self.bidirectional = True
+        self.num_directions = 2 if self.bidirectional else 1
+
+        self.weight_ih = nn.ParameterList()
+        self.weight_hh = nn.ParameterList()
+        self.bias_ih = nn.ParameterList()
+        self.bias_hh = nn.ParameterList()
+
+        for layer in range(num_layers):
+            layer_input_size = input_size if layer == 0 else hidden_size * self.num_directions
+            for direction in range(self.num_directions):
+                w_ih = nn.Parameter(torch.randn(3, layer_input_size, hidden_size))
+                w_hh = nn.Parameter(torch.randn(3, hidden_size, hidden_size))
+                self.weight_ih.append(w_ih)
+                self.weight_hh.append(w_hh)
+                if bias:
+                    b_ih = nn.Parameter(torch.randn(3, hidden_size))
+                    b_hh = nn.Parameter(torch.randn(3, hidden_size))
+                else:
+                    b_ih = nn.Parameter(torch.zeros(3, hidden_size), requires_grad=False)
+                    b_hh = nn.Parameter(torch.zeros(3, hidden_size), requires_grad=False)
+                self.bias_ih.append(b_ih)
+                self.bias_hh.append(b_hh)
+
+    def forward(self, x, h0=None):
+        """
+        x: (seq_len, batch, input_size) if batch_first=False
+           (batch, seq_len, input_size) if batch_first=True
+        h0: (num_layers * num_directions, batch, hidden_size)
+        returns: output, h_n
+          output: (seq_len, batch, num_directions * hidden_size) if batch_first=False
+                  (batch, seq_len, num_directions * hidden_size) if batch_first=True
+          h_n: (num_layers * num_directions, batch, hidden_size)
+        """
+        if self.batch_first:
+            x = x.transpose(0, 1)  # (T, B, C)
+
+        seq_len, batch_size, _ = x.shape
+
+        if h0 is None:
+            h0 = torch.zeros(
+                self.num_layers * self.num_directions,
+                batch_size,
+                self.hidden_size,
+                device=x.device,
+                dtype=x.dtype,
+            )
+        else:
+            if self.batch_first:
+                # h0 is always (num_layers * num_directions, batch, hidden)
+                pass
+
+        x_seq = x
+        final_h_list = []
+
+        for layer in range(self.num_layers):
+            layer_input_size = x_seq.shape[2]
+            layer_out_fwd = torch.empty(
+                seq_len, batch_size, self.hidden_size,
+                device=x_seq.device, dtype=x_seq.dtype,
+            )
+            if self.num_directions == 2:
+                layer_out_bwd = torch.empty_like(layer_out_fwd)
+
+            for direction in range(self.num_directions):
+                idx = layer * self.num_directions + direction
+
+                w_ih = self.weight_ih[idx]
+                w_hh = self.weight_hh[idx]
+                b_ih = self.bias_ih[idx]
+                b_hh = self.bias_hh[idx]
+
+                if direction == 0:
+                    seq = x_seq
+                else:
+                    seq = torch.flip(x_seq, dims=[0])
+
+                seq_flat = seq.reshape(seq_len * batch_size, layer_input_size)
+
+                ig_r_flat = matmul_bias(
+                    seq_flat,
+                    w_ih[0],
+                    b_ih[0],
+                )
+                ig_z_flat = matmul_bias(
+                    seq_flat,
+                    w_ih[1],
+                    b_ih[1],
+                )
+                ig_n_flat = matmul_bias(
+                    seq_flat,
+                    w_ih[2],
+                    b_ih[2],
+                )
+
+                ig_r = ig_r_flat.view(seq_len, batch_size, self.hidden_size)
+                ig_z = ig_z_flat.view(seq_len, batch_size, self.hidden_size)
+                ig_n = ig_n_flat.view(seq_len, batch_size, self.hidden_size)
+
+                h_prev = h0[idx]
+
+                for t in range(seq_len):
+                    ig_r_t = ig_r[t]
+                    ig_z_t = ig_z[t]
+                    ig_n_t = ig_n[t]
+
+                    h_prev = gru_step_triton(
+                        h_prev,
+                        ig_r_t,
+                        ig_z_t,
+                        ig_n_t,
+                        w_hh,
+                        b_hh,
+                    )
+
+                    if direction == 0:
+                        layer_out_fwd[t] = h_prev
+                    else:
+                        orig_t = seq_len - 1 - t
+                        layer_out_bwd[orig_t] = h_prev
+
+                final_h_list.append(h_prev)
+
+            if self.num_directions == 1:
+                x_seq = layer_out_fwd
+            else:
+                x_seq = torch.cat([layer_out_fwd, layer_out_bwd], dim=2)
+
+        output = x_seq
+        h_n = torch.stack(final_h_list, dim=0)
+
+        if self.batch_first:
+            output = output.transpose(0, 1)
+
+        return output, h_n

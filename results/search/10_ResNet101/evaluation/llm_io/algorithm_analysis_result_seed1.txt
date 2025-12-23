@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The Triton model is slower than the PyTorch baseline, and a large fraction of time is spent in many small unfused ops (Conv → BN → ReLU) and residual adds around each bottleneck.",
+  "bottleneck": "Each Bottleneck block executes multiple separate kernels per conv (Triton conv, PyTorch BatchNorm, ReLU, residual add), forcing repeated global memory reads/writes of the same activations and paying launch overhead for every op.",
+  "optimisation method": "Fuse Conv2d + (BN affine) + ReLU into a single Triton kernel (and fold BatchNorm into conv weights/bias for inference), so that activations stay in registers/shared memory until the final write.",
+  "modification plan": "Implement a fused Triton kernel that takes input x, per-channel BN scale/shift, and applies convolution, BN affine (using pre-computed fused weight/bias in eval mode), and ReLU before storing the output once. Replace BottleneckNew’s `conv*/bn*/relu` triplets with this fused module (and optionally fold the residual add + final ReLU into the same kernel for the main path when shapes/stride allow). Ensure training uses BN’s running statistics to precompute the fused scale/shift on-the-fly (or keeps a lightweight BN kernel), while inference uses fully folded parameters to eliminate standalone BN and ReLU kernels.",
+  "expected_speedup": "30-40%"
+}
