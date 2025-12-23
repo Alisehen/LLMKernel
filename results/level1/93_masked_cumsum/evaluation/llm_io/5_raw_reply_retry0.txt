@@ -5,177 +5,193 @@ import triton
 import triton.language as tl
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"num_warps": 4, "num_stages": 2}),
-        triton.Config({"num_warps": 4, "num_stages": 3}),
-        triton.Config({"num_warps": 8, "num_stages": 2}),
-        triton.Config({"num_warps": 8, "num_stages": 3}),
-    ],
-    key=["rows"],
-)
 @triton.jit
-def masked_chunk_scan_kernel(
-    x_ptr,
-    mask_ptr,
-    partial_ptr,
-    chunk_sums_ptr,
-    rows,
-    cols,
-    n_chunks,
-    stride_row,
-    BLOCK_COL: tl.constexpr,
+def _cumsum_tile_kernel(
+    x_ptr,               # *x_dtype, [M, N]
+    y_ptr,               # *x_dtype, [M, N]
+    M,                   # number of rows
+    N,                   # number of columns (cumsum dim)
+    stride_m,            # row stride in elements
+    stride_n,            # col stride in elements (usually 1)
+    BLOCK_SIZE: tl.constexpr,
 ):
-    row = tl.program_id(0)
-    chunk = tl.program_id(1)
-    if (row >= rows) or (chunk >= n_chunks):
-        return
+    pid_m = tl.program_id(axis=0)  # row index
+    pid_b = tl.program_id(axis=1)  # block index within the row
 
-    chunk_start = chunk * BLOCK_COL
-    base_offset = row * stride_row
-    running = tl.zeros((), dtype=tl.float32)
-    chunk_has_work = chunk_start < cols
+    # starting column for this tile
+    col_start = pid_b * BLOCK_SIZE
 
-    for i in tl.static_range(0, BLOCK_COL):
-        col_idx = chunk_start + i
-        element_active = (col_idx < cols) & chunk_has_work
-        x_val = tl.load(x_ptr + base_offset + col_idx, mask=element_active, other=0.0).to(tl.float32)
-        m_val = tl.load(mask_ptr + base_offset + col_idx, mask=element_active, other=0.0).to(tl.float32)
-        running += x_val * m_val
-        tl.store(partial_ptr + base_offset + col_idx, running, mask=element_active)
+    # local indices [0, BLOCK_SIZE)
+    idx = tl.arange(0, BLOCK_SIZE)
+    offs = col_start + idx
 
-    tl.store(chunk_sums_ptr + row * n_chunks + chunk, running, mask=chunk_has_work)
+    # mask for elements within the row length N
+    mask = offs < N
+
+    # base pointers for this row
+    x_row_ptr = x_ptr + pid_m * stride_m
+    y_row_ptr = y_ptr + pid_m * stride_m
+
+    # load this tile, zero-padding out-of-range columns
+    vals = tl.load(x_row_ptr + offs * stride_n, mask=mask, other=0.0)
+
+    # perform an inclusive scan within the tile in registers
+    # vals is 1D, so axis=0
+    vals = tl.cumsum(vals, axis=0)
+
+    # store back
+    tl.store(y_row_ptr + offs * stride_n, vals, mask=mask)
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"num_warps": 4, "num_stages": 2}),
-        triton.Config({"num_warps": 4, "num_stages": 3}),
-        triton.Config({"num_warps": 2, "num_stages": 2}),
-    ],
-    key=["rows"],
-)
 @triton.jit
-def chunk_prefix_kernel(
-    chunk_sums_ptr,
-    chunk_offsets_ptr,
-    rows,
-    n_chunks,
-    MAX_CHUNKS: tl.constexpr,
+def _add_block_offsets_kernel(
+    y_ptr,                # *x_dtype, [M, N]
+    block_offsets_ptr,    # *x_dtype, [M, num_blocks]
+    M,
+    N,
+    num_blocks,
+    stride_m,
+    stride_n,
+    BLOCK_SIZE: tl.constexpr,
 ):
-    row = tl.program_id(0)
-    if row >= rows:
-        return
+    pid_m = tl.program_id(axis=0)  # row index
+    pid_b = tl.program_id(axis=1)  # block index within row
 
-    base = row * n_chunks
-    running = tl.zeros((), dtype=tl.float32)
+    col_start = pid_b * BLOCK_SIZE
+    idx = tl.arange(0, BLOCK_SIZE)
+    offs = col_start + idx
+    mask = offs < N
 
-    for idx in tl.static_range(0, MAX_CHUNKS):
-        valid = idx < n_chunks
-        val = tl.load(chunk_sums_ptr + base + idx, mask=valid, other=0.0).to(tl.float32)
-        tl.store(chunk_offsets_ptr + base + idx, running, mask=valid)
-        running += val
+    # base pointer for this row
+    y_row_ptr = y_ptr + pid_m * stride_m
 
+    # scalar block offset for this tile
+    bs_offset = pid_m * num_blocks + pid_b
+    block_off = tl.load(block_offsets_ptr + bs_offset)
 
-@triton.autotune(
-    configs=[
-        triton.Config({"num_warps": 4, "num_stages": 2}),
-        triton.Config({"num_warps": 4, "num_stages": 3}),
-        triton.Config({"num_warps": 8, "num_stages": 2}),
-        triton.Config({"num_warps": 8, "num_stages": 3}),
-    ],
-    key=["rows"],
-)
-@triton.jit
-def add_chunk_offsets_kernel(
-    partial_ptr,
-    chunk_offsets_ptr,
-    out_ptr,
-    rows,
-    cols,
-    n_chunks,
-    stride_row,
-    BLOCK_COL: tl.constexpr,
-):
-    row = tl.program_id(0)
-    chunk = tl.program_id(1)
-    if (row >= rows) or (chunk >= n_chunks):
-        return
-
-    chunk_start = chunk * BLOCK_COL
-    offs = chunk_start + tl.arange(0, BLOCK_COL)
-    mask = offs < cols
-    base_offset = row * stride_row
-
-    vals = tl.load(partial_ptr + base_offset + offs, mask=mask, other=0.0)
-    offset = tl.load(chunk_offsets_ptr + row * n_chunks + chunk, mask=chunk_start < cols, other=0.0)
-    vals += offset
-    tl.store(out_ptr + base_offset + offs, vals, mask=mask)
+    # load current prefix sums, add block offset, and store back
+    vals = tl.load(y_row_ptr + offs * stride_n, mask=mask, other=0.0)
+    vals = vals + block_off
+    tl.store(y_row_ptr + offs * stride_n, vals, mask=mask)
 
 
-def _move_dim_last(tensor: torch.Tensor, dim: int):
-    dim = dim % tensor.ndim
-    permute_order = [i for i in range(tensor.ndim) if i != dim] + [dim]
-    inv_permute = [0] * tensor.ndim
-    for i, p in enumerate(permute_order):
-        inv_permute[p] = i
-    tensor_perm = tensor.permute(permute_order).contiguous()
-    cols = tensor_perm.shape[-1]
-    rows = tensor_perm.numel() // cols
-    tensor_2d = tensor_perm.view(rows, cols)
-    return tensor_2d, tensor_perm.shape, inv_permute
+def triton_masked_cumsum(x: torch.Tensor, mask: torch.Tensor, dim: int) -> torch.Tensor:
+    """
+    Masked cumulative sum using Triton, equivalent to torch.cumsum(x * mask, dim=dim).
+    Assumes x and mask are on CUDA device.
+    """
+    assert x.device.type == "cuda", "Input tensor must be on CUDA for Triton kernels."
+    assert mask.device == x.device, "Mask must be on the same device as input."
+    assert x.shape == mask.shape, "x and mask must have the same shape."
 
+    # Apply mask (boolean -> same dtype as x)
+    x_masked = x * mask.to(x.dtype)
 
-def masked_cumsum_triton(x: torch.Tensor, mask: torch.Tensor, dim: int) -> torch.Tensor:
-    assert x.shape == mask.shape, "Input and mask must have the same shape"
-    x = x.contiguous()
-    mask = mask.contiguous()
+    if x_masked.numel() == 0:
+        return x_masked
 
-    x_2d, perm_shape, inv_perm = _move_dim_last(x, dim)
-    mask_2d, _, _ = _move_dim_last(mask, dim)
+    dim = dim if dim >= 0 else x_masked.dim() + dim
+    assert 0 <= dim < x_masked.dim()
 
-    rows, cols = x_2d.shape
-    out_2d = torch.empty_like(x_2d)
-    partial = torch.empty_like(x_2d)
+    # Move cumsum dimension to the last axis and make contiguous
+    if dim != x_masked.dim() - 1:
+        x_perm = x_masked.transpose(dim, -1).contiguous()
+        transposed = True
+    else:
+        x_perm = x_masked.contiguous()
+        transposed = False
 
-    BLOCK_COL = 128
-    MAX_CHUNKS = 1024
-    n_chunks = triton.cdiv(cols, BLOCK_COL)
-    if n_chunks > MAX_CHUNKS:
-        raise ValueError(f"Number of chunks {n_chunks} exceeds MAX_CHUNKS={MAX_CHUNKS}")
+    M = x_perm.numel() // x_perm.size(-1)
+    N = x_perm.size(-1)
 
-    chunk_sums = torch.zeros((rows, n_chunks), dtype=x.dtype, device=x.device)
-    chunk_offsets = torch.zeros_like(chunk_sums)
-    stride_row = x_2d.stride(0)
-    grid_blocks = (rows, n_chunks)
+    if N == 0:
+        # Nothing to scan along cumsum dimension
+        out_perm = x_perm
+    else:
+        x2d = x_perm.view(M, N)
+        y2d = torch.empty_like(x2d)
 
-    masked_chunk_scan_kernel[grid_blocks](
-        x_2d, mask_2d, partial, chunk_sums,
-        rows, cols, n_chunks, stride_row,
-        BLOCK_COL=BLOCK_COL,
-    )
+        BLOCK_SIZE = 256  # power-of-two, as required
+        num_blocks = triton.cdiv(N, BLOCK_SIZE)
 
-    chunk_prefix_kernel[(rows,)](
-        chunk_sums, chunk_offsets,
-        rows, n_chunks,
-        MAX_CHUNKS=MAX_CHUNKS,
-    )
+        stride_m = x2d.stride(0)
+        stride_n = x2d.stride(1)
 
-    add_chunk_offsets_kernel[grid_blocks](
-        partial, chunk_offsets, out_2d,
-        rows, cols, n_chunks, stride_row,
-        BLOCK_COL=BLOCK_COL,
-    )
+        grid = (M, num_blocks)
 
-    out_perm = out_2d.view(perm_shape).permute(inv_permute).contiguous()
-    return out_perm
+        # First pass: per-tile prefix sums (local scan, no inter-tile carry)
+        _cumsum_tile_kernel[grid](
+            x2d,
+            y2d,
+            M,
+            N,
+            stride_m,
+            stride_n,
+            BLOCK_SIZE=BLOCK_SIZE,
+            num_warps=4,
+        )
+
+        # Compute tile sums on PyTorch: sum of original masked x within each tile
+        # Shape [M, num_blocks]
+        if num_blocks == 1:
+            # Single tile per row: sum across the row (not actually needed for offsets)
+            block_sums = x2d.sum(dim=1, keepdim=True)
+        else:
+            total_elems = num_blocks * BLOCK_SIZE
+            pad = total_elems - N
+            if pad > 0:
+                pad_tensor = torch.zeros(
+                    (M, pad), device=x2d.device, dtype=x2d.dtype
+                )
+                x_padded = torch.cat([x2d, pad_tensor], dim=1)
+            else:
+                x_padded = x2d
+            x_blocks = x_padded.view(M, num_blocks, BLOCK_SIZE)
+            block_sums = x_blocks.sum(dim=2)
+
+        # Second pass: prefix sum over tiles per row on PyTorch (small, fast)
+        # exclusive prefix: offset[b] = sum_{k < b} tile_sum[k]
+        if num_blocks == 1:
+            block_offsets = torch.zeros_like(block_sums)
+        else:
+            zeros_col = torch.zeros_like(block_sums[:, :1])
+            prefix_input = torch.cat([zeros_col, block_sums[:, :-1]], dim=1)
+            block_offsets = torch.cumsum(prefix_input, dim=1)
+
+        # Third pass: add tile offsets to each element
+        _add_block_offsets_kernel[grid](
+            y2d,
+            block_offsets,
+            M,
+            N,
+            num_blocks,
+            stride_m,
+            stride_n,
+            BLOCK_SIZE=BLOCK_SIZE,
+            num_warps=4,
+        )
+
+        out_perm = y2d.view_as(x_perm)
+
+    # Move back to original dimension order
+    if transposed:
+        out = out_perm.transpose(-1, dim)
+    else:
+        out = out_perm
+
+    return out
 
 
 class ModelNew(nn.Module):
+    """
+    Triton-accelerated model that performs masked cumulative sum along a given dimension:
+        output = torch.cumsum(x * mask, dim=dim)
+    """
+
     def __init__(self, dim):
         super().__init__()
         self.dim = dim
 
     def forward(self, x, mask):
-        return masked_cumsum_triton(x, mask, self.dim)
+        return triton_masked_cumsum(x, mask, self.dim)
 ```

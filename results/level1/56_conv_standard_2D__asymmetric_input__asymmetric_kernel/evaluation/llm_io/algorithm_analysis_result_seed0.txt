@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The custom Triton kernel is ~2x slower than the PyTorch baseline, so there is clear headroom for a meaningful speedup.",
+  "bottleneck": "The kernel implements a direct sliding-window convolution with heavy on-the-fly index decoding and irregular memory access inside the inner reduction loop, preventing it from achieving matmul-like arithmetic intensity and efficient use of tensor cores and cache.",
+  "optimisation method": "Replace the current direct-convolution formulation with an im2col + GEMM algorithm: explicitly unfold the input into a contiguous (N*OH*OW, C_in_per_group*K_H*K_W) matrix and then use a highly optimized Triton matmul kernel (with fp32 accumulation) against a reshaped weight matrix of shape (C_in_per_group*K_H*K_W, C_out).",
+  "modification plan": "1) Add an im2col Triton kernel that, for each (n, oh, ow), writes the corresponding K_H*K_W*C_in_per_group patch into a row of a preallocated matrix A with fully contiguous K dimension, handling padding/stride/dilation. 2) Reshape weights to matrix B of shape (K_SIZE, C_out) and call a standard, well-tuned Triton matmul kernel C = A @ B, optionally fusing bias addition into the matmul epilogue. 3) Reshape C back to (N, C_out, OH, OW) and integrate this path into ModelNew.forward, keeping groups by running im2col+GEMM per group or by grouping the matrices appropriately.",
+  "expected_speedup": "2-3x over the current Triton kernel (bringing it to roughly 1.2-1.5x the PyTorch baseline for this configuration)."
+}

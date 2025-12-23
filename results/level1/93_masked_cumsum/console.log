@@ -1,0 +1,420 @@
+[Seed] Level1 task detected, using 1 seed instead of 2 (seed quality is stable)
+[Seed] Generating seed kernel...
+[Seed 1/1] Generating...
+[92mFinish reason: stop[0m
+Usage: In=1183, Out=8712, Total=9895
+[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 43, in wrapper
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 1094, in __getitem__
+    for dim, sl in enumerate(slices):
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 41, in wrapper
+    raise ValueError("Did you forget to add @triton.jit ? "
+ValueError: Did you forget to add @triton.jit ? (`_semantic` argument must be provided outside of JIT functions.)
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 554, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251223_124226_93_masked_cumsum_openai_deepseek/93_masked_cumsum/code/kernel_20251223_124351.py", line 201, in forward
+    return triton_masked_cumsum(x, mask, self.dim)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251223_124226_93_masked_cumsum_openai_deepseek/93_masked_cumsum/code/kernel_20251223_124351.py", line 150, in triton_masked_cumsum
+    _cumsum_tile_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 419, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 733, in run
+    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 861, in _do_compile
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 300, in compile
+    module = src.make_ir(target, options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 80, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 32:36:
+
+    # base pointers for this row
+    x_row_ptr = x_ptr + pid_m * stride_m
+    y_row_ptr = y_ptr + pid_m * stride_m
+
+    # load this tile, zero-padding out-of-range columns
+    vals = tl.load(x_row_ptr + offs * stride_n, mask=mask, other=0.0)
+
+    # inclusive scan within the tile (BLOCK_SIZE must be 256 here)
+    idx = tl.arange(0, BLOCK_SIZE)
+    # Hillis-Steele scan, unrolled for BLOCK_SIZE = 256
+    vals_shift = tl.where(idx >= 1, vals[idx - 1], 0.0)
+                                    ^
+Did you forget to add @triton.jit ? (`_semantic` argument must be provided outside of JIT functions.)
+
+[seed_0] failed. See metrics.message for details.
+[seed_0] metrics saved to: /home/hyc/LLMKernel/run/20251223_124226_93_masked_cumsum_openai_deepseek/93_masked_cumsum/evaluation/eval_0000.json
+[Seed 1] Failed, attempting repair...
+[92mFinish reason: stop[0m
+Usage: In=3219, Out=7547, Total=10766
+[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 554, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251223_124226_93_masked_cumsum_openai_deepseek/93_masked_cumsum/code/kernel_20251223_124515.py", line 198, in forward
+    return triton_masked_cumsum(x, mask, self.dim)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251223_124226_93_masked_cumsum_openai_deepseek/93_masked_cumsum/code/kernel_20251223_124515.py", line 148, in triton_masked_cumsum
+    _cumsum_tile_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 419, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 733, in run
+    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 861, in _do_compile
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 300, in compile
+    module = src.make_ir(target, options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 80, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 41:4:
+    # load this tile, zero-padding out-of-range columns
+    vals = tl.load(x_row_ptr + offs * stride_n, mask=mask, other=0.0)
+
+    # compute tile sum BEFORE modifying vals (sum of original values)
+    tile_sum = tl.sum(vals, axis=0)
+
+    # write initial values to y (stage 0 of scan)
+    tl.store(y_row_ptr + offs * stride_n, vals, mask=mask)
+
+    # Hillis-Steele inclusive scan within the tile using global memory as scratch
+    # BLOCK_SIZE is 256, so shifts up to 128
+    for shift in (1, 2, 4, 8, 16, 32, 64, 128):
+    ^
+AttributeError("'Tuple' object has no attribute 'func'")
+
+[seed_0_repair_1] failed. See metrics.message for details.
+[seed_0_repair_1] metrics saved to: /home/hyc/LLMKernel/run/20251223_124226_93_masked_cumsum_openai_deepseek/93_masked_cumsum/evaluation/eval_0001.json
+[92mFinish reason: stop[0m
+Usage: In=2961, Out=3709, Total=6670
+[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 644, in compare_and_bench
+    raise ValueError(
+ValueError: Outputs are not close (atol=1, rtol=1). max_abs_err=nan, mean_abs_err=nan
+
+[seed_0_repair_2] failed. See metrics.message for details.
+[seed_0_repair_2] metrics saved to: /home/hyc/LLMKernel/run/20251223_124226_93_masked_cumsum_openai_deepseek/93_masked_cumsum/evaluation/eval_0002.json
+[92mFinish reason: stop[0m
+Usage: In=2223, Out=9501, Total=11724
+[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 644, in compare_and_bench
+    raise ValueError(
+ValueError: Outputs are not close (atol=1, rtol=1). max_abs_err=nan, mean_abs_err=nan
+
+[seed_0_repair_3] failed. See metrics.message for details.
+[seed_0_repair_3] metrics saved to: /home/hyc/LLMKernel/run/20251223_124226_93_masked_cumsum_openai_deepseek/93_masked_cumsum/evaluation/eval_0003.json
+[92mFinish reason: stop[0m
+Usage: In=2328, Out=6331, Total=8659
+[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 644, in compare_and_bench
+    raise ValueError(
+ValueError: Outputs are not close (atol=1, rtol=1). max_abs_err=nan, mean_abs_err=nan
+
+[seed_0_repair_4] failed. See metrics.message for details.
+[seed_0_repair_4] metrics saved to: /home/hyc/LLMKernel/run/20251223_124226_93_masked_cumsum_openai_deepseek/93_masked_cumsum/evaluation/eval_0004.json
+[92mFinish reason: stop[0m
+Usage: In=2440, Out=6879, Total=9319
+[seed_0_repair_5] score=0.4181 (baseline=22.0345ms)
+[seed_0_repair_5] metrics saved to: /home/hyc/LLMKernel/run/20251223_124226_93_masked_cumsum_openai_deepseek/93_masked_cumsum/evaluation/eval_0005.json
+[Seed 1 Repair] Score: 0.4181 ✓
+[Seed 1] Final score: 0.4181 ✓
+
+================================================================================
+[Hybrid Strategy] Analyzing all seeds for algorithmic optimization...
+[Hybrid Strategy] - 1 seed(s) with score < 1.0 (rescue)
+================================================================================
+
+[Hybrid] Seed 1: score=0.4181 < 1.0
+[Hybrid] Attempting algorithm analysis rescue...
+[ncu] Using GPU device 5 (CUDA_VISIBLE_DEVICES=5)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_1126544.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_1126544.py /home/hyc/LLMKernel/KernelBench/t/93_masked_cumsum.py /home/hyc/LLMKernel/run/20251223_124226_93_masked_cumsum_openai_deepseek/93_masked_cumsum/code/test_kernel_analysis_seed0.py --repeat 1
+[ncu] ⚠️ Command timed out after 300 seconds
+[93mWarning: NCU profiling failed: NCU CSV file is empty (benchmark script likely failed): /home/hyc/LLMKernel/ncu_temp_1126544.csv[0m
+[Hybrid] Requesting LLM analysis for seed 1...
+[92mFinish reason: stop[0m
+Usage: In=2458, Out=1309, Total=3767
+[Hybrid] Worth optimizing: yes
+[Hybrid] Reason: The current implementation performs an extra full-tensor pass to apply the mask before the Triton cumsum, which is avoidable and likely memory-bandwidth bound.
+[Hybrid] Analysis complete for seed 1, generating optimized kernel...
+[Hybrid] Bottleneck: The code first computes `x_masked = x * mask.to(x.dtype)` as a separate CUDA ker...
+[Hybrid] Optimization: Fuse the mask application into the Triton cumsum kernel: pass `mask_ptr` into `_...
+[Hybrid] Expected speedup: 20-30% for large, memory-bound tensors where the cost of the extra read/write of the full input dominates.
+[92mFinish reason: stop[0m
+Usage: In=2828, Out=5929, Total=8757
+[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 554, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251223_124226_93_masked_cumsum_openai_deepseek/93_masked_cumsum/code/kernel_20251223_125626.py", line 209, in forward
+    return triton_masked_cumsum(x, mask, self.dim)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251223_124226_93_masked_cumsum_openai_deepseek/93_masked_cumsum/code/kernel_20251223_125626.py", line 162, in triton_masked_cumsum
+    mask_blocks = mask_padded.view(M, num_blocks, BLOCK_SIZE).to(x_dtype)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 4.00 GiB. GPU 0 has a total capacity of 23.52 GiB of which 1.50 GiB is free. Process 1092327 has 8.44 GiB memory in use. Including non-PyTorch memory, this process has 13.44 GiB memory in use. Of the allocated memory 13.00 GiB is allocated by PyTorch, and 0 bytes is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+
+[algorithm_optimized_seed0] failed. See metrics.message for details.
+[algorithm_optimized_seed0] metrics saved to: /home/hyc/LLMKernel/run/20251223_124226_93_masked_cumsum_openai_deepseek/93_masked_cumsum/evaluation/eval_0006.json
+[Hybrid] Algorithm-optimized kernel failed, attempting repair...
+[92mFinish reason: stop[0m
+Usage: In=2710, Out=5413, Total=8123
+[algorithm_optimized_seed0_repair1] score=0.8627 (baseline=22.0129ms)
+[algorithm_optimized_seed0_repair1] metrics saved to: /home/hyc/LLMKernel/run/20251223_124226_93_masked_cumsum_openai_deepseek/93_masked_cumsum/evaluation/eval_0007.json
+[Hybrid] ✓ Repair successful for algorithm-optimized seed 1
+[Hybrid] ✓ Rescue successful: 0.4181 → 0.8627
+
+================================================================================
+[Hybrid] Candidate Selection
+================================================================================
+[Hybrid] Total candidates: 2
+  [1] seed 1: 0.4181
+  [2] algo-optimized (from seed 1): 0.8627
+
+[Hybrid] ★ Selected best candidate: score=0.8627
+
+[Optimization] Starting 3-stage optimization...
+
+================================================================================
+[Stage 1/3] grid_and_parallel
+Description: Optimize grid layout and parallel work distribution across SMs.
+Current candidates: 1, best score: 0.8627
+================================================================================
+[Stage 1] Profiling best candidate...
+[ncu] Using GPU device 5 (CUDA_VISIBLE_DEVICES=5)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_1126544.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_1126544.py /home/hyc/LLMKernel/KernelBench/t/93_masked_cumsum.py /home/hyc/LLMKernel/run/20251223_124226_93_masked_cumsum_openai_deepseek/93_masked_cumsum/code/test_kernel_analysis_seed0.py --repeat 1
+[ncu stdout]: [bench] Completed 1 iterations successfully
+
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_1126544.csv
+[Stage 1] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=2570, Out=6416, Total=8986
+[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 43, in wrapper
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 1101, in __getitem__
+    raise ValueError(f"unsupported tensor index: {sl}")
+ValueError: unsupported tensor index: constexpr[255]
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 554, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251223_124226_93_masked_cumsum_openai_deepseek/93_masked_cumsum/code/kernel_20251223_130121.py", line 237, in forward
+    return triton_masked_cumsum(x, mask, self.dim)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251223_124226_93_masked_cumsum_openai_deepseek/93_masked_cumsum/code/kernel_20251223_130121.py", line 173, in triton_masked_cumsum
+    _cumsum_tile_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 419, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 733, in run
+    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 861, in _do_compile
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 300, in compile
+    module = src.make_ir(target, options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 80, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 54:15:
+    vals = tl.where(mask_vals, x_vals, 0.0)
+
+    # perform an inclusive scan within the tile in registers
+    vals = tl.cumsum(vals, axis=0)
+
+    # store back per-element cumsums
+    tl.store(y_row_ptr + offs * stride_n, vals, mask=in_bounds)
+
+    # tile sum is the last element of the in-register cumsum
+    # (for a partial tile, trailing out-of-bounds columns were zeros,
+    #  so the last position still holds the correct tile sum)
+    tile_sum = vals[BLOCK_SIZE - 1]
+               ^
+unsupported tensor index: constexpr[255]
+
+[stage1_grid_and_parallel] failed. See metrics.message for details.
+[stage1_grid_and_parallel] metrics saved to: /home/hyc/LLMKernel/run/20251223_124226_93_masked_cumsum_openai_deepseek/93_masked_cumsum/evaluation/eval_0008.json
+  Optimization failed, attempting repair...
+[92mFinish reason: stop[0m
+Usage: In=3400, Out=3808, Total=7208
+[stage1_grid_and_parallel_repair] score=0.8649 (baseline=21.9838ms)
+[stage1_grid_and_parallel_repair] metrics saved to: /home/hyc/LLMKernel/run/20251223_124226_93_masked_cumsum_openai_deepseek/93_masked_cumsum/evaluation/eval_0009.json
+  Optimized kernel score: 0.8649 ✓
+[Stage 1] ★ New best score: 0.8649
+
+================================================================================
+[Stage 2/3] block_tiling
+Description: Tune BLOCK_M/N/K sizes for optimal register/memory balance.
+Current candidates: 1, best score: 0.8649
+================================================================================
+[Stage 2] Profiling best candidate...
+[ncu] Using GPU device 5 (CUDA_VISIBLE_DEVICES=5)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_1126544.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_1126544.py /home/hyc/LLMKernel/KernelBench/t/93_masked_cumsum.py /home/hyc/LLMKernel/run/20251223_124226_93_masked_cumsum_openai_deepseek/93_masked_cumsum/code/test_kernel_analysis_seed0.py --repeat 1
+[ncu stdout]: [bench] Completed 1 iterations successfully
+
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_1126544.csv
+[Stage 2] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=2753, Out=7032, Total=9785
+[stage2_block_tiling] score=0.8316 (baseline=22.0113ms)
+[stage2_block_tiling] metrics saved to: /home/hyc/LLMKernel/run/20251223_124226_93_masked_cumsum_openai_deepseek/93_masked_cumsum/evaluation/eval_0010.json
+  Optimized kernel score: 0.8316 ✓
+[Stage 2] Current: 0.8316 (global best: 0.8649)
+
+================================================================================
+[Stage 3/3] memory_and_tuning
+Description: Optimize memory access patterns and fine-tune num_stages/num_warps.
+Current candidates: 1, best score: 0.8649
+================================================================================
+[Stage 3] Profiling best candidate...
+[ncu] Using GPU device 5 (CUDA_VISIBLE_DEVICES=5)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_1126544.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_1126544.py /home/hyc/LLMKernel/KernelBench/t/93_masked_cumsum.py /home/hyc/LLMKernel/run/20251223_124226_93_masked_cumsum_openai_deepseek/93_masked_cumsum/code/test_kernel_analysis_seed0.py --repeat 1
+[ncu stdout]: [bench] Completed 1 iterations successfully
+
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_1126544.csv
+[Stage 3] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=2960, Out=5916, Total=8876
+[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 43, in wrapper
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 1101, in __getitem__
+    raise ValueError(f"unsupported tensor index: {sl}")
+ValueError: unsupported tensor index: constexpr[127]
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 554, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251223_124226_93_masked_cumsum_openai_deepseek/93_masked_cumsum/code/kernel_20251223_130827.py", line 325, in forward
+    return triton_masked_cumsum(x, mask, self.dim)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251223_124226_93_masked_cumsum_openai_deepseek/93_masked_cumsum/code/kernel_20251223_130827.py", line 257, in triton_masked_cumsum
+    _cumsum_tile_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 419, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 238, in run
+    benchmark()
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 227, in benchmark
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 227, in <dictcomp>
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 162, in _bench
+    return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/testing.py", line 149, in do_bench
+    fn()
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 148, in kernel_call
+    self.fn.run(
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 733, in run
+    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 861, in _do_compile
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 300, in compile
+    module = src.make_ir(target, options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 80, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 49:15:
+    # load this tile of x and mask, zero-padding out-of-range columns
+    x_vals = tl.load(x_row_ptr + offs * stride_n, mask=in_bounds, other=0.0)
+    mask_vals = tl.load(mask_row_ptr + offs * stride_n, mask=in_bounds, other=0)
+
+    # apply mask: only sum elements where mask is True
+    masked_vals = tl.where(mask_vals, x_vals, 0.0)
+
+    # perform an inclusive scan within the tile in registers
+    vals = tl.cumsum(masked_vals, axis=0)
+
+    # tile sum = last element of inclusive scan (covers out-of-bounds as zeros)
+    tile_sum = vals[BLOCK_SIZE - 1]
+               ^
+unsupported tensor index: constexpr[127]
+
+[stage3_memory_and_tuning] failed. See metrics.message for details.
+[stage3_memory_and_tuning] metrics saved to: /home/hyc/LLMKernel/run/20251223_124226_93_masked_cumsum_openai_deepseek/93_masked_cumsum/evaluation/eval_0011.json
+  Optimization failed, attempting repair...
+[92mFinish reason: stop[0m
+Usage: In=4439, Out=3908, Total=8347
+[stage3_memory_and_tuning_repair] score=0.8390 (baseline=21.9867ms)
+[stage3_memory_and_tuning_repair] metrics saved to: /home/hyc/LLMKernel/run/20251223_124226_93_masked_cumsum_openai_deepseek/93_masked_cumsum/evaluation/eval_0012.json
+  Optimized kernel score: 0.8390 ✓
+[Stage 3] Current: 0.8390 (global best: 0.8649)
+[93_masked_cumsum.py] Figure saved to: /home/hyc/LLMKernel/run/20251223_124226_93_masked_cumsum_openai_deepseek/93_masked_cumsum/figures/93_masked_cumsum_score.png

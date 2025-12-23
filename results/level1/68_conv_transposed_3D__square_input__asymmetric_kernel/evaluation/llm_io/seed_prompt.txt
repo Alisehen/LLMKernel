@@ -1,135 +1,41 @@
 
-Write a correct and reasonably fast Triton kernel to replace the given PyTorch operator.
-This is a SEED implementation: prioritize correctness and stable compilation.
+Write high-performance Triton kernels to replace PyTorch operators.
+Generate the FASTEST kernel while maintaining correctness.
 
-Rules:
-- Use `tl.program_id(axis)` (axis=0/1/2 only)
-- Use `tl.arange()` for block indices
-- Operate on blocks (no CUDA thread model)
-- No manual shared memory or synchronization
+## CRITICAL — These cause 60%+ of failures:
+1. EVERY kernel function MUST have `@triton.jit` decorator — MANDATORY
+2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+3. BLOCK sizes MUST be power-of-2 constexpr: 16, 32, 64, 128, 256
+4. `tl.program_id(axis)` only supports axis = 0, 1, 2 (max 3D grid)
 
-Hard Constraints:
-- All BLOCK_* are `tl.constexpr` and powers of 2
-- `tl.arange(0, BLOCK)` requires BLOCK to be power-of-2
-- No dynamic `tl.reshape()` or view
-- `tl.load` / `tl.store`: scalar ptr → scalar, block ptr → block
-- No Python control flow on `tl.tensor` or BLOCK_*
-- Triton does NOT support `continue`, `break`, or `return` inside loops — use masking instead
-- Import ALL modules you use (e.g., `import math` if using `math.sqrt`)
-- Do NOT index tensors with loop variables: `tensor[:, i]` or `tensor[i, :]` where i is a loop var is INVALID
-- Shared memory limit ~100KB: for matmul, BLOCK_M*BLOCK_K + BLOCK_K*BLOCK_N < 25000 floats
+## Triton Syntax Rules:
+- For matmul/conv/linear ops, prefer `tl.dot(a, b, allow_tf32=True)` over element-wise multiply-add
+- No `continue`, `break`, `return` inside loops — use masking instead
+- No tensor indexing with loop vars: `x[:, i]` or `x[i, :]` is INVALID
+- No tuple unpacking inside kernel: `a, b = tl.load(...)` is INVALID
+- No nested functions inside @triton.jit
+- No Python control flow on tl.tensor or BLOCK_* values
+- No dynamic `tl.reshape()` or view operations
 
-CRITICAL API Constraints:
-- Triton does NOT have `tl.any()` → use: `tl.sum(mask) > 0`
-- Triton does NOT have `tl.all()` → use: `tl.sum(mask) == mask.numel()`
-- Triton does NOT have `tl.reduce()` → use: `tl.sum()`, `tl.max()`, `tl.min()` with axis parameter
-- Do NOT use f-strings or .format() with tl.constexpr in assert/error messages
+## Missing Triton Functions (implement manually):
+- tl.tanh → `(tl.exp(2*x) - 1) / (tl.exp(2*x) + 1)`
+- tl.sigmoid → `1 / (1 + tl.exp(-x))`
+- tl.gelu, tl.silu, tl.softmax, tl.mish → implement from definition
 
-Memory Best Practices:
-- Avoid unnecessary `.contiguous()` calls - Triton kernels work with strided tensors
-- Only call `.contiguous()` if you verified stride pattern causes correctness issues
+## Load/Store Rules:
+- Pointer + scalar offset → scalar value
+- Pointer + block offset (via tl.arange) → block of values
+- mask shape MUST match data shape exactly
 
+## Output Format (STRICT):
+1. Imports: `import torch, torch.nn as nn, triton, triton.language as tl` (and math if needed)
+2. `@triton.jit` kernel(s) — MUST have this decorator
+3. Wrapper function with grid calculation
+4. `class ModelNew(nn.Module)` — REQUIRED
 
-Performance Guidelines for Transposed Convolution (ConvTranspose):
-⚠️ CRITICAL DIFFERENCES from standard convolution:
-- Output size GROWS: out_size = (in_size - 1) * stride + kernel_size - 2*padding
-- Each INPUT element writes to MULTIPLE OUTPUT positions (scatter pattern)
-- Groups require: in_channels % groups == 0 AND out_channels % groups == 0
-
-RECOMMENDED APPROACH - Direct Implementation (NOT implicit GEMM):
-1. **Reverse Index Mapping**:
-   For each output position (od, oh, ow), find ALL contributing input positions:
-   ```python
-   # For each kernel position (kd, kh, kw):
-   id = (od + padding - kd) // stride  # Must check if divisible!
-   ih = (oh + padding - kh) // stride
-   iw = (ow + padding - kw) // stride
-
-   # Valid only if:
-   valid = ((od + padding - kd) % stride == 0) & (id >= 0) & (id < ID) & ...
-   ```
-
-2. **Grid Layout for 3D Transposed Conv**:
-   ```python
-   # Parallelize over output spatial dimensions
-   N, C_out, OD, OH, OW = output.shape
-   grid = (triton.cdiv(N * OD * OH * OW, BLOCK_OUT), C_out // groups, groups)
-
-   # In kernel - decode flat index:
-   pid = tl.program_id(0)
-   out_idx = pid * BLOCK_OUT + tl.arange(0, BLOCK_OUT)
-   n = out_idx // (OD * OH * OW)
-   remainder = out_idx % (OD * OH * OW)
-   od = remainder // (OH * OW)
-   oh = (remainder % (OH * OW)) // OW
-   ow = remainder % OW
-   ```
-
-3. **Grouped Convolution Handling**:
-   ```python
-   group_id = tl.program_id(2)
-   C_in_per_group = C_in // groups
-   C_out_per_group = C_out // groups
-
-   c_in_start = group_id * C_in_per_group
-   c_out_start = group_id * C_out_per_group
-
-   # Weight indexing: weight[c_out_in_group, c_in_in_group, kd, kh, kw]
-   # where c_out_in_group ∈ [0, C_out_per_group)
-   #       c_in_in_group ∈ [0, C_in_per_group)
-   ```
-
-4. **Accumulation Pattern**:
-   ```python
-   acc = tl.zeros((BLOCK_OUT,), dtype=tl.float32)
-
-   # Loop over kernel dimensions
-   for kd in range(KD):
-       for kh in range(KH):
-           for kw in range(KW):
-               # Compute input indices
-               id = (od + padding - kd) // stride
-               ih = (oh + padding - kh) // stride
-               iw = (ow + padding - kw) // stride
-
-               # Check validity (must be divisible AND in bounds)
-               valid_d = ((od + padding - kd) % stride == 0) & (id >= 0) & (id < ID)
-               valid_h = ((oh + padding - kh) % stride == 0) & (ih >= 0) & (ih < IH)
-               valid_w = ((ow + padding - kw) % stride == 0) & (iw >= 0) & (iw < IW)
-               valid = valid_d & valid_h & valid_w
-
-               # Loop over input channels in this group
-               for c_in_offset in range(C_in_per_group):
-                   c_in = c_in_start + c_in_offset
-                   input_val = tl.load(input_ptr + ..., mask=valid, other=0.0)
-                   weight_val = tl.load(weight_ptr + ...)
-                   acc += input_val * weight_val
-   ```
-
-5. **AVOID Common Errors**:
-   ❌ Do NOT use implicit GEMM (access pattern is fundamentally different)
-   ❌ Do NOT forget modulo check: (od + pad - kd) % stride == 0
-   ❌ Do NOT ignore groups in weight/channel indexing
-   ❌ Do NOT use atomics unless truly necessary (prefer output parallelism)
-
-6. **Numerical Precision**:
-   - Use fp32 accumulation even for fp16 input
-   - Test stride > 1 and groups > 1 carefully
-   - Verify output shape formula matches PyTorch exactly
-
-7. **Performance Tips**:
-   - For small kernels (3x3x3), unroll loops manually
-   - Use vectorized loads when possible (BLOCK_OUT should be power of 2)
-   - Consider tiling over channels if C_in_per_group is large
+Do NOT include: testing code, `if __name__ == "__main__"`, get_inputs, get_init_inputs
 
 
-Output Format (STRICT):
-1. Imports (torch, torch.nn, triton, triton.language, and any other needed modules like math)
-2. `@triton.jit` kernel(s)
-3. Wrapper function(s)
-4. `class ModelNew(nn.Module)` — this class is REQUIRED
-
-Do NOT include testing code or `if __name__ == "__main__"`.
 
 Example PyTorch:
 '''
@@ -200,22 +106,6 @@ class ModelNew(nn.Module):
     def forward(self, a, b):
         return triton_add(a, b)
 '''
-
-Hardware:
-• Compute Capability: 8.9
-• Number of SMs: 128
-• Memory Bandwidth: 1008 GB/s
-• TF32 Tensor Core TFLOPS: 82.6 with dense
-• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
-• FP16 Tensor Core TFLOPS: 165.2 with dense
-• Maximum number of registers per thread: 255
-• Maximum threads per block: 1024
-• Maximum threads per SM: 1536
-• Warp size: 32
-• Maximum concurrent warps per SM: 48
-• Shared memory capacity per SM: 100 KB
-• Maximum shared memory per thread block: 99 KB
-• L2 cache (global, all SM shared): 72 MB
 
 Target:
 ```python

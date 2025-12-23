@@ -1,0 +1,271 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+configs_conv2d = [
+    triton.Config({}, num_warps=4, num_stages=2),
+    triton.Config({}, num_warps=8, num_stages=2),
+    triton.Config({}, num_warps=8, num_stages=3),
+]
+
+
+@triton.autotune(configs=configs_conv2d, key=['N', 'C_out', 'H_out', 'W_out'])
+@triton.jit
+def conv2d_nchw_implicit_gemm_kernel(
+    x_ptr,        # *f32, [N, C_in, H_in, W_in]
+    w_ptr,        # *f32, [C_out, C_in, K, K]
+    b_ptr,        # *f32, [C_out] (dummy if no bias)
+    y_ptr,        # *f32, [N, C_out, H_out, W_out]
+    N, C_in, H_in, W_in,
+    C_out,
+    K,
+    stride_h, stride_w,
+    pad_h, pad_w,
+    dil_h, dil_w,
+    H_out, W_out,
+    has_bias: tl.constexpr,
+    R: tl.constexpr,          # total reduction dim = C_in * K * K
+    BLOCK_OC: tl.constexpr,
+    BLOCK_OW: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+):
+    # -------------------------------------------------------------------------
+    # Program IDs:
+    #  axis 0: over N * H_out         (each program handles one (n, oh) row)
+    #  axis 1: over W_out tiles       (BLOCK_OW-wide tile of output width)
+    #  axis 2: over C_out tiles       (BLOCK_OC-wide tile of output channels)
+    # -------------------------------------------------------------------------
+    pid_nh = tl.program_id(axis=0)
+    pid_ow = tl.program_id(axis=1)
+    pid_oc = tl.program_id(axis=2)
+
+    # map flattened pid_nh -> (n, oh)
+    n = pid_nh // H_out
+    oh = pid_nh - n * H_out
+
+    # output channel and width indices for this block
+    oc_offsets = pid_oc * BLOCK_OC + tl.arange(0, BLOCK_OC)
+    ow_offsets = pid_ow * BLOCK_OW + tl.arange(0, BLOCK_OW)
+
+    oc_mask = oc_offsets < C_out
+    ow_mask = ow_offsets < W_out
+
+    # combined output mask
+    out_mask = oc_mask[:, None] & ow_mask[None, :]
+
+    # accumulator for output tile [BLOCK_OC, BLOCK_OW]
+    acc = tl.zeros((BLOCK_OC, BLOCK_OW), dtype=tl.float32)
+
+    # optional bias addition
+    if has_bias:
+        bias_vals = tl.load(b_ptr + oc_offsets, mask=oc_mask, other=0.0)
+        acc += bias_vals[:, None]
+
+    # strides for NCHW layout
+    x_n_stride = C_in * H_in * W_in
+    x_c_stride = H_in * W_in
+    x_h_stride = W_in
+
+    # weight layout: [C_out, C_in, K, K]
+    # flattened reduction dimension r = ci * (K*K) + kh * K + kw
+    w_oc_stride = C_in * K * K  # == R
+
+    K2 = K * K
+    r_idx = tl.arange(0, BLOCK_R)
+
+    # -------------------------------------------------------------------------
+    # Implicit-GEMM over reduction dimension R = C_in * K * K
+    # We process R in tiles of size BLOCK_R, and for each tile:
+    #   X_tile: [BLOCK_R, BLOCK_OW]  (input patches)
+    #   W_tile: [BLOCK_OC, BLOCK_R]  (weights)
+    # then: acc += W_tile @ X_tile
+    # -------------------------------------------------------------------------
+    for r_start in range(0, R, BLOCK_R):
+        r_offsets = r_start + r_idx  # [BLOCK_R]
+        r_mask = r_offsets < R       # [BLOCK_R]
+
+        # map reduction index -> (ci, kh, kw)
+        ci = r_offsets // K2
+        rem = r_offsets - ci * K2
+        kh = rem // K
+        kw = rem - kh * K
+
+        # input height index for each reduction element (vector [BLOCK_R])
+        ih = oh * stride_h + kh * dil_h - pad_h
+        h_in_bounds = (ih >= 0) & (ih < H_in)  # [BLOCK_R]
+
+        # base input offset for each reduction element (ignoring width) [BLOCK_R]
+        base_in = n * x_n_stride + ci * x_c_stride + ih * x_h_stride
+
+        # input width indices for this tile: [BLOCK_R, BLOCK_OW]
+        ow = ow_offsets[None, :]  # [1, BLOCK_OW]
+        iw = ow * stride_w + kw[:, None] * dil_w - pad_w  # [BLOCK_R, BLOCK_OW]
+
+        # width bounds + global col masks
+        w_in_bounds = (iw >= 0) & (iw < W_in) & ow_mask[None, :]  # [BLOCK_R, BLOCK_OW]
+
+        # full input mask: valid h, valid w, valid r
+        in_mask = (h_in_bounds[:, None] & w_in_bounds) & r_mask[:, None]
+
+        # input offsets: [BLOCK_R, BLOCK_OW]
+        in_offsets = base_in[:, None] + iw
+
+        # load input tile; OOB elements are zero
+        x_tile = tl.load(x_ptr + in_offsets, mask=in_mask, other=0.0)
+
+        # weight offsets for tile: [BLOCK_OC, BLOCK_R]
+        w_offsets = oc_offsets[:, None] * w_oc_stride + r_offsets[None, :]
+        w_mask = oc_mask[:, None] & r_mask[None, :]
+
+        # load weight tile; OOB elements are zero
+        w_tile = tl.load(w_ptr + w_offsets, mask=w_mask, other=0.0)
+
+        # GEMM-like update: [BLOCK_OC, BLOCK_OW]
+        acc += tl.dot(w_tile, x_tile, allow_tf32=True)
+
+    # -------------------------------------------------------------------------
+    # Store results: y[n, oc, oh, ow]
+    # layout: NCHW contiguous
+    # index = ((n*C_out + oc)*H_out + oh)*W_out + ow
+    # -------------------------------------------------------------------------
+    base_n = n * C_out
+    oc_indices = base_n + oc_offsets             # [BLOCK_OC]
+    row_indices = oc_indices * H_out + oh        # [BLOCK_OC]
+    y_offsets = row_indices[:, None] * W_out + ow_offsets[None, :]  # [BLOCK_OC, BLOCK_OW]
+
+    tl.store(y_ptr + y_offsets, acc, mask=out_mask)
+
+
+def triton_conv2d_nchw(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    stride=(1, 1),
+    padding=(0, 0),
+    dilation=(1, 1),
+    groups: int = 1,
+) -> torch.Tensor:
+    """
+    High-performance Triton implementation of NCHW Conv2d for groups == 1.
+
+    Uses an implicit-GEMM algorithm that tiles the reduction dimension
+    R = C_in * K * K and performs block-level matrix multiplications.
+    """
+    assert x.is_cuda and weight.is_cuda, "Inputs must be CUDA tensors"
+    assert x.dtype == torch.float32 and weight.dtype == torch.float32, "Only float32 supported"
+    assert groups == 1, "Current Triton kernel supports groups == 1 only"
+
+    x = x.contiguous()
+    weight = weight.contiguous()
+    N, C_in, H_in, W_in = x.shape
+    C_out, C_per_group, K, K2 = weight.shape
+    assert K == K2, "Kernel must be square"
+    assert C_per_group * groups == C_in, "Inconsistent in_channels/groups"
+
+    stride_h, stride_w = stride
+    pad_h, pad_w = padding
+    dil_h, dil_w = dilation
+
+    # output spatial dimensions (PyTorch formula)
+    H_out = (H_in + 2 * pad_h - dil_h * (K - 1) - 1) // stride_h + 1
+    W_out = (W_in + 2 * pad_w - dil_w * (K - 1) - 1) // stride_w + 1
+
+    y = torch.empty((N, C_out, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    # Handle degenerate cases early to avoid invalid grid / div-by-zero
+    if N == 0 or C_out == 0 or H_out == 0 or W_out == 0:
+        return y
+
+    # bias handling
+    has_bias = bias is not None
+    if has_bias:
+        b = bias.contiguous()
+    else:
+        # dummy tensor to satisfy pointer requirements; won't be read
+        b = torch.empty(1, device=x.device, dtype=x.dtype)
+
+    # total reduction dimension: R = C_in * K * K
+    R = C_in * K * K
+
+    # Tile sizes (power-of-2); tuned for high throughput on RTX 4090
+    BLOCK_OC = 32
+    BLOCK_OW = 64
+    BLOCK_R = 32
+
+    grid = (
+        max(1, N * H_out),                    # pid_nh over N*H_out
+        triton.cdiv(W_out, BLOCK_OW),         # pid_ow
+        triton.cdiv(C_out, BLOCK_OC),         # pid_oc
+    )
+
+    conv2d_nchw_implicit_gemm_kernel[grid](
+        x, weight, b, y,
+        N, C_in, H_in, W_in,
+        C_out,
+        K,
+        stride_h, stride_w,
+        pad_h, pad_w,
+        dil_h, dil_w,
+        H_out, W_out,
+        has_bias,
+        R,
+        BLOCK_OC=BLOCK_OC,
+        BLOCK_OW=BLOCK_OW,
+        BLOCK_R=BLOCK_R,
+    )
+
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-accelerated replacement for a standard 2D convolution (NCHW).
+
+    Supports:
+      - arbitrary stride, padding, dilation
+      - square kernels
+      - groups == 1 (grouped/depthwise conv not supported)
+    """
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        stride: int = 1,
+        padding: int = 0,
+        dilation: int = 1,
+        groups: int = 1,
+        bias: bool = False,
+    ):
+        super().__init__()
+        # use nn.Conv2d only as a container for weights/bias
+        self.conv = nn.Conv2d(
+            in_channels,
+            out_channels,
+            (kernel_size, kernel_size),
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            groups=groups,
+            bias=bias,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        w = self.conv.weight
+        b = self.conv.bias
+        stride_h, stride_w = self.conv.stride
+        pad_h, pad_w = self.conv.padding
+        dil_h, dil_w = self.conv.dilation
+        groups = self.conv.groups
+
+        return triton_conv2d_nchw(
+            x,
+            w,
+            b,
+            stride=(stride_h, stride_w),
+            padding=(pad_h, pad_w),
+            dilation=(dil_h, dil_w),
+            groups=groups,
+        )

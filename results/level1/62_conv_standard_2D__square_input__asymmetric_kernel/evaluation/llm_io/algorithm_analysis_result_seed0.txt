@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The Triton kernel is ~3x slower than the PyTorch/cuDNN baseline, indicating a substantial structural inefficiency rather than minor tuning issues.",
+  "bottleneck": "The current implicit-im2col GEMM formulation over NCHW uses a reduction dimension K = C_in*KH*KW with complex index arithmetic and highly strided, poorly coalesced loads from x and w, making the kernel memory‑bound and arithmetic‑intensive on address computation instead of FLOPs.",
+  "optimisation method": "Change the convolution algorithm to operate on a channels-last (NHWC) / HWIO layout and reorder the reduction so that the innermost K-subdimension is C_in, turning each tl.dot into a tensor‑core‑friendly GEMM over contiguous channels; this removes most of the per-element spatial index math in the inner loop and yields coalesced vector loads for both activations and weights.",
+  "modification plan": "Store and consume inputs/weights in channels_last (NHWC for x, HWIO for w) in ModelNew (or convert at entry), and redesign the Triton kernel so that its K loop iterates with C_in as the fastest-varying index and KH/KW as outer loops, using strides consistent with NHWC/HWIO. Specialize this NHWC kernel for the common case (groups=1, stride=1, dilation=1, no padding) to drop bounds checks and simplify pointer arithmetic, mapping the computation to a standard MxK · KxN matmul tile shape that Triton can implement efficiently with tl.dot and tensor cores.",
+  "expected_speedup": "2-3x versus the current Triton kernel (bringing it close to or slightly better than the PyTorch/cuDNN baseline for this configuration)."
+}

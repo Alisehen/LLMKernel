@@ -1,0 +1,10 @@
+```json
+{
+  "worth_optimizing": "yes",
+  "reason": "The current kernel does a dense reduction over Ci*Kd*Kh*Kw for every output point and then throws away most work with stride/alignment masks, leaving clear algorithmic waste, especially for stride > 1.",
+  "bottleneck": "For each output tile, the kernel iterates over all (ci, kd, kh, kw) combinations and computes expensive integer mod/div checks plus pointer arithmetic, even though only a small subset satisfy the stride alignment and bounds; most (P,K) pairs are masked out, so you pay the control/memory cost without contributing to the result.",
+  "optimisation method": "Reformulate the transposed convolution as an input-stationary scatter-style algorithm: iterate over input elements and kernel taps to directly accumulate into only the valid output positions (id, ih, iw → do, ho, wo), eliminating the per-(P,K) modulo/stride checks and the large masked reduction over K_total.",
+  "modification plan": "Redesign the core loop so each program instance tiles over (B, Ci_g, Di, Hi, Wi) or a subset thereof, and for each input voxel and kernel offset compute the corresponding output coordinates via closed-form formulas derived from the transposed-conv relation, checking only simple output-range conditions. Use atomic adds (or carefully structured tiling/reduction if you want to avoid atomics) to accumulate into y, thereby only visiting contributions that are actually used instead of looping over the full K_total for every output. Once this traversal is in place, retune BLOCK sizes and grid mapping for the new input-stationary pattern.",
+  "expected_speedup": "20-30%"
+}
+```

@@ -7,184 +7,228 @@ import triton.language as tl
 
 @triton.autotune(
     configs=[
-        triton.Config({}, num_warps=4, num_stages=2),
-        triton.Config({}, num_warps=8, num_stages=2),
-        triton.Config({}, num_warps=4, num_stages=3),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32},
+            num_warps=8,
+            num_stages=2,
+        ),
     ],
-    key=["C_in", "C_out", "H_out", "W_out", "KH", "KW", "HAS_BIAS"],
+    key=["M", "C_out", "K_TOTAL"],
 )
 @triton.jit
-def conv_transpose2d_full_kernel(
-    x_ptr,        # *f32, [N, C_in, H_in, W_in]
-    w_ptr,        # *f32, [C_in, C_out, KH, KW]
-    y_ptr,        # *f32, [N, C_out, H_out, W_out]
-    bias_ptr,     # *f32, [C_out] (unused if HAS_BIAS == False)
+def conv2d_nchw_kernel(
+    x_ptr,            # float*  [N, C_in, H_in, W_in]
+    w_ptr,            # float*  [C_out, C_in, K_h, K_w]  (flipped+permuted)
+    b_ptr,            # float*  [C_out]
+    y_ptr,            # float*  [N, C_out, H_out, W_out]
     N, C_in, H_in, W_in,
     C_out, H_out, W_out,
-    KH, KW,
-    HAS_BIAS: tl.constexpr,
+    K_h, K_w,
+    PAD_H, PAD_W,
+    K_TOTAL,          # C_in * K_h * K_w
+    M,                # N * H_out * W_out
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    """
-    ConvTranspose2d, special case:
-        stride = 1, padding = 0, output_padding = 0, dilation = 1, groups = 1
-    Implemented as a full 2D convolution.
+    # Program ids for tiles along output "rows" (M = N*H_out*W_out) and channels (C_out)
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
 
-    Tiling / grid (3D):
-      - program_id(0): batch  n in [0, N)
-      - program_id(1): M tiles over H_out * W_out (output positions per batch)
-      - program_id(2): N tiles over C_out (output channels)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
 
-      M dimension: H_out * W_out, processed in blocks of BLOCK_M
-      N dimension: C_out, processed in blocks of BLOCK_N
-      K dimension (reduced): C_in, processed in blocks of BLOCK_K
-    """
-    pid_n = tl.program_id(axis=0)  # batch index n
-    pid_m = tl.program_id(axis=1)  # tile over spatial positions H_out * W_out
-    pid_co = tl.program_id(axis=2)  # tile over output channels C_out
+    mask_m = offs_m < M
+    mask_n = offs_n < C_out
 
-    # Offsets in spatial (ho, wo) and output-channel dimensions
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # [BLOCK_M]
-    offs_co = pid_co * BLOCK_N + tl.arange(0, BLOCK_N)  # [BLOCK_N]
+    # Map "row" index m -> (n, h_out, w_out)
+    HW_out = H_out * W_out
+    n_idx = offs_m // HW_out
+    rem = offs_m % HW_out
+    h_out = rem // W_out
+    w_out = rem % W_out
 
-    tl.multiple_of(offs_m, BLOCK_M)
-    tl.multiple_of(offs_co, BLOCK_N)
+    # Broadcasted versions for tile computations
+    row_n = n_idx[:, None]        # [BM, 1]
+    row_ho = h_out[:, None]       # [BM, 1]
+    row_wo = w_out[:, None]       # [BM, 1]
+    col_co = offs_n[None, :]      # [1, BN]
 
-    hw_out = H_out * W_out
-    mask_m = offs_m < hw_out
-    mask_co = offs_co < C_out
+    # Strides for contiguous NCHW tensors
+    HW_in = H_in * W_in
+    stride_xn = C_in * HW_in
+    stride_xc = HW_in
+    stride_xh = W_in
+    stride_xw = 1
 
-    # Decompose spatial index into (ho, wo)
-    ho = offs_m // W_out  # [BLOCK_M]
-    wo = offs_m % W_out   # [BLOCK_M]
+    HW_out_full = H_out * W_out
+    stride_yn = C_out * HW_out_full
+    stride_yc = HW_out_full
+    stride_yh = W_out
+    stride_yw = 1
 
-    # Broadcasted versions for pointer arithmetic
-    ho_b = ho[:, None]              # [BLOCK_M, 1]
-    wo_b = wo[:, None]              # [BLOCK_M, 1]
-    co_b = offs_co[None, :]         # [1, BLOCK_N]
+    stride_wc_out = C_in * K_h * K_w
+    stride_wc_in = K_h * K_w
+    stride_wkh = K_w
+    stride_wkw = 1
 
-    # Accumulator for output tile
+    # Initialize accumulator with bias
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    # Load bias for columns and broadcast across rows
+    b = tl.load(b_ptr + offs_n, mask=mask_n, other=0.0)
+    acc += b[None, :]
 
-    n = pid_n  # scalar batch index
+    # Reduction over K dimension = C_in * K_h * K_w
+    kk_size = K_h * K_w
+    for k_start in range(0, K_TOTAL, BLOCK_K):
+        offs_k = k_start + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < K_TOTAL
 
-    # Main loops over kernel spatial dims and input channels
-    for kh in range(0, KH):
-        hi = ho - kh
-        valid_hi = (hi >= 0) & (hi < H_in)
-        hi_b = hi[:, None]  # [BLOCK_M, 1]
+        # Map k -> (c_in, k_h, k_w)
+        ci = offs_k // kk_size
+        remk = offs_k % kk_size
+        kh = remk // K_w
+        kw = remk % K_w
 
-        for kw in range(0, KW):
-            wi = wo - kw
-            valid_wi = (wi >= 0) & (wi < W_in)
-            wi_b = wi[:, None]  # [BLOCK_M, 1]
+        # Broadcasted kernel indices
+        ci_bc = ci[None, :]        # [1, BK]
+        kh_bc = kh[None, :]        # [1, BK]
+        kw_bc = kw[None, :]        # [1, BK]
 
-            mask_hw = mask_m & valid_hi & valid_wi  # [BLOCK_M]
+        # Input coordinates for this output tile and K-block
+        h_in = row_ho - PAD_H + kh_bc   # [BM, BK]
+        w_in = row_wo - PAD_W + kw_bc   # [BM, BK]
 
-            for c_start in range(0, C_in, BLOCK_K):
-                ci = c_start + tl.arange(0, BLOCK_K)  # [BLOCK_K]
-                mask_ci = ci < C_in                   # [BLOCK_K]
+        # Broadcast batch and channel indices
+        n_bc = row_n                    # [BM, 1]
 
-                ci_row = ci[None, :]   # [1, BLOCK_K]
-                ci_col = ci[:, None]   # [BLOCK_K, 1]
+        # Compute flat indices into x
+        x_idx = (
+            n_bc * stride_xn
+            + ci_bc * stride_xc
+            + h_in * stride_xh
+            + w_in * stride_xw
+        )  # [BM, BK]
 
-                # ------------------------------------------------------------------
-                # Load input tile X: shape [BLOCK_M, BLOCK_K]
-                #   x[n, ci, hi, wi]
-                # Linear index: (((n * C_in + ci) * H_in + hi) * W_in + wi)
-                # ------------------------------------------------------------------
-                x_ptrs = (((n * C_in + ci_row) * H_in + hi_b) * W_in + wi_b)
-                mask_x = mask_hw[:, None] & mask_ci[None, :]
-                x_tile = tl.load(x_ptr + x_ptrs, mask=mask_x, other=0.0)
+        # Validity mask for x
+        valid_h = (h_in >= 0) & (h_in < H_in)
+        valid_w = (w_in >= 0) & (w_in < W_in)
+        mask_x = valid_h & valid_w
+        mask_x = mask_x & mask_m[:, None] & mask_k[None, :]
 
-                # ------------------------------------------------------------------
-                # Load weight tile W: shape [BLOCK_K, BLOCK_N]
-                #   w[ci, co, kh, kw]
-                # Linear index: (((ci * C_out + co) * KH + kh) * KW + kw)
-                # ------------------------------------------------------------------
-                w_ptrs = (((ci_col * C_out + co_b) * KH + kh) * KW + kw)
-                mask_w = mask_ci[:, None] & mask_co[None, :]
-                w_tile = tl.load(w_ptr + w_ptrs, mask=mask_w, other=0.0)
+        x_tile = tl.load(x_ptr + x_idx, mask=mask_x, other=0.0)
 
-                # Accumulate
-                acc += tl.dot(x_tile, w_tile)
+        # Weight tile [BK, BN]
+        ci_k = ci[:, None]      # [BK, 1]
+        kh_k = kh[:, None]      # [BK, 1]
+        kw_k = kw[:, None]      # [BK, 1]
 
-    # Add bias if present
-    if HAS_BIAS:
-        bias = tl.load(bias_ptr + offs_co, mask=mask_co, other=0.0)  # [BLOCK_N]
-        acc = acc + bias[None, :]                                    # [BLOCK_M, BLOCK_N]
+        w_idx = (
+            col_co * stride_wc_out
+            + ci_k * stride_wc_in
+            + kh_k * stride_wkh
+            + kw_k * stride_wkw
+        )  # [BK, BN]
 
-    # Store results
-    # y[n, co, ho, wo]
-    y_ptrs = (((n * C_out + co_b) * H_out + ho_b) * W_out + wo_b)
-    mask_y = mask_m[:, None] & mask_co[None, :]
-    tl.store(y_ptr + y_ptrs, acc, mask=mask_y)
+        mask_w = mask_n[None, :] & mask_k[:, None]
+        w_tile = tl.load(w_ptr + w_idx, mask=mask_w, other=0.0)
+
+        # Accumulate dot product along K
+        acc += tl.dot(x_tile, w_tile, allow_tf32=True)
+
+    # Store results to y
+    y_idx = (
+        n_idx[:, None] * stride_yn
+        + offs_n[None, :] * stride_yc
+        + h_out[:, None] * stride_yh
+        + w_out[:, None] * stride_yw
+    )  # [BM, BN]
+
+    mask_y = mask_m[:, None] & mask_n[None, :]
+    tl.store(y_ptr + y_idx, acc, mask=mask_y)
 
 
-def triton_conv_transpose2d_full(x: torch.Tensor,
-                                 weight: torch.Tensor,
-                                 bias: torch.Tensor | None) -> torch.Tensor:
+def triton_conv_transpose2d_nchw_stride1_pad0(
+    x: torch.Tensor,
+    weight: torch.Tensor,  # [C_in, C_out, K_h, K_w]
+    bias: torch.Tensor or None,
+) -> torch.Tensor:
     """
-    Triton implementation of ConvTranspose2d for the restricted case:
-
-        stride = 1
-        padding = 0
-        output_padding = 0
-        dilation = 1
-        groups = 1
-
-    which is equivalent to a 2D full convolution.
-
-    Args:
-        x:      [N, C_in, H_in, W_in], float32, CUDA
-        weight: [C_in, C_out, KH, KW], float32, CUDA
-        bias:   [C_out] or None, float32, CUDA
-
-    Returns:
-        y: [N, C_out, H_out, W_out]
-           where H_out = H_in + KH - 1, W_out = W_in + KW - 1
+    High-performance ConvTranspose2d for:
+        - NCHW layout
+        - stride = (1, 1)
+        - padding = (0, 0)
+        - output_padding = (0, 0)
+        - dilation = (1, 1)
+        - groups = 1
+    Implemented via equivalent Conv2d with flipped/permuted weights.
     """
-    assert x.is_cuda and weight.is_cuda, "Inputs must be CUDA tensors"
-    assert x.dtype == torch.float32 and weight.dtype == torch.float32, "Only float32 is supported in Triton kernel"
-    assert x.ndim == 4 and weight.ndim == 4, "x must be [N,C,H,W], weight must be [C_in,C_out,KH,KW]"
+    assert x.is_cuda, "Triton kernel requires CUDA tensor"
+    x = x.contiguous()
+    weight = weight.contiguous()
 
     N, C_in, H_in, W_in = x.shape
-    C_in_w, C_out, KH, KW = weight.shape
+    C_in_w, C_out, K_h, K_w = weight.shape
     assert C_in_w == C_in, "Input channels mismatch between x and weight"
 
-    H_out = H_in + KH - 1
-    W_out = W_in + KW - 1
+    if bias is None:
+        bias = torch.zeros(C_out, device=x.device, dtype=x.dtype)
+    else:
+        bias = bias.contiguous()
 
-    y = torch.empty((N, C_out, H_out, W_out), device=x.device, dtype=x.dtype)
+    # Equivalent Conv2d params:
+    #   y = conv2d(x, V, padding=(K_h-1, K_w-1))
+    # where V[co, ci, kh, kw] = weight[ci, co, K_h-1-kh, K_w-1-kw]
+    V = (
+        weight.permute(1, 0, 2, 3)  # [C_out, C_in, K_h, K_w]
+        .flip(-1, -2)               # flip spatial dims
+        .contiguous()
+    )
 
-    # Tile sizes (kept constant; autotune explores num_warps / num_stages)
-    BLOCK_M = 64  # spatial tile (H_out * W_out)
-    BLOCK_N = 64  # output-channel tile
-    BLOCK_K = 32  # input-channel reduction tile
+    PAD_H = K_h - 1
+    PAD_W = K_w - 1
 
-    # 3D grid: (batch, spatial tiles, channel tiles)
+    H_out = H_in + K_h - 1
+    W_out = W_in + K_w - 1
+
+    y = torch.empty(
+        (N, C_out, H_out, W_out),
+        device=x.device,
+        dtype=x.dtype,
+    )
+
+    K_total = C_in * K_h * K_w
+    M = N * H_out * W_out
+
+    # Grid: tiles over "M" (flattened N*H_out*W_out) and C_out
     grid = lambda meta: (
-        N,
-        triton.cdiv(H_out * W_out, meta["BLOCK_M"]),
+        triton.cdiv(M, meta["BLOCK_M"]),
         triton.cdiv(C_out, meta["BLOCK_N"]),
     )
 
-    has_bias = bias is not None
-    if bias is None:
-        # Dummy pointer; will not be used when HAS_BIAS=False
-        bias = y.new_empty(1)
-
-    conv_transpose2d_full_kernel[grid](
-        x, weight, y, bias,
-        N, C_in, H_in, W_in,
-        C_out, H_out, W_out,
-        KH, KW,
-        HAS_BIAS=has_bias,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_K=BLOCK_K,
+    conv2d_nchw_kernel[grid](
+        x,
+        V,
+        bias,
+        y,
+        N,
+        C_in,
+        H_in,
+        W_in,
+        C_out,
+        H_out,
+        W_out,
+        K_h,
+        K_w,
+        PAD_H,
+        PAD_W,
+        K_total,
+        M,
     )
 
     return y
@@ -192,15 +236,14 @@ def triton_conv_transpose2d_full(x: torch.Tensor,
 
 class ModelNew(nn.Module):
     """
-    Triton-accelerated ConvTranspose2d for the restricted case:
-
-        stride == 1
-        padding == 0
-        output_padding == 0
-        dilation == 1
-        groups == 1
-        dtype == float32
-        device == CUDA
+    Triton-accelerated version of ConvTranspose2d for the common fast path:
+      - stride = 1
+      - padding = 0
+      - output_padding = 0
+      - dilation = 1
+      - groups = 1
+      - float32, NCHW, CUDA tensors
+    Falls back to PyTorch's ConvTranspose2d otherwise.
     """
 
     def __init__(
@@ -213,7 +256,7 @@ class ModelNew(nn.Module):
         output_padding: int = 0,
         groups: int = 1,
         bias: bool = False,
-    ) -> None:
+    ):
         super().__init__()
         self.conv_transpose2d = nn.ConvTranspose2d(
             in_channels,
@@ -227,22 +270,24 @@ class ModelNew(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        ct = self.conv_transpose2d
+        conv = self.conv_transpose2d
 
         use_triton = (
             x.is_cuda
             and x.dtype == torch.float32
-            and ct.weight.is_cuda
-            and ct.weight.dtype == torch.float32
-            and ct.groups == 1
-            and ct.dilation == (1, 1)
-            and ct.stride == (1, 1)
-            and ct.padding == (0, 0)
-            and ct.output_padding == (0, 0)
+            and conv.stride == (1, 1)
+            and conv.padding == (0, 0)
+            and conv.output_padding == (0, 0)
+            and conv.dilation == (1, 1)
+            and conv.groups == 1
         )
 
-        if use_triton:
-            return triton_conv_transpose2d_full(x, ct.weight, ct.bias)
-        else:
-            return ct(x)
+        if not use_triton:
+            return conv(x)
+
+        return triton_conv_transpose2d_nchw_stride1_pad0(
+            x,
+            conv.weight,
+            conv.bias,
+        )
 ```

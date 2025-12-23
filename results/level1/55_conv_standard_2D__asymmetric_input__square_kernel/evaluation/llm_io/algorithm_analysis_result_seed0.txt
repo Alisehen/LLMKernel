@@ -1,0 +1,10 @@
+```json
+{
+  "worth_optimizing": "yes",
+  "reason": "The current kernel uses a naive spatial-domain triple loop over (C_in, K, K) per output element, which is fundamentally less efficient than GEMM-style convolutions and leads to a >7x slowdown vs PyTorch/cuDNN.",
+  "bottleneck": "Each thread/block performs scalar FMA work over the entire reduction dimension (C_in * K * K) with no blocking or data reuse, preventing effective use of memory bandwidth, caches, and tensor cores; this direct convolution approach is algorithmically inferior to GEMM-based or implicit-GEMM convolutions.",
+  "optimisation method": "Replace the naive direct conv with an implicit-GEMM algorithm: reinterpret the convolution as a matrix multiplication where the reduction dimension is C_in * K * K, and tile over this reduction dimension inside the Triton kernel to perform blocked GEMM (reusing input/weight tiles in registers/SMEM instead of reloading for each (ci, kh, kw) scalar iteration).",
+  "modification plan": "Redesign the kernel so that each program instance computes a 2D output tile over (OC_block, OW_block or HW_block) while iterating over the reduction dimension R = C_in * K * K in chunks (e.g., BLOCK_R). For each chunk, cooperatively load a tile of input patches and corresponding weight submatrix into registers/shared memory, then perform a small matrix multiplication update on the accumulator tile using Triton’s block-level operations (and optionally tensor cores). This eliminates the inner ci/kh/kw Python-style loops, turns the core into a highly-optimized GEMM-like kernel, and allows tuning of BLOCK_OC, BLOCK_OW/HW, and BLOCK_R for the asymmetric 512x1024 input and 64→128 channel sizes.",
+  "expected_speedup": "5-10x vs the current Triton kernel (and likely 1.5-3x vs the PyTorch baseline) once a reasonably tuned implicit-GEMM tiling is implemented."
+}
+```

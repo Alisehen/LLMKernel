@@ -1,0 +1,392 @@
+import math
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        # Larger tile – good for large feature maps / channels
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+        # More parallelism in spatial dimension
+        triton.Config(
+            {'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+        # More parallelism in channel dimension
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+    ],
+    # Autotune per logical problem size (per group)
+    key=['N', 'OH', 'OW', 'C_out_per_group', 'groups'],
+)
+@triton.jit
+def conv2d_fwd_kernel(
+    x_ptr,         # *T, [N, C_in, H, W]
+    w_ptr,         # *T, [C_out, C_in/groups, K_H, K_W]
+    b_ptr,         # *T or dummy, [C_out]
+    y_ptr,         # *T, [N, C_out, OH, OW]
+    N, H, W,
+    C_in, C_out,
+    OH, OW,
+    C_in_per_group,
+    C_out_per_group,
+    groups,
+    x_stride_n, x_stride_c, x_stride_h, x_stride_w,
+    w_stride_o, w_stride_i, w_stride_h, w_stride_w,
+    y_stride_n, y_stride_c, y_stride_h, y_stride_w,
+    STRIDE_H: tl.constexpr,
+    STRIDE_W: tl.constexpr,
+    PAD_H: tl.constexpr,
+    PAD_W: tl.constexpr,
+    DIL_H: tl.constexpr,
+    DIL_W: tl.constexpr,
+    K_H: tl.constexpr,
+    K_W: tl.constexpr,
+    K_SIZE: tl.constexpr,   # C_in_per_group * K_H * K_W
+    HAS_BIAS: tl.constexpr,
+    IS_FP16: tl.constexpr,
+    IS_BF16: tl.constexpr,
+    BLOCK_M: tl.constexpr,  # tile over (N * OH * OW)
+    BLOCK_N: tl.constexpr,  # tile over out_channels per group
+    BLOCK_K: tl.constexpr,  # tile over reduction dimension
+):
+    # -------------------------------------------------------------------------
+    # Program IDs (grid = [M_tiles, OC_tiles_per_group, groups])
+    # -------------------------------------------------------------------------
+    pid_m = tl.program_id(axis=0)  # tile along spatial positions * batch
+    pid_n = tl.program_id(axis=1)  # tile along output channels per group
+    pid_g = tl.program_id(axis=2)  # group id
+
+    g = pid_g
+    M = N * OH * OW  # total output positions per group
+
+    # -------------------------------------------------------------------------
+    # Compute logical indices this program is responsible for
+    # -------------------------------------------------------------------------
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n_group = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    # masks for valid indices
+    mask_m = offs_m < M
+    mask_n = offs_n_group < C_out_per_group
+
+    # Decode m -> (n, oh, ow)
+    tmp = offs_m // (OH * OW)
+    n_idx = tmp
+    rem = offs_m - tmp * (OH * OW)
+    oh_idx = rem // OW
+    ow_idx = rem - oh_idx * OW
+
+    # Global output channel indices
+    oc_in_group = offs_n_group
+    oc = g * C_out_per_group + oc_in_group
+
+    # -------------------------------------------------------------------------
+    # Initialize accumulator in fp32
+    # -------------------------------------------------------------------------
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # -------------------------------------------------------------------------
+    # Reduction over K = C_in_per_group * K_H * K_W
+    # -------------------------------------------------------------------------
+    for k0 in range(0, K_SIZE, BLOCK_K):
+        k_idx = k0 + tl.arange(0, BLOCK_K)
+        mask_k = k_idx < K_SIZE
+
+        # Decode k -> (ci_in_group, kh, kw)
+        ci = k_idx // (K_H * K_W)
+        remk = k_idx - ci * (K_H * K_W)
+        kh = remk // K_W
+        kw = remk - kh * K_W
+
+        # Broadcast output indices
+        n_b = n_idx[:, None]
+        oh_b = oh_idx[:, None]
+        ow_b = ow_idx[:, None]
+
+        # Broadcast reduction indices
+        ci_b = ci[None, :]
+        kh_b = kh[None, :]
+        kw_b = kw[None, :]
+
+        # Compute input spatial coordinates
+        ih = oh_b * STRIDE_H + kh_b * DIL_H - PAD_H
+        iw = ow_b * STRIDE_W + kw_b * DIL_W - PAD_W
+
+        # Global input channel indices for this group
+        c = ci_b + g * C_in_per_group
+
+        # Bounds for input
+        mask_h = (ih >= 0) & (ih < H)
+        mask_w = (iw >= 0) & (iw < W)
+
+        # Final mask for input tile [M,K]
+        mask_a = (
+            mask_m[:, None] &
+            mask_k[None, :] &
+            mask_h &
+            mask_w
+        )
+
+        # Input tile [M, K]
+        a_ptrs = (
+            x_ptr
+            + n_b * x_stride_n
+            + c * x_stride_c
+            + ih * x_stride_h
+            + iw * x_stride_w
+        )
+        a = tl.load(a_ptrs, mask=mask_a, other=0.0)
+
+        # Weight tile [K, N]
+        oc_b = oc[None, :]
+        ci_col = ci[:, None]
+        kh_col = kh[:, None]
+        kw_col = kw[:, None]
+
+        mask_b = mask_k[:, None] & mask_n[None, :]
+
+        b_ptrs = (
+            w_ptr
+            + oc_b * w_stride_o
+            + ci_col * w_stride_i
+            + kh_col * w_stride_h
+            + kw_col * w_stride_w
+        )
+        b = tl.load(b_ptrs, mask=mask_b, other=0.0)
+
+        # Fused matmul accumulate
+        acc += tl.dot(a, b, allow_tf32=True)
+
+    # -------------------------------------------------------------------------
+    # Add bias if present
+    # -------------------------------------------------------------------------
+    if HAS_BIAS:
+        bias = tl.load(b_ptr + oc, mask=mask_n, other=0.0)
+        acc = acc + bias[None, :]
+
+    # -------------------------------------------------------------------------
+    # Cast to output dtype
+    # -------------------------------------------------------------------------
+    out = acc
+    if IS_FP16:
+        out = acc.to(tl.float16)
+    if IS_BF16:
+        out = acc.to(tl.bfloat16)
+
+    # -------------------------------------------------------------------------
+    # Store results
+    # -------------------------------------------------------------------------
+    n_b = n_idx[:, None]
+    oh_b = oh_idx[:, None]
+    ow_b = ow_idx[:, None]
+    oc_b = oc[None, :]
+
+    y_ptrs = (
+        y_ptr
+        + n_b * y_stride_n
+        + oc_b * y_stride_c
+        + oh_b * y_stride_h
+        + ow_b * y_stride_w
+    )
+
+    mask_out = mask_m[:, None] & mask_n[None, :]
+    tl.store(y_ptrs, out, mask=mask_out)
+
+
+def triton_conv2d(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor = None,
+    stride=(1, 1),
+    padding=(0, 0),
+    dilation=(1, 1),
+    groups: int = 1,
+) -> torch.Tensor:
+    assert x.ndim == 4, "Input must be NCHW"
+    assert weight.ndim == 4, "Weight must be OIHW"
+
+    if isinstance(stride, int):
+        stride = (stride, stride)
+    if isinstance(padding, int):
+        padding = (padding, padding)
+    if isinstance(dilation, int):
+        dilation = (dilation, dilation)
+
+    N, C_in, H, W = x.shape
+    C_out, C_in_per_group, K_H, K_W = weight.shape
+    assert C_in == C_in_per_group * groups, "Incompatible in_channels and groups"
+    assert C_out % groups == 0, "out_channels must be divisible by groups"
+
+    stride_h, stride_w = stride
+    pad_h, pad_w = padding
+    dil_h, dil_w = dilation
+
+    # Output spatial size (same as PyTorch's Conv2d)
+    OH = (H + 2 * pad_h - dil_h * (K_H - 1) - 1) // stride_h + 1
+    OW = (W + 2 * pad_w - dil_w * (K_W - 1) - 1) // stride_w + 1
+
+    # Handle degenerate case
+    if OH <= 0 or OW <= 0:
+        return x.new_empty((N, C_out, OH, OW))
+
+    # Ensure contiguous for predictable strides
+    x_contig = x.contiguous()
+    w_contig = weight.contiguous()
+
+    y = torch.empty(
+        (N, C_out, OH, OW),
+        device=x.device,
+        dtype=x.dtype,
+    )
+
+    # Strides (in elements)
+    x_stride_n, x_stride_c, x_stride_h, x_stride_w = x_contig.stride()
+    w_stride_o, w_stride_i, w_stride_h, w_stride_w = w_contig.stride()
+    y_stride_n, y_stride_c, y_stride_h, y_stride_w = y.stride()
+
+    C_out_per_group = C_out // groups
+    K_SIZE = C_in_per_group * K_H * K_W
+
+    # Dtype flags
+    is_fp16 = x.dtype == torch.float16
+    is_bf16 = x.dtype == torch.bfloat16
+
+    # 3D grid:
+    #   axis 0 -> tiles over M = N * OH * OW
+    #   axis 1 -> tiles over output channels within each group
+    #   axis 2 -> groups
+    M = N * OH * OW
+
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta['BLOCK_M']),
+            triton.cdiv(C_out_per_group, meta['BLOCK_N']),
+            groups,
+        )
+
+    b_ptr = bias if bias is not None else y  # dummy pointer if no bias
+
+    conv2d_fwd_kernel[grid](
+        x_contig,
+        w_contig,
+        b_ptr,
+        y,
+        N,
+        H,
+        W,
+        C_in,
+        C_out,
+        OH,
+        OW,
+        C_in_per_group,
+        C_out_per_group,
+        groups,
+        x_stride_n,
+        x_stride_c,
+        x_stride_h,
+        x_stride_w,
+        w_stride_o,
+        w_stride_i,
+        w_stride_h,
+        w_stride_w,
+        y_stride_n,
+        y_stride_c,
+        y_stride_h,
+        y_stride_w,
+        STRIDE_H=stride_h,
+        STRIDE_W=stride_w,
+        PAD_H=pad_h,
+        PAD_W=pad_w,
+        DIL_H=dil_h,
+        DIL_W=dil_w,
+        K_H=K_H,
+        K_W=K_W,
+        K_SIZE=K_SIZE,
+        HAS_BIAS=bias is not None,
+        IS_FP16=is_fp16,
+        IS_BF16=is_bf16,
+    )
+
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-accelerated 2D convolution layer, replacing nn.Conv2d forward with
+    a high-performance custom kernel.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size,
+        stride=(1, 1),
+        padding=(0, 0),
+        dilation=(1, 1),
+        groups: int = 1,
+        bias: bool = False,
+    ):
+        super().__init__()
+
+        if isinstance(kernel_size, int):
+            kernel_size = (kernel_size, kernel_size)
+        if isinstance(stride, int):
+            stride = (stride, stride)
+        if isinstance(padding, int):
+            padding = (padding, padding)
+        if isinstance(dilation, int):
+            dilation = (dilation, dilation)
+
+        assert in_channels % groups == 0, "in_channels must be divisible by groups"
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+        self.groups = groups
+
+        kH, kW = kernel_size
+        weight = torch.empty(
+            out_channels,
+            in_channels // groups,
+            kH,
+            kW,
+        )
+
+        # Kaiming uniform init, matching nn.Conv2d
+        nn.init.kaiming_uniform_(weight, a=math.sqrt(5))
+        self.weight = nn.Parameter(weight)
+
+        if bias:
+            bias_param = torch.empty(out_channels)
+            fan_in = in_channels * kH * kW // groups
+            bound = 1 / math.sqrt(fan_in)
+            nn.init.uniform_(bias_param, -bound, bound)
+            self.bias = nn.Parameter(bias_param)
+        else:
+            self.bias = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_conv2d(
+            x,
+            self.weight,
+            self.bias,
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation,
+            groups=self.groups,
+        )

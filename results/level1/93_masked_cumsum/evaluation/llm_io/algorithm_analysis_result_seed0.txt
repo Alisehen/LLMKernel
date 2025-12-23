@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The current implementation performs an extra full-tensor pass to apply the mask before the Triton cumsum, which is avoidable and likely memory-bandwidth bound.",
+  "bottleneck": "The code first computes `x_masked = x * mask.to(x.dtype)` as a separate CUDA kernel and writes it to global memory, then reads `x_masked` again inside the Triton scan. This doubles global memory traffic for the input and adds an extra launch, which is costly for large tensors and bandwidth-bound scans.",
+  "optimisation method": "Fuse the mask application into the Triton cumsum kernel: pass `mask_ptr` into `_cumsum_tile_kernel` and zero out elements based on the boolean mask at load time, eliminating the separate `x * mask` kernel and the intermediate `x_masked` tensor.",
+  "modification plan": "Remove the precomputation of `x_masked` in Python and keep `x` and `mask` in their original form. Extend `_cumsum_tile_kernel` (and the surrounding 2D reshape/transposition logic) to accept a `mask_ptr` with the same shape/strides as `x`, load both `x` and `mask` for each element, and compute `vals = tl.where(mask_vals, x_vals, 0)` before the local `tl.cumsum`. This keeps the rest of the multi-pass block-sum logic unchanged but reduces memory traffic and kernel launches.",
+  "expected_speedup": "20-30% for large, memory-bound tensors where the cost of the extra read/write of the full input dominates."
+}

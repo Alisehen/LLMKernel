@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The kernel is strongly compute‑bound with long per‑thread reduction loops, so an algorithm that exposes more structured matrix math can significantly increase effective FLOP/s (especially via tensor cores).",
+  "bottleneck": "Each thread performs a full serial reduction over C_IN * KD * KH * KW for every (output‑channel, output‑spatial) pair, which underutilizes tensor‑core hardware and limits parallelism in the reduction dimension even though SMs are near peak FP32 usage.",
+  "optimisation method": "Replace the direct nested-loop convolution with a GEMM-style algorithm (3D im2col/vol2col) so that conv_transpose3d is computed as a batched matrix multiplication; implement the core as tiled block‑GEMMs (M = C_OUT, K = C_IN * KD * KH * KW, N = spatial tiles) using tl.dot/tensor-core paths.",
+  "modification plan": "Logically reshape the operation so that for each batch you form a K×N matrix of unfolded input patches (3D im2col for transpose conv) and a M×K weight matrix, then write a Triton kernel that loads tiles of these two matrices into shared memory and computes C = W·X using block GEMM, reusing input/weight tiles across many outputs. Map C_OUT and spatial positions to the GEMM’s M and N dimensions, perform the K reduction via tiled tl.dot on tensor cores (e.g., FP16/BF16/TF32), and finally reshape the M×N output back to [N, C_out, D_out, H_out, W_out].",
+  "expected_speedup": "30-50% (and potentially >2× if switching to tensor-core friendly dtypes such as FP16/BF16/TF32)"
+}

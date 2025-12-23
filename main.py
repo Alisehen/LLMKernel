@@ -1068,130 +1068,169 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
         # All candidates pool: original seeds + algorithm-optimized seeds
         all_candidates = list(runnable_seeds)
 
-        if args.model == MODEL_NETWORK or args.model == MODEL_FUSION:
-            # Always attempt algorithm analysis, even for seeds >= 1.0
-            # This can potentially optimize further (e.g., 1.2x -> 1.8x)
-            print(f"\n{'='*80}")
-            print(f"[Hybrid Strategy] Analyzing all seeds for algorithmic optimization...")
-            seeds_below_1 = [s for s in runnable_seeds if s.score < 1.0]
-            seeds_above_1 = [s for s in runnable_seeds if s.score >= 1.0]
-            if seeds_below_1:
-                print(f"[Hybrid Strategy] - {len(seeds_below_1)} seed(s) with score < 1.0 (rescue)")
-            if seeds_above_1:
-                print(f"[Hybrid Strategy] - {len(seeds_above_1)} seed(s) with score >= 1.0 (further optimization)")
-            print(f"{'='*80}")
+        # Always attempt algorithm analysis for all model types (level1/2/3)
+        # This can potentially optimize further (e.g., 1.2x -> 1.8x)
+        print(f"\n{'='*80}")
+        print(f"[Hybrid Strategy] Analyzing all seeds for algorithmic optimization...")
+        seeds_below_1 = [s for s in runnable_seeds if s.score < 1.0]
+        seeds_above_1 = [s for s in runnable_seeds if s.score >= 1.0]
+        if seeds_below_1:
+            print(f"[Hybrid Strategy] - {len(seeds_below_1)} seed(s) with score < 1.0 (rescue)")
+        if seeds_above_1:
+            print(f"[Hybrid Strategy] - {len(seeds_above_1)} seed(s) with score >= 1.0 (further optimization)")
+        print(f"{'='*80}")
 
-            # Setup bench script once
-            bench_template_source = root_dir / "bench_ref_inputs_template.py"
-            bench_script = root_dir / f"bench_ref_inputs_{proc_id}.py"
-            if not bench_script.exists() or proc_id != 0:
-                import shutil
-                if bench_template_source.exists():
-                    shutil.copy(bench_template_source, bench_script)
-                else:
-                    raise FileNotFoundError(f"Bench template not found: {bench_template_source}")
+        # Setup bench script once
+        bench_template_source = root_dir / "bench_ref_inputs_template.py"
+        bench_script = root_dir / f"bench_ref_inputs_{proc_id}.py"
+        if not bench_script.exists() or proc_id != 0:
+            import shutil
+            if bench_template_source.exists():
+                shutil.copy(bench_template_source, bench_script)
+            else:
+                raise FileNotFoundError(f"Bench template not found: {bench_template_source}")
 
-            # Analyze each seed regardless of score
-            for seed_idx, seed_candidate in enumerate(runnable_seeds):
-                if seed_candidate.score >= 1.0:
-                    print(f"\n[Hybrid] Seed {seed_idx + 1}: score={seed_candidate.score:.4f} >= 1.0")
-                    print(f"[Hybrid] Attempting algorithm analysis for further optimization...")
-                else:
-                    print(f"\n[Hybrid] Seed {seed_idx + 1}: score={seed_candidate.score:.4f} < 1.0")
-                    print(f"[Hybrid] Attempting algorithm analysis rescue...")
+        # Analyze each seed regardless of score
+        for seed_idx, seed_candidate in enumerate(runnable_seeds):
+            if seed_candidate.score >= 1.0:
+                print(f"\n[Hybrid] Seed {seed_idx + 1}: score={seed_candidate.score:.4f} >= 1.0")
+                print(f"[Hybrid] Attempting algorithm analysis for further optimization...")
+            else:
+                print(f"\n[Hybrid] Seed {seed_idx + 1}: score={seed_candidate.score:.4f} < 1.0")
+                print(f"[Hybrid] Attempting algorithm analysis rescue...")
 
-                # Profile the seed to get NCU metrics
-                test_kernel = code_dir / f"test_kernel_analysis_seed{seed_idx}.py"
-                with open(test_kernel, "w") as f:
-                    f.write(seed_candidate.kernel.code)
+            # Profile the seed to get NCU metrics
+            test_kernel = code_dir / f"test_kernel_analysis_seed{seed_idx}.py"
+            with open(test_kernel, "w") as f:
+                f.write(seed_candidate.kernel.code)
 
-                metrics_df, ncu_block = _profile_kernel_ncu(
-                    seed_candidate.kernel, test_kernel, f"bench_ref_inputs_{proc_id}.py",
-                    task_path, args.device, args.model, proc_id
-                )
+            metrics_df, ncu_block = _profile_kernel_ncu(
+                seed_candidate.kernel, test_kernel, f"bench_ref_inputs_{proc_id}.py",
+                task_path, args.device, args.model, proc_id
+            )
 
-                # Get latency information from seed
-                seed_latency_ms = None
-                if hasattr(seed_candidate.kernel, 'metrics') and seed_candidate.kernel.metrics:
-                    test_latency = seed_candidate.kernel.metrics.get('test_latency_ms', {})
-                    if isinstance(test_latency, dict) and 'avg' in test_latency:
-                        seed_latency_ms = test_latency['avg']
+            # Get latency information from seed
+            seed_latency_ms = None
+            if hasattr(seed_candidate.kernel, 'metrics') and seed_candidate.kernel.metrics:
+                test_latency = seed_candidate.kernel.metrics.get('test_latency_ms', {})
+                if isinstance(test_latency, dict) and 'avg' in test_latency:
+                    seed_latency_ms = test_latency['avg']
 
-                # Build analysis prompt using algorithm_analysis
-                analysis_prompt = build_algorithm_analysis_prompt(
-                    arch_path=task_path,
-                    gpu_name=args.gpu,
-                    cuda_code=seed_candidate.kernel.code,
-                    ncu_metrics_block=ncu_block if ncu_block != "No NCU metrics available" else "",
-                    current_latency_ms=seed_latency_ms,
-                    baseline_latency_ms=pytorch_baseline_ms,
-                )
+            # Build analysis prompt using algorithm_analysis
+            analysis_prompt = build_algorithm_analysis_prompt(
+                arch_path=task_path,
+                gpu_name=args.gpu,
+                cuda_code=seed_candidate.kernel.code,
+                ncu_metrics_block=ncu_block if ncu_block != "No NCU metrics available" else "",
+                current_latency_ms=seed_latency_ms,
+                baseline_latency_ms=pytorch_baseline_ms,
+            )
 
-                # Save analysis prompt
-                analysis_prompt_file = io_dir / f"algorithm_analysis_prompt_seed{seed_idx}.txt"
-                analysis_prompt_file.write_text(analysis_prompt, encoding="utf-8")
+            # Save analysis prompt
+            analysis_prompt_file = io_dir / f"algorithm_analysis_prompt_seed{seed_idx}.txt"
+            analysis_prompt_file.write_text(analysis_prompt, encoding="utf-8")
 
-                # Call LLM for algorithm analysis
-                print(f"[Hybrid] Requesting LLM analysis for seed {seed_idx + 1}...")
-                analysis_result = call_llm(
-                    analysis_prompt,
-                    sys_prompt="You are an expert GPU kernel optimization architect. Analyze the kernel's algorithmic structure and identify high-level optimization opportunities.",
-                    log_path=log_path,
-                    call_type=f"algorithm_analysis_seed{seed_idx}",
-                    round_idx=1000 + seed_idx,
-                )
+            # Call LLM for algorithm analysis
+            print(f"[Hybrid] Requesting LLM analysis for seed {seed_idx + 1}...")
+            analysis_result = call_llm(
+                analysis_prompt,
+                sys_prompt="You are an expert GPU kernel optimization architect. Analyze the kernel's algorithmic structure and identify high-level optimization opportunities.",
+                log_path=log_path,
+                call_type=f"algorithm_analysis_seed{seed_idx}",
+                round_idx=1000 + seed_idx,
+            )
 
-                # Save analysis result
-                analysis_result_file = io_dir / f"algorithm_analysis_result_seed{seed_idx}.txt"
-                analysis_result_file.write_text(analysis_result, encoding="utf-8")
+            # Save analysis result
+            analysis_result_file = io_dir / f"algorithm_analysis_result_seed{seed_idx}.txt"
+            analysis_result_file.write_text(analysis_result, encoding="utf-8")
 
-                # Extract analysis and check if worth optimizing
-                try:
-                    # Parse JSON analysis result
-                    analysis_json = extract_json(analysis_result)
-                    if analysis_json:
-                        worth_optimizing = analysis_json.get('worth_optimizing', 'yes').lower()
-                        reason = analysis_json.get('reason', 'N/A')
+            # Extract analysis and check if worth optimizing
+            try:
+                # Parse JSON analysis result
+                analysis_json = extract_json(analysis_result)
+                if analysis_json:
+                    worth_optimizing = analysis_json.get('worth_optimizing', 'yes').lower()
+                    reason = analysis_json.get('reason', 'N/A')
 
-                        print(f"[Hybrid] Worth optimizing: {worth_optimizing}")
-                        print(f"[Hybrid] Reason: {reason}")
+                    print(f"[Hybrid] Worth optimizing: {worth_optimizing}")
+                    print(f"[Hybrid] Reason: {reason}")
 
-                        # Check if optimization is worthwhile
-                        if worth_optimizing == 'no':
-                            print(f"[Hybrid] ⊘ Skipping optimization for seed {seed_idx + 1} (not worth optimizing)")
-                            continue
+                    # Check if optimization is worthwhile
+                    if worth_optimizing == 'no':
+                        print(f"[Hybrid] ⊘ Skipping optimization for seed {seed_idx + 1} (not worth optimizing)")
+                        continue
 
-                        # Continue with optimization if worthwhile
-                        print(f"[Hybrid] Analysis complete for seed {seed_idx + 1}, generating optimized kernel...")
-                        print(f"[Hybrid] Bottleneck: {analysis_json.get('bottleneck', 'N/A')[:80]}...")
-                        print(f"[Hybrid] Optimization: {analysis_json.get('optimisation method', 'N/A')[:80]}...")
-                        print(f"[Hybrid] Expected speedup: {analysis_json.get('expected_speedup', 'N/A')}")
+                    # Continue with optimization if worthwhile
+                    print(f"[Hybrid] Analysis complete for seed {seed_idx + 1}, generating optimized kernel...")
+                    print(f"[Hybrid] Bottleneck: {analysis_json.get('bottleneck', 'N/A')[:80]}...")
+                    print(f"[Hybrid] Optimization: {analysis_json.get('optimisation method', 'N/A')[:80]}...")
+                    print(f"[Hybrid] Expected speedup: {analysis_json.get('expected_speedup', 'N/A')}")
 
-                        # Read PyTorch reference code
-                        pytorch_code = task_path.read_text(encoding="utf-8")
+                    # Read PyTorch reference code
+                    pytorch_code = task_path.read_text(encoding="utf-8")
 
-                        # Build prompt for generating optimized seed based on analysis
-                        optimization_instruction = build_optimization_from_analysis_prompt(
-                            bottleneck=analysis_json.get('bottleneck', 'N/A'),
-                            optimization_method=analysis_json.get('optimisation method', 'N/A'),
-                            modification_plan=analysis_json.get('modification plan', 'N/A'),
-                            expected_speedup=analysis_json.get('expected_speedup', 'N/A'),
-                            current_kernel=seed_candidate.kernel.code,
-                            pytorch_reference=pytorch_code,
+                    # Build prompt for generating optimized seed based on analysis
+                    optimization_instruction = build_optimization_from_analysis_prompt(
+                        bottleneck=analysis_json.get('bottleneck', 'N/A'),
+                        optimization_method=analysis_json.get('optimisation method', 'N/A'),
+                        modification_plan=analysis_json.get('modification plan', 'N/A'),
+                        expected_speedup=analysis_json.get('expected_speedup', 'N/A'),
+                        current_kernel=seed_candidate.kernel.code,
+                        pytorch_reference=pytorch_code,
+                    )
+
+                    # Save optimization prompt
+                    optimization_prompt_file = io_dir / f"optimization_from_analysis_prompt_seed{seed_idx}.txt"
+                    optimization_prompt_file.write_text(optimization_instruction, encoding="utf-8")
+
+                    # Generate optimized seed
+                    optimized_kernel = _llm_to_kernel(
+                        optimization_instruction, code_dir, call_llm, io_dir,
+                        2000 + seed_idx, log_path=log_path, call_type=f"algorithm_optimized_seed{seed_idx}",
+                    )
+
+                    # Benchmark optimized seed
+                    baseline_result = _bench_and_score(
+                        optimized_kernel,
+                        ref_py=task_path,
+                        device_idx=args.device,
+                        warmup=args.warmup,
+                        repeat=args.repeat,
+                        tol=args.tol,
+                        rtol=args.rtol,
+                        phase=f"algorithm_optimized_seed{seed_idx}",
+                        metrics_dir=eval_dir,
+                        cached_baseline_ms=pytorch_baseline_ms,
+                    )
+
+                    runnable = bool(getattr(optimized_kernel, "metrics", {}).get("runnable", False))
+                    optimized_score = optimized_kernel.score if (optimized_kernel.score is not None and runnable) else 0.0
+
+                    # Repair if algorithm-optimized kernel failed
+                    max_algo_repair = 1
+                    algo_repair_attempt = 0
+                    while (not runnable or optimized_score == 0) and algo_repair_attempt < max_algo_repair:
+                        algo_repair_attempt += 1
+                        print(f"[Hybrid] Algorithm-optimized kernel failed, attempting repair...")
+
+                        error_log = _last_n_lines(getattr(optimized_kernel, "metrics", {}).get("message", ""))
+                        repair_prompt = build_error_prompt(
+                            old_code=optimized_kernel.code,
+                            error_log=error_log,
+                            problem=None,
+                            gpu_name=args.gpu,
+                            error_history="",
+                            arch_path=task_path,
                         )
 
-                        # Save optimization prompt
-                        optimization_prompt_file = io_dir / f"optimization_from_analysis_prompt_seed{seed_idx}.txt"
-                        optimization_prompt_file.write_text(optimization_instruction, encoding="utf-8")
-
-                        # Generate optimized seed
                         optimized_kernel = _llm_to_kernel(
-                            optimization_instruction, code_dir, call_llm, io_dir,
-                            2000 + seed_idx, log_path=log_path, call_type=f"algorithm_optimized_seed{seed_idx}",
+                            repair_prompt, code_dir, call_llm, io_dir,
+                            2000 + seed_idx * 10 + algo_repair_attempt,
+                            log_path=log_path,
+                            call_type=f"algorithm_optimized_seed{seed_idx}_repair{algo_repair_attempt}",
                         )
 
-                        # Benchmark optimized seed
-                        baseline_result = _bench_and_score(
+                        _bench_and_score(
                             optimized_kernel,
                             ref_py=task_path,
                             device_idx=args.device,
@@ -1199,7 +1238,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                             repeat=args.repeat,
                             tol=args.tol,
                             rtol=args.rtol,
-                            phase=f"algorithm_optimized_seed{seed_idx}",
+                            phase=f"algorithm_optimized_seed{seed_idx}_repair{algo_repair_attempt}",
                             metrics_dir=eval_dir,
                             cached_baseline_ms=pytorch_baseline_ms,
                         )
@@ -1207,67 +1246,27 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                         runnable = bool(getattr(optimized_kernel, "metrics", {}).get("runnable", False))
                         optimized_score = optimized_kernel.score if (optimized_kernel.score is not None and runnable) else 0.0
 
-                        # Repair if algorithm-optimized kernel failed
-                        max_algo_repair = 1
-                        algo_repair_attempt = 0
-                        while (not runnable or optimized_score == 0) and algo_repair_attempt < max_algo_repair:
-                            algo_repair_attempt += 1
-                            print(f"[Hybrid] Algorithm-optimized kernel failed, attempting repair...")
-
-                            error_log = _last_n_lines(getattr(optimized_kernel, "metrics", {}).get("message", ""))
-                            repair_prompt = build_error_prompt(
-                                old_code=optimized_kernel.code,
-                                error_log=error_log,
-                                problem=None,
-                                gpu_name=args.gpu,
-                                error_history="",
-                                arch_path=task_path,
-                            )
-
-                            optimized_kernel = _llm_to_kernel(
-                                repair_prompt, code_dir, call_llm, io_dir,
-                                2000 + seed_idx * 10 + algo_repair_attempt,
-                                log_path=log_path,
-                                call_type=f"algorithm_optimized_seed{seed_idx}_repair{algo_repair_attempt}",
-                            )
-
-                            _bench_and_score(
-                                optimized_kernel,
-                                ref_py=task_path,
-                                device_idx=args.device,
-                                warmup=args.warmup,
-                                repeat=args.repeat,
-                                tol=args.tol,
-                                rtol=args.rtol,
-                                phase=f"algorithm_optimized_seed{seed_idx}_repair{algo_repair_attempt}",
-                                metrics_dir=eval_dir,
-                                cached_baseline_ms=pytorch_baseline_ms,
-                            )
-
-                            runnable = bool(getattr(optimized_kernel, "metrics", {}).get("runnable", False))
-                            optimized_score = optimized_kernel.score if (optimized_kernel.score is not None and runnable) else 0.0
-
-                            if runnable and optimized_score > 0:
-                                print(f"[Hybrid] ✓ Repair successful for algorithm-optimized seed {seed_idx + 1}")
-                                break
-
                         if runnable and optimized_score > 0:
-                            print(f"[Hybrid] ✓ Rescue successful: {seed_candidate.score:.4f} → {optimized_score:.4f}")
-                            # Add to all candidates pool
-                            all_candidates.append(BeamCandidate(
-                                kernel=optimized_kernel,
-                                score=optimized_score,
-                                runnable=True,
-                            ))
-                            if optimized_score > best_score:
-                                best_score = optimized_score
-                                best_kernel = optimized_kernel
-                        else:
-                            print(f"[Hybrid] ✗ Rescue failed, keeping original seed")
+                            print(f"[Hybrid] ✓ Repair successful for algorithm-optimized seed {seed_idx + 1}")
+                            break
 
-                except Exception as e:
-                    print(f"[Hybrid] ✗ Algorithm analysis failed for seed {seed_idx + 1}: {e}")
-                    print(f"[Hybrid] Continuing with original seed...")
+                    if runnable and optimized_score > 0:
+                        print(f"[Hybrid] ✓ Rescue successful: {seed_candidate.score:.4f} → {optimized_score:.4f}")
+                        # Add to all candidates pool
+                        all_candidates.append(BeamCandidate(
+                            kernel=optimized_kernel,
+                            score=optimized_score,
+                            runnable=True,
+                        ))
+                        if optimized_score > best_score:
+                            best_score = optimized_score
+                            best_kernel = optimized_kernel
+                    else:
+                        print(f"[Hybrid] ✗ Rescue failed, keeping original seed")
+
+            except Exception as e:
+                print(f"[Hybrid] ✗ Algorithm analysis failed for seed {seed_idx + 1}: {e}")
+                print(f"[Hybrid] Continuing with original seed...")
 
         # ====== Step 4: Select Best Candidate from All (seeds + algo-optimized) ======
         print(f"\n{'='*80}")
