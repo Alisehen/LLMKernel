@@ -135,12 +135,6 @@ FUSION_STAGE_FOCUS_MAP = {
     "grid_and_parallel": """
 Focus: Grid layout & indexing for FUSED operations.
 
-⚠️ FUSION EXCLUSIONS (do NOT apply fusion rules to these):
-- Reduction ops (sum, mean, softmax along axis)
-- Atomic operations
-- Irregular/data-dependent access patterns
-- Cross-block dependencies
-
 Key Principle:
 - All fused ops share the SAME grid AND the SAME (offsets, mask) tuple
 - Grid covers OUTPUT tensor dimensions

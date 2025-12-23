@@ -112,9 +112,10 @@ ow_idx = rem2 % W_out
 # Network model guidance (level3) - selective optimization
 # ---------------------------------------------------------------------------
 NETWORK_GUIDANCE = """
-## Full Network Optimization
-- Preserve model structure (helper classes, Sequential, ModuleList)
-- Fuse adjacent ops in forward() where beneficial
+## Full-Network Optimization Guidance
+- Target is a **complete nn.Module**, not a single operator.
+- Preserve module structure and forward() control flow.
+- Allow fusion **within a branch or module**, but NOT across branches.
 """
 
 # ---------------------------------------------------------------------------
