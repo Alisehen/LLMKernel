@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The current pipeline does a full global-memory round-trip and a second kernel launch for InstanceNorm + division after convolution, which is a classic operator-fusion opportunity with substantial bandwidth savings.",
+  "bottleneck": "After the conv2d kernel writes the entire output tensor to global memory, instance_norm_divide_kernel re-reads and re-writes the same tensor, so the operation is heavily memory-bandwidth bound with redundant global traffic and extra launch overhead.",
+  "optimisation method": "Fuse Conv2d + InstanceNorm + division into a single Triton kernel by changing the parallelization so that each program instance owns a full (n, c_out, :, :) slice, computes convolution, accumulates per-(n,c) statistics over H×W, then normalizes and divides before a single global store.",
+  "modification plan": "Redesign the fused kernel to launch over (N, C_out) instead of (N*H_out*W_out, C_out): inside each program, loop over H_out×W_out to compute conv outputs for that (n, c_out), while accumulating sum and sum of squares in registers. After finishing the spatial loop, compute mean/variance, then run a second intra-program pass over H_out×W_out (recomputing conv or buffering in shared/local memory depending on resource tradeoffs) to apply instance normalization and the final divide, writing results once to global memory. Replace the two-kernel sequence in ModelNew.forward with this single fused kernel, keeping the PyTorch InstanceNorm module only for eps/state_dict compatibility.",
+  "expected_speedup": "30-40%"
+}

@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "Most FLOPs and memory traffic are in the Inception modules, while Triton is only used for light ops (ReLU, final FC), giving overhead without addressing the real hotspot.",
+  "bottleneck": "Each InceptionModule computes four branches (1x1, 1x1→3x3, 1x1→5x5, pool→1x1) as separate conv/pool kernels; this rereads the same input feature map multiple times from DRAM and incurs many small kernel launches per module.",
+  "optimisation method": "Use operator fusion: implement a single Triton kernel per InceptionModule that loads tiles of the input once, computes all four branches (including the 1x1 reductions and 3x3/5x5 convs and pooling) in shared/register memory, and writes out the concatenated channels in one launch.",
+  "modification plan": "Replace the nn.Sequential-based InceptionModule with a Triton-backed module whose forward() calls a custom fused kernel. In that kernel, for each output spatial tile: load the corresponding input tile once, compute the 1x1 branch, 1x1-reduction + 3x3 branch, 1x1-reduction + 5x5 branch, and maxpool + 1x1 branch using shared weights; accumulate each branch’s outputs into separate channel ranges, and store a single concatenated output tensor. This removes redundant global loads and multiple kernel launches per branch, shifting Triton to the true compute hotspot.",
+  "expected_speedup": "20-30%"
+}

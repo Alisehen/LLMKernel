@@ -1,0 +1,156 @@
+```python
+import torch, torch.nn as nn, triton, triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8},
+            num_stages=4, num_warps=8
+        ),
+        triton.Config(
+            {'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 4},
+            num_stages=4, num_warps=8
+        ),
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_M': 8},
+            num_stages=5, num_warps=4
+        ),
+    ],
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def fused_linear_swish_scale_kernel_optimized(
+    a_ptr, b_ptr, bias_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    scaling_factor,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr, GROUP_M: tl.constexpr,
+):
+    # -------------------------------------------------------------------------
+    # High-performance matmul tiling (Triton matmul template style)
+    # -------------------------------------------------------------------------
+    pid = tl.program_id(axis=0)
+
+    # Number of tiles along M and N
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+
+    # Grouped ordering along M to improve L2 locality
+    group_size = GROUP_M * num_pid_n
+    group_id = pid // group_size
+    first_pid_m = group_id * GROUP_M
+    pid_in_group = pid % group_size
+    pid_m = first_pid_m + pid_in_group // num_pid_n
+    pid_n = pid_in_group % num_pid_n
+
+    # Compute offsets for this block
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Pointers to first tiles of A and B
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    # Accumulator in FP32
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Loop over K
+    for k in range(0, K, BLOCK_K):
+        a_mask = (offs_m[:, None] < M) & (k + offs_k[None, :] < K)
+        b_mask = (k + offs_k[:, None] < K) & (offs_n[None, :] < N)
+
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+        acc += tl.dot(a, b, allow_tf32=True)
+
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # -------------------------------------------------------------------------
+    # Fused epilogue: bias + Swish + scaling
+    #   y = (x @ W^T + b)
+    #   y = y * sigmoid(y)
+    #   y = y * scaling_factor
+    # -------------------------------------------------------------------------
+    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc += bias[None, :]
+
+    # Swish: x * sigmoid(x), sigmoid(x) = 1 / (1 + exp(-x))
+    neg_acc = -acc
+    exp_neg = tl.exp(neg_acc)
+    sig = 1.0 / (1.0 + exp_neg)
+    acc = acc * sig
+
+    # Scaling
+    acc = acc * scaling_factor
+
+    # Store result
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    out_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, acc, mask=out_mask)
+
+
+def fused_linear_swish_scale(x: torch.Tensor,
+                             weight: torch.Tensor,
+                             bias: torch.Tensor,
+                             scaling_factor: float) -> torch.Tensor:
+    """
+    x:      [M, K]
+    weight: [N, K] (same layout as nn.Linear.weight)
+    bias:   [N]
+    Returns:
+      y = (x @ weight.T + bias) * sigmoid(x @ weight.T + bias) * scaling_factor
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda, "All tensors must be on CUDA"
+    M, K = x.shape
+    N = weight.shape[0]
+    assert weight.shape[1] == K
+    assert bias.shape[0] == N
+
+    # Convert weight [N, K] -> [K, N] for GEMM (A: [M,K], B: [K,N])
+    b = weight.t().contiguous()
+
+    # Output tensor
+    c = torch.empty((M, N), device=x.device, dtype=x.dtype)
+
+    # 1D launch grid over (M, N) tiles
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta['BLOCK_M']) * triton.cdiv(N, meta['BLOCK_N']),
+        )
+
+    fused_linear_swish_scale_kernel_optimized[grid](
+        x, b, bias, c,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        b.stride(0), b.stride(1),
+        c.stride(0), c.stride(1),
+        scaling_factor,
+    )
+    return c
+
+
+class ModelNew(nn.Module):
+    """
+    Fused implementation of:
+      y = (x @ W^T + b)
+      y = y * sigmoid(y)   # Swish
+      y = y * scaling_factor
+    using a high-performance Triton matmul kernel with fused epilogue.
+    """
+    def __init__(self, in_features, out_features, scaling_factor):
+        super(ModelNew, self).__init__()
+        # Match nn.Linear parameter shapes: weight [out_features, in_features], bias [out_features]
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.bias = nn.Parameter(torch.randn(out_features))
+        self.scaling_factor = float(scaling_factor)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return fused_linear_swish_scale(x, self.weight, self.bias, self.scaling_factor)
+```

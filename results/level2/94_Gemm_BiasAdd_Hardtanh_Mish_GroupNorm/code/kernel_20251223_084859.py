@@ -1,0 +1,331 @@
+# <complete ModelNew code with optimized Triton kernels>
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+# ------------------------------------------------------------
+# Fused GEMM + Bias + Hardtanh + Mish
+# ------------------------------------------------------------
+
+@triton.autotune(
+    configs=[
+        # Conservative baseline (good for high register pressure / small shapes)
+        triton.Config(
+            {
+                "BLOCK_M": 64,
+                "BLOCK_N": 64,
+                "BLOCK_K": 32,
+            },
+            num_warps=4,
+            num_stages=2,
+        ),
+        # Wider N tile – good when N is large, more reuse of bias/weights
+        triton.Config(
+            {
+                "BLOCK_M": 64,
+                "BLOCK_N": 128,
+                "BLOCK_K": 32,
+            },
+            num_warps=8,
+            num_stages=2,
+        ),
+        # Taller M tile – good when batch is large
+        triton.Config(
+            {
+                "BLOCK_M": 128,
+                "BLOCK_N": 64,
+                "BLOCK_K": 32,
+            },
+            num_warps=8,
+            num_stages=2,
+        ),
+        # Deeper K tile – better for skinny matrices / large K
+        triton.Config(
+            {
+                "BLOCK_M": 32,
+                "BLOCK_N": 128,
+                "BLOCK_K": 64,
+            },
+            num_warps=4,
+            num_stages=2,
+        ),
+    ],
+    key=["M", "N", "K"],
+)
+@triton.jit
+def fused_gemm_bias_hardtanh_mish_kernel(
+    a_ptr, b_ptr, bias_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    min_val, max_val,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    # Program IDs for 2D tiling of C = A @ B
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    # Offsets within the tile
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+
+    # Pointers to the first K-tile for A and B
+    # A: (M, K) with strides (stride_am, stride_ak)
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+
+    # B is logical (K, N) (i.e., W^T) where W is stored as (N, K)
+    # B: (K, N) with strides (stride_bk, stride_bn)
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    # FP32 accumulator for numerical stability
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Loop over K dimension
+    for k in range(0, K, BLOCK_K):
+        k_remaining = K - k
+        k_mask = offs_k < k_remaining
+
+        a = tl.load(
+            a_ptrs,
+            mask=mask_m[:, None] & k_mask[None, :],
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptrs,
+            mask=k_mask[:, None] & mask_n[None, :],
+            other=0.0,
+        )
+
+        # Fused MMA (tf32 enabled for RTX 4090 throughput)
+        acc += tl.dot(a, b, allow_tf32=True)
+
+        # Advance pointers along K
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Load bias (N,) once per program and broadcast over M
+    bias = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0)
+    acc = acc + bias[None, :]
+
+    # Hardtanh clamp
+    acc = tl.maximum(acc, min_val)
+    acc = tl.minimum(acc, max_val)
+
+    # Mish activation: x * tanh(softplus(x)), x is already clamped
+    # softplus(x) = log(1 + exp(x)), safe here since x in [min_val, max_val]
+    sp = tl.log(1.0 + tl.exp(acc))
+    t = tl.exp(2.0 * sp)
+    mish_scale = (t - 1.0) / (t + 1.0)
+    acc = acc * mish_scale
+
+    # Store result (single store, no intermediate stores)
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    tl.store(
+        c_ptrs,
+        acc,
+        mask=mask_m[:, None] & mask_n[None, :],
+    )
+
+
+def fused_gemm_bias_hardtanh_mish(x, weight, bias, min_val=-1.0, max_val=1.0):
+    """
+    x:      (B, in_features)
+    weight: (out_features, in_features)  -- stored as (N, K)
+    bias:   (out_features,)
+    returns: (B, out_features)
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+
+    x_contig = x.contiguous()
+    w_contig = weight.contiguous()
+    b_contig = bias.contiguous()
+
+    B, K = x_contig.shape
+    out_features, in_features = w_contig.shape
+    assert in_features == K
+    N = out_features
+
+    y = torch.empty((B, N), device=x.device, dtype=x.dtype)
+
+    # weight (N, K): strides (stride_bn over n, stride_bk over k)
+    stride_bk = w_contig.stride(1)
+    stride_bn = w_contig.stride(0)
+
+    def grid(meta):
+        return (
+            triton.cdiv(B, meta["BLOCK_M"]),
+            triton.cdiv(N, meta["BLOCK_N"]),
+        )
+
+    fused_gemm_bias_hardtanh_mish_kernel[grid](
+        x_contig,
+        w_contig,
+        b_contig,
+        y,
+        B, N, K,
+        x_contig.stride(0), x_contig.stride(1),
+        stride_bk, stride_bn,
+        y.stride(0), y.stride(1),
+        min_val, max_val,
+        # num_warps & num_stages come from autotune configs
+    )
+    return y
+
+
+# ------------------------------------------------------------
+# GroupNorm over (B, C) with full support for large group_size
+# Single-kernel two-pass implementation (mean/var + normalize)
+# ------------------------------------------------------------
+
+@triton.jit
+def groupnorm_forward_kernel(
+    x_ptr, gamma_ptr, beta_ptr, y_ptr,
+    B, C, G, group_size, eps,
+    stride_xb, stride_xc, stride_yb, stride_yc,
+    BLOCK_SIZE: tl.constexpr,
+):
+    # Grid: (B, G) = (batch, group)
+    pid_b = tl.program_id(0)  # batch index
+    pid_g = tl.program_id(1)  # group index
+
+    # Early mask for valid (b, g)
+    is_valid_bg = (pid_b < B) & (pid_g < G)
+    if not is_valid_bg:
+        return  # allowed: no loop inside
+
+    group_start = pid_g * group_size
+    offs = tl.arange(0, BLOCK_SIZE)
+
+    # -----------------------------
+    # Pass 1: compute mean and var
+    # -----------------------------
+    mean_acc = tl.zeros((), dtype=tl.float32)
+    var_acc = tl.zeros((), dtype=tl.float32)
+
+    # Loop over channel tiles inside the group
+    for c_off in range(0, group_size, BLOCK_SIZE):
+        c_idxs = group_start + c_off + offs
+
+        mask = (c_idxs < group_start + group_size) & (c_idxs < C)
+        # Broadcast batch/row index into pointer arithmetic
+        x_ptrs = x_ptr + pid_b * stride_xb + c_idxs * stride_xc
+
+        x = tl.load(x_ptrs, mask=mask, other=0.0)
+        x = x.to(tl.float32)
+
+        mean_acc += tl.sum(x, axis=0)
+        var_acc += tl.sum(x * x, axis=0)
+
+    denom = tl.full((), group_size, dtype=tl.float32)
+    mean = mean_acc / denom
+    var = var_acc / denom - mean * mean
+    rstd = 1.0 / tl.sqrt(var + eps)
+
+    # -----------------------------
+    # Pass 2: normalize and affine
+    # -----------------------------
+    for c_off in range(0, group_size, BLOCK_SIZE):
+        c_idxs = group_start + c_off + offs
+
+        mask = (c_idxs < group_start + group_size) & (c_idxs < C)
+        x_ptrs = x_ptr + pid_b * stride_xb + c_idxs * stride_xc
+        y_ptrs = y_ptr + pid_b * stride_yb + c_idxs * stride_yc
+
+        x = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
+        gamma = tl.load(gamma_ptr + c_idxs, mask=mask, other=1.0).to(tl.float32)
+        beta = tl.load(beta_ptr + c_idxs, mask=mask, other=0.0).to(tl.float32)
+
+        x_hat = (x - mean) * rstd
+        y = x_hat * gamma + beta
+
+        # Single store for final output
+        tl.store(y_ptrs, y, mask=mask)
+
+
+def groupnorm_forward(x, weight, bias, num_groups, eps=1e-5):
+    """
+    x:      (B, C)
+    weight: (C,)
+    bias:   (C,)
+    GroupNorm over channel dimension with num_groups groups.
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+
+    x_contig = x.contiguous()
+    w_contig = weight.contiguous()
+    b_contig = bias.contiguous()
+
+    B, C = x_contig.shape
+    assert C == w_contig.numel() == b_contig.numel()
+    assert C % num_groups == 0
+    group_size = C // num_groups
+
+    y = torch.empty_like(x_contig)
+
+    # Single BLOCK_SIZE, chunked in-kernel; supports any group_size
+    BLOCK_SIZE = 256
+
+    grid = lambda META: (B, num_groups)
+
+    groupnorm_forward_kernel[grid](
+        x_contig, w_contig, b_contig, y,
+        B, C, num_groups, group_size, eps,
+        x_contig.stride(0), x_contig.stride(1),
+        y.stride(0), y.stride(1),
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=4,
+        num_stages=2,
+    )
+    return y
+
+
+# ------------------------------------------------------------
+# ModelNew using Triton kernels
+# ------------------------------------------------------------
+
+class ModelNew(nn.Module):
+    """
+    GEMM + BiasAdd + Hardtanh + Mish + GroupNorm
+    implemented with high-performance Triton kernels.
+    """
+    def __init__(self, in_features, out_features, bias_shape, num_groups):
+        super(ModelNew, self).__init__()
+        assert bias_shape == (out_features,)
+
+        # Linear layer parameters
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+
+        # GroupNorm affine parameters (per-channel scale and shift)
+        self.num_groups = num_groups
+        self.gn_weight = nn.Parameter(torch.ones(out_features))
+        self.gn_bias = nn.Parameter(torch.zeros(out_features))
+        self.eps = 1e-5
+
+    def forward(self, x):
+        # Ensure CUDA tensors
+        if not x.is_cuda:
+            x = x.cuda(non_blocking=True)
+        if not self.weight.is_cuda:
+            self.weight.data = self.weight.data.cuda(non_blocking=True)
+        if not self.bias.is_cuda:
+            self.bias.data = self.bias.data.cuda(non_blocking=True)
+        if not self.gn_weight.is_cuda:
+            self.gn_weight.data = self.gn_weight.data.cuda(non_blocking=True)
+        if not self.gn_bias.is_cuda:
+            self.gn_bias.data = self.gn_bias.data.cuda(non_blocking=True)
+
+        # Fused GEMM + Bias + Hardtanh + Mish
+        x = fused_gemm_bias_hardtanh_mish(x, self.weight, self.bias)
+
+        # GroupNorm over (batch, channels)
+        x = groupnorm_forward(x, self.gn_weight, self.gn_bias, self.num_groups, eps=self.eps)
+        return x

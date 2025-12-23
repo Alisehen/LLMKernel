@@ -1,34 +1,12 @@
 You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
 
-# Target GPU
-GPU Name: 4090
-Architecture: Ada Lovelace
-• Compute Capability: 8.9
-• Number of SMs: 128
-• Memory Bandwidth: 1008 GB/s
-• TF32 Tensor Core TFLOPS: 82.6 with dense
-• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
-• FP16 Tensor Core TFLOPS: 165.2 with dense
-• Maximum number of registers per thread: 255
-• Maximum threads per block: 1024
-• Maximum threads per SM: 1536
-• Warp size: 32
-• Maximum concurrent warps per SM: 48
-• Shared memory capacity per SM: 100 KB
-• Maximum shared memory per thread block: 99 KB
-• L2 cache (global, all SM shared): 72 MB
+# Target GPU: 4090
 
-[OPTIMIZATION STAGE]f
+[OPTIMIZATION STAGE]
 
 ## Current Optimization Stage
 
 Focus: Grid layout & indexing for FUSED operations.
-
-⚠️ FUSION EXCLUSIONS (do NOT apply fusion rules to these):
-- Reduction ops (sum, mean, softmax along axis)
-- Atomic operations
-- Irregular/data-dependent access patterns
-- Cross-block dependencies
 
 Key Principle:
 - All fused ops share the SAME grid AND the SAME (offsets, mask) tuple
@@ -50,191 +28,165 @@ Verification:
 
 [CURRENT CODE]
 ```python
-# <complete ModelNew code with optimized Triton kernels>
+# Optimized Triton-backed implementation of the given GoogLeNet-style model.
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import triton
 import triton.language as tl
 
 
-# -----------------------------------------
-# Triton matmul + bias kernel (A @ B + bias)
-# -----------------------------------------
+# -------------------------
+# Triton Kernels & Wrappers
+# -------------------------
 
 @triton.jit
-def matmul_bias_kernel(
-    a_ptr, b_ptr, bias_ptr, c_ptr,
+def relu_kernel(
+    x_ptr, y_ptr,
+    N,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < N
+
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+    x = tl.maximum(x, 0.0)
+    tl.store(y_ptr + offs, x, mask=mask)
+
+
+def triton_relu(x: torch.Tensor) -> torch.Tensor:
+    """
+    Elementwise ReLU using Triton.
+    Works on contiguous tensors of any shape/dtype supported by Triton.
+    """
+    assert x.is_cuda, "Input must be a CUDA tensor"
+    y = torch.empty_like(x)
+    N = x.numel()
+    if N == 0:
+        return x
+    grid = lambda META: (triton.cdiv(N, META["BLOCK_SIZE"]),)
+    relu_kernel[grid](
+        x, y,
+        N,
+        BLOCK_SIZE=256,
+    )
+    return y
+
+
+@triton.jit
+def linear_kernel(
+    a_ptr,  # [M, K]
+    b_ptr,  # [K, N] = weight^T
+    bias_ptr,  # [N]
+    c_ptr,  # [M, N]
     M, N, K,
     stride_am, stride_ak,
     stride_bk, stride_bn,
     stride_cm, stride_cn,
-    HAS_BIAS: tl.constexpr,
-    BLOCK_M: tl.constexpr,  # power of 2
-    BLOCK_N: tl.constexpr,  # power of 2
-    BLOCK_K: tl.constexpr,  # power of 2
+    BLOCK_M: tl.constexpr,  # tile size in M
+    BLOCK_N: tl.constexpr,  # tile size in N
+    BLOCK_K: tl.constexpr,  # tile size in K
 ):
-    """
-    Computes C = A @ B + bias, where:
-      A: [M, K]
-      B: [K, N]
-      C: [M, N]
-      bias: [N] (optional, broadcast over rows)
-    """
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
 
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # [BLOCK_M]
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # [BLOCK_N]
-    offs_k = tl.arange(0, BLOCK_K)                    # [BLOCK_K]
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
 
-    mask_m = offs_m < M
-    mask_n = offs_n < N
-
-    # Pointers for first K-tile
     a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
     b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    # Loop over K dimension
     for k in range(0, K, BLOCK_K):
-        k_rem = K - k
-        a_mask = (offs_m[:, None] < M) & (offs_k[None, :] < k_rem)
-        b_mask = (offs_k[:, None] < k_rem) & (offs_n[None, :] < N)
+        k_remaining = K - k
+        mask_k = offs_k[None, :] < k_remaining
 
-        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
-        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
-
-        acc += tl.dot(a, b)
+        a = tl.load(
+            a_ptrs,
+            mask=(offs_m[:, None] < M) & mask_k,
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptrs,
+            mask=(offs_n[None, :] < N) & (offs_k[:, None] < k_remaining),
+            other=0.0,
+        )
+        acc += tl.dot(a, b, allow_tf32=True)
 
         a_ptrs += BLOCK_K * stride_ak
         b_ptrs += BLOCK_K * stride_bk
 
-    if HAS_BIAS:
-        bias = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0)
-        acc += bias[None, :]
+    # Add bias
+    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc += bias[None, :]
 
-    # Store C
+    # Write result
     c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
-    c_mask = mask_m[:, None] & mask_n[None, :]
-    tl.store(c_ptrs, acc, mask=c_mask)
+    tl.store(
+        c_ptrs,
+        acc.to(c_ptr.dtype.element_ty),
+        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+    )
 
 
-# ---------------------------
-# Python wrappers
-# ---------------------------
-
-def _launch_matmul_bias(a, weight, bias=None):
+def triton_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
     """
-    Generic matmul wrapper:
-      out = a @ weight.T + bias
-    where:
-      a:        [M, K]
-      weight:   [N, K]
-      bias:     [N] or None
-      returns:  [M, N]
+    Fully-connected layer: y = x @ weight.T + bias
+    x: [M, K]
+    weight: [N, K]
+    bias: [N]
     """
-    assert a.is_cuda and weight.is_cuda, "Inputs must be on CUDA for Triton path."
-    assert a.dtype == weight.dtype == torch.float32, "This seed kernel assumes float32."
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda, "All tensors must be CUDA tensors"
+    assert x.dim() == 2, "Input to triton_linear must be 2D"
+    M, K = x.shape
+    N, Kw = weight.shape
+    assert Kw == K, "Incompatible shapes for linear layer"
 
-    a = a.contiguous()
-    weight = weight.contiguous()
-    M, K = a.shape
-    N = weight.shape[0]
-    assert weight.shape[1] == K, "Incompatible shapes for matmul."
+    # B is weight^T with shape [K, N]
+    b_mat = weight.t().contiguous()
 
-    # We want B: [K, N]
-    b = weight.t().contiguous()
+    c = torch.empty((M, N), device=x.device, dtype=x.dtype)
+    if M == 0 or N == 0 or K == 0:
+        return c
 
-    c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+    def grid(META):
+        return (
+            triton.cdiv(M, META["BLOCK_M"]),
+            triton.cdiv(N, META["BLOCK_N"]),
+        )
 
-    def grid(meta):
-        return (triton.cdiv(M, meta["BLOCK_M"]), triton.cdiv(N, meta["BLOCK_N"]))
-
-    has_bias = bias is not None
-    bias_ptr = bias if has_bias else c  # dummy pointer when bias unused
-
-    matmul_bias_kernel[grid](
-        a, b, bias_ptr, c,
+    linear_kernel[grid](
+        x, b_mat, bias, c,
         M, N, K,
-        a.stride(0), a.stride(1),
-        b.stride(0), b.stride(1),
+        x.stride(0), x.stride(1),
+        b_mat.stride(0), b_mat.stride(1),
         c.stride(0), c.stride(1),
-        HAS_BIAS=has_bias,
         BLOCK_M=64,
         BLOCK_N=64,
-        BLOCK_K=32,
+        BLOCK_K=64,
     )
     return c
 
 
-def triton_linear(x, weight, bias=None):
-    """
-    Fused linear: x @ weight.T + bias
-      x:       [batch, in_features]
-      weight:  [out_features, in_features]
-      bias:    [out_features] or None
-    """
-    if (not x.is_cuda) or (not weight.is_cuda):
-        return F.linear(x, weight, bias)
+# -------------------------
+# Model Definition
+# -------------------------
 
-    x = x.contiguous()
-    weight = weight.contiguous()
-    if bias is not None:
-        bias = bias.contiguous()
-    out = _launch_matmul_bias(x, weight, bias)
-    return out
-
-
-def conv1x1_triton(x, weight, bias=None):
-    """
-    1x1 convolution via matmul:
-      x:       [B, C_in, H, W]
-      weight:  [C_out, C_in, 1, 1] or [C_out, C_in]
-      bias:    [C_out] or None
-
-    Assumes stride=1, padding=0, dilation=1, groups=1.
-    """
-    # Fallback for non-CUDA tensors
-    if (not x.is_cuda) or (not weight.is_cuda):
-        return F.conv2d(x, weight, bias, stride=1, padding=0, dilation=1, groups=1)
-
-    B, C_in, H, W = x.shape
-
-    # Accept standard Conv2d 4D weights or 2D flattened weights
-    if weight.ndim == 4:
-        C_out, C_in_w, kh, kw = weight.shape
-        assert kh == 1 and kw == 1, "Only 1x1 convolution weights are supported."
-        weight_2d = weight.view(C_out, C_in_w).contiguous()
-    elif weight.ndim == 2:
-        C_out, C_in_w = weight.shape
-        weight_2d = weight.contiguous()
-    else:
-        raise AssertionError(f"Unsupported weight shape for 1x1 conv: {weight.shape}")
-
-    assert C_in == C_in_w, "Channel mismatch for 1x1 conv."
-
-    if bias is not None:
-        bias = bias.contiguous()
-
-    # Convert to NHWC then flatten spatial + batch dims
-    x_nhwc = x.permute(0, 2, 3, 1).contiguous()   # [B, H, W, C_in]
-    x_mat = x_nhwc.view(-1, C_in)                 # [M, C_in], M = B*H*W
-
-    # Matmul: [M, C_in] @ [C_out, C_in]^T + bias -> [M, C_out]
-    out_mat = _launch_matmul_bias(x_mat, weight_2d, bias)  # [M, C_out]
-
-    out_nhwc = out_mat.view(B, H, W, C_out)       # [B, H, W, C_out]
-    out = out_nhwc.permute(0, 3, 1, 2).contiguous()  # [B, C_out, H, W]
-    return out
-
-
-class InceptionModuleNew(nn.Module):
-    def __init__(self, in_channels, out_1x1, reduce_3x3, out_3x3,
-                 reduce_5x5, out_5x5, pool_proj):
-        super(InceptionModuleNew, self).__init__()
+class InceptionModule(nn.Module):
+    def __init__(self, in_channels, out_1x1, reduce_3x3, out_3x3, reduce_5x5, out_5x5, pool_proj):
+        """
+        :param in_channels: Number of input channels
+        :param out_1x1: Number of output channels for the 1x1 convolution
+        :param reduce_3x3: Number of output channels for the 1x1 reduction before 3x3 convolution
+        :param out_3x3: Number of output channels for the 3x3 convolution
+        :param reduce_5x5: Number of output channels for the 1x1 reduction before 5x5 convolution
+        :param out_5x5: Number of output channels for the 5x5 convolution
+        :param pool_proj: Number of output channels for the pooling projection
+        """
+        super(InceptionModule, self).__init__()
 
         # 1x1 convolution branch
         self.branch1x1 = nn.Conv2d(in_channels, out_1x1, kernel_size=1)
@@ -242,73 +194,43 @@ class InceptionModuleNew(nn.Module):
         # 3x3 convolution branch
         self.branch3x3 = nn.Sequential(
             nn.Conv2d(in_channels, reduce_3x3, kernel_size=1),
-            nn.Conv2d(reduce_3x3, out_3x3, kernel_size=3, padding=1),
+            nn.Conv2d(reduce_3x3, out_3x3, kernel_size=3, padding=1)
         )
 
         # 5x5 convolution branch
         self.branch5x5 = nn.Sequential(
             nn.Conv2d(in_channels, reduce_5x5, kernel_size=1),
-            nn.Conv2d(reduce_5x5, out_5x5, kernel_size=5, padding=2),
+            nn.Conv2d(reduce_5x5, out_5x5, kernel_size=5, padding=2)
         )
 
         # Max pooling branch
         self.branch_pool = nn.Sequential(
             nn.MaxPool2d(kernel_size=3, stride=1, padding=1),
-            nn.Conv2d(in_channels, pool_proj, kernel_size=1),
+            nn.Conv2d(in_channels, pool_proj, kernel_size=1)
         )
 
     def forward(self, x):
-        if not x.is_cuda:
-            branch1x1 = self.branch1x1(x)
-            branch3x3 = self.branch3x3(x)
-            branch5x5 = self.branch5x5(x)
-            branch_pool = self.branch_pool(x)
-            outputs = [branch1x1, branch3x3, branch5x5, branch_pool]
-            return torch.cat(outputs, dim=1)
-
-        # CUDA path: use Triton for all 1x1 convolutions
-
-        # 1x1 branch
-        branch1x1 = conv1x1_triton(x, self.branch1x1.weight, self.branch1x1.bias)
-
-        # 3x3 branch: 1x1 reduction via Triton, 3x3 via PyTorch
-        reduce3 = conv1x1_triton(
-            x,
-            self.branch3x3[0].weight,
-            self.branch3x3[0].bias,
-        )
-        branch3x3 = self.branch3x3[1](reduce3)
-
-        # 5x5 branch: 1x1 reduction via Triton, 5x5 via PyTorch
-        reduce5 = conv1x1_triton(
-            x,
-            self.branch5x5[0].weight,
-            self.branch5x5[0].bias,
-        )
-        branch5x5 = self.branch5x5[1](reduce5)
-
-        # Pool branch: pooling via PyTorch, projection 1x1 via Triton
-        pooled = self.branch_pool[0](x)
-        branch_pool = conv1x1_triton(
-            pooled,
-            self.branch_pool[1].weight,
-            self.branch_pool[1].bias,
-        )
+        """
+        :param x: Input tensor, shape (batch_size, in_channels, height, width)
+        :return: Output tensor, shape (batch_size, out_channels, height, width)
+        """
+        branch1x1 = self.branch1x1(x)
+        branch3x3 = self.branch3x3(x)
+        branch5x5 = self.branch5x5(x)
+        branch_pool = self.branch_pool(x)
 
         outputs = [branch1x1, branch3x3, branch5x5, branch_pool]
-        return torch.cat(outputs, dim=1)
+        # Keep concatenation in PyTorch to preserve branch separation
+        return torch.cat(outputs, 1)
 
-
-# ---------------------------
-# Full model using Triton ops
-# ---------------------------
 
 class ModelNew(nn.Module):
     def __init__(self, num_classes=1000):
         """
-        Same topology as the original Model, but:
-        - 1x1 convolutions use Triton matmul kernels when on CUDA
-        - Final linear layer uses Triton matmul when on CUDA
+        Triton-optimized version of the given GoogLeNet-style model.
+        Uses:
+          - Triton ReLU for activation after conv1, conv2, conv3
+          - Triton GEMM for the final fully-connected layer
         """
         super(ModelNew, self).__init__()
 
@@ -318,43 +240,47 @@ class ModelNew(nn.Module):
         self.conv3 = nn.Conv2d(64, 192, kernel_size=3, padding=1)
         self.maxpool2 = nn.MaxPool2d(3, stride=2, padding=1)
 
-        self.inception3a = InceptionModuleNew(192, 64, 96, 128, 16, 32, 32)
-        self.inception3b = InceptionModuleNew(256, 128, 128, 192, 32, 96, 64)
+        self.inception3a = InceptionModule(192, 64, 96, 128, 16, 32, 32)
+        self.inception3b = InceptionModule(256, 128, 128, 192, 32, 96, 64)
         self.maxpool3 = nn.MaxPool2d(3, stride=2, padding=1)
 
-        self.inception4a = InceptionModuleNew(480, 192, 96, 208, 16, 48, 64)
-        self.inception4b = InceptionModuleNew(512, 160, 112, 224, 24, 64, 64)
-        self.inception4c = InceptionModuleNew(512, 128, 128, 256, 24, 64, 64)
-        self.inception4d = InceptionModuleNew(512, 112, 144, 288, 32, 64, 64)
-        self.inception4e = InceptionModuleNew(528, 256, 160, 320, 32, 128, 128)
+        self.inception4a = InceptionModule(480, 192, 96, 208, 16, 48, 64)
+        self.inception4b = InceptionModule(512, 160, 112, 224, 24, 64, 64)
+        self.inception4c = InceptionModule(512, 128, 128, 256, 24, 64, 64)
+        self.inception4d = InceptionModule(512, 112, 144, 288, 32, 64, 64)
+        self.inception4e = InceptionModule(528, 256, 160, 320, 32, 128, 128)
         self.maxpool4 = nn.MaxPool2d(3, stride=2, padding=1)
 
-        self.inception5a = InceptionModuleNew(832, 256, 160, 320, 32, 128, 128)
-        self.inception5b = InceptionModuleNew(832, 384, 192, 384, 48, 128, 128)
+        self.inception5a = InceptionModule(832, 256, 160, 320, 32, 128, 128)
+        self.inception5b = InceptionModule(832, 384, 192, 384, 48, 128, 128)
 
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.dropout = nn.Dropout(0.0)
-        self.fc = nn.Linear(1024, num_classes)
+
+        # Replace nn.Linear with explicit parameters so we can call Triton GEMM
+        in_features = 1024
+        self.fc_weight = nn.Parameter(torch.randn(num_classes, in_features))
+        self.fc_bias = nn.Parameter(torch.randn(num_classes))
 
     def forward(self, x):
         """
         :param x: Input tensor, shape (batch_size, 3, height, width)
         :return: Output tensor, shape (batch_size, num_classes)
         """
-        # conv1 + ReLU + maxpool1 (conv1 is 7x7, kept as PyTorch)
-        x = self.maxpool1(F.relu(self.conv1(x)))
+        # conv1 + ReLU (Triton) + maxpool1
+        x = self.conv1(x)
+        x = triton_relu(x)
+        x = self.maxpool1(x)
 
-        # conv2 (1x1) + ReLU: Triton for conv on CUDA, then ReLU
-        if x.is_cuda:
-            x = conv1x1_triton(x, self.conv2.weight, self.conv2.bias)
-        else:
-            x = self.conv2(x)
-        x = F.relu(x)
+        # conv2 + ReLU (Triton)
+        x = self.conv2(x)
+        x = triton_relu(x)
 
-        # conv3 (3x3) + ReLU + maxpool2 (3x3)
-        x = self.maxpool2(F.relu(self.conv3(x)))
+        # conv3 + ReLU (Triton) + maxpool2
+        x = self.conv3(x)
+        x = triton_relu(x)
+        x = self.maxpool2(x)
 
-        # Inception modules (their internal 1x1 convs use Triton on CUDA)
         x = self.inception3a(x)
         x = self.inception3b(x)
         x = self.maxpool3(x)
@@ -369,35 +295,40 @@ class ModelNew(nn.Module):
         x = self.inception5a(x)
         x = self.inception5b(x)
 
-        # Global average pooling, flatten, dropout
         x = self.avgpool(x)
         x = torch.flatten(x, 1)
         x = self.dropout(x)
 
-        # Final fully connected layer: Triton matmul on CUDA
-        if x.is_cuda:
-            x = triton_linear(x, self.fc.weight, self.fc.bias)
-        else:
-            x = self.fc(x)
+        # Final FC with Triton GEMM
+        x = triton_linear(x, self.fc_weight, self.fc_bias)
 
         return x
 ```
 
 [NCU PROFILING METRICS]
-No NCU metrics available (skipped for network-level model)
+No NCU metrics available
 
 **Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
 
-TRITON API CONSTRAINTS (CRITICAL):
-- Triton has NO: tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+## CRITICAL — Code MUST compile and run:
+1. EVERY kernel function MUST have `@triton.jit` decorator
+2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+3. BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+4. `tl.program_id(axis)` only supports axis = 0, 1, 2
+5. No `continue`, `break`, `return` inside loops — use masking
+6. No tensor indexing with loop vars: `x[:, i]` is INVALID
+7. mask shape MUST match data shape in tl.load/tl.store
 
-OUTPUT RULES (STRICT):
-1. Follow this exact order:
-   1. Imports: torch, torch.nn, triton, triton.language as tl
-   2. @triton.jit decorated kernel function(s)
-   3. Wrapper function(s) for grid calculation and kernel launch
-   4. class ModelNew(nn.Module) that calls your kernels
-2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+## Missing Triton Functions (implement manually):
+- tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+## OUTPUT FORMAT (STRICT):
+1. Imports: torch, torch.nn, triton, triton.language as tl
+2. @triton.jit decorated kernel function(s)
+3. Wrapper function(s) for grid calculation and kernel launch
+4. class ModelNew(nn.Module) that calls your kernels
+
+Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
 
 ```python
 # <optimized Triton code>

@@ -1,0 +1,91 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_SIZE": 64}, num_warps=2, num_stages=2),
+        triton.Config({"BLOCK_SIZE": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_SIZE": 256}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_SIZE": 256}, num_warps=8, num_stages=2),
+    ],
+    key=["numel"],
+)
+@triton.jit
+def mul_leakyrelu_inplace_kernel(
+    x_ptr,
+    numel,
+    multiplier,
+    negative_slope,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    In-place: x = leaky_relu(x * multiplier, negative_slope)
+    x is assumed to be a contiguous tensor flattened to 1D of length numel.
+    """
+    pid = tl.program_id(0)
+
+    # 1D grid, single shared offsets for all fused ops
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < numel  # shared boundary condition
+
+    # Help Triton generate coalesced, aligned accesses
+    tl.multiple_of(offs, BLOCK_SIZE)
+
+    # Fused elementwise ops share same offsets and mask
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+    x = x * multiplier
+    zero = 0.0
+    x = tl.where(x >= zero, x, x * negative_slope)
+    tl.store(x_ptr + offs, x, mask=mask)
+
+
+def mul_leakyrelu_inplace(x, multiplier, negative_slope):
+    """
+    Apply: x <- leaky_relu(x * multiplier, negative_slope) in-place using Triton.
+    x: contiguous tensor (e.g., [batch_size, out_features]).
+    """
+    assert x.is_cuda, "Input must be on CUDA"
+    if not x.is_contiguous():
+        x = x.contiguous()
+
+    numel = x.numel()
+
+    # 1D launch grid over flattened output tensor
+    def grid(meta):
+        return (triton.cdiv(numel, meta["BLOCK_SIZE"]),)
+
+    mul_leakyrelu_inplace_kernel[grid](
+        x,
+        numel,
+        float(multiplier),
+        float(negative_slope),
+    )
+    return x
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized replacement for:
+      Linear(in_features, out_features) + scalar multiply + LeakyReLU
+
+    Strategy:
+      - Use cuBLAS-backed GEMM via torch.nn.functional.linear for the Linear.
+      - Use a Triton kernel to fuse the scalar multiply and LeakyReLU epilogue.
+    """
+    def __init__(self, in_features, out_features, multiplier, negative_slope):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.bias = nn.Parameter(torch.randn(out_features))
+        self.multiplier = float(multiplier)
+        self.negative_slope = float(negative_slope)
+
+    def forward(self, x):
+        # x: [batch_size, in_features]
+        # cuBLAS GEMM + bias
+        y = nn.functional.linear(x, self.weight, self.bias)  # [batch_size, out_features]
+        # Fused epilogue: multiply + LeakyReLU with a single 1D grid & offsets
+        y = mul_leakyrelu_inplace(y, self.multiplier, self.negative_slope)
+        return y

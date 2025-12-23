@@ -1,0 +1,375 @@
+You are optimizing a Triton kernel based on algorithmic analysis.
+
+# PyTorch Reference (Target Behavior)
+
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs a convolution, subtracts a value, applies HardSwish, MaxPool, and Mish activation functions.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, subtract_value, pool_kernel_size):
+        super(Model, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.subtract_value = subtract_value
+        self.pool = nn.MaxPool2d(pool_kernel_size)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = x - self.subtract_value
+        x = torch.nn.functional.hardswish(x)
+        x = self.pool(x)
+        x = torch.nn.functional.mish(x)
+        return x
+
+batch_size = 128
+in_channels = 64
+out_channels = 128
+height = width = 128
+kernel_size = 3
+subtract_value = 0.5
+pool_kernel_size = 2
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, subtract_value, pool_kernel_size]
+```
+
+**CRITICAL**: Study the PyTorch code carefully to understand:
+- What does `forward()` return? (full output sequence vs final hidden state only)
+- What is the computational pattern?
+- What are the input/output shapes?
+
+Your optimized kernel MUST match this exact behavior.
+
+---
+
+# Analysis Results
+
+**Bottleneck**: Each program instance iterates over C_in * K_H * K_W, repeatedly loading scalar elements from global memory and accumulating in a small register tile, with no tiling over the reduction dimension and no use of a matmul-like dataflow. This makes the conv part of the kernel both memory-inefficient and compute-underutilized relative to cuDNN’s GEMM-based or Winograd algorithms.
+
+**Optimization Strategy**: Replace the current direct convolution loop with a GEMM-style implicit-im2col convolution: treat each output pixel (N * H_out * W_out) as one row, flatten (C_in * K_H * K_W) as the reduction dimension, and use a Triton matmul kernel (blocked over M, N, and K) to compute conv + bias + subtract + HardSwish in a single, highly-tiled kernel.
+
+**Implementation Plan**: Refactor conv2d_hswish_kernel to follow Triton’s matmul template: (1) define M = N * H_out * W_out, N = C_out, K = C_in * K_H * K_W; (2) in the kernel, load tiles of the input ‘A’ matrix by implicitly gathering the corresponding (n, ih, iw, ic) locations (implicit im2col) and tiles of the weight ‘B’ matrix from [C_out, C_in, K_H, K_W], both in BLOCK_M x BLOCK_K and BLOCK_K x BLOCK_N shapes; (3) perform a tiled K-loop accumulating into a BLOCK_M x BLOCK_N accumulator, then fuse bias add, subtract_value, and HardSwish before storing to output. This reuses the standard blocked matmul dataflow and enables coalesced loads, cache reuse, and high occupancy.
+
+**Expected Speedup**: 3-6x vs the current Triton kernel (bringing it close to or faster than the PyTorch baseline, i.e., ~70-85% reduction in current Triton conv latency).
+
+---
+
+# Current Kernel (needs optimization)
+
+```python
+import math
+import torch, torch.nn as nn, triton, triton.language as tl
+
+
+@triton.jit
+def conv2d_hswish_kernel(
+    x_ptr, w_ptr, b_ptr, y_ptr,
+    N, H_in, W_in,
+    C_out, H_out, W_out,
+    subtract_value,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    C_IN: tl.constexpr,
+    K_H: tl.constexpr, K_W: tl.constexpr,
+):
+    # program ids
+    pid_m = tl.program_id(0)  # flattened (N * H_out * W_out)
+    pid_n = tl.program_id(1)  # output channels
+
+    # offsets
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # [BM]
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # [BN]
+
+    P = N * H_out * W_out
+    mask_m = offs_m < P
+    mask_n = offs_n < C_out
+
+    # decode flat spatial index -> (n, oh, ow)
+    HW_out = H_out * W_out
+    n_idx = offs_m // HW_out
+    rem = offs_m % HW_out
+    oh_idx = rem // W_out
+    ow_idx = rem % W_out
+
+    # accumulator
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # convolution loops over input channel and kernel
+    for ic in range(0, C_IN):
+        for kh in range(0, K_H):
+            ih = oh_idx + kh  # [BM]
+            for kw in range(0, K_W):
+                iw = ow_idx + kw  # [BM]
+
+                # input indices for this (ic, kh, kw)
+                in_index = (((n_idx * C_IN + ic) * H_in + ih) * W_in + iw)  # [BM]
+                x_vals = tl.load(
+                    x_ptr + in_index,
+                    mask=mask_m,
+                    other=0.0,
+                )  # [BM]
+
+                # weight indices: [C_out, C_IN, K_H, K_W]
+                w_index = (((offs_n * C_IN + ic) * K_H + kh) * K_W + kw)  # [BN]
+                w_vals = tl.load(
+                    w_ptr + w_index,
+                    mask=mask_n,
+                    other=0.0,
+                )  # [BN]
+
+                # outer product accumulate
+                acc += x_vals[:, None] * w_vals[None, :]
+
+    # add bias
+    bias_vals = tl.load(b_ptr + offs_n, mask=mask_n, other=0.0)  # [BN]
+    acc += bias_vals[None, :]
+
+    # subtract scalar
+    acc = acc - subtract_value
+
+    # HardSwish: x * clamp(x+3, 0, 6) / 6
+    tmp = acc + 3.0
+    tmp = tl.maximum(tmp, 0.0)
+    tmp = tl.minimum(tmp, 6.0)
+    acc = acc * (tmp * (1.0 / 6.0))
+
+    # store output
+    n2 = n_idx[:, None]           # [BM,1]
+    oh2 = oh_idx[:, None]         # [BM,1]
+    ow2 = ow_idx[:, None]         # [BM,1]
+    oc2 = offs_n[None, :]         # [1,BN]
+
+    out_index = (((n2 * C_out + oc2) * H_out + oh2) * W_out + ow2)  # [BM,BN]
+    out_mask = mask_m[:, None] & mask_n[None, :]
+
+    tl.store(y_ptr + out_index, acc, mask=out_mask)
+
+
+def conv2d_hswish(x, weight, bias, subtract_value: float):
+    """
+    NCHW conv2d with kernel_size=K_H=K_W, stride=1, padding=0, dilation=1,
+    fused with bias add, subtract_value, and HardSwish activation.
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+    x = x.contiguous()
+    weight = weight.contiguous()
+    bias = bias.contiguous()
+
+    N, C_in, H_in, W_in = x.shape
+    C_out, C_in_w, K_H, K_W = weight.shape
+    assert C_in == C_in_w
+
+    H_out = H_in - K_H + 1
+    W_out = W_in - K_W + 1
+
+    y = torch.empty((N, C_out, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    P = N * H_out * W_out
+
+    def grid(meta):
+        return (
+            triton.cdiv(P, meta["BLOCK_M"]),
+            triton.cdiv(C_out, meta["BLOCK_N"]),
+        )
+
+    conv2d_hswish_kernel[grid](
+        x, weight, bias, y,
+        N, H_in, W_in,
+        C_out, H_out, W_out,
+        float(subtract_value),
+        BLOCK_M=64, BLOCK_N=64,
+        C_IN=C_in,
+        K_H=K_H, K_W=K_W,
+    )
+
+    return y
+
+
+@triton.jit
+def maxpool2d_mish_kernel(
+    x_ptr, y_ptr,
+    N, C, H_in, W_in,
+    H_out, W_out,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    K_P: tl.constexpr,
+):
+    # program ids
+    pid_m = tl.program_id(0)  # flattened (N * H_out * W_out)
+    pid_n = tl.program_id(1)  # channels
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # [BM]
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # [BN]
+
+    P = N * H_out * W_out
+    mask_m = offs_m < P
+    mask_n = offs_n < C
+
+    HW_out = H_out * W_out
+    n_idx = offs_m // HW_out
+    rem = offs_m % HW_out
+    oh_idx = rem // W_out
+    ow_idx = rem % W_out
+
+    n = n_idx[:, None]   # [BM,1]
+    oh = oh_idx[:, None] # [BM,1]
+    ow = ow_idx[:, None] # [BM,1]
+    c = offs_n[None, :]  # [1,BN]
+
+    full_mask = mask_m[:, None] & mask_n[None, :]
+
+    # initialize max accumulator
+    acc = tl.full((BLOCK_M, BLOCK_N), -1e30, dtype=tl.float32)
+
+    # MaxPool2d over K_P x K_P with stride=K_P, no padding
+    for kh in range(0, K_P):
+        ih = oh * K_P + kh
+        for kw in range(0, K_P):
+            iw = ow * K_P + kw
+            in_index = (((n * C + c) * H_in + ih) * W_in + iw)  # [BM,BN]
+            x_vals = tl.load(
+                x_ptr + in_index,
+                mask=full_mask,
+                other=-1e30,
+            )
+            acc = tl.maximum(acc, x_vals)
+
+    # Mish: x * tanh(softplus(x)), softplus(x) = log(1 + exp(x))
+    sp = tl.log(1.0 + tl.exp(acc))
+    e2 = tl.exp(2.0 * sp)
+    t = (e2 - 1.0) / (e2 + 1.0)
+    out_vals = acc * t
+
+    out_index = (((n * C + c) * H_out + oh) * W_out + ow)  # [BM,BN]
+    tl.store(y_ptr + out_index, out_vals, mask=full_mask)
+
+
+def maxpool2d_mish(x, kernel_size: int):
+    """
+    NCHW MaxPool2d with kernel_size=stride=kernel_size, padding=0, dilation=1,
+    fused with Mish activation.
+    """
+    assert x.is_cuda
+    x = x.contiguous()
+
+    N, C, H_in, W_in = x.shape
+    K_P = int(kernel_size)
+
+    # For stride=kernel_size, no padding:
+    H_out = H_in // K_P
+    W_out = W_in // K_P
+
+    y = torch.empty((N, C, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    P = N * H_out * W_out
+
+    def grid(meta):
+        return (
+            triton.cdiv(P, meta["BLOCK_M"]),
+            triton.cdiv(C, meta["BLOCK_N"]),
+        )
+
+    maxpool2d_mish_kernel[grid](
+        x, y,
+        N, C, H_in, W_in,
+        H_out, W_out,
+        BLOCK_M=64, BLOCK_N=64,
+        K_P=K_P,
+    )
+
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized version of the target model:
+    Conv2d -> subtract constant -> HardSwish -> MaxPool2d -> Mish
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, subtract_value, pool_kernel_size):
+        super(ModelNew, self).__init__()
+        k = int(kernel_size)
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = k
+        self.subtract_value = float(subtract_value)
+        self.pool_kernel_size = int(pool_kernel_size)
+
+        # Parameters equivalent to nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.weight = nn.Parameter(
+            torch.empty(out_channels, in_channels, k, k)
+        )
+        self.bias = nn.Parameter(torch.empty(out_channels))
+
+        # Use a standard conv init for similar behavior
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+        bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+        nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x):
+        # Ensure tensors are on CUDA for Triton
+        if not x.is_cuda:
+            x = x.cuda()
+
+        device = x.device
+        if not self.weight.is_cuda:
+            self.weight.data = self.weight.data.to(device)
+        if not self.bias.is_cuda:
+            self.bias.data = self.bias.data.to(device)
+
+        x = conv2d_hswish(x, self.weight, self.bias, self.subtract_value)
+        x = maxpool2d_mish(x, self.pool_kernel_size)
+        return x
+```
+
+---
+
+# Your Task
+
+Implement the optimization strategy above. Focus on the specific bottleneck identified.
+
+## Key Requirements
+
+1. **Preserve correctness**: Maintain the same input/output behavior
+2. **Apply the optimization**: Follow the implementation plan exactly
+3. **Use valid Triton syntax**:
+   - Every kernel MUST have `@triton.jit` decorator
+   - Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+   - BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+   - No `continue`, `break`, `return` inside kernels (use masking)
+   - Prefer `tl.dot(a, b, allow_tf32=True)` for matmul operations
+
+4. **CRITICAL for RNN/GRU/LSTM Persistent Kernels**:
+   - Time loop MUST be inside @triton.jit kernel, NOT in Python forward()
+   - **HYBRID computation strategy** (CRITICAL for performance):
+     * Precompute input-side gates OUTSIDE kernel: `gates_x = (T*B, In) @ W_ih` (ONE large GEMM)
+     * INSIDE kernel: only recurrent-side: `for t: gates_h = h @ W_hh` (T small GEMMs)
+   - CORRECT (FAST - use this):
+     ```python
+     # Python forward():
+     gates_x_all = x.reshape(T*B, In) @ W_ih + b_ih  # ONE large GEMM
+     gates_x_all = gates_x_all.view(T, B, 3*H)
+     gru_persistent_kernel[grid](gates_x_all, h0, W_hh, ...)  # Launch ONCE
+
+     @triton.jit
+     def gru_persistent_kernel(gates_x_ptr, h_ptr, W_hh_ptr, ...):
+         for t in range(T):  # Inside kernel
+             gates_x_t = tl.load(gates_x_ptr + t*...)  # Precomputed
+             gates_h = h @ W_hh  # Only recurrent GEMM
+             h = (1-z)*n + z*h   # Fuse and update
+     ```
+
+5. **Output format**:
+   - Imports: `import torch, torch.nn as nn, triton, triton.language as tl`
+   - `@triton.jit` kernel(s)
+   - Wrapper function(s)
+   - `class ModelNew(nn.Module)` — REQUIRED
+   - NO testing code, NO `if __name__ == "__main__"`
+
+---
+
+Generate the optimized kernel now. Output ONLY the complete Python code.

@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "Each forward does a full `weight.t().contiguous()` of an 8192×8192 matrix, adding a huge extra O(K·N) memory copy on the critical path.",
+  "bottleneck": "The Triton GEMM requires `b` to be laid out as (K, N), so the code explicitly transposes and materializes `weight` every call. This 256 MB read+write per forward is pure overhead and can easily dominate the saved work from fusing the pointwise ops.",
+  "optimisation method": "Eliminate the explicit `weight.t().contiguous()` by adapting the Triton GEMM kernel to consume `weight` in its native (out_features, in_features) layout via appropriate strides / index mapping, computing A·Wᵀ logically without a physical transpose.",
+  "modification plan": "Remove `b = weight.t().contiguous()` and pass `weight` directly into the GEMM kernel. Inside `fused_gemm_bias_hardtanh_mish_kernel`, change how `b_ptrs` is computed so that each tile of B is read from `weight` with swapped indices/strides (i.e., load Wᵀ tiles on the fly by using `offs_n` over the row dimension and `offs_k` over the column dimension of the stored weight). This preserves the mathematical A·Wᵀ while avoiding the full-matrix transpose+copy, cutting a large bandwidth-only cost from every forward.",
+  "expected_speedup": "20-30%"
+}

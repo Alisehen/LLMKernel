@@ -1,5 +1,0 @@
-{
-  "critical_issue": "GEMM uses tf32 via allow_tf32=True, while reference linear uses full fp32 matmul, so the matrix product accumulates larger rounding error, causing max_abs_err above the 1e-3 tolerance.",
-  "why_it_matters": "TF32 has only 10-bit mantissa, so multiplying 8192-length vectors significantly increases relative error; after Mish and GroupNorm, deviations grow to several 1e-3, failing the specified atol/rtol closeness check.",
-  "minimal_fix_hint": "Disable TF32 in the Triton GEMM (use allow_tf32=False or default), ensuring the dot product matches PyTorch’s fp32 Linear numerics within the given error tolerances."
-}

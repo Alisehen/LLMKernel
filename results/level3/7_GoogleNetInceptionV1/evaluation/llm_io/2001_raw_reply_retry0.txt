@@ -1,0 +1,613 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+# -------------------------
+# Basic Triton Kernels
+# -------------------------
+
+@triton.jit
+def relu_kernel(
+    x_ptr, y_ptr,
+    N,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < N
+
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+    x = tl.maximum(x, 0.0)
+    tl.store(y_ptr + offs, x, mask=mask)
+
+
+def triton_relu(x: torch.Tensor) -> torch.Tensor:
+    assert x.is_cuda, "Input must be a CUDA tensor"
+    y = torch.empty_like(x)
+    N = x.numel()
+    if N == 0:
+        return x
+    grid = lambda META: (triton.cdiv(N, META["BLOCK_SIZE"]),)
+    relu_kernel[grid](
+        x, y,
+        N,
+        BLOCK_SIZE=256,  # power of two
+    )
+    return y
+
+
+@triton.jit
+def linear_kernel(
+    a_ptr,  # [M, K]
+    b_ptr,  # [K, N] = weight^T
+    bias_ptr,  # [N]
+    c_ptr,  # [M, N]
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k in range(0, K, BLOCK_K):
+        k_remaining = K - k
+        mask_k = offs_k[None, :] < k_remaining
+
+        a = tl.load(
+            a_ptrs,
+            mask=(offs_m[:, None] < M) & mask_k,
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptrs,
+            mask=(offs_n[None, :] < N) & (offs_k[:, None] < k_remaining),
+            other=0.0,
+        )
+        acc += tl.dot(a, b, allow_tf32=True)
+
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc += bias[None, :]
+
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    tl.store(
+        c_ptrs,
+        acc.to(c_ptr.dtype.element_ty),
+        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+    )
+
+
+def triton_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda, "All tensors must be CUDA tensors"
+    assert x.dim() == 2, "Input to triton_linear must be 2D"
+    M, K = x.shape
+    N, Kw = weight.shape
+    assert Kw == K, "Incompatible shapes for linear layer"
+
+    b_mat = weight.t().contiguous()
+
+    c = torch.empty((M, N), device=x.device, dtype=x.dtype)
+    if M == 0 or N == 0 or K == 0:
+        return c
+
+    def grid(META):
+        return (
+            triton.cdiv(M, META["BLOCK_M"]),
+            triton.cdiv(N, META["BLOCK_N"]),
+        )
+
+    linear_kernel[grid](
+        x, b_mat, bias, c,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        b_mat.stride(0), b_mat.stride(1),
+        c.stride(0), c.stride(1),
+        BLOCK_M=64,
+        BLOCK_N=64,
+        BLOCK_K=64,
+    )
+    return c
+
+
+# -------------------------
+# Fused Inception Triton Kernel
+# -------------------------
+
+@triton.jit
+def inception_fwd_kernel(
+    x_ptr,           # float32[N, C_in, H, W]
+    w1_ptr, b1_ptr,  # branch1x1: [O1, C_in], [O1]
+    w3_ptr, b3_ptr,  # fused 3x3: [O3, C_in, 3, 3], [O3]
+    w5_ptr, b5_ptr,  # fused 5x5: [O5, C_in, 5, 5], [O5]
+    wp_ptr, bp_ptr,  # pool-proj 1x1: [Op, C_in], [Op]
+    y_ptr,           # float32[N, C_out, H, W]
+
+    N, C_in, H, W,
+    O1, O3, O5, Op,
+
+    x_sN, x_sC, x_sH, x_sW,
+    y_sN, y_sC, y_sH, y_sW,
+
+    w1_sO, w1_sC,
+    w3_sO, w3_sC, w3_sKH, w3_sKW,
+    w5_sO, w5_sC, w5_sKH, w5_sKW,
+    wp_sO, wp_sC,
+
+    BLOCK_CIN: tl.constexpr,
+    BLOCK_O1: tl.constexpr,
+    BLOCK_O3: tl.constexpr,
+    BLOCK_O5: tl.constexpr,
+    BLOCK_OP: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    P = N * H * W
+    mask_p = pid < P
+
+    HW = H * W
+    n = pid // HW
+    rem = pid % HW
+    h = rem // W
+    w = rem % W
+
+    # -----------------
+    # Branch 1: 1x1 conv
+    # -----------------
+    if O1 > 0:
+        oc_offsets = tl.arange(0, BLOCK_O1)
+        for oc0 in range(0, O1, BLOCK_O1):
+            oc = oc0 + oc_offsets
+            mask_oc = (oc < O1) & mask_p
+
+            acc = tl.zeros((BLOCK_O1,), dtype=tl.float32)
+            acc = tl.where(
+                mask_oc,
+                tl.load(b1_ptr + oc, mask=mask_oc, other=0.0),
+                acc,
+            )
+
+            ci_offsets = tl.arange(0, BLOCK_CIN)
+            for c0 in range(0, C_in, BLOCK_CIN):
+                c = c0 + ci_offsets
+                mask_ci = (c < C_in) & mask_p
+
+                x_ptrs = x_ptr + n * x_sN + c * x_sC + h * x_sH + w * x_sW
+                x_vals = tl.load(x_ptrs, mask=mask_ci, other=0.0)
+
+                w_ptrs = w1_ptr + oc[:, None] * w1_sO + c[None, :] * w1_sC
+                w_mask = (oc[:, None] < O1) & (c[None, :] < C_in) & mask_p
+                w_vals = tl.load(w_ptrs, mask=w_mask, other=0.0)
+
+                acc += tl.sum(w_vals * x_vals[None, :], axis=1)
+
+            c_out = oc
+            y_ptrs = y_ptr + n * y_sN + c_out * y_sC + h * y_sH + w * y_sW
+            tl.store(y_ptrs, acc, mask=mask_oc)
+
+    # -----------------
+    # Branch 2: fused 3x3 conv
+    # -----------------
+    if O3 > 0:
+        oc_offsets3 = tl.arange(0, BLOCK_O3)
+        for oc0 in range(0, O3, BLOCK_O3):
+            oc3 = oc0 + oc_offsets3
+            mask_oc3 = (oc3 < O3) & mask_p
+
+            acc3 = tl.zeros((BLOCK_O3,), dtype=tl.float32)
+            acc3 = tl.where(
+                mask_oc3,
+                tl.load(b3_ptr + oc3, mask=mask_oc3, other=0.0),
+                acc3,
+            )
+
+            ci_offsets = tl.arange(0, BLOCK_CIN)
+
+            for ky in range(0, 3):
+                for kx in range(0, 3):
+                    dh = ky - 1
+                    dw = kx - 1
+                    h_in = h + dh
+                    w_in = w + dw
+                    in_bounds_hw = (h_in >= 0) & (h_in < H) & (w_in >= 0) & (w_in < W) & mask_p
+
+                    for c0 in range(0, C_in, BLOCK_CIN):
+                        c = c0 + ci_offsets
+                        mask_ci = (c < C_in) & in_bounds_hw
+
+                        x_ptrs = x_ptr + n * x_sN + c * x_sC + h_in * x_sH + w_in * x_sW
+                        x_vals = tl.load(x_ptrs, mask=mask_ci, other=0.0)
+
+                        w_ptrs = (
+                            w3_ptr
+                            + oc3[:, None] * w3_sO
+                            + c[None, :] * w3_sC
+                            + ky * w3_sKH
+                            + kx * w3_sKW
+                        )
+                        w_mask = (oc3[:, None] < O3) & (c[None, :] < C_in) & in_bounds_hw
+                        w_vals = tl.load(w_ptrs, mask=w_mask, other=0.0)
+
+                        acc3 += tl.sum(w_vals * x_vals[None, :], axis=1)
+
+            c_out3 = O1 + oc3
+            y_ptrs3 = y_ptr + n * y_sN + c_out3 * y_sC + h * y_sH + w * y_sW
+            tl.store(y_ptrs3, acc3, mask=mask_oc3)
+
+    # -----------------
+    # Branch 3: fused 5x5 conv
+    # -----------------
+    if O5 > 0:
+        oc_offsets5 = tl.arange(0, BLOCK_O5)
+        for oc0 in range(0, O5, BLOCK_O5):
+            oc5 = oc0 + oc_offsets5
+            mask_oc5 = (oc5 < O5) & mask_p
+
+            acc5 = tl.zeros((BLOCK_O5,), dtype=tl.float32)
+            acc5 = tl.where(
+                mask_oc5,
+                tl.load(b5_ptr + oc5, mask=mask_oc5, other=0.0),
+                acc5,
+            )
+
+            ci_offsets = tl.arange(0, BLOCK_CIN)
+
+            for ky in range(0, 5):
+                for kx in range(0, 5):
+                    dh = ky - 2
+                    dw = kx - 2
+                    h_in = h + dh
+                    w_in = w + dw
+                    in_bounds_hw = (h_in >= 0) & (h_in < H) & (w_in >= 0) & (w_in < W) & mask_p
+
+                    for c0 in range(0, C_in, BLOCK_CIN):
+                        c = c0 + ci_offsets
+                        mask_ci = (c < C_in) & in_bounds_hw
+
+                        x_ptrs = x_ptr + n * x_sN + c * x_sC + h_in * x_sH + w_in * x_sW
+                        x_vals = tl.load(x_ptrs, mask=mask_ci, other=0.0)
+
+                        w_ptrs = (
+                            w5_ptr
+                            + oc5[:, None] * w5_sO
+                            + c[None, :] * w5_sC
+                            + ky * w5_sKH
+                            + kx * w5_sKW
+                        )
+                        w_mask = (oc5[:, None] < O5) & (c[None, :] < C_in) & in_bounds_hw
+                        w_vals = tl.load(w_ptrs, mask=w_mask, other=0.0)
+
+                        acc5 += tl.sum(w_vals * x_vals[None, :], axis=1)
+
+            c_out5 = O1 + O3 + oc5
+            y_ptrs5 = y_ptr + n * y_sN + c_out5 * y_sC + h * y_sH + w * y_sW
+            tl.store(y_ptrs5, acc5, mask=mask_oc5)
+
+    # -----------------
+    # Branch 4: maxpool 3x3 (s=1,p=1) + 1x1 conv
+    # -----------------
+    if Op > 0:
+        oc_offsets_p = tl.arange(0, BLOCK_OP)
+        for oc0 in range(0, Op, BLOCK_OP):
+            ocp = oc0 + oc_offsets_p
+            mask_ocp = (ocp < Op) & mask_p
+
+            accp = tl.zeros((BLOCK_OP,), dtype=tl.float32)
+            accp = tl.where(
+                mask_ocp,
+                tl.load(bp_ptr + ocp, mask=mask_ocp, other=0.0),
+                accp,
+            )
+
+            ci_offsets = tl.arange(0, BLOCK_CIN)
+
+            for c0 in range(0, C_in, BLOCK_CIN):
+                c = c0 + ci_offsets
+                mask_ci_base = (c < C_in) & mask_p
+
+                pooled = tl.full((BLOCK_CIN,), -1.0e30, dtype=tl.float32)
+
+                for ky in range(0, 3):
+                    for kx in range(0, 3):
+                        dh = ky - 1
+                        dw = kx - 1
+                        h_in = h + dh
+                        w_in = w + dw
+                        in_bounds_hw = (h_in >= 0) & (h_in < H) & (w_in >= 0) & (w_in < W) & mask_ci_base
+
+                        x_ptrs = x_ptr + n * x_sN + c * x_sC + h_in * x_sH + w_in * x_sW
+                        x_vals = tl.load(x_ptrs, mask=in_bounds_hw, other=-1.0e30)
+                        pooled = tl.maximum(pooled, x_vals)
+
+                w_ptrs = wp_ptr + ocp[:, None] * wp_sO + c[None, :] * wp_sC
+                w_mask = (ocp[:, None] < Op) & (c[None, :] < C_in) & mask_p
+                w_vals = tl.load(w_ptrs, mask=w_mask, other=0.0)
+
+                accp += tl.sum(w_vals * pooled[None, :], axis=1)
+
+            c_outp = O1 + O3 + O5 + ocp
+            y_ptrsp = y_ptr + n * y_sN + c_outp * y_sC + h * y_sH + w * y_sW
+            tl.store(y_ptrsp, accp, mask=mask_ocp)
+
+
+def triton_inception_forward(x: torch.Tensor, module) -> torch.Tensor:
+    """
+    Fused forward for one Inception module:
+      - branch1x1: 1x1 conv
+      - branch3x3: 1x1 reduction + 3x3 conv (fused into single 3x3)
+      - branch5x5: 1x1 reduction + 5x5 conv (fused into single 5x5)
+      - branch_pool: 3x3 maxpool (s=1,p=1) + 1x1 conv
+    All branches are computed in a single Triton kernel.
+    """
+    assert x.is_cuda, "Input must be a CUDA tensor"
+    x = x.contiguous()
+    N, C_in, H, W = x.shape
+
+    # Unpack PyTorch branches
+    conv1x1 = module.branch1x1
+
+    conv3_reduce = module.branch3x3[0]
+    conv3 = module.branch3x3[1]
+
+    conv5_reduce = module.branch5x5[0]
+    conv5 = module.branch5x5[1]
+
+    pool_conv = module.branch_pool[1]
+
+    O1 = conv1x1.out_channels
+    O3 = conv3.out_channels
+    O5 = conv5.out_channels
+    Op = pool_conv.out_channels
+
+    # We must match the original InceptionModule behavior exactly.
+    # For 3x3 and 5x5 branches, we analytically fuse 1x1 reduction + kxk conv
+    # into a single kxk conv on the original input.
+    with torch.no_grad():
+        # ---- Fused 3x3 weights ----
+        if O3 > 0:
+            w3r = conv3_reduce.weight.view(conv3_reduce.out_channels, C_in)  # [R3, C_in]
+            b3r = conv3_reduce.bias  # [R3]
+            w3 = conv3.weight  # [O3, R3, 3, 3]
+            b3 = conv3.bias    # [O3]
+
+            O3_, R3_, KH3, KW3 = w3.shape
+            assert O3_ == O3 and KH3 == 3 and KW3 == 3
+
+            w3_flat = w3.view(O3, R3_, KH3 * KW3)  # [O3, R3, 9]
+            # eff_w3[o, c, k] = sum_r w3[o, r, k] * w3r[r, c]
+            eff_w3_flat = torch.einsum("ork,rc->ock", w3_flat, w3r)  # [O3, C_in, 9]
+            eff_w3 = eff_w3_flat.view(O3, C_in, KH3, KW3).contiguous()
+
+            # eff_b3[o] = b3[o] + sum_r,kh,kw w3[o,r,kh,kw] * b3r[r]
+            eff_b3 = b3 + (w3_flat * b3r.view(1, R3_, 1)).sum(dim=(1, 2))
+            eff_b3 = eff_b3.contiguous()
+        else:
+            eff_w3 = torch.empty((0, C_in, 3, 3), device=x.device, dtype=x.dtype)
+            eff_b3 = torch.empty((0,), device=x.device, dtype=x.dtype)
+
+        # ---- Fused 5x5 weights ----
+        if O5 > 0:
+            w5r = conv5_reduce.weight.view(conv5_reduce.out_channels, C_in)  # [R5, C_in]
+            b5r = conv5_reduce.bias  # [R5]
+            w5 = conv5.weight  # [O5, R5, 5, 5]
+            b5 = conv5.bias    # [O5]
+
+            O5_, R5_, KH5, KW5 = w5.shape
+            assert O5_ == O5 and KH5 == 5 and KW5 == 5
+
+            w5_flat = w5.view(O5, R5_, KH5 * KW5)  # [O5, R5, 25]
+            eff_w5_flat = torch.einsum("ork,rc->ock", w5_flat, w5r)  # [O5, C_in, 25]
+            eff_w5 = eff_w5_flat.view(O5, C_in, KH5, KW5).contiguous()
+
+            eff_b5 = b5 + (w5_flat * b5r.view(1, R5_, 1)).sum(dim=(1, 2))
+            eff_b5 = eff_b5.contiguous()
+        else:
+            eff_w5 = torch.empty((0, C_in, 5, 5), device=x.device, dtype=x.dtype)
+            eff_b5 = torch.empty((0,), device=x.device, dtype=x.dtype)
+
+        # ---- Branch 1: 1x1 conv ----
+        if O1 > 0:
+            w1 = conv1x1.weight.view(O1, C_in).contiguous()
+            b1 = conv1x1.bias.contiguous()
+        else:
+            w1 = torch.empty((0, C_in), device=x.device, dtype=x.dtype)
+            b1 = torch.empty((0,), device=x.device, dtype=x.dtype)
+
+        # ---- Pool projection 1x1 conv ----
+        if Op > 0:
+            wp = pool_conv.weight.view(Op, C_in).contiguous()
+            bp = pool_conv.bias.contiguous()
+        else:
+            wp = torch.empty((0, C_in), device=x.device, dtype=x.dtype)
+            bp = torch.empty((0,), device=x.device, dtype=x.dtype)
+
+    C_out = O1 + O3 + O5 + Op
+    y = torch.empty((N, C_out, H, W), device=x.device, dtype=x.dtype)
+
+    if N * C_in * H * W == 0:
+        return y
+
+    x_sN, x_sC, x_sH, x_sW = x.stride()
+    y_sN, y_sC, y_sH, y_sW = y.stride()
+
+    w1_sO, w1_sC = w1.stride()
+    w3_sO, w3_sC, w3_sKH, w3_sKW = eff_w3.stride()
+    w5_sO, w5_sC, w5_sKH, w5_sKW = eff_w5.stride()
+    wp_sO, wp_sC = wp.stride()
+
+    P = N * H * W
+    grid = (P,)
+
+    inception_fwd_kernel[grid](
+        x,
+        w1, b1,
+        eff_w3, eff_b3,
+        eff_w5, eff_b5,
+        wp, bp,
+        y,
+        N, C_in, H, W,
+        O1, O3, O5, Op,
+        x_sN, x_sC, x_sH, x_sW,
+        y_sN, y_sC, y_sH, y_sW,
+        w1_sO, w1_sC,
+        w3_sO, w3_sC, w3_sKH, w3_sKW,
+        w5_sO, w5_sC, w5_sKH, w5_sKW,
+        wp_sO, wp_sC,
+        BLOCK_CIN=32,
+        BLOCK_O1=32,
+        BLOCK_O3=32,
+        BLOCK_O5=32,
+        BLOCK_OP=32,
+    )
+
+    return y
+
+
+# -------------------------
+# Inception Module (fused)
+# -------------------------
+
+class InceptionModule(nn.Module):
+    def __init__(self, in_channels, out_1x1, reduce_3x3, out_3x3,
+                 reduce_5x5, out_5x5, pool_proj):
+        """
+        Triton-fused Inception module that matches the reference behavior.
+
+        Branches:
+          - 1x1 convolution
+          - 1x1 reduction + 3x3 convolution
+          - 1x1 reduction + 5x5 convolution
+          - 3x3 max pooling (stride=1, padding=1) + 1x1 convolution
+        """
+        super(InceptionModule, self).__init__()
+
+        # 1x1 convolution branch
+        self.branch1x1 = nn.Conv2d(in_channels, out_1x1, kernel_size=1)
+
+        # 3x3 convolution branch
+        self.branch3x3 = nn.Sequential(
+            nn.Conv2d(in_channels, reduce_3x3, kernel_size=1),
+            nn.Conv2d(reduce_3x3, out_3x3, kernel_size=3, padding=1)
+        )
+
+        # 5x5 convolution branch
+        self.branch5x5 = nn.Sequential(
+            nn.Conv2d(in_channels, reduce_5x5, kernel_size=1),
+            nn.Conv2d(reduce_5x5, out_5x5, kernel_size=5, padding=2)
+        )
+
+        # Max pooling branch
+        self.branch_pool = nn.Sequential(
+            nn.MaxPool2d(kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(in_channels, pool_proj, kernel_size=1)
+        )
+
+    def forward(self, x):
+        """
+        Fused forward that reproduces the exact behavior of the reference
+        InceptionModule, but computes all four branches in a single Triton kernel.
+        """
+        return triton_inception_forward(x, self)
+
+
+# -------------------------
+# Full Model Definition
+# -------------------------
+
+class ModelNew(nn.Module):
+    def __init__(self, num_classes=1000):
+        """
+        Triton-optimized version of the given GoogLeNet-style model.
+        Uses:
+          - Triton ReLU for activations after conv1, conv2, conv3
+          - Fused Triton Inception modules
+          - Triton GEMM for the final fully-connected layer
+        """
+        super(ModelNew, self).__init__()
+
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3)
+        self.maxpool1 = nn.MaxPool2d(3, stride=2, padding=1)
+        self.conv2 = nn.Conv2d(64, 64, kernel_size=1)
+        self.conv3 = nn.Conv2d(64, 192, kernel_size=3, padding=1)
+        self.maxpool2 = nn.MaxPool2d(3, stride=2, padding=1)
+
+        self.inception3a = InceptionModule(192, 64, 96, 128, 16, 32, 32)
+        self.inception3b = InceptionModule(256, 128, 128, 192, 32, 96, 64)
+        self.maxpool3 = nn.MaxPool2d(3, stride=2, padding=1)
+
+        self.inception4a = InceptionModule(480, 192, 96, 208, 16, 48, 64)
+        self.inception4b = InceptionModule(512, 160, 112, 224, 24, 64, 64)
+        self.inception4c = InceptionModule(512, 128, 128, 256, 24, 64, 64)
+        self.inception4d = InceptionModule(512, 112, 144, 288, 32, 64, 64)
+        self.inception4e = InceptionModule(528, 256, 160, 320, 32, 128, 128)
+        self.maxpool4 = nn.MaxPool2d(3, stride=2, padding=1)
+
+        self.inception5a = InceptionModule(832, 256, 160, 320, 32, 128, 128)
+        self.inception5b = InceptionModule(832, 384, 192, 384, 48, 128, 128)
+
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.dropout = nn.Dropout(0.0)
+
+        in_features = 1024
+        self.fc_weight = nn.Parameter(torch.randn(num_classes, in_features))
+        self.fc_bias = nn.Parameter(torch.randn(num_classes))
+
+    def forward(self, x):
+        """
+        :param x: Input tensor, shape (batch_size, 3, height, width)
+        :return: Output tensor, shape (batch_size, num_classes)
+        """
+        # conv1 + ReLU + maxpool1
+        x = self.conv1(x)
+        x = triton_relu(x)
+        x = self.maxpool1(x)
+
+        # conv2 + ReLU
+        x = self.conv2(x)
+        x = triton_relu(x)
+
+        # conv3 + ReLU + maxpool2
+        x = self.conv3(x)
+        x = triton_relu(x)
+        x = self.maxpool2(x)
+
+        # Inception + pooling stacks
+        x = self.inception3a(x)
+        x = self.inception3b(x)
+        x = self.maxpool3(x)
+
+        x = self.inception4a(x)
+        x = self.inception4b(x)
+        x = self.inception4c(x)
+        x = self.inception4d(x)
+        x = self.inception4e(x)
+        x = self.maxpool4(x)
+
+        x = self.inception5a(x)
+        x = self.inception5b(x)
+
+        # Global pool + dropout + FC (Triton GEMM)
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.dropout(x)
+
+        x = triton_linear(x, self.fc_weight, self.fc_bias)
+
+        return x
+```

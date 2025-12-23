@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The custom Triton 3D convolution is slower than the PyTorch/cuDNN baseline, indicating a clear algorithmic inefficiency in the core compute kernel.",
+  "bottleneck": "The conv3d_div_kernel implements a direct convolution with nested loops over C_in and Kd×Kh×Kw and many scalar loads, instead of using a GEMM-friendly formulation; this leads to poor cache reuse and low tensor-core utilization compared to cuDNN’s implicit-GEMM/Winograd implementations.",
+  "optimisation method": "Replace the naive direct 3D convolution with an im2col + GEMM (or implicit-GEMM) algorithm so that the convolution is expressed as a matrix multiplication, which can then be implemented via Triton’s optimized matmul templates or delegated to cuBLAS/cuDNN, while still fusing the division by the constant.",
+  "modification plan": "Reshape the convolution into a matrix multiplication where each output position (n, od, oh, ow) becomes a row in a matrix A of shape [N*D_out*H_out*W_out, C_in*Kd*Kh*Kw] and the weights are reshaped into a matrix B of shape [C_in*Kd*Kh*Kw, C_out]. Implement an im2col loader in Triton that tiles and stages A and B into shared memory, and call an optimized Triton matmul kernel to compute C = A @ B, applying the inv_div scaling inside the matmul epilogue to avoid an extra pass. Finally, reshape the GEMM output back to [N, C_out, D_out, H_out, W_out] to feed into the existing pooling pipeline.",
+  "expected_speedup": "30-40% on the convolution phase (bringing overall model latency at or below the PyTorch baseline), due to much higher arithmetic intensity and better GPU utilization."
+}

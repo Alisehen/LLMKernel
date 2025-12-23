@@ -1,0 +1,85 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_SIZE": 256}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_SIZE": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_SIZE": 256}, num_warps=8, num_stages=2),
+    ],
+    key=["numel"],
+)
+@triton.jit
+def mul_leakyrelu_inplace_kernel(
+    x_ptr,
+    numel,
+    multiplier,
+    negative_slope,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    In-place: x = leaky_relu(x * multiplier, negative_slope)
+    x is assumed to be a contiguous 1D buffer of length numel.
+    """
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < numel
+
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+    # Fused multiply + LeakyReLU
+    x = x * multiplier
+    x = tl.where(x >= 0, x, x * negative_slope)
+    tl.store(x_ptr + offs, x, mask=mask)
+
+
+def mul_leakyrelu_inplace(x, multiplier, negative_slope):
+    """
+    Apply: x <- leaky_relu(x * multiplier, negative_slope) in-place using Triton.
+    x: [M, N] tensor (output of Linear).
+    """
+    assert x.is_cuda, "Input must be on CUDA"
+
+    # We operate on a contiguous view; if the incoming tensor isn't contiguous,
+    # we return an out-of-place contiguous result to preserve correctness.
+    if not x.is_contiguous():
+        x = x.contiguous()
+
+    numel = x.numel()
+
+    # Ensure grid size is always > 0 even for numel == 0
+    grid = lambda META: (max(1, triton.cdiv(numel, META["BLOCK_SIZE"])),)
+
+    mul_leakyrelu_inplace_kernel[grid](
+        x,
+        numel,
+        multiplier,
+        negative_slope,
+    )
+    return x
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized replacement for:
+      Linear(in_features, out_features) + scalar multiply + LeakyReLU
+
+    Reference behavior:
+      y = self.linear(x)
+      y = y * multiplier
+      y = F.leaky_relu(y, negative_slope)
+    """
+    def __init__(self, in_features, out_features, multiplier, negative_slope):
+        super(ModelNew, self).__init__()
+        # Match nn.Linear structure so state_dict loading works seamlessly
+        self.linear = nn.Linear(in_features, out_features)
+        self.multiplier = float(multiplier)
+        self.negative_slope = float(negative_slope)
+
+    def forward(self, x):
+        # x: [batch_size, in_features]
+        y = self.linear(x)
+        y = mul_leakyrelu_inplace(y, self.multiplier, self.negative_slope)
+        return y

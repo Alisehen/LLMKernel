@@ -1,0 +1,293 @@
+import torch, torch.nn as nn, triton, triton.language as tl
+import math
+
+
+@triton.jit
+def conv3d_div_kernel(
+    x_ptr,  # float32[N, C_in, D_in, H_in, W_in]
+    w_ptr,  # float32[C_out, C_in, Kd, Kh, Kw]
+    y_ptr,  # float32[N, C_out, D_out, H_out, W_out]
+    N, C_in,
+    D_in, H_in, W_in,
+    C_out,
+    Kd, Kh, Kw,
+    D_out, H_out, W_out,
+    P,                 # N * D_out * H_out * W_out
+    inv_div,           # 1.0 / divisor
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # flattened output positions
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # output channels
+
+    mask_m = offs_m < P
+    mask_n = offs_n < C_out
+
+    # Decode flat index -> (n, od, oh, ow)
+    DHW = D_out * H_out * W_out
+    HW = H_out * W_out
+
+    n_idx = offs_m // DHW
+    rem = offs_m % DHW
+    od_idx = rem // HW
+    rem2 = rem % HW
+    oh_idx = rem2 // W_out
+    ow_idx = rem2 % W_out
+
+    # Expand dimensions for broadcasting
+    n_idx_2d = n_idx[:, None]
+    od_idx_2d = od_idx[:, None]
+    oh_idx_2d = oh_idx[:, None]
+    ow_idx_2d = ow_idx[:, None]
+    oc_idx_2d = offs_n[None, :]
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # 3D convolution: sum over input channels and kernel volume
+    for ic in range(0, C_in):
+        for kd in range(0, Kd):
+            id_idx = od_idx + kd  # [BLOCK_M]
+            for kh in range(0, Kh):
+                ih_idx = oh_idx + kh
+                for kw in range(0, Kw):
+                    iw_idx = ow_idx + kw
+
+                    # Input indices: (((n*C_in + ic)*D_in + id)*H_in + ih)*W_in + iw
+                    x_index = (
+                        (((n_idx * C_in + ic) * D_in + id_idx) * H_in + ih_idx) * W_in
+                        + iw_idx
+                    )
+
+                    x_vals = tl.load(
+                        x_ptr + x_index,
+                        mask=mask_m,
+                        other=0.0,
+                    )  # [BLOCK_M]
+
+                    # Weight indices: ((((oc*C_in + ic)*Kd + kd)*Kh + kh)*Kw + kw)
+                    w_index = (
+                        ((((offs_n * C_in + ic) * Kd + kd) * Kh + kh) * Kw + kw)
+                    )
+
+                    w_vals = tl.load(
+                        w_ptr + w_index,
+                        mask=mask_n,
+                        other=0.0,
+                    )  # [BLOCK_N]
+
+                    acc += x_vals[:, None] * w_vals[None, :]
+
+    # Apply division by constant
+    acc = acc * inv_div
+
+    # Store result to y
+    # y_index = ((((n*C_out + oc)*D_out + od)*H_out + oh)*W_out + ow)
+    y_index = (
+        (((n_idx_2d * C_out + oc_idx_2d) * D_out + od_idx_2d) * H_out + oh_idx_2d)
+        * W_out
+        + ow_idx_2d
+    )
+
+    y_mask = mask_m[:, None] & mask_n[None, :]
+    tl.store(
+        y_ptr + y_index,
+        acc,
+        mask=y_mask,
+    )
+
+
+def conv3d_div_triton(x: torch.Tensor, weight: torch.Tensor, divisor: float):
+    """
+    x: [N, C_in, D_in, H_in, W_in]
+    weight: [C_out, C_in, Kd, Kh, Kw]
+    returns: conv3d(x, weight) / divisor  with stride=1, padding=0, dilation=1
+    """
+    assert x.is_cuda and weight.is_cuda
+    assert x.dtype == torch.float32 and weight.dtype == torch.float32
+
+    N, C_in, D_in, H_in, W_in = x.shape
+    C_out, C_in_w, Kd, Kh, Kw = weight.shape
+    assert C_in_w == C_in
+
+    D_out = D_in - Kd + 1
+    H_out = H_in - Kh + 1
+    W_out = W_in - Kw + 1
+
+    y = torch.empty((N, C_out, D_out, H_out, W_out), device=x.device, dtype=x.dtype)
+    P = N * D_out * H_out * W_out
+    inv_div = float(1.0 / divisor)
+
+    BLOCK_M = 64
+    BLOCK_N = 16
+
+    grid = lambda META: (
+        triton.cdiv(P, META["BLOCK_M"]),
+        triton.cdiv(C_out, META["BLOCK_N"]),
+    )
+
+    conv3d_div_kernel[grid](
+        x,
+        weight,
+        y,
+        N,
+        C_in,
+        D_in,
+        H_in,
+        W_in,
+        C_out,
+        Kd,
+        Kh,
+        Kw,
+        D_out,
+        H_out,
+        W_out,
+        P,
+        inv_div,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        num_warps=4,
+        num_stages=2,
+    )
+
+    return y
+
+
+@triton.jit
+def add_bias_sum_dim1_kernel(
+    x_ptr,      # float32[N, C]
+    bias_ptr,   # float32[C]
+    out_ptr,    # float32[N]
+    N, C,
+    stride_xn, stride_xc,
+    stride_biasc,
+    stride_outn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid = tl.program_id(0)
+
+    offs_n = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_n = offs_n < N
+
+    acc = tl.zeros((BLOCK_M,), dtype=tl.float32)
+
+    for c_start in range(0, C, BLOCK_K):
+        offs_c = c_start + tl.arange(0, BLOCK_K)
+        mask_c = offs_c < C
+
+        x_ptrs = x_ptr + offs_n[:, None] * stride_xn + offs_c[None, :] * stride_xc
+        x_vals = tl.load(
+            x_ptrs,
+            mask=mask_n[:, None] & mask_c[None, :],
+            other=0.0,
+        )  # [BLOCK_M, BLOCK_K]
+
+        bias_vals = tl.load(
+            bias_ptr + offs_c * stride_biasc,
+            mask=mask_c,
+            other=0.0,
+        )  # [BLOCK_K]
+
+        x_vals = x_vals + bias_vals[None, :]
+
+        acc += tl.sum(x_vals, axis=1)
+
+    tl.store(out_ptr + offs_n * stride_outn, acc, mask=mask_n)
+
+
+def add_bias_and_sum_dim1_triton(x: torch.Tensor, bias: torch.Tensor):
+    """
+    x: [N, C]  (result of global avg pooling)
+    bias: [C]  (broadcast along batch)
+    returns: [N] where out[n] = sum_c (x[n,c] + bias[c])
+    """
+    assert x.is_cuda and bias.is_cuda
+    assert x.dtype == torch.float32 and bias.dtype == torch.float32
+    N, C = x.shape
+    assert bias.shape[0] == C
+
+    out = torch.empty((N,), device=x.device, dtype=x.dtype)
+
+    stride_xn, stride_xc = x.stride()
+    stride_biasc = bias.stride(0)
+    stride_outn = out.stride(0)
+
+    BLOCK_M = 64
+    BLOCK_K = 32
+
+    grid = lambda META: (triton.cdiv(N, META["BLOCK_M"]),)
+
+    add_bias_sum_dim1_kernel[grid](
+        x,
+        bias,
+        out,
+        N,
+        C,
+        stride_xn,
+        stride_xc,
+        stride_biasc,
+        stride_outn,
+        BLOCK_M=BLOCK_M,
+        BLOCK_K=BLOCK_K,
+        num_warps=4,
+        num_stages=1,
+    )
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    High-performance Triton implementation of:
+
+      Conv3d -> divide by constant -> MaxPool3d -> AdaptiveAvgPool3d(1,1,1)
+      -> add bias -> sum along channel dimension.
+
+    Conv3d + division and final bias+sum are implemented with Triton kernels.
+    MaxPool3d and AdaptiveAvgPool3d use PyTorch.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size,
+                 divisor, pool_size, bias_shape, sum_dim):
+        super(ModelNew, self).__init__()
+        # Conv weights (no built-in bias; we handle bias separately)
+        if isinstance(kernel_size, int):
+            kernel_size = (kernel_size, kernel_size, kernel_size)
+        self.weight = nn.Parameter(
+            torch.empty(out_channels, in_channels, *kernel_size)
+        )
+        # Kaiming uniform similar to nn.Conv3d default
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+
+        self.divisor = float(divisor)
+        self.max_pool = nn.MaxPool3d(pool_size)
+        self.global_avg_pool = nn.AdaptiveAvgPool3d((1, 1, 1))
+
+        # Bias after global pooling (broadcast over spatial dims)
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+
+        self.sum_dim = sum_dim
+        assert self.sum_dim == 1, "This optimized implementation assumes sum_dim == 1."
+
+    def forward(self, x):
+        # Conv3d + division in Triton
+        x = x.to(self.weight.dtype)
+        weight = self.weight
+        y = conv3d_div_triton(x, weight, self.divisor)
+
+        # MaxPool3d and global average pooling in PyTorch
+        y = self.max_pool(y)
+        y = self.global_avg_pool(y)  # [N, C, 1, 1, 1]
+
+        N, C = y.shape[0], y.shape[1]
+
+        # Bias: [C, 1, 1, 1] -> [C]
+        bias_vec = self.bias.view(C)
+
+        # Flatten to [N, C] for Triton reduction
+        y_flat = y.view(N, C)
+
+        out_flat = add_bias_and_sum_dim1_triton(y_flat, bias_vec)  # [N]
+        out = out_flat.view(N, 1, 1, 1)
+        return out

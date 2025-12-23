@@ -1,0 +1,200 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        # Main high-throughput tile – good balance for 4090, keeps regs moderate
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=3,
+        ),
+        # Skewed tile – can help for tall/skinny or wide/short shapes
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=3,
+        ),
+        # Conservative fallback – smallest register footprint
+        triton.Config(
+            {'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 32},
+            num_warps=2,
+            num_stages=2,
+        ),
+    ],
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def fused_gemm_sigmoid_scale_residual_kernel(
+    a_ptr, b_ptr, bias_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    scaling_factor,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    # -------------------------------------------------------------------------
+    # 2D program ids
+    # -------------------------------------------------------------------------
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    # Offsets for this program's tile
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Masks for boundaries
+    m_mask = offs_m < M
+    n_mask = offs_n < N
+    out_mask = m_mask[:, None] & n_mask[None, :]
+
+    # -------------------------------------------------------------------------
+    # Pointers for A (M x K) and B (K x N)
+    # A is [M, K] row-major
+    # B is logical [K, N] (weight.T), with given strides
+    # -------------------------------------------------------------------------
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    # FP32 accumulator
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # -------------------------------------------------------------------------
+    # GEMM main loop over K
+    # -------------------------------------------------------------------------
+    for k in range(0, K, BLOCK_K):
+        k_remaining = K - k
+        k_mask = offs_k < k_remaining  # (BLOCK_K,)
+
+        # Load tiles with boundary masking
+        a = tl.load(
+            a_ptrs,
+            mask=m_mask[:, None] & k_mask[None, :],
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptrs,
+            mask=k_mask[:, None] & n_mask[None, :],
+            other=0.0,
+        )
+
+        # Tensor-core matmul: fp16/bf16 inputs, fp32 accumulate
+        acc += tl.dot(a, b, allow_tf32=True)
+
+        # Advance pointers along K
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # -------------------------------------------------------------------------
+    # Fused epilogue: +bias, sigmoid, scale, residual
+    #
+    # z = x @ W^T + b
+    # y = z + scaling_factor * sigmoid(z)
+    #
+    # Bias is [N]; we load once per column and broadcast across rows.
+    # -------------------------------------------------------------------------
+    bias = tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0).to(tl.float32)
+    acc = acc + bias[None, :]  # broadcast over M
+
+    # Sigmoid in-place on acc to minimize temporaries:
+    # sigmoid(z) = 1 / (1 + exp(-z))
+    tmp = tl.exp(-acc)
+    sig = 1.0 / (1.0 + tmp)
+    acc = acc + scaling_factor * sig
+
+    # -------------------------------------------------------------------------
+    # Store result to C
+    # -------------------------------------------------------------------------
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    tl.store(c_ptrs, acc, mask=out_mask)
+
+
+def fused_gemm_sigmoid_scale_residual(x, weight, bias, scaling_factor: float):
+    """
+    x:       (M, K), arbitrary dtype (will be cast for matmul)
+    weight:  (N, K) = (out_features, in_features), fp16/bf16
+    bias:    (N,)
+    returns: (M, N) with
+             z = x @ weight.T + bias
+             y = z + scaling_factor * sigmoid(z)
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+    M, K = x.shape
+    N = weight.shape[0]
+    assert weight.shape[1] == K, "weight shape must be (out_features=N, in_features=K)"
+    assert bias.shape[0] == N
+
+    mixed_dtype = weight.dtype
+    assert mixed_dtype in (torch.float16, torch.bfloat16), \
+        "weight must be float16 or bfloat16 for tensor-core matmul"
+
+    # Cast inputs/bias to mixed precision used by weight
+    x_mixed = x.to(mixed_dtype) if x.dtype != mixed_dtype else x
+    bias_mixed = bias.to(mixed_dtype) if bias.dtype != mixed_dtype else bias
+
+    # Output buffer in mixed precision; kernel does FP32 accumulate then casts
+    c = torch.empty((M, N), device=x.device, dtype=mixed_dtype)
+
+    # Strides (row-major assumed)
+    stride_am, stride_ak = x_mixed.stride()
+    # weight is [N, K] row-major; treat as B[K, N]
+    stride_bn, stride_bk = weight.stride()  # (stride_n, stride_k)
+    stride_bk, stride_bn = stride_bk, stride_bn  # now strides for [K, N]
+    stride_cm, stride_cn = c.stride()
+
+    # 2D launch grid over output tiles [M, N]
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta['BLOCK_M']),
+            triton.cdiv(N, meta['BLOCK_N']),
+        )
+
+    fused_gemm_sigmoid_scale_residual_kernel[grid](
+        x_mixed, weight, bias_mixed, c,
+        M, N, K,
+        stride_am, stride_ak,
+        stride_bk, stride_bn,
+        stride_cm, stride_cn,
+        float(scaling_factor),
+    )
+
+    return c
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized block:
+
+        z = x @ W^T + b
+        y = z + scaling_factor * sigmoid(z)
+
+    GEMM runs in mixed precision (fp16/bf16 inputs, fp32 accumulate) on tensor cores,
+    and the bias-add + sigmoid + scale + residual are fused into the matmul kernel.
+    """
+
+    def __init__(self, input_size, hidden_size, scaling_factor):
+        super(ModelNew, self).__init__()
+        dtype = torch.float16
+        self.weight = nn.Parameter(
+            torch.randn(hidden_size, input_size, dtype=dtype)
+        )
+        self.bias = nn.Parameter(
+            torch.randn(hidden_size, dtype=dtype)
+        )
+        self.scaling_factor = float(scaling_factor)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (batch_size, input_size)
+        returns: (batch_size, hidden_size)
+        """
+        input_dtype = x.dtype
+        y_mixed = fused_gemm_sigmoid_scale_residual(
+            x, self.weight, self.bias, self.scaling_factor
+        )
+        return y_mixed.to(input_dtype) if y_mixed.dtype != input_dtype else y_mixed

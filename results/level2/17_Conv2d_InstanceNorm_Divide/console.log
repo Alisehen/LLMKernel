@@ -1,0 +1,95 @@
+[Seed] Generating seed kernel...
+[Seed 1/2] Generating...
+[92mFinish reason: stop[0m
+Usage: In=2157, Out=12607, Total=14764
+[seed_0] score=1.0001 (baseline=13.9798ms)
+[seed_0] metrics saved to: /home/hyc/LLMKernel/run/20251223_085025_17_Conv2d_InstanceNorm_Divide_openai_deepseek/17_Conv2d_InstanceNorm_Divide/evaluation/eval_0000.json
+[Seed 1] Final score: 1.0001 ✓
+[Seed] Early stop: seed 1 already beats PyTorch (1.0001 >= 1.0)
+[Seed] Skipping remaining 1 seed(s)
+[Seed] Will proceed to algorithm analysis to attempt further optimization
+
+================================================================================
+[Hybrid Strategy] Analyzing all seeds for algorithmic optimization...
+[Hybrid Strategy] - 1 seed(s) with score >= 1.0 (further optimization)
+================================================================================
+
+[Hybrid] Seed 1: score=1.0001 >= 1.0
+[Hybrid] Attempting algorithm analysis for further optimization...
+[ncu] Using GPU device 6 (CUDA_VISIBLE_DEVICES=6)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_944071.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_944071.py /home/hyc/LLMKernel/KernelBench/level2/17_Conv2d_InstanceNorm_Divide.py /home/hyc/LLMKernel/run/20251223_085025_17_Conv2d_InstanceNorm_Divide_openai_deepseek/17_Conv2d_InstanceNorm_Divide/code/test_kernel_analysis_seed0.py --repeat 1
+[ncu stdout]: [bench] Completed 1 iterations successfully
+
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_944071.csv
+[Hybrid] Requesting LLM analysis for seed 1...
+[92mFinish reason: stop[0m
+Usage: In=3175, Out=1462, Total=4637
+[Hybrid] Worth optimizing: yes
+[Hybrid] Reason: The current pipeline does a full global-memory round-trip and a second kernel launch for InstanceNorm + division after convolution, which is a classic operator-fusion opportunity with substantial bandwidth savings.
+[Hybrid] Analysis complete for seed 1, generating optimized kernel...
+[Hybrid] Bottleneck: After the conv2d kernel writes the entire output tensor to global memory, instan...
+[Hybrid] Optimization: Fuse Conv2d + InstanceNorm + division into a single Triton kernel by changing th...
+[Hybrid] Expected speedup: 30-40%
+[92mFinish reason: stop[0m
+Usage: In=3506, Out=8976, Total=12482
+[algorithm_optimized_seed0] score=0.3963 (baseline=13.9798ms)
+[algorithm_optimized_seed0] metrics saved to: /home/hyc/LLMKernel/run/20251223_085025_17_Conv2d_InstanceNorm_Divide_openai_deepseek/17_Conv2d_InstanceNorm_Divide/evaluation/eval_0001.json
+[Hybrid] ✓ Rescue successful: 1.0001 → 0.3963
+
+================================================================================
+[Hybrid] Candidate Selection
+================================================================================
+[Hybrid] Total candidates: 2
+  [1] seed 1: 1.0001
+  [2] algo-optimized (from seed 1): 0.3963
+
+[Hybrid] ★ Selected best candidate: score=1.0001
+
+[Optimization] Starting 3-stage optimization...
+
+================================================================================
+[Stage 1/3] grid_and_parallel
+Description: Optimize grid layout and parallel work distribution across SMs.
+Current candidates: 1, best score: 1.0001
+================================================================================
+[Stage 1] Profiling best candidate...
+[ncu] Using GPU device 6 (CUDA_VISIBLE_DEVICES=6)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_944071.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_944071.py /home/hyc/LLMKernel/KernelBench/level2/17_Conv2d_InstanceNorm_Divide.py /home/hyc/LLMKernel/run/20251223_085025_17_Conv2d_InstanceNorm_Divide_openai_deepseek/17_Conv2d_InstanceNorm_Divide/code/test_kernel_analysis_seed0.py --repeat 1
+[ncu stdout]: [bench] Completed 1 iterations successfully
+
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_944071.csv
+[Stage 1] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=3076, Out=10170, Total=13246
+[stage1_grid_and_parallel] score=1.0230 (baseline=13.9798ms)
+[stage1_grid_and_parallel] metrics saved to: /home/hyc/LLMKernel/run/20251223_085025_17_Conv2d_InstanceNorm_Divide_openai_deepseek/17_Conv2d_InstanceNorm_Divide/evaluation/eval_0002.json
+  Optimized kernel score: 1.0230 ✓
+[Stage 1] ★ New best score: 1.0230
+
+================================================================================
+[Stage 2/3] block_tiling
+Description: Tune BLOCK_M/N/K sizes for optimal register/memory balance.
+Current candidates: 1, best score: 1.0230
+================================================================================
+[Stage 2] Profiling best candidate...
+[ncu] Using GPU device 6 (CUDA_VISIBLE_DEVICES=6)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_944071.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_944071.py /home/hyc/LLMKernel/KernelBench/level2/17_Conv2d_InstanceNorm_Divide.py /home/hyc/LLMKernel/run/20251223_085025_17_Conv2d_InstanceNorm_Divide_openai_deepseek/17_Conv2d_InstanceNorm_Divide/code/test_kernel_analysis_seed0.py --repeat 1
+[ncu stdout]: [bench] Completed 1 iterations successfully
+
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_944071.csv
+[Stage 2] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=3861, Out=6390, Total=10251
+[stage2_block_tiling] score=0.9767 (baseline=13.9798ms)
+[stage2_block_tiling] metrics saved to: /home/hyc/LLMKernel/run/20251223_085025_17_Conv2d_InstanceNorm_Divide_openai_deepseek/17_Conv2d_InstanceNorm_Divide/evaluation/eval_0003.json
+  Optimized kernel score: 0.9767 ✓
+[Stage 2] Current: 0.9767 (global best: 1.0230)
+
+================================================================================
+[Stage 3/3] memory_and_tuning
+Description: Optimize memory access patterns and fine-tune num_stages/num_warps.
+Current candidates: 1, best score: 1.0230
+================================================================================
+[Stage 3] Profiling best candidate...
+[ncu] Using GPU device 6 (CUDA_VISIBLE_DEVICES=6)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_944071.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_944071.py /home/hyc/LLMKernel/KernelBench/level2/17_Conv2d_InstanceNorm_Divide.py /home/hyc/LLMKernel/run/20251223_085025_17_Conv2d_InstanceNorm_Divide_openai_deepseek/17_Conv2d_InstanceNorm_Divide/code/test_kernel_analysis_seed0.py --repeat 1

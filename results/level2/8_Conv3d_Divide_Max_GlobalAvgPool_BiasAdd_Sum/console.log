@@ -1,183 +1,182 @@
-[Seed] Generating 2 seed candidates...
+[Seed] Generating seed kernel...
 [Seed 1/2] Generating...
 [92mFinish reason: stop[0m
-Usage: In=1313, Out=5605, Total=6918
-[seed_0] score=1.0000 (baseline=7.3042ms)
-[seed_0] metrics saved to: /home/hyc/LLMKernel/run/20251221_114357_batch_range7to9_openai_deepseek/8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum/evaluation/eval_0008.json
-[Seed 1] Score: 1.0000 ✓
+Usage: In=2308, Out=10054, Total=12362
+[seed_0] score=0.7441 (baseline=7.3058ms)
+[seed_0] metrics saved to: /home/hyc/LLMKernel/run/20251223_082353_8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum_openai_deepseek/8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum/evaluation/eval_0000.json
+[Seed 1] Final score: 0.7441 ✓
 [Seed 2/2] Generating...
 [92mFinish reason: stop[0m
-Usage: In=1313, Out=8071, Total=9384
-[seed_1] score=0.9989 (baseline=7.3042ms)
-[seed_1] metrics saved to: /home/hyc/LLMKernel/run/20251221_114357_batch_range7to9_openai_deepseek/8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum/evaluation/eval_0009.json
-[Seed 2] Score: 0.9989 ✓
+Usage: In=2308, Out=18625, Total=20933
+[seed_1] score=0.2500 (baseline=7.3058ms)
+[seed_1] metrics saved to: /home/hyc/LLMKernel/run/20251223_082353_8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum_openai_deepseek/8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum/evaluation/eval_0001.json
+[Seed 2] Final score: 0.2500 ✓
 
-[Optimization] Starting 3-stage optimization with Soft Elimination...
-  - 2 seed(s) → Stage 1
-  - Elimination threshold τ = 2.0%
-  - Stage 2/3: greedy on selected candidate(s)
+================================================================================
+[Hybrid Strategy] Analyzing all seeds for algorithmic optimization...
+[Hybrid Strategy] - 2 seed(s) with score < 1.0 (rescue)
+================================================================================
+
+[Hybrid] Seed 1: score=0.7441 < 1.0
+[Hybrid] Attempting algorithm analysis rescue...
+[ncu] Using GPU device 6 (CUDA_VISIBLE_DEVICES=6)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_914578.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_914578.py /home/hyc/LLMKernel/KernelBench/level2/8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum.py /home/hyc/LLMKernel/test_kernel_analysis_seed0.py --repeat 1
+[ncu stderr]: Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/bench_ref_inputs_914578.py", line 81, in <module>
+    main()
+  File "/home/hyc/LLMKernel/bench_ref_inputs_914578.py", line 54, in main
+    test_mod = load_module(args.candidate, "test_module")
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/bench_ref_inputs_914578.py", line 21, in load_module
+    spec.loader.exec_module(module)
+  File "<frozen importlib._bootstrap_external>", line 936, in exec_mo
+[93mWarning: NCU profiling failed: NCU CSV file is empty (benchmark script likely failed): /home/hyc/LLMKernel/ncu_temp_914578.csv[0m
+[Hybrid] Requesting LLM analysis for seed 1...
+[92mFinish reason: stop[0m
+Usage: In=3477, Out=1605, Total=5082
+[Hybrid] Worth optimizing: yes
+[Hybrid] Reason: The custom Triton 3D convolution is slower than the PyTorch/cuDNN baseline, indicating a clear algorithmic inefficiency in the core compute kernel.
+[Hybrid] Analysis complete for seed 1, generating optimized kernel...
+[Hybrid] Bottleneck: The conv3d_div_kernel implements a direct convolution with nested loops over C_i...
+[Hybrid] Optimization: Replace the naive direct 3D convolution with an im2col + GEMM (or implicit-GEMM)...
+[Hybrid] Expected speedup: 30-40% on the convolution phase (bringing overall model latency at or below the PyTorch baseline), due to much higher arithmetic intensity and better GPU utilization.
+[92mFinish reason: stop[0m
+Usage: In=3868, Out=6464, Total=10332
+[algorithm_optimized_seed0] score=1.0104 (baseline=7.3058ms)
+[algorithm_optimized_seed0] metrics saved to: /home/hyc/LLMKernel/run/20251223_082353_8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum_openai_deepseek/8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum/evaluation/eval_0002.json
+[Hybrid] ✓ Rescue successful: 0.7441 → 1.0104
+
+[Hybrid] Seed 2: score=0.2500 < 1.0
+[Hybrid] Attempting algorithm analysis rescue...
+[ncu] Using GPU device 6 (CUDA_VISIBLE_DEVICES=6)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_914578.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_914578.py /home/hyc/LLMKernel/KernelBench/level2/8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum.py /home/hyc/LLMKernel/test_kernel_analysis_seed1.py --repeat 1
+[ncu stderr]: Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/bench_ref_inputs_914578.py", line 81, in <module>
+    main()
+  File "/home/hyc/LLMKernel/bench_ref_inputs_914578.py", line 54, in main
+    test_mod = load_module(args.candidate, "test_module")
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/bench_ref_inputs_914578.py", line 21, in load_module
+    spec.loader.exec_module(module)
+  File "<frozen importlib._bootstrap_external>", line 936, in exec_mo
+[93mWarning: NCU profiling failed: NCU CSV file is empty (benchmark script likely failed): /home/hyc/LLMKernel/ncu_temp_914578.csv[0m
+[Hybrid] Requesting LLM analysis for seed 2...
+[92mFinish reason: stop[0m
+Usage: In=3973, Out=1069, Total=5042
+[Hybrid] Worth optimizing: yes
+[Hybrid] Reason: The custom 3D convolution kernel is ~4x slower than the PyTorch/cuDNN baseline and dominates total runtime, so improving its algorithmic structure can yield large gains.
+[Hybrid] Analysis complete for seed 2, generating optimized kernel...
+[Hybrid] Bottleneck: The conv3d_kernel uses a naive direct-convolution loop over C_in and K_D*K_H*K_W...
+[Hybrid] Optimization: Replace the current direct 3D convolution with a GEMM-style (implicit im2col) co...
+[Hybrid] Expected speedup: 60-80% overall (about 2.5-4x speedup for the convolution kernel itself, bringing total runtime near or better than the 7.3 ms PyTorch baseline).
+[92mFinish reason: stop[0m
+Usage: In=4406, Out=7292, Total=11698
+[algorithm_optimized_seed1] score=0.3779 (baseline=7.3058ms)
+[algorithm_optimized_seed1] metrics saved to: /home/hyc/LLMKernel/run/20251223_082353_8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum_openai_deepseek/8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum/evaluation/eval_0003.json
+[Hybrid] ✓ Rescue successful: 0.2500 → 0.3779
+
+================================================================================
+[Hybrid] Candidate Selection
+================================================================================
+[Hybrid] Total candidates: 4
+  [1] seed 1: 0.7441
+  [2] seed 2: 0.2500
+  [3] algo-optimized (from seed 1): 1.0104
+  [4] algo-optimized (from seed 2): 0.3779
+
+[Hybrid] ★ Selected best candidate: score=1.0104
+
+[Optimization] Starting 3-stage optimization...
 
 ================================================================================
 [Stage 1/3] grid_and_parallel
 Description: Optimize grid layout and parallel work distribution across SMs.
-Current candidates: 2, best score: 1.0000
+Current candidates: 1, best score: 1.0104
 ================================================================================
-[Stage 1] Profiling 2 candidate(s)...
-[ncu] Using GPU device 7 (CUDA_VISIBLE_DEVICES=7)
-[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_3533388.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_3533388.py /home/hyc/LLMKernel/KernelBench/level2/8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum.py /home/hyc/LLMKernel/test_kernel_3533388.py --repeat 1
-[ncu] ⚠️ Command timed out after 300 seconds
-[93mWarning: NCU profiling failed: NCU CSV file is empty (benchmark script likely failed): /home/hyc/LLMKernel/ncu_temp_3533388.csv[0m
-[ncu] Using GPU device 7 (CUDA_VISIBLE_DEVICES=7)
-[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_3533388.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_3533388.py /home/hyc/LLMKernel/KernelBench/level2/8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum.py /home/hyc/LLMKernel/test_kernel_3533388.py --repeat 1
-[ncu] ⚠️ Command timed out after 300 seconds
-[93mWarning: NCU profiling failed: NCU CSV file is empty (benchmark script likely failed): /home/hyc/LLMKernel/ncu_temp_3533388.csv[0m
-[Stage 1] Optimizing candidate 1/2...
+[Stage 1] Profiling best candidate...
+[ncu] Using GPU device 6 (CUDA_VISIBLE_DEVICES=6)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_914578.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_914578.py /home/hyc/LLMKernel/KernelBench/level2/8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum.py /home/hyc/LLMKernel/test_kernel_analysis_seed1.py --repeat 1
+[ncu stderr]: Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/bench_ref_inputs_914578.py", line 81, in <module>
+    main()
+  File "/home/hyc/LLMKernel/bench_ref_inputs_914578.py", line 54, in main
+    test_mod = load_module(args.candidate, "test_module")
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/bench_ref_inputs_914578.py", line 21, in load_module
+    spec.loader.exec_module(module)
+  File "<frozen importlib._bootstrap_external>", line 936, in exec_mo
+[93mWarning: NCU profiling failed: NCU CSV file is empty (benchmark script likely failed): /home/hyc/LLMKernel/ncu_temp_914578.csv[0m
+[Stage 1] Generating optimized kernel...
 [92mFinish reason: stop[0m
-Usage: In=1839, Out=8409, Total=10248
-[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
-  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 644, in compare_and_bench
-    raise ValueError(
-ValueError: Outputs are not close (atol=0.1, rtol=0.1). max_abs_err=1.213e+03, mean_abs_err=1.209e+03
-
-[stage1_grid_and_parallel_cand0] failed. See metrics.message for details.
-[stage1_grid_and_parallel_cand0] metrics saved to: /home/hyc/LLMKernel/run/20251221_114357_batch_range7to9_openai_deepseek/8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum/evaluation/eval_0010.json
-  Candidate 1: failed, attempting repair...
-[92mFinish reason: stop[0m
-Usage: In=1730, Out=4516, Total=6246
-[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
-  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 644, in compare_and_bench
-    raise ValueError(
-ValueError: Outputs are not close (atol=0.1, rtol=0.1). max_abs_err=1.833e+03, mean_abs_err=1.827e+03
-
-[stage1_grid_and_parallel_repair_beam0] failed. See metrics.message for details.
-[stage1_grid_and_parallel_repair_beam0] metrics saved to: /home/hyc/LLMKernel/run/20251221_114357_batch_range7to9_openai_deepseek/8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum/evaluation/eval_0011.json
-  Candidate 1: failed (after repair attempt) ✗
-[Stage 1] Optimizing candidate 2/2...
-[92mFinish reason: stop[0m
-Usage: In=1741, Out=8573, Total=10314
-[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
-  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 644, in compare_and_bench
-    raise ValueError(
-ValueError: Outputs are not close (atol=0.1, rtol=0.1). max_abs_err=1.472e+03, mean_abs_err=1.467e+03
-
-[stage1_grid_and_parallel_cand1] failed. See metrics.message for details.
-[stage1_grid_and_parallel_cand1] metrics saved to: /home/hyc/LLMKernel/run/20251221_114357_batch_range7to9_openai_deepseek/8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum/evaluation/eval_0012.json
-  Candidate 2: failed, attempting repair...
-[92mFinish reason: stop[0m
-Usage: In=1649, Out=11485, Total=13134
-[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
-  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 644, in compare_and_bench
-    raise ValueError(
-ValueError: Outputs are not close (atol=0.1, rtol=0.1). max_abs_err=1.405e+03, mean_abs_err=1.400e+03
-
-[stage1_grid_and_parallel_repair_beam1] failed. See metrics.message for details.
-[stage1_grid_and_parallel_repair_beam1] metrics saved to: /home/hyc/LLMKernel/run/20251221_114357_batch_range7to9_openai_deepseek/8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum/evaluation/eval_0013.json
-  Candidate 2: failed (after repair attempt) ✗
-[Stage 1] Soft elimination: gap=0.0011 <= τ=0.02, keeping 2 candidates
-[Stage 1] Best in beam: 1.0000 (global best: 1.0000)
-[Stage 1] Beam after selection: ['1.0000', '0.9989']
+Usage: In=3653, Out=9124, Total=12777
+[stage1_grid_and_parallel] score=0.8130 (baseline=7.3058ms)
+[stage1_grid_and_parallel] metrics saved to: /home/hyc/LLMKernel/run/20251223_082353_8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum_openai_deepseek/8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum/evaluation/eval_0004.json
+  Optimized kernel score: 0.8130 ✓
+[Stage 1] Current: 0.8130 (global best: 1.0104)
 
 ================================================================================
 [Stage 2/3] block_tiling
 Description: Tune BLOCK_M/N/K sizes for optimal register/memory balance.
-Current candidates: 2, best score: 1.0000
+Current candidates: 1, best score: 1.0104
 ================================================================================
-[Stage 2] Profiling 2 candidate(s)...
-[Stage 2] Optimizing candidate 1/2...
+[Stage 2] Profiling best candidate...
+[ncu] Using GPU device 6 (CUDA_VISIBLE_DEVICES=6)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_914578.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_914578.py /home/hyc/LLMKernel/KernelBench/level2/8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum.py /home/hyc/LLMKernel/test_kernel_analysis_seed1.py --repeat 1
+[ncu stderr]: Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/bench_ref_inputs_914578.py", line 81, in <module>
+    main()
+  File "/home/hyc/LLMKernel/bench_ref_inputs_914578.py", line 54, in main
+    test_mod = load_module(args.candidate, "test_module")
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/bench_ref_inputs_914578.py", line 21, in load_module
+    spec.loader.exec_module(module)
+  File "<frozen importlib._bootstrap_external>", line 936, in exec_mo
+[93mWarning: NCU profiling failed: NCU CSV file is empty (benchmark script likely failed): /home/hyc/LLMKernel/ncu_temp_914578.csv[0m
+[Stage 2] Generating optimized kernel...
 [92mFinish reason: stop[0m
-Usage: In=1710, Out=4563, Total=6273
+Usage: In=4062, Out=7088, Total=11150
 [91mTest Error (RuntimeError):[0m Traceback (most recent call last):
-  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 644, in compare_and_bench
-    raise ValueError(
-ValueError: Outputs are not close (atol=0.1, rtol=0.1). max_abs_err=2.752e+03, mean_abs_err=2.742e+03
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 536, in compare_and_bench
+    test_model = ModelNew(*init_args, **init_kwargs)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251223_082353_8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum_openai_deepseek/8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum/code/kernel_20251223_083428.py", line 408, in __init__
+    nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+                                            ^^^^
+NameError: name 'math' is not defined
 
-[stage2_block_tiling_cand0] failed. See metrics.message for details.
-[stage2_block_tiling_cand0] metrics saved to: /home/hyc/LLMKernel/run/20251221_114357_batch_range7to9_openai_deepseek/8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum/evaluation/eval_0014.json
-  Candidate 1: failed, attempting repair...
+[stage2_block_tiling] failed. See metrics.message for details.
+[stage2_block_tiling] metrics saved to: /home/hyc/LLMKernel/run/20251223_082353_8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum_openai_deepseek/8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum/evaluation/eval_0005.json
+  Optimization failed, attempting repair...
 [92mFinish reason: stop[0m
-Usage: In=1741, Out=17696, Total=19437
-[stage2_block_tiling_repair_beam0] score=0.9987 (baseline=7.3042ms)
-[stage2_block_tiling_repair_beam0] metrics saved to: /home/hyc/LLMKernel/run/20251221_114357_batch_range7to9_openai_deepseek/8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum/evaluation/eval_0015.json
-  Candidate 1: score=0.9987 ✓
-[Stage 2] Optimizing candidate 2/2...
-[92mFinish reason: stop[0m
-Usage: In=1612, Out=8087, Total=9699
-[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
-  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 644, in compare_and_bench
-    raise ValueError(
-ValueError: Outputs are not close (atol=0.1, rtol=0.1). max_abs_err=2.184e+03, mean_abs_err=2.176e+03
-
-[stage2_block_tiling_cand1] failed. See metrics.message for details.
-[stage2_block_tiling_cand1] metrics saved to: /home/hyc/LLMKernel/run/20251221_114357_batch_range7to9_openai_deepseek/8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum/evaluation/eval_0016.json
-  Candidate 2: failed, attempting repair...
-[92mFinish reason: stop[0m
-Usage: In=1684, Out=8220, Total=9904
-[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
-  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 644, in compare_and_bench
-    raise ValueError(
-ValueError: Outputs are not close (atol=0.1, rtol=0.1). max_abs_err=1.449e+03, mean_abs_err=1.444e+03
-
-[stage2_block_tiling_repair_beam1] failed. See metrics.message for details.
-[stage2_block_tiling_repair_beam1] metrics saved to: /home/hyc/LLMKernel/run/20251221_114357_batch_range7to9_openai_deepseek/8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum/evaluation/eval_0017.json
-  Candidate 2: failed (after repair attempt) ✗
-[Stage 2] Best in beam: 1.0000 (global best: 1.0000)
-[Stage 2] Beam after selection: ['1.0000']
+Usage: In=4211, Out=6840, Total=11051
+[stage2_block_tiling_repair] score=1.1758 (baseline=7.3058ms)
+[stage2_block_tiling_repair] metrics saved to: /home/hyc/LLMKernel/run/20251223_082353_8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum_openai_deepseek/8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum/evaluation/eval_0006.json
+  Optimized kernel score: 1.1758 ✓
+[Stage 2] ★ New best score: 1.1758
 
 ================================================================================
 [Stage 3/3] memory_and_tuning
 Description: Optimize memory access patterns and fine-tune num_stages/num_warps.
-Current candidates: 1, best score: 1.0000
+Current candidates: 1, best score: 1.1758
 ================================================================================
-[Stage 3] Profiling 1 candidate(s)...
-[Stage 3] Optimizing candidate 1/1...
+[Stage 3] Profiling best candidate...
+[ncu] Using GPU device 6 (CUDA_VISIBLE_DEVICES=6)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_914578.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_914578.py /home/hyc/LLMKernel/KernelBench/level2/8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum.py /home/hyc/LLMKernel/test_kernel_analysis_seed1.py --repeat 1
+[ncu stderr]: Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/bench_ref_inputs_914578.py", line 81, in <module>
+    main()
+  File "/home/hyc/LLMKernel/bench_ref_inputs_914578.py", line 54, in main
+    test_mod = load_module(args.candidate, "test_module")
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/bench_ref_inputs_914578.py", line 21, in load_module
+    spec.loader.exec_module(module)
+  File "<frozen importlib._bootstrap_external>", line 936, in exec_mo
+[93mWarning: NCU profiling failed: NCU CSV file is empty (benchmark script likely failed): /home/hyc/LLMKernel/ncu_temp_914578.csv[0m
+[Stage 3] Generating optimized kernel...
 [92mFinish reason: stop[0m
-Usage: In=1789, Out=3396, Total=5185
-[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
-  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 554, in compare_and_bench
-    test_out, _ = _run_once(test_model, inp, dev)
-                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
-    out = model(*inp)
-          ^^^^^^^^^^^
-  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
-    return self._call_impl(*args, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
-    return forward_call(*args, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/hyc/LLMKernel/run/20251221_114357_batch_range7to9_openai_deepseek/8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum/code/kernel_20251221_122324.py", line 162, in forward
-    x = triton_bias_add_sum(x, self.bias)
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/hyc/LLMKernel/run/20251221_114357_batch_range7to9_openai_deepseek/8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum/code/kernel_20251221_122324.py", line 113, in triton_bias_add_sum
-    bias_add_sum_kernel[grid](
-  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 419, in <lambda>
-    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
-                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 238, in run
-    benchmark()
-  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 227, in benchmark
-    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
-              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 227, in <dictcomp>
-    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
-                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 137, in _bench
-    raise ValueError(f"Conflicting meta-parameters: {', '.join(conflicts)}."
-ValueError: Conflicting meta-parameters: BLOCK_C. Make sure that you don't re-define auto-tuned symbols.
-
-[stage3_memory_and_tuning_cand0] failed. See metrics.message for details.
-[stage3_memory_and_tuning_cand0] metrics saved to: /home/hyc/LLMKernel/run/20251221_114357_batch_range7to9_openai_deepseek/8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum/evaluation/eval_0018.json
-  Candidate 1: failed, attempting repair...
-[92mFinish reason: stop[0m
-Usage: In=2456, Out=2992, Total=5448
-[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
-  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 644, in compare_and_bench
-    raise ValueError(
-ValueError: Outputs are not close (atol=0.1, rtol=0.1). max_abs_err=3.672e+03, mean_abs_err=3.660e+03
-
-[stage3_memory_and_tuning_repair_beam0] failed. See metrics.message for details.
-[stage3_memory_and_tuning_repair_beam0] metrics saved to: /home/hyc/LLMKernel/run/20251221_114357_batch_range7to9_openai_deepseek/8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum/evaluation/eval_0019.json
-  Candidate 1: failed (after repair attempt) ✗
-[Stage 3] Best in beam: 1.0000 (global best: 1.0000)
-[Stage 3] Beam after selection: ['1.0000']
-[8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum.py] Figure saved to: /home/hyc/LLMKernel/run/20251221_114357_batch_range7to9_openai_deepseek/8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum/figures/8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum_score.png
+Usage: In=4442, Out=6593, Total=11035
+[stage3_memory_and_tuning] score=1.2265 (baseline=7.3058ms)
+[stage3_memory_and_tuning] metrics saved to: /home/hyc/LLMKernel/run/20251223_082353_8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum_openai_deepseek/8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum/evaluation/eval_0007.json
+  Optimized kernel score: 1.2265 ✓
+[Stage 3] ★ New best score: 1.2265
+[8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum.py] Figure saved to: /home/hyc/LLMKernel/run/20251223_082353_8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum_openai_deepseek/8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum/figures/8_Conv3d_Divide_Max_GlobalAvgPool_BiasAdd_Sum_score.png

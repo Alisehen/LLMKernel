@@ -1,0 +1,362 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def fused_linear_bias_hardtanh_mish_kernel(
+    a_ptr, b_ptr, bias_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    # 2D tiling over output matrix C[M, N]
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # GEMM
+    for k in range(0, K, BLOCK_K):
+        k_remaining = K - k
+        a_mask = (offs_m[:, None] < M) & (offs_k[None, :] < k_remaining)
+        b_mask = (offs_k[:, None] < k_remaining) & (offs_n[None, :] < N)
+
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+        acc += tl.dot(a, b, allow_tf32=True)
+
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Add bias: [N]
+    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc += bias[None, :]
+
+    # Hardtanh: clamp between -1 and 1
+    acc = tl.minimum(tl.maximum(acc, -1.0), 1.0)
+
+    # Mish: x * tanh(softplus(x)), softplus(x) = log(1 + exp(x))
+    softplus = tl.log(1.0 + tl.exp(acc))
+    two_sp = 2.0 * softplus
+    t = tl.exp(two_sp)
+    tanh_sp = (t - 1.0) / (t + 1.0)
+    acc = acc * tanh_sp
+
+    # Store result
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    out_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, acc, mask=out_mask)
+
+
+def fused_linear_bias_hardtanh_mish(x, weight, bias):
+    """
+    x:      [B, I]
+    weight: [O, I]
+    bias:   [O]
+    returns: [B, O]
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+    B, I = x.shape
+    O = weight.shape[0]
+
+    # Use W^T as [I, O] for GEMM
+    w_t = weight.t().contiguous()
+    out = torch.empty((B, O), device=x.device, dtype=x.dtype)
+
+    def grid(META):
+        return (
+            triton.cdiv(B, META['BLOCK_M']),
+            triton.cdiv(O, META['BLOCK_N']),
+        )
+
+    fused_linear_bias_hardtanh_mish_kernel[grid](
+        x, w_t, bias, out,
+        B, O, I,
+        x.stride(0), x.stride(1),
+        w_t.stride(0), w_t.stride(1),
+        out.stride(0), out.stride(1),
+        BLOCK_M=128, BLOCK_N=128, BLOCK_K=32,
+    )
+    return out
+
+
+@triton.jit
+def groupnorm_kernel(
+    x_ptr, weight_ptr, bias_ptr, y_ptr,
+    B, C, G, group_size, eps,
+    stride_xn, stride_xc, stride_yn, stride_yc,
+    BLOCK_C: tl.constexpr,
+):
+    # One program per (batch, group) pair
+    pid = tl.program_id(0)
+    n = pid // G
+    g = pid % G
+
+    offs_c = tl.arange(0, BLOCK_C)
+    mask_n = n < B
+
+    # First pass: compute mean and variance for this (n, g)
+    sum_val = tl.zeros((), dtype=tl.float32)
+    sum_sq = tl.zeros((), dtype=tl.float32)
+
+    for c0 in range(0, group_size, BLOCK_C):
+        rel_c = c0 + offs_c          # [BLOCK_C]
+        mask_c = rel_c < group_size  # [BLOCK_C]
+        c_idx = g * group_size + rel_c  # [BLOCK_C] -> channel indices in this group
+
+        mask = mask_c & mask_n
+
+        x_ptrs = x_ptr + n * stride_xn + c_idx * stride_xc
+        x = tl.load(x_ptrs, mask=mask, other=0.0)
+
+        sum_val += tl.sum(x, axis=0)
+        sum_sq += tl.sum(x * x, axis=0)
+
+    mean = sum_val / group_size
+    var = sum_sq / group_size - mean * mean
+    inv_std = 1.0 / tl.sqrt(var + eps)
+
+    # Second pass: normalize and apply affine
+    for c0 in range(0, group_size, BLOCK_C):
+        rel_c = c0 + offs_c
+        mask_c = rel_c < group_size
+        c_idx = g * group_size + rel_c
+
+        mask = mask_c & mask_n
+
+        x_ptrs = x_ptr + n * stride_xn + c_idx * stride_xc
+        x = tl.load(x_ptrs, mask=mask, other=0.0)
+
+        gamma = tl.load(weight_ptr + c_idx, mask=mask, other=1.0)
+        beta = tl.load(bias_ptr + c_idx, mask=mask, other=0.0)
+
+        x_norm = (x - mean) * inv_std
+        y = x_norm * gamma + beta
+
+        y_ptrs = y_ptr + n * stride_yn + c_idx * stride_yc
+        tl.store(y_ptrs, y, mask=mask)
+
+
+def triton_groupnorm(x, weight, bias, num_groups, eps=1e-5):
+    """
+    x: [B, C]
+    weight, bias: [C]
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+    B, C = x.shape
+    assert C % num_groups == 0
+    group_size = C // num_groups
+
+    y = torch.empty_like(x)
+
+    def grid(META):
+        # One program per (batch, group) pair
+        return (max(1, B * num_groups),)
+
+    groupnorm_kernel[grid](
+        x, weight, bias, y,
+        B, C, num_groups, group_size, eps,
+        x.stride(0), x.stride(1),
+        y.stride(0), y.stride(1),
+        BLOCK_C=128,
+    )
+    return y
+
+
+@triton.jit
+def fused_linear_bias_hardtanh_mish_groupnorm_kernel(
+    a_ptr, b_ptr, bias_ptr, gn_weight_ptr, gn_bias_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak, stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    eps,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """
+    Fused kernel:
+      C = GroupNorm(Mish(Hardtanh(A @ B + bias)))
+    A: [M, K]
+    B: [K, N]
+    bias: [N]
+    gn_weight, gn_bias: [N]
+    C: [M, N]
+    GroupNorm over channels N, with groups of size GROUP_SIZE.
+    """
+
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # GEMM
+    for k in range(0, K, BLOCK_K):
+        k_remaining = K - k
+        a_mask = (offs_m[:, None] < M) & (offs_k[None, :] < k_remaining)
+        b_mask = (offs_k[:, None] < k_remaining) & (offs_n[None, :] < N)
+
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+        acc += tl.dot(a, b, allow_tf32=True)
+
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Add bias: [N]
+    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc += bias[None, :]
+
+    # Hardtanh: clamp between -1 and 1
+    acc = tl.minimum(tl.maximum(acc, -1.0), 1.0)
+
+    # Mish: x * tanh(softplus(x)), softplus(x) = log(1 + exp(x))
+    softplus = tl.log(1.0 + tl.exp(acc))
+    two_sp = 2.0 * softplus
+    t = tl.exp(two_sp)
+    tanh_sp = (t - 1.0) / (t + 1.0)
+    acc = acc * tanh_sp
+
+    # -------- GroupNorm over channels N, per row --------
+    # We assume BLOCK_N is a multiple of GROUP_SIZE and that global
+    # tiling along N starts at multiples of GROUP_SIZE, so each
+    # GROUP_SIZE slice corresponds to exactly one GroupNorm group.
+    NUM_GROUPS = BLOCK_N // GROUP_SIZE
+
+    # Reshape to [BLOCK_M, NUM_GROUPS, GROUP_SIZE]
+    acc_reshaped = tl.reshape(acc, (BLOCK_M, NUM_GROUPS, GROUP_SIZE))
+
+    # Compute mean and variance over the GROUP_SIZE dimension
+    sum_val = tl.sum(acc_reshaped, axis=2)               # [BLOCK_M, NUM_GROUPS]
+    sum_sq = tl.sum(acc_reshaped * acc_reshaped, axis=2)
+
+    mean = sum_val / GROUP_SIZE
+    var = sum_sq / GROUP_SIZE - mean * mean
+    inv_std = 1.0 / tl.sqrt(var + eps)
+
+    # Normalize
+    acc_norm = (acc_reshaped - mean[:, :, None]) * inv_std[:, :, None]
+    acc_norm = tl.reshape(acc_norm, (BLOCK_M, BLOCK_N))  # back to [BLOCK_M, BLOCK_N]
+
+    # Apply affine parameters (gamma, beta) along channel dimension
+    gamma = tl.load(gn_weight_ptr + offs_n, mask=offs_n < N, other=1.0)
+    beta = tl.load(gn_bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+
+    acc_out = acc_norm * gamma[None, :] + beta[None, :]
+
+    # Store result
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    store_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, acc_out, mask=store_mask)
+
+
+def fused_linear_bias_hardtanh_mish_groupnorm(
+    x, weight, bias, gn_weight, gn_bias, num_groups, eps=1e-5
+):
+    """
+    Fully fused:
+        y = GroupNorm(Mish(Hardtanh(x @ W^T + b)))
+    x:         [B, I]
+    weight:    [O, I]
+    bias:      [O]
+    gn_weight: [O]
+    gn_bias:   [O]
+    num_groups: number of groups for GroupNorm along O
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+    assert gn_weight.is_cuda and gn_bias.is_cuda
+
+    B, I = x.shape
+    O = weight.shape[0]
+    assert O == gn_weight.numel() == gn_bias.numel()
+    assert O % num_groups == 0
+    group_size = O // num_groups
+
+    # Choose BLOCK_N as a power-of-2 multiple of group_size when possible
+    candidates = [256, 128, 64, 32, 16]
+    BLOCK_N = None
+    for cand in candidates:
+        if cand % group_size == 0:
+            BLOCK_N = cand
+            break
+
+    # If we cannot align tile boundaries with groups, fall back to two-kernel path
+    if BLOCK_N is None:
+        y = fused_linear_bias_hardtanh_mish(x, weight, bias)
+        y = triton_groupnorm(y, gn_weight, gn_bias, num_groups, eps)
+        return y
+
+    BLOCK_M = 64
+    BLOCK_K = 32
+
+    # Use W^T as [I, O] for GEMM
+    w_t = weight.t().contiguous()
+    out = torch.empty((B, O), device=x.device, dtype=x.dtype)
+
+    def grid(META):
+        return (
+            triton.cdiv(B, META['BLOCK_M']),
+            triton.cdiv(O, META['BLOCK_N']),
+        )
+
+    fused_linear_bias_hardtanh_mish_groupnorm_kernel[grid](
+        x, w_t, bias, gn_weight, gn_bias, out,
+        B, O, I,
+        x.stride(0), x.stride(1),
+        w_t.stride(0), w_t.stride(1),
+        out.stride(0), out.stride(1),
+        eps,
+        GROUP_SIZE=group_size,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+    )
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized version of:
+        Linear -> BiasAdd -> Hardtanh -> Mish -> GroupNorm
+    """
+    def __init__(self, in_features, out_features, bias_shape, num_groups):
+        super(ModelNew, self).__init__()
+        # Match original Linear parameter shapes
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+
+        # GroupNorm affine parameters over channels (out_features)
+        self.gn_weight = nn.Parameter(torch.ones(out_features))
+        self.gn_bias = nn.Parameter(torch.zeros(out_features))
+        self.num_groups = num_groups
+        self.eps = 1e-5
+
+    def forward(self, x):
+        # Move to CUDA if not already (to use Triton kernels)
+        if not x.is_cuda:
+            x = x.cuda()
+        if not self.weight.is_cuda:
+            self.weight.data = self.weight.data.cuda()
+            self.bias.data = self.bias.data.cuda()
+            self.gn_weight.data = self.gn_weight.data.cuda()
+            self.gn_bias.data = self.gn_bias.data.cuda()
+
+        x = fused_linear_bias_hardtanh_mish_groupnorm(
+            x, self.weight, self.bias,
+            self.gn_weight, self.gn_bias,
+            self.num_groups, self.eps,
+        )
+        return x

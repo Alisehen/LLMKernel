@@ -1,329 +1,319 @@
 ```python
+# <optimized Triton code>
+
 import torch
 import torch.nn as nn
 import triton
 import triton.language as tl
-import math
 
-# -----------------------------------------------------------------------------
-# OPTIMIZED Gemm kernel with TF32 Tensor Cores
-# -----------------------------------------------------------------------------
+
+# ---------------------------------------------
+# Optimized GEMM (Linear) kernel: y = x @ W^T + b
+# Tuned for RTX 4090 (Ada) with aggressive tiling and
+# register-pressure-aware num_warps / num_stages.
+#
+# Memory-fusion rule:
+#   - Only ONE tl.store() for the output tile
+#   - All intermediates (matmul + bias) stay in registers
+# ---------------------------------------------
+@triton.autotune(
+    configs=[
+        # High throughput for large M,N (compute-friendly, more warps)
+        triton.Config(
+            {'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_warps=8,
+            num_stages=2,
+        ),
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32},
+            num_warps=8,
+            num_stages=2,
+        ),
+        # Conservative baseline (good occupancy, lower registers)
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+    ],
+    key=['M', 'N', 'K'],
+)
 @triton.jit
-def gemm_kernel(
-    a_ptr, b_ptr, c_ptr,
+def linear_forward_kernel(
+    a_ptr,  # [M, K], row-major
+    b_ptr,  # [K, N] logical (transposed weight)
+    bias_ptr,  # [N]
+    c_ptr,  # [M, N]
     M, N, K,
-    stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    USE_TF32: tl.constexpr,
-    GROUP_M: tl.constexpr = 8,
 ):
-    # 2D grid: pid for M and N dimensions
-    pid = tl.program_id(axis=0)
-    num_pid_n = tl.cdiv(N, BLOCK_N)
-    num_pid_m = tl.cdiv(M, BLOCK_M)
-    
-    # Reorder program IDs for better L2 cache utilization
-    group_id = pid // GROUP_M
-    group_size = min(num_pid_m, GROUP_M)
-    first_pid_m = group_id * group_size
-    group_size_m = min(group_size, num_pid_m - first_pid_m)
-    pid_m = first_pid_m + (pid % group_size_m)
-    pid_n = (pid % num_pid_n)
-    
-    # Create offsets
-    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    rk = tl.arange(0, BLOCK_K)
-    
-    # Create pointers
-    A = a_ptr + rm[:, None] * stride_am + rk[None, :] * stride_ak
-    B = b_ptr + rk[:, None] * stride_bk + rn[None, :] * stride_bn
-    
-    # Pre-fetch first tile
-    mask_a = (rm[:, None] < M) & (rk[None, :] < K)
-    mask_b = (rk[:, None] < K) & (rn[None, :] < N)
-    a = tl.load(A, mask=mask_a, other=0.0)
-    b = tl.load(B, mask=mask_b, other=0.0)
-    
+    # 2D program id: tile in output space [M, N]
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    # Offsets for this tile
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Hints for better codegen / vectorization
+    tl.multiple_of(offs_m, BLOCK_M)
+    tl.multiple_of(offs_n, BLOCK_N)
+    tl.multiple_of(offs_k, BLOCK_K)
+
+    # Masks for M and N dimensions (broadcasted later with K)
+    mask_m = offs_m < M  # (BLOCK_M,)
+    mask_n = offs_n < N  # (BLOCK_N,)
+
+    # Base pointers for this tile
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    # Accumulator in fp32 for better precision and tensor-core friendly matmul
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    
-    # Main accumulation loop
-    for k in range(0, tl.cdiv(K, BLOCK_K)):
-        if k > 0:
-            # Pre-fetch next tile
-            A += BLOCK_K * stride_ak
-            B += BLOCK_K * stride_bk
-            mask_a = (rm[:, None] < M) & ((rk[None, :] + (k * BLOCK_K)) < K)
-            mask_b = ((rk[:, None] + (k * BLOCK_K)) < K) & (rn[None, :] < N)
-            a = tl.load(A, mask=mask_a, other=0.0)
-            b = tl.load(B, mask=mask_b, other=0.0)
-        
-        acc += tl.dot(a, b, allow_tf32=USE_TF32)
-    
-    # Store results
-    C = c_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn
-    mask_c = (rm[:, None] < M) & (rn[None, :] < N)
-    tl.store(C, acc, mask=mask_c)
 
-# -----------------------------------------------------------------------------
-# OPTIMIZED Fused BatchNorm + Scale + Softmax kernel - SINGLE PASS
-# -----------------------------------------------------------------------------
-@triton.jit
-def fused_bn_scale_softmax_kernel(
-    x_ptr, gamma_ptr, beta_ptr, running_mean_ptr, running_var_ptr,
-    scale_ptr, output_ptr,
-    M, N,
-    stride_xm, stride_xn, stride_output_m, stride_output_n,
-    eps,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
-):
-    # Process multiple rows per program to increase occupancy
-    pid = tl.program_id(axis=0)
-    num_rows_per_program = BLOCK_M
-    row_start = pid * num_rows_per_program
-    row_end = tl.minimum(row_start + num_rows_per_program, M)
-    actual_rows = row_end - row_start
-    
-    # Allocate shared memory for max and sum reductions
-    max_vals = tl.zeros((BLOCK_M,), dtype=tl.float32) - float('inf')
-    sum_vals = tl.zeros((BLOCK_M,), dtype=tl.float32)
-    
-    # Process columns in chunks
-    for col_start in range(0, N, BLOCK_N):
-        col_offsets = col_start + tl.arange(0, BLOCK_N)
-        col_mask = col_offsets < N
-        
-        # Load normalization parameters once per column block
-        if col_start == 0 or tl.multiple_of(col_start, BLOCK_N * 4):  # Reduced frequency
-            gamma = tl.load(gamma_ptr + col_offsets, mask=col_mask, other=1.0)
-            beta = tl.load(beta_ptr + col_offsets, mask=col_mask, other=0.0)
-            r_mean = tl.load(running_mean_ptr + col_offsets, mask=col_mask, other=0.0)
-            r_var = tl.load(running_var_ptr + col_offsets, mask=col_mask, other=1.0)
-            inv_std = 1.0 / tl.sqrt(r_var + eps)
-            scale = tl.load(scale_ptr)
-        
-        # Process rows within this program
-        for row_idx in range(actual_rows):
-            row = row_start + row_idx
-            
-            # Load input
-            x_ptrs = x_ptr + row * stride_xm + col_offsets * stride_xn
-            x_row = tl.load(x_ptrs, mask=col_mask, other=0.0)
-            
-            # Apply BN and scale
-            normalized = (x_row - r_mean) * inv_std * gamma + beta
-            scaled = normalized * scale
-            
-            # Online softmax algorithm (single pass)
-            # Compute max
-            row_max = tl.maximum(max_vals[row_idx], tl.max(scaled, axis=0))
-            
-            # Update sum with previous max correction
-            if max_vals[row_idx] != row_max:
-                # Rescale existing sum
-                correction = tl.exp(max_vals[row_idx] - row_max)
-                sum_vals = sum_vals * correction
-                max_vals = row_max
-            
-            # Compute exponentials
-            exp_vals = tl.exp(scaled - max_vals[row_idx])
-            sum_vals = sum_vals + tl.sum(exp_vals, axis=0)
-            
-            # Store intermediate exponentials (will normalize in second loop)
-            out_ptrs = output_ptr + row * stride_output_m + col_offsets * stride_output_n
-            tl.store(out_ptrs, exp_vals, mask=col_mask)
-    
-    # Second pass: normalize
-    for col_start in range(0, N, BLOCK_N):
-        col_offsets = col_start + tl.arange(0, BLOCK_N)
-        col_mask = col_offsets < N
-        
-        for row_idx in range(actual_rows):
-            row = row_start + row_idx
-            
-            # Load exponentials
-            out_ptrs = output_ptr + row * stride_output_m + col_offsets * stride_output_n
-            exp_vals = tl.load(out_ptrs, mask=col_mask, other=0.0)
-            
-            # Normalize
-            softmax_out = exp_vals / sum_vals[row_idx]
-            
-            # Store final result
-            tl.store(out_ptrs, softmax_out, mask=col_mask)
+    # Loop over K dimension
+    for k in range(0, K, BLOCK_K):
+        k_indices = k + offs_k  # (BLOCK_K,)
+        k_mask = k_indices < K  # (BLOCK_K,)
 
-# -----------------------------------------------------------------------------
-# Optimized wrapper functions with autotuning
-# -----------------------------------------------------------------------------
-def gemm_wrapper(x, weight):
-    """Optimized matrix multiplication wrapper."""
+        # Full 2D masks for loads
+        a_mask = mask_m[:, None] & k_mask[None, :]    # (BLOCK_M, BLOCK_K)
+        b_mask = k_mask[:, None] & mask_n[None, :]    # (BLOCK_K, BLOCK_N)
+
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+        acc += tl.dot(a, b, allow_tf32=True)
+
+        # Advance pointers along K
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Bias add: broadcast over rows, using offs_n / mask_n for indexing
+    bias = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0)
+    acc += bias[None, :]
+
+    # Write back final result (single store site: no intermediate stores)
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    out_mask = mask_m[:, None] & mask_n[None, :]
+    tl.store(c_ptrs, acc, mask=out_mask)
+
+
+def fused_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    High-performance replacement for:
+        x = F.linear(x, weight, bias)  # (x @ weight.T + bias)
+
+    Args:
+        x:      [M, K]
+        weight: [N, K]
+        bias:   [N]
+    Returns:
+        y:      [M, N]
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+
+    # Ensure contiguous for predictable strides and aligned memory
+    x = x.contiguous()
+    weight = weight.contiguous()
+    bias = bias.contiguous()
+
     M, K = x.shape
     N = weight.shape[0]
-    
-    # Prepare output tensor
-    output = torch.empty((M, N), device=x.device, dtype=x.dtype)
-    
-    # Transpose weight for efficient access
-    weight_t = weight.t().contiguous()
-    
-    # Grid configuration with GROUP_M for better cache utilization
-    def grid(META):
-        return (triton.cdiv(M, META['BLOCK_M']) * triton.cdiv(N, META['BLOCK_N']),)
-    
-    # Optimized configurations for Ada Lovelace
-    configs = [
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_warps=4, num_stages=4),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_warps=4, num_stages=3),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_warps=4, num_stages=4),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_warps=4, num_stages=3),
-    ]
-    
-    # Use autotune or select best for typical sizes
-    best_config = configs[1]  # Balanced 128x128
-    
-    gemm_kernel[grid](
-        x, weight_t, output,
+    y = torch.empty((M, N), device=x.device, dtype=x.dtype)
+
+    # x is [M, K] row-major
+    stride_am, stride_ak = x.stride()
+
+    # Interpret weight as logical [K, N] without material transpose:
+    #   physical: weight [N, K], strides (K, 1)
+    #   logical: B[k, n] = weight[n, k]
+    stride_w0, stride_w1 = weight.stride()  # (N, K)
+    stride_bk = stride_w1  # stride along K dim
+    stride_bn = stride_w0  # stride along N dim
+
+    stride_cm, stride_cn = y.stride()
+
+    def grid(meta):
+        grid_m = triton.cdiv(M, meta['BLOCK_M'])
+        grid_n = triton.cdiv(N, meta['BLOCK_N'])
+        return (max(1, grid_m), max(1, grid_n))
+
+    linear_forward_kernel[grid](
+        x, weight, bias, y,
         M, N, K,
-        x.stride(0), x.stride(1),
-        weight_t.stride(0), weight_t.stride(1),
-        output.stride(0), output.stride(1),
-        BLOCK_M=best_config.kwargs['BLOCK_M'],
-        BLOCK_N=best_config.kwargs['BLOCK_N'],
-        BLOCK_K=best_config.kwargs['BLOCK_K'],
-        GROUP_M=best_config.kwargs['GROUP_M'],
-        USE_TF32=True,
-        num_warps=best_config.num_warps,
-        num_stages=best_config.num_stages,
+        stride_am, stride_ak,
+        stride_bk, stride_bn,
+        stride_cm, stride_cn,
     )
-    
-    return output
+    return y
 
-def fused_bn_scale_softmax_wrapper(x, gamma, beta, running_mean, running_var, scale, eps=1e-5):
-    """Fused BatchNorm + Scale + Softmax wrapper (inference only)."""
+
+# ---------------------------------------------
+# Optimized fused scale + softmax over dim=1
+# y[i, j] = softmax_j(scale * x[i, j])
+#
+# Memory-fusion constraints:
+#   - Multiple loads from x are allowed
+#   - NO intermediate stores: exactly one tl.store() site for y
+#   - All temporaries (max, sum) stay in registers
+#
+# 3-pass algorithm, with 2 exp() per element:
+#   1) Find row-wise max of scaled values
+#   2) Compute row-wise sum of exp(x - max)
+#   3) Compute final softmax values and store once
+#
+# This removes the store-then-load pattern and cuts global memory traffic
+# at the cost of extra compute, which is favorable on a 4090.
+# ---------------------------------------------
+@triton.autotune(
+    configs=[
+        # Conservative baseline (good for wide range of N)
+        triton.Config({'BLOCK_SIZE': 64}, num_warps=4, num_stages=2),
+        # Higher per-row parallelism
+        triton.Config({'BLOCK_SIZE': 128}, num_warps=4, num_stages=2),
+        # Large tile for long rows, more warps to saturate memory
+        triton.Config({'BLOCK_SIZE': 256}, num_warps=8, num_stages=2),
+    ],
+    key=['N'],
+)
+@triton.jit
+def fused_scale_softmax_kernel(
+    x_ptr, y_ptr,
+    scale,
+    M, N,
+    stride_xm, stride_xn,
+    stride_ym, stride_yn,
+    BLOCK_SIZE: tl.constexpr,
+):
+    # 1D grid: each program handles one row of the output
+    row = tl.program_id(0)
+    row_in_bounds = row < M
+
+    offs = tl.arange(0, BLOCK_SIZE)
+
+    # Row start pointers
+    x_row_ptr = x_ptr + row * stride_xm
+    y_row_ptr = y_ptr + row * stride_ym
+
+    # -------------------------
+    # Pass 1: row-wise max of scaled values
+    # -------------------------
+    row_max = -float('inf')
+    for start_n in range(0, N, BLOCK_SIZE):
+        cols = start_n + offs                      # (BLOCK_SIZE,)
+        col_mask = cols < N                        # (BLOCK_SIZE,)
+        mask = row_in_bounds & col_mask            # (BLOCK_SIZE,)
+
+        x_block_ptrs = x_row_ptr + cols * stride_xn
+        # Load with -inf for OOB so they don't affect max
+        x_vals = tl.load(x_block_ptrs, mask=mask, other=-float('inf'))
+        x_scaled = x_vals * scale
+        # Explicitly ensure OOB lanes are -inf
+        x_scaled = tl.where(mask, x_scaled, -float('inf'))
+        block_max = tl.max(x_scaled, axis=0)       # scalar
+        row_max = tl.maximum(row_max, block_max)
+
+    # -------------------------
+    # Pass 2: compute sum of exp(x - row_max)
+    # -------------------------
+    row_sum = 0.0
+    for start_n in range(0, N, BLOCK_SIZE):
+        cols = start_n + offs
+        col_mask = cols < N
+        mask = row_in_bounds & col_mask
+
+        x_block_ptrs = x_row_ptr + cols * stride_xn
+        x_vals = tl.load(x_block_ptrs, mask=mask, other=-float('inf'))
+        x_scaled = x_vals * scale
+        x_scaled = tl.where(mask, x_scaled, -float('inf'))
+
+        exp_x = tl.exp(x_scaled - row_max)
+        # Only in-bounds lanes contribute to the sum
+        exp_x = tl.where(mask, exp_x, 0.0)
+
+        block_sum = tl.sum(exp_x, axis=0)
+        row_sum += block_sum
+
+    inv_row_sum = 1.0 / row_sum
+
+    # -------------------------
+    # Pass 3: compute final softmax and store ONCE
+    # -------------------------
+    for start_n in range(0, N, BLOCK_SIZE):
+        cols = start_n + offs
+        col_mask = cols < N
+        mask = row_in_bounds & col_mask
+
+        x_block_ptrs = x_row_ptr + cols * stride_xn
+        y_block_ptrs = y_row_ptr + cols * stride_yn
+
+        x_vals = tl.load(x_block_ptrs, mask=mask, other=0.0)
+        x_scaled = x_vals * scale
+        exp_x = tl.exp(x_scaled - row_max)
+        y_vals = exp_x * inv_row_sum
+
+        # Single store site for output tensor y
+        tl.store(y_block_ptrs, y_vals, mask=mask)
+
+
+def fused_scale_softmax(x: torch.Tensor, scale_param: torch.Tensor) -> torch.Tensor:
+    """
+    High-performance replacement for:
+        x = scale * x
+        x = softmax(x, dim=1)
+
+    Args:
+        x:           [M, N]
+        scale_param: scalar tensor (shape (1,) or broadcastable to x)
+    Returns:
+        y:           [M, N]
+    """
+    assert x.is_cuda and scale_param.is_cuda
+    x = x.contiguous()
     M, N = x.shape
-    
-    # Prepare output tensor
-    output = torch.empty_like(x)
-    
-    # Grid configuration
-    def grid(META):
-        return (triton.cdiv(M, META['BLOCK_M']),)
-    
-    # Optimized configurations to reduce register pressure
-    configs = [
-        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 256}, num_warps=4, num_stages=3),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128}, num_warps=4, num_stages=3),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 32}, num_warps=4, num_stages=2),
-    ]
-    
-    # Select configuration based on input size
-    if N >= 512:
-        best_config = configs[0]  # Prefer wider columns for large N
-    elif M >= 256:
-        best_config = configs[2]  # More rows for tall matrices
-    else:
-        best_config = configs[1]  # Balanced
-    
-    fused_bn_scale_softmax_kernel[grid](
-        x, gamma, beta, running_mean, running_var,
-        scale, output,
-        M, N,
-        x.stride(0), x.stride(1),
-        output.stride(0), output.stride(1),
-        eps,
-        BLOCK_M=best_config.kwargs['BLOCK_M'],
-        BLOCK_N=best_config.kwargs['BLOCK_N'],
-        num_warps=best_config.num_warps,
-        num_stages=best_config.num_stages,
-    )
-    
-    return output
+    y = torch.empty_like(x)
 
-# -----------------------------------------------------------------------------
-# Main Model Class
-# -----------------------------------------------------------------------------
+    # Use scalar scale for best performance
+    scale = float(scale_param.item())
+
+    stride_xm, stride_xn = x.stride()
+    stride_ym, stride_yn = y.stride()
+
+    def grid(meta):
+        # One program per row; ensure at least one program for degenerate M
+        return (max(1, M),)
+
+    fused_scale_softmax_kernel[grid](
+        x, y,
+        scale,
+        M, N,
+        stride_xm, stride_xn,
+        stride_ym, stride_yn,
+    )
+    return y
+
+
+# ---------------------------------------------
+# Model with Triton-accelerated Linear + scale*Softmax
+# BatchNorm is kept as in PyTorch to preserve training semantics
+# ---------------------------------------------
 class ModelNew(nn.Module):
-    """
-    Optimized model that performs matrix multiplication (Gemm), 
-    Batch Normalization, scaling, and Softmax in fused kernels.
-    """
     def __init__(self, in_features, out_features, bn_eps=1e-5, bn_momentum=0.1, scale_shape=(1,)):
         super(ModelNew, self).__init__()
-        
-        # Store parameters
-        self.in_features = in_features
-        self.out_features = out_features
-        self.bn_eps = bn_eps
-        self.bn_momentum = bn_momentum
-        
-        # Learnable parameters
-        self.weight = nn.Parameter(torch.randn(out_features, in_features))
-        self.gamma = nn.Parameter(torch.ones(out_features))
-        self.beta = nn.Parameter(torch.zeros(out_features))
+        # Keep module structure/parameter names for easy state_dict loading
+        self.gemm = nn.Linear(in_features, out_features)
+        self.bn = nn.BatchNorm1d(out_features, eps=bn_eps, momentum=bn_momentum)
         self.scale = nn.Parameter(torch.ones(scale_shape))
-        
-        # BatchNorm buffers (running statistics)
-        self.register_buffer('running_mean', torch.zeros(out_features))
-        self.register_buffer('running_var', torch.ones(out_features))
-        
-        # Initialize parameters
-        self._initialize_parameters()
-    
-    def _initialize_parameters(self):
-        """Initialize weights using Kaiming initialization."""
-        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
-        
-        # Initialize gamma and beta
-        nn.init.ones_(self.gamma)
-        nn.init.zeros_(self.beta)
-    
+
     def forward(self, x):
-        """
-        Args:
-            x (torch.Tensor): Input tensor of shape (batch_size, in_features).
-        Returns:
-            torch.Tensor: Output tensor of shape (batch_size, out_features).
-        """
-        # Step 1: Matrix multiplication with optimized kernel
-        x = gemm_wrapper(x, self.weight)
-        
-        # Step 2: Fused BatchNorm + Scale + Softmax (inference only)
-        x = fused_bn_scale_softmax_wrapper(
-            x, self.gamma, self.beta,
-            self.running_mean, self.running_var,
-            self.scale, self.bn_eps
-        )
-        
+        # Expect x to be on CUDA for Triton kernels
+        x = fused_linear(x, self.gemm.weight, self.gemm.bias)
+        x = self.bn(x)
+        x = fused_scale_softmax(x, self.scale)
         return x
 ```
-
-## Key Optimizations Applied:
-
-### 1. **Gemm Kernel Improvements:**
-- **GROUP_M for cache optimization**: Added program reordering to improve L2 cache hit rates
-- **Pre-fetching**: Load next tile while computing current one
-- **Optimized configurations**: Added more balanced configs (128x128, 64x128, 128x64)
-- **TF32 enabled**: Full utilization of Ada Lovelace TF32 tensor cores (82.6 TFLOPS)
-
-### 2. **Fused Kernel Major Rewrite:**
-- **Single-pass softmax**: Implemented online algorithm to compute max and sum in one pass
-- **Reduced register pressure**: Used smaller BLOCK_M (32-128) with more warps
-- **Parameter loading optimization**: Load normalization parameters less frequently
-- **Memory access pattern**: Process columns in large chunks (BLOCK_N up to 256)
-
-### 3. **GPU-Specific Tuning for RTX 4090:**
-- **num_stages parameter**: Added explicit pipeline stages (2-4) for better latency hiding
-- **Register pressure management**: Limited BLOCK sizes to avoid register spilling
-- **Occupancy optimization**: Used 4 warps per block (128 threads) for better SM utilization
-- **Tensor Core utilization**: Full TF32 support for matmul
-
-### 4. **Performance Focus:**
-- Reduced memory traffic in fused kernel by ~33% (from 3 passes to ~1.5 passes)
-- Improved cache utilization through program ID reordering
-- Better occupancy through smaller block sizes that increase total blocks
-- Maintained fusion benefits while avoiding register spilling
-
-**Expected Improvements:**
-- Gemm throughput: ~2x from better cache utilization and pre-fetching
-- Fused kernel throughput: ~3-4x from reduced memory passes and better occupancy
-- Overall: ~2.5x speedup on Ada Lovelace architecture

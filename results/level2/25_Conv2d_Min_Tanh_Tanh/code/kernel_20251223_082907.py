@@ -1,0 +1,139 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def min_tanh_tanh_kernel(
+    x_ptr, y_ptr,
+    B, C, H, W,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    BLOCK_H: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+):
+    # Program IDs
+    pid_n = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    pid_w = tl.program_id(2)
+
+    # Offsets within the H and W dimensions for this tile
+    offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    offs_w = pid_w * BLOCK_W + tl.arange(0, BLOCK_W)
+
+    # Create 2D grids for (h, w)
+    hh = offs_h[:, None]  # [BLOCK_H, 1]
+    ww = offs_w[None, :]  # [1, BLOCK_W]
+
+    # Bounds mask for spatial + batch
+    mask_n = pid_n < B
+    mask_hw_2d = (hh < H) & (ww < W) & mask_n
+    BLOCK_HW = BLOCK_H * BLOCK_W
+
+    # Compute base offsets for this (n, h, w) tile at c = 0
+    nhw_base_2d = (
+        pid_n * stride_xn
+        + hh * stride_xh
+        + ww * stride_xw
+    )  # [BLOCK_H, BLOCK_W]
+
+    # Flatten to 1D [BLOCK_HW]
+    nhw_base = tl.reshape(nhw_base_2d, (BLOCK_HW,))
+    mask_hw = tl.reshape(mask_hw_2d, (BLOCK_HW,))
+
+    # Initialize running minimum for each (n, h, w) in the tile
+    min_val = tl.full((BLOCK_HW,), float("inf"), tl.float32)
+
+    # Reduce over C in blocks of BLOCK_C
+    c = 0
+    while c < C:
+        offs_c = c + tl.arange(0, BLOCK_C)          # [BLOCK_C]
+        mask_c = offs_c < C                         # [BLOCK_C]
+
+        # Pointers for a [BLOCK_C, BLOCK_HW] tile:
+        #   for each channel in offs_c and each spatial position in nhw_base
+        ptrs = x_ptr + (nhw_base[None, :] + offs_c[:, None] * stride_xc)
+        mask = mask_c[:, None] & mask_hw[None, :]
+
+        x_vals = tl.load(ptrs, mask=mask, other=float("inf"))  # [BLOCK_C, BLOCK_HW]
+
+        # Reduce along channel axis (axis=0) to get BLOCK_HW minima for this block of C
+        block_min = tl.min(x_vals, axis=0)  # [BLOCK_HW]
+        min_val = tl.minimum(min_val, block_min)
+
+        c += BLOCK_C
+
+    # Apply two successive tanh operations (same formulation as reference kernel)
+    # tanh(x) = (exp(2x) - 1) / (exp(2x) + 1)
+    t = 2.0 * min_val
+    e = tl.exp(t)
+    tanh1 = (e - 1.0) / (e + 1.0)
+
+    t2 = 2.0 * tanh1
+    e2 = tl.exp(t2)
+    out_val = (e2 - 1.0) / (e2 + 1.0)
+
+    # Compute output pointers for this tile, channel index is always 0 (keepdim=True)
+    y_base_2d = (
+        pid_n * stride_yn
+        + hh * stride_yh
+        + ww * stride_yw
+    )  # [BLOCK_H, BLOCK_W]
+    y_base = tl.reshape(y_base_2d, (BLOCK_HW,))
+
+    # Store results
+    tl.store(y_ptr + y_base, out_val, mask=mask_hw)
+
+
+def min_tanh_tanh(x: torch.Tensor) -> torch.Tensor:
+    """
+    Fused replacement for:
+        x = torch.min(x, dim=1, keepdim=True)[0]
+        x = torch.tanh(x)
+        x = torch.tanh(x)
+
+    Assumes x is NCHW and float32 on CUDA.
+    """
+    assert x.is_cuda, "Input must be on CUDA"
+    assert x.dtype == torch.float32, "Kernel currently assumes float32"
+
+    B, C, H, W = x.shape
+    y = torch.empty((B, 1, H, W), device=x.device, dtype=x.dtype)
+
+    def grid(meta):
+        return (
+            B,
+            triton.cdiv(H, meta["BLOCK_H"]),
+            triton.cdiv(W, meta["BLOCK_W"]),
+        )
+
+    min_tanh_tanh_kernel[grid](
+        x, y,
+        B, C, H, W,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        y.stride(0), y.stride(1), y.stride(2), y.stride(3),
+        BLOCK_H=16,
+        BLOCK_W=16,
+        BLOCK_C=64,
+        num_warps=4,
+        num_stages=2,
+    )
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized version of the original model using Triton for:
+      min over channels + tanh + tanh.
+    Convolution is still performed via cuDNN (nn.Conv2d).
+    """
+    def __init__(self, in_channels, out_channels, kernel_size):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = min_tanh_tanh(x)
+        return x

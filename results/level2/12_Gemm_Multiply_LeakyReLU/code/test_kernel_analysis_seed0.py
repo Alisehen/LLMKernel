@@ -1,0 +1,120 @@
+import torch, torch.nn as nn, triton, triton.language as tl
+
+
+@triton.jit
+def fused_linear_mul_leakyrelu_kernel(
+    a_ptr, b_ptr, bias_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    multiplier, negative_slope,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    # Program IDs
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    # Offsets
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)        # [BLOCK_M]
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)        # [BLOCK_N]
+    offs_k = tl.arange(0, BLOCK_K)                          # [BLOCK_K]
+
+    # Pointers for A (M x K) and B (K x N)
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    # Accumulator in FP32 for numerical stability
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Loop over K dimension
+    for k in range(0, K, BLOCK_K):
+        k_remaining = K - k
+
+        a = tl.load(
+            a_ptrs,
+            mask=(offs_m[:, None] < M) & (offs_k[None, :] < k_remaining),
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptrs,
+            mask=(offs_k[:, None] < k_remaining) & (offs_n[None, :] < N),
+            other=0.0,
+        )
+
+        acc += tl.dot(a, b, allow_tf32=True)
+
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Add bias (broadcast over rows)
+    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc += bias[None, :]
+
+    # Fused multiply
+    acc = acc * multiplier
+
+    # Fused LeakyReLU: x if x >= 0 else negative_slope * x
+    zero = 0.0
+    acc = tl.where(acc >= zero, acc, acc * negative_slope)
+
+    # Store result
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    tl.store(
+        c_ptrs,
+        acc,
+        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+    )
+
+
+def fused_linear_mul_leakyrelu(x, weight, bias, multiplier, negative_slope):
+    """
+    x:       [M, K]
+    weight:  [N, K] (PyTorch Linear weight: [out_features, in_features])
+    bias:    [N]
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda, "Inputs must be on CUDA"
+
+    M, K = x.shape
+    N = weight.shape[0]
+    # Convert weight to [K, N] for A @ B
+    b = weight.t().contiguous()
+
+    y = torch.empty((M, N), device=x.device, dtype=x.dtype)
+
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_M"]),
+        triton.cdiv(N, META["BLOCK_N"]),
+    )
+
+    fused_linear_mul_leakyrelu_kernel[grid](
+        x, b, bias, y,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        b.stride(0), b.stride(1),
+        y.stride(0), y.stride(1),
+        multiplier, negative_slope,
+        BLOCK_M=128, BLOCK_N=128, BLOCK_K=32,
+        num_warps=4, num_stages=3,
+    )
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized replacement for:
+      Linear(in_features, out_features) + scalar multiply + LeakyReLU
+    """
+    def __init__(self, in_features, out_features, multiplier, negative_slope):
+        super(ModelNew, self).__init__()
+        # Match original Linear dimensions: [out_features, in_features]
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.bias = nn.Parameter(torch.randn(out_features))
+        self.multiplier = float(multiplier)
+        self.negative_slope = float(negative_slope)
+
+    def forward(self, x):
+        # x: [batch_size, in_features]
+        return fused_linear_mul_leakyrelu(
+            x, self.weight, self.bias, self.multiplier, self.negative_slope
+        )

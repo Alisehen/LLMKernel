@@ -1,0 +1,359 @@
+[Seed] Generating seed kernel...
+[Seed 1/2] Generating...
+[92mFinish reason: stop[0m
+Usage: In=1727, Out=6720, Total=8447
+[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 554, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251223_083710_94_Gemm_BiasAdd_Hardtanh_Mish_GroupNorm_openai_deepseek/94_Gemm_BiasAdd_Hardtanh_Mish_GroupNorm/code/kernel_20251223_083758.py", line 199, in forward
+    x = triton_groupnorm(x, self.gn_weight, self.gn_bias, self.num_groups, self.eps)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251223_083710_94_Gemm_BiasAdd_Hardtanh_Mish_GroupNorm_openai_deepseek/94_Gemm_BiasAdd_Hardtanh_Mish_GroupNorm/code/kernel_20251223_083758.py", line 161, in triton_groupnorm
+    groupnorm_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 419, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 733, in run
+    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 861, in _do_compile
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 300, in compile
+    module = src.make_ir(target, options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 80, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 32:19:
+    for c0 in range(0, group_size, BLOCK_C):
+        rel_c = c0 + offs_c
+        mask = rel_c < group_size
+        c_idx = g * group_size + rel_c
+
+        x_ptrs = x_ptr + n * stride_xn + c_idx * stride_xc
+        x = tl.load(x_ptrs, mask=mask, other=0.0)
+
+        sum_val += tl.sum(x, axis=0)
+        sum_sq += tl.sum(x * x, axis=0)
+
+    group_size_f = float(group_size)
+                   ^
+TypeError("float() argument must be a string or a real number, not 'tensor'")
+
+[seed_0] failed. See metrics.message for details.
+[seed_0] metrics saved to: /home/hyc/LLMKernel/run/20251223_083710_94_Gemm_BiasAdd_Hardtanh_Mish_GroupNorm_openai_deepseek/94_Gemm_BiasAdd_Hardtanh_Mish_GroupNorm/evaluation/eval_0000.json
+[Seed 1] Failed, attempting repair...
+[92mFinish reason: stop[0m
+Usage: In=3178, Out=4900, Total=8078
+[seed_0_repair_1] score=0.8308 (baseline=3.3585ms)
+[seed_0_repair_1] metrics saved to: /home/hyc/LLMKernel/run/20251223_083710_94_Gemm_BiasAdd_Hardtanh_Mish_GroupNorm_openai_deepseek/94_Gemm_BiasAdd_Hardtanh_Mish_GroupNorm/evaluation/eval_0001.json
+[Seed 1 Repair] Score: 0.8308 ✓
+[Seed 1] Final score: 0.8308 ✓
+[Seed 2/2] Generating...
+[92mFinish reason: stop[0m
+Usage: In=1727, Out=8434, Total=10161
+[seed_1] score=0.8211 (baseline=3.3452ms)
+[seed_1] metrics saved to: /home/hyc/LLMKernel/run/20251223_083710_94_Gemm_BiasAdd_Hardtanh_Mish_GroupNorm_openai_deepseek/94_Gemm_BiasAdd_Hardtanh_Mish_GroupNorm/evaluation/eval_0002.json
+[Seed 2] Final score: 0.8211 ✓
+
+================================================================================
+[Hybrid Strategy] Analyzing all seeds for algorithmic optimization...
+[Hybrid Strategy] - 2 seed(s) with score < 1.0 (rescue)
+================================================================================
+
+[Hybrid] Seed 1: score=0.8308 < 1.0
+[Hybrid] Attempting algorithm analysis rescue...
+[ncu] Using GPU device 6 (CUDA_VISIBLE_DEVICES=6)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_928039.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_928039.py /home/hyc/LLMKernel/KernelBench/level2/94_Gemm_BiasAdd_Hardtanh_Mish_GroupNorm.py /home/hyc/LLMKernel/test_kernel_analysis_seed0.py --repeat 1
+[ncu stderr]: Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/bench_ref_inputs_928039.py", line 81, in <module>
+    main()
+  File "/home/hyc/LLMKernel/bench_ref_inputs_928039.py", line 54, in main
+    test_mod = load_module(args.candidate, "test_module")
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/bench_ref_inputs_928039.py", line 21, in load_module
+    spec.loader.exec_module(module)
+  File "<frozen importlib._bootstrap_external>", line 936, in exec_mo
+[93mWarning: NCU profiling failed: NCU CSV file is empty (benchmark script likely failed): /home/hyc/LLMKernel/ncu_temp_928039.csv[0m
+[Hybrid] Requesting LLM analysis for seed 1...
+[92mFinish reason: stop[0m
+Usage: In=2954, Out=1681, Total=4635
+[Hybrid] Worth optimizing: yes
+[Hybrid] Reason: The computation is split into two Triton kernels, so GroupNorm reads and writes the full [B, O] tensor again, adding extra memory traffic and launch overhead on top of a GEMM that is already slower than cuBLAS.
+[Hybrid] Analysis complete for seed 1, generating optimized kernel...
+[Hybrid] Bottleneck: The main inefficiency is that GroupNorm is implemented as a separate kernel afte...
+[Hybrid] Optimization: Fuse GroupNorm into the existing fused_linear_bias_hardtanh_mish kernel so that,...
+[Hybrid] Expected speedup: 20-30% over the current Triton implementation (bringing it closer to or slightly above the PyTorch baseline), mainly from removing one full read/write of the [B, O] tensor and a kernel launch, while retaining fusion of all pointwise ops.
+[92mFinish reason: stop[0m
+Usage: In=3320, Out=15062, Total=18382
+[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 43, in wrapper
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 1094, in __getitem__
+    for dim, sl in enumerate(slices):
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 41, in wrapper
+    raise ValueError("Did you forget to add @triton.jit ? "
+ValueError: Did you forget to add @triton.jit ? (`_semantic` argument must be provided outside of JIT functions.)
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 554, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251223_083710_94_Gemm_BiasAdd_Hardtanh_Mish_GroupNorm_openai_deepseek/94_Gemm_BiasAdd_Hardtanh_Mish_GroupNorm/code/kernel_20251223_084218.py", line 355, in forward
+    x = fused_linear_bias_hardtanh_mish_groupnorm(
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251223_083710_94_Gemm_BiasAdd_Hardtanh_Mish_GroupNorm_openai_deepseek/94_Gemm_BiasAdd_Hardtanh_Mish_GroupNorm/code/kernel_20251223_084218.py", line 315, in fused_linear_bias_hardtanh_mish_groupnorm
+    fused_linear_bias_hardtanh_mish_groupnorm_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 419, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 733, in run
+    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 861, in _do_compile
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 300, in compile
+    module = src.make_ir(target, options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 80, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 67:19:
+    t = tl.exp(two_sp)
+    tanh_sp = (t - 1.0) / (t + 1.0)
+    acc = acc * tanh_sp
+
+    # GroupNorm over channels N, per row (batch element)
+    rows_mask = offs_m < M
+    c_row_base = c_ptr + offs_m[:, None] * stride_cm
+
+    # Process each group of GROUP_SIZE contiguous channels in this BLOCK_N tile
+    for g in range(0, BLOCK_N, GROUP_SIZE):
+        cols = g + tl.arange(0, GROUP_SIZE)       # [GROUP_SIZE] local column indices
+        channels = offs_n[cols]                   # [GROUP_SIZE] global channel indices
+                   ^
+Did you forget to add @triton.jit ? (`_semantic` argument must be provided outside of JIT functions.)
+
+[algorithm_optimized_seed0] failed. See metrics.message for details.
+[algorithm_optimized_seed0] metrics saved to: /home/hyc/LLMKernel/run/20251223_083710_94_Gemm_BiasAdd_Hardtanh_Mish_GroupNorm_openai_deepseek/94_Gemm_BiasAdd_Hardtanh_Mish_GroupNorm/evaluation/eval_0003.json
+[Hybrid] Algorithm-optimized kernel failed, attempting repair...
+[92mFinish reason: stop[0m
+Usage: In=5033, Out=9309, Total=14342
+[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 43, in wrapper
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 1911, in reshape
+    shape = _shape_check_impl(_unwrap_iterable(shape))
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 1661, in _shape_check_impl
+    validate_block_shape(shape)
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/_utils.py", line 52, in validate_block_shape
+    raise TypeError(f"Shape element {i} must have type `constexpr[int]`, got `constexpr[{type(d)}]")
+TypeError: Shape element 1 must have type `constexpr[int]`, got `constexpr[<class 'triton.language.core.tensor'>]
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 554, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251223_083710_94_Gemm_BiasAdd_Hardtanh_Mish_GroupNorm_openai_deepseek/94_Gemm_BiasAdd_Hardtanh_Mish_GroupNorm/code/kernel_20251223_084329.py", line 357, in forward
+    x = fused_linear_bias_hardtanh_mish_groupnorm(
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251223_083710_94_Gemm_BiasAdd_Hardtanh_Mish_GroupNorm_openai_deepseek/94_Gemm_BiasAdd_Hardtanh_Mish_GroupNorm/code/kernel_20251223_084329.py", line 317, in fused_linear_bias_hardtanh_mish_groupnorm
+    fused_linear_bias_hardtanh_mish_groupnorm_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 419, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 733, in run
+    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 861, in _do_compile
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 300, in compile
+    module = src.make_ir(target, options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 80, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 67:19:
+    t = tl.exp(two_sp)
+    tanh_sp = (t - 1.0) / (t + 1.0)
+    acc = acc * tanh_sp
+
+    # -------- GroupNorm over channels N, per row --------
+    # We assume BLOCK_N is a multiple of GROUP_SIZE and that global
+    # tiling along N starts at multiples of GROUP_SIZE, so each
+    # GROUP_SIZE slice corresponds to exactly one GroupNorm group.
+    NUM_GROUPS = BLOCK_N // GROUP_SIZE
+
+    # Reshape to [BLOCK_M, NUM_GROUPS, GROUP_SIZE]
+    acc_reshaped = tl.reshape(acc, (BLOCK_M, NUM_GROUPS, GROUP_SIZE))
+                   ^
+Shape element 1 must have type `constexpr[int]`, got `constexpr[<class 'triton.language.core.tensor'>]
+
+[algorithm_optimized_seed0_repair1] failed. See metrics.message for details.
+[algorithm_optimized_seed0_repair1] metrics saved to: /home/hyc/LLMKernel/run/20251223_083710_94_Gemm_BiasAdd_Hardtanh_Mish_GroupNorm_openai_deepseek/94_Gemm_BiasAdd_Hardtanh_Mish_GroupNorm/evaluation/eval_0004.json
+[Hybrid] Algorithm-optimized kernel failed, attempting repair...
+[92mFinish reason: stop[0m
+Usage: In=5116, Out=8185, Total=13301
+[algorithm_optimized_seed0_repair2] score=0.8149 (baseline=3.3452ms)
+[algorithm_optimized_seed0_repair2] metrics saved to: /home/hyc/LLMKernel/run/20251223_083710_94_Gemm_BiasAdd_Hardtanh_Mish_GroupNorm_openai_deepseek/94_Gemm_BiasAdd_Hardtanh_Mish_GroupNorm/evaluation/eval_0005.json
+[Hybrid] ✓ Repair successful for algorithm-optimized seed 1
+[Hybrid] ✓ Rescue successful: 0.8308 → 0.8149
+
+[Hybrid] Seed 2: score=0.8211 < 1.0
+[Hybrid] Attempting algorithm analysis rescue...
+[ncu] Using GPU device 6 (CUDA_VISIBLE_DEVICES=6)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_928039.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_928039.py /home/hyc/LLMKernel/KernelBench/level2/94_Gemm_BiasAdd_Hardtanh_Mish_GroupNorm.py /home/hyc/LLMKernel/test_kernel_analysis_seed1.py --repeat 1
+[ncu stderr]: Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/bench_ref_inputs_928039.py", line 81, in <module>
+    main()
+  File "/home/hyc/LLMKernel/bench_ref_inputs_928039.py", line 54, in main
+    test_mod = load_module(args.candidate, "test_module")
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/bench_ref_inputs_928039.py", line 21, in load_module
+    spec.loader.exec_module(module)
+  File "<frozen importlib._bootstrap_external>", line 936, in exec_mo
+[93mWarning: NCU profiling failed: NCU CSV file is empty (benchmark script likely failed): /home/hyc/LLMKernel/ncu_temp_928039.csv[0m
+[Hybrid] Requesting LLM analysis for seed 2...
+[92mFinish reason: stop[0m
+Usage: In=3051, Out=2148, Total=5199
+[Hybrid] Worth optimizing: yes
+[Hybrid] Reason: Each forward does a full `weight.t().contiguous()` of an 8192×8192 matrix, adding a huge extra O(K·N) memory copy on the critical path.
+[Hybrid] Analysis complete for seed 2, generating optimized kernel...
+[Hybrid] Bottleneck: The Triton GEMM requires `b` to be laid out as (K, N), so the code explicitly tr...
+[Hybrid] Optimization: Eliminate the explicit `weight.t().contiguous()` by adapting the Triton GEMM ker...
+[Hybrid] Expected speedup: 20-30%
+[92mFinish reason: stop[0m
+Usage: In=3366, Out=6796, Total=10162
+[algorithm_optimized_seed1] score=1.4931 (baseline=3.3452ms)
+[algorithm_optimized_seed1] metrics saved to: /home/hyc/LLMKernel/run/20251223_083710_94_Gemm_BiasAdd_Hardtanh_Mish_GroupNorm_openai_deepseek/94_Gemm_BiasAdd_Hardtanh_Mish_GroupNorm/evaluation/eval_0006.json
+[Hybrid] ✓ Rescue successful: 0.8211 → 1.4931
+
+================================================================================
+[Hybrid] Candidate Selection
+================================================================================
+[Hybrid] Total candidates: 4
+  [1] seed 1: 0.8308
+  [2] seed 2: 0.8211
+  [3] algo-optimized (from seed 1): 0.8149
+  [4] algo-optimized (from seed 2): 1.4931
+
+[Hybrid] ★ Selected best candidate: score=1.4931
+
+[Optimization] Starting 3-stage optimization...
+
+================================================================================
+[Stage 1/3] grid_and_parallel
+Description: Optimize grid layout and parallel work distribution across SMs.
+Current candidates: 1, best score: 1.4931
+================================================================================
+[Stage 1] Profiling best candidate...
+[ncu] Using GPU device 6 (CUDA_VISIBLE_DEVICES=6)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_928039.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_928039.py /home/hyc/LLMKernel/KernelBench/level2/94_Gemm_BiasAdd_Hardtanh_Mish_GroupNorm.py /home/hyc/LLMKernel/test_kernel_analysis_seed1.py --repeat 1
+[ncu stderr]: Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/bench_ref_inputs_928039.py", line 81, in <module>
+    main()
+  File "/home/hyc/LLMKernel/bench_ref_inputs_928039.py", line 54, in main
+    test_mod = load_module(args.candidate, "test_module")
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/bench_ref_inputs_928039.py", line 21, in load_module
+    spec.loader.exec_module(module)
+  File "<frozen importlib._bootstrap_external>", line 936, in exec_mo
+[93mWarning: NCU profiling failed: NCU CSV file is empty (benchmark script likely failed): /home/hyc/LLMKernel/ncu_temp_928039.csv[0m
+[Stage 1] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=2919, Out=9049, Total=11968
+[stage1_grid_and_parallel] score=1.5782 (baseline=3.3452ms)
+[stage1_grid_and_parallel] metrics saved to: /home/hyc/LLMKernel/run/20251223_083710_94_Gemm_BiasAdd_Hardtanh_Mish_GroupNorm_openai_deepseek/94_Gemm_BiasAdd_Hardtanh_Mish_GroupNorm/evaluation/eval_0007.json
+  Optimized kernel score: 1.5782 ✓
+[Stage 1] ★ New best score: 1.5782
+
+================================================================================
+[Stage 2/3] block_tiling
+Description: Tune BLOCK_M/N/K sizes for optimal register/memory balance.
+Current candidates: 1, best score: 1.5782
+================================================================================
+[Stage 2] Profiling best candidate...
+[ncu] Using GPU device 6 (CUDA_VISIBLE_DEVICES=6)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_928039.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_928039.py /home/hyc/LLMKernel/KernelBench/level2/94_Gemm_BiasAdd_Hardtanh_Mish_GroupNorm.py /home/hyc/LLMKernel/test_kernel_analysis_seed1.py --repeat 1
+[ncu stderr]: Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/bench_ref_inputs_928039.py", line 81, in <module>
+    main()
+  File "/home/hyc/LLMKernel/bench_ref_inputs_928039.py", line 54, in main
+    test_mod = load_module(args.candidate, "test_module")
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/bench_ref_inputs_928039.py", line 21, in load_module
+    spec.loader.exec_module(module)
+  File "<frozen importlib._bootstrap_external>", line 936, in exec_mo
+[93mWarning: NCU profiling failed: NCU CSV file is empty (benchmark script likely failed): /home/hyc/LLMKernel/ncu_temp_928039.csv[0m
+[Stage 2] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=3232, Out=4619, Total=7851
+[stage2_block_tiling] score=1.6176 (baseline=3.3452ms)
+[stage2_block_tiling] metrics saved to: /home/hyc/LLMKernel/run/20251223_083710_94_Gemm_BiasAdd_Hardtanh_Mish_GroupNorm_openai_deepseek/94_Gemm_BiasAdd_Hardtanh_Mish_GroupNorm/evaluation/eval_0008.json
+  Optimized kernel score: 1.6176 ✓
+[Stage 2] ★ New best score: 1.6176
+
+================================================================================
+[Stage 3/3] memory_and_tuning
+Description: Optimize memory access patterns and fine-tune num_stages/num_warps.
+Current candidates: 1, best score: 1.6176
+================================================================================
+[Stage 3] Profiling best candidate...
+[ncu] Using GPU device 6 (CUDA_VISIBLE_DEVICES=6)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_928039.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_928039.py /home/hyc/LLMKernel/KernelBench/level2/94_Gemm_BiasAdd_Hardtanh_Mish_GroupNorm.py /home/hyc/LLMKernel/test_kernel_analysis_seed1.py --repeat 1
+[ncu stderr]: Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/bench_ref_inputs_928039.py", line 81, in <module>
+    main()
+  File "/home/hyc/LLMKernel/bench_ref_inputs_928039.py", line 54, in main
+    test_mod = load_module(args.candidate, "test_module")
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/bench_ref_inputs_928039.py", line 21, in load_module
+    spec.loader.exec_module(module)
+  File "<frozen importlib._bootstrap_external>", line 936, in exec_mo
+[93mWarning: NCU profiling failed: NCU CSV file is empty (benchmark script likely failed): /home/hyc/LLMKernel/ncu_temp_928039.csv[0m
+[Stage 3] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=3379, Out=7663, Total=11042
+[stage3_memory_and_tuning] score=1.4273 (baseline=3.3452ms)
+[stage3_memory_and_tuning] metrics saved to: /home/hyc/LLMKernel/run/20251223_083710_94_Gemm_BiasAdd_Hardtanh_Mish_GroupNorm_openai_deepseek/94_Gemm_BiasAdd_Hardtanh_Mish_GroupNorm/evaluation/eval_0009.json
+  Optimized kernel score: 1.4273 ✓
+[Stage 3] Current: 1.4273 (global best: 1.6176)
+[94_Gemm_BiasAdd_Hardtanh_Mish_GroupNorm.py] Figure saved to: /home/hyc/LLMKernel/run/20251223_083710_94_Gemm_BiasAdd_Hardtanh_Mish_GroupNorm_openai_deepseek/94_Gemm_BiasAdd_Hardtanh_Mish_GroupNorm/figures/94_Gemm_BiasAdd_Hardtanh_Mish_GroupNorm_score.png

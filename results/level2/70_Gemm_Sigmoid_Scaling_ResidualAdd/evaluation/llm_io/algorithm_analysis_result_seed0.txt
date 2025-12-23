@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The kernel is dominated by the GEMM compute, and moving it to mixed-precision tensor-core math can significantly increase effective FLOPs.",
+  "bottleneck": "The workload is a very large GEMM (M=1024, K=8192, N=8192), so runtime is primarily compute-bound on FP32 matmul; the following sigmoid/scale/residual epilogue is negligible in comparison.",
+  "optimisation method": "Replace the current FP32 GEMM with a mixed-precision (FP16 or BF16 inputs, FP32 accumulate) tensor-core matmul in Triton, i.e., run the model in mixed precision and configure `tl.dot`/tiling to use MMA paths.",
+  "modification plan": "Change the model to use `torch.float16` or `torch.bfloat16` for `x`, `weight`, and `bias`, while keeping accumulation in FP32 inside the kernel (i.e., `acc` stays `tl.float32`). Adjust the Triton kernel to operate on FP16/BF16 pointers (e.g., `a = tl.load(..., dtype=tl.float16)`), tune BLOCK_M/N/K and `num_warps` so that `tl.dot` lowers to tensor-core MMA instructions, and keep the fused sigmoid/scale/residual epilogue as-is in FP32 before casting back to the desired output dtype. Ensure the rest of the model (and loss/optimizer) is AMP-compatible so this layer runs in mixed precision without extra casts.",
+  "expected_speedup": "30-50%"
+}

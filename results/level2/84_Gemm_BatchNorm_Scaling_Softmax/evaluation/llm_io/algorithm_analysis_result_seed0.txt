@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "There is still a full BatchNorm + scale pass between the Triton GEMM and Triton softmax, causing an extra read/write of the entire [batch_size, out_features] matrix.",
+  "bottleneck": "After the fused GEMM kernel writes its MxN output, PyTorch BatchNorm and the separate scaling op read and write the same MxN tensor again before the Triton softmax, so the pipeline is dominated by redundant global memory traffic and extra kernel launches rather than math.",
+  "optimisation method": "In inference/eval mode, fold BatchNorm and the separate scaling parameter into the linear layer by precomputing an equivalent fused weight and bias (BN is affine at inference), then run a single Triton GEMM that directly outputs the pre-normalized, scaled activations which can go straight into softmax.",
+  "modification plan": "In ModelNew.forward, when self.training is False, replace `gemm -> bn -> scale` with a single fused linear: compute per-output feature coefficients `alpha_j = (bn.weight[j] * scale) / sqrt(bn.running_var[j] + bn.eps)` and `beta_j = bn.bias[j] - alpha_j * bn.running_mean[j]`, then form `W_fused[j,:] = alpha_j * W[j,:]` and `b_fused[j] = alpha_j * b[j] + beta_j`. Pass W_fused and b_fused into the existing fused_linear Triton kernel and feed its output directly to the softmax kernel (no BN, no extra scaling). Cache W_fused/b_fused and refresh them only when BN/scale parameters or BN running stats change to avoid recomputing each forward.",
+  "expected_speedup": "20-30%"
+}

@@ -1,184 +1,211 @@
 ```python
+# Optimized Triton code for fused GEMM + bias + sigmoid + scale + residual on RTX 4090
+
 import torch
 import torch.nn as nn
 import triton
 import triton.language as tl
 
+
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_warps=4, num_stages=3),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=8, num_stages=3),
-        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4, num_stages=3),
-        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_warps=2, num_stages=4),
+        # Baseline, good for most shapes, low-ish register pressure
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+        # Wide tile: good for large N, exploits more parallelism across columns
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32},
+            num_warps=8,
+            num_stages=2,
+        ),
+        # Tall tile: good for large M (batch), keeps N smaller
+        triton.Config(
+            {'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_warps=8,
+            num_stages=2,
+        ),
+        # Higher K blocking + extra pipeline stage for large-K problems
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64},
+            num_warps=4,
+            num_stages=3,
+        ),
     ],
     key=['M', 'N', 'K'],
 )
 @triton.jit
-def fused_gemm_sigmoid_scale_resadd_kernel(
-    # Pointers to matrices
+def fused_gemm_sigmoid_scale_residual_kernel(
     a_ptr, b_ptr, bias_ptr, c_ptr,
-    # Matrix dimensions
     M, N, K,
-    # Stride information
     stride_am, stride_ak,
     stride_bk, stride_bn,
     stride_cm, stride_cn,
-    # Block sizes
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    # Scaling factor
     scaling_factor,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
-    # Program IDs
-    pid = tl.program_id(0)
-    num_pid_m = tl.cdiv(M, BLOCK_M)
-    num_pid_n = tl.cdiv(N, BLOCK_N)
-    
-    pid_m = pid // num_pid_n
-    pid_n = pid % num_pid_n
-    
-    # Offsets for this block
-    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    rk = tl.arange(0, BLOCK_K)
-    
-    # Create masks for boundary checks
-    mask_m = rm < M
-    mask_n = rn < N
-    
-    # Pointers to A and B blocks
-    A = a_ptr + (rm[:, None] * stride_am + rk[None, :] * stride_ak)
-    B = b_ptr + (rk[:, None] * stride_bk + rn[None, :] * stride_bn)
-    
-    # Initialize accumulator
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    
-    # Main GEMM loop - using Tensor Cores with tf32 for Ada Lovelace
-    for k in range(0, tl.cdiv(K, BLOCK_K)):
-        # Load blocks with masking
-        k_remaining = K - k * BLOCK_K
-        mask_k = rk < k_remaining
-        
-        a = tl.load(A, mask=mask_m[:, None] & mask_k[None, :], other=0.0)
-        b = tl.load(B, mask=mask_k[:, None] & mask_n[None, :], other=0.0)
-        
-        # TF32 Tensor Core matmul for Ada Lovelace (compute capability 8.9)
-        acc += tl.dot(a, b, allow_tf32=True)
-        
-        # Move pointers to next blocks
-        A += BLOCK_K * stride_ak
-        B += BLOCK_K * stride_bk
-    
-    # Add bias (broadcast along columns)
-    bias = tl.load(bias_ptr + rn, mask=mask_n, other=0.0)
-    acc += bias[None, :]
-    
-    # Fused Sigmoid + Scale + Residual with minimal register usage
-    # Compute sigmoid using exp(-x) to avoid overflow
-    # Keep x in registers, recompute cheap operations to save registers
-    x = acc  # Keep in register
-    neg_x = -x  # Cheap recompute if needed
-    exp_neg_x = tl.exp(neg_x)  # Keep expensive op result
-    one_over = 1.0 / (1.0 + exp_neg_x)  # Sigmoid
-    
-    # Scale and add residual in single expression to minimize register pressure
-    output = x + (one_over * scaling_factor)
-    
-    # Store output
-    C = c_ptr + (rm[:, None] * stride_cm + rn[None, :] * stride_cn)
-    tl.store(C, output, mask=mask_m[:, None] & mask_n[None, :])
+    # -------------------------------------------------------------------------
+    # 2D program ids
+    # -------------------------------------------------------------------------
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
 
-def fused_gemm_sigmoid_scale_resadd(x, weight, bias, scaling_factor):
+    # Offsets for this program's tile
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Masks for boundaries
+    m_mask = offs_m < M
+    n_mask = offs_n < N
+    out_mask = m_mask[:, None] & n_mask[None, :]
+
+    # -------------------------------------------------------------------------
+    # Base pointers for A (M x K) and B (K x N)
+    # A: [M, K], row-major, strides (stride_am, stride_ak)
+    # B: logically [K, N] (from weight [N, K]), strides (stride_bk, stride_bn)
+    # -------------------------------------------------------------------------
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    # FP32 accumulator tile kept entirely in registers
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # -------------------------------------------------------------------------
+    # GEMM main loop over K with tensor cores
+    # -------------------------------------------------------------------------
+    for k in range(0, K, BLOCK_K):
+        k_mask = (k + offs_k) < K  # (BLOCK_K,)
+
+        # Load tiles from A and B; no intermediate stores
+        a = tl.load(
+            a_ptrs,
+            mask=m_mask[:, None] & k_mask[None, :],
+            other=0.0,
+            eviction_policy='evict_last',  # A is reused across N within this CTA
+        )
+        b = tl.load(
+            b_ptrs,
+            mask=k_mask[:, None] & n_mask[None, :],
+            other=0.0,
+            eviction_policy='evict_first',  # B is streamed across K
+        )
+
+        # Tensor-core matmul: fp16/bf16 inputs, fp32 accumulate
+        acc += tl.dot(a, b)
+
+        # Advance pointers along K dimension
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # -------------------------------------------------------------------------
+    # Fused epilogue: +bias, sigmoid, scale, residual
+    #
+    # z = x @ W^T + b
+    # y = z + scaling_factor * sigmoid(z)
+    #
+    # Bias is [N]; load once per column and broadcast over M.
+    # -------------------------------------------------------------------------
+    bias = tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0).to(tl.float32)
+    acc = acc + bias[None, :]  # broadcast bias across rows
+
+    # Efficient sigmoid + residual:
+    # sigmoid(z) = 1 / (1 + exp(-z))
+    # y = z + s * sigmoid(z)
+    tmp = tl.exp(-acc)
+    acc = acc + scaling_factor / (1.0 + tmp)
+
+    # -------------------------------------------------------------------------
+    # Store final result to C (single store, no intermediates)
+    # -------------------------------------------------------------------------
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    tl.store(c_ptrs, acc, mask=out_mask)
+
+
+def fused_gemm_sigmoid_scale_residual(x, weight, bias, scaling_factor: float):
     """
-    Fused operation: GEMM -> Sigmoid -> Scaling -> Residual Add
-    
-    Args:
-        x: Input tensor of shape (M, K)
-        weight: Weight tensor of shape (N, K)
-        bias: Bias tensor of shape (N,)
-        scaling_factor: Scaling factor for sigmoid output
-        
-    Returns:
-        Output tensor of shape (M, N)
+    x:       (M, K), arbitrary dtype (will be cast for matmul)
+    weight:  (N, K) = (out_features, in_features), fp16/bf16
+    bias:    (N,)
+    returns: (M, N) with
+             z = x @ weight.T + bias
+             y = z + scaling_factor * sigmoid(z)
     """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
     M, K = x.shape
-    N, K_w = weight.shape
-    assert K == K_w, f"Dimension mismatch: x has K={K}, weight has K={K_w}"
-    
-    # Allocate output tensor
-    output = torch.empty((M, N), device=x.device, dtype=x.dtype)
-    
-    # Ensure contiguous memory layout
-    if not x.is_contiguous():
-        x = x.contiguous()
-    weight_t = weight.t().contiguous()
-    if not bias.is_contiguous():
-        bias = bias.contiguous()
-    
-    # Calculate grid size - 1D grid for better occupancy
-    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']) * triton.cdiv(N, META['BLOCK_N']),)
-    
-    # Launch kernel with autotune
-    fused_gemm_sigmoid_scale_resadd_kernel[grid](
-        x, weight_t, bias, output,
+    N = weight.shape[0]
+    assert weight.shape[1] == K, "weight shape must be (out_features=N, in_features=K)"
+    assert bias.shape[0] == N
+
+    mixed_dtype = weight.dtype
+    assert mixed_dtype in (torch.float16, torch.bfloat16), \
+        "weight must be float16 or bfloat16 for tensor-core matmul"
+
+    # Cast inputs/bias to mixed precision used by weight
+    x_mixed = x.to(mixed_dtype) if x.dtype != mixed_dtype else x
+    bias_mixed = bias.to(mixed_dtype) if bias.dtype != mixed_dtype else bias
+
+    # Output buffer in mixed precision; kernel does FP32 accumulate then casts implicitly
+    c = torch.empty((M, N), device=x.device, dtype=mixed_dtype)
+
+    # Strides (row-major assumed)
+    stride_am, stride_ak = x_mixed.stride()
+    # weight is [N, K] row-major; treat as B[K, N]
+    stride_bn, stride_bk = weight.stride()  # (stride_n, stride_k)
+    stride_bk, stride_bn = stride_bk, stride_bn  # now strides for logical [K, N]
+    stride_cm, stride_cn = c.stride()
+
+    # 2D launch grid over output tiles [M, N]
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta['BLOCK_M']),
+            triton.cdiv(N, meta['BLOCK_N']),
+        )
+
+    fused_gemm_sigmoid_scale_residual_kernel[grid](
+        x_mixed, weight, bias_mixed, c,
         M, N, K,
-        x.stride(0), x.stride(1),
-        weight_t.stride(0), weight_t.stride(1),
-        output.stride(0), output.stride(1),
-        scaling_factor=scaling_factor,
+        stride_am, stride_ak,
+        stride_bk, stride_bn,
+        stride_cm, stride_cn,
+        float(scaling_factor),
     )
-    
-    return output
+
+    return c
+
 
 class ModelNew(nn.Module):
     """
-    Model implementing the pattern "Gemm_Sigmoid_Scaling_ResidualAdd".
+    Triton-optimized block:
+
+        z = x @ W^T + b
+        y = z + scaling_factor * sigmoid(z)
+
+    GEMM runs in mixed precision (fp16/bf16 inputs, fp32 accumulate) on tensor cores,
+    and the bias-add + sigmoid + scale + residual are fused into the matmul kernel.
     """
+
     def __init__(self, input_size, hidden_size, scaling_factor):
         super(ModelNew, self).__init__()
-        self.weight = nn.Parameter(torch.randn(hidden_size, input_size))
-        self.bias = nn.Parameter(torch.randn(hidden_size))
-        self.scaling_factor = scaling_factor
+        dtype = torch.float16
+        self.weight = nn.Parameter(
+            torch.randn(hidden_size, input_size, dtype=dtype)
+        )
+        self.bias = nn.Parameter(
+            torch.randn(hidden_size, dtype=dtype)
+        )
+        self.scaling_factor = float(scaling_factor)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass of the model.
-
-        Args:
-            x (torch.Tensor): Input tensor of shape (batch_size, input_size).
-
-        Returns:
-            torch.Tensor: Output tensor of shape (batch_size, hidden_size).
+        x: (batch_size, input_size)
+        returns: (batch_size, hidden_size)
         """
-        return fused_gemm_sigmoid_scale_resadd(
+        input_dtype = x.dtype
+        y_mixed = fused_gemm_sigmoid_scale_residual(
             x, self.weight, self.bias, self.scaling_factor
         )
+        return y_mixed.to(input_dtype) if y_mixed.dtype != input_dtype else y_mixed
 ```
-
-**Key Optimizations Applied:**
-
-1. **TF32 Tensor Cores**: Enabled `allow_tf32=True` for Ada Lovelace's Tensor Cores (82.6 TFLOPS vs ~13 TFLOPS for FP32).
-
-2. **Register Pressure Optimization**: 
-   - Multiple configurations with smaller block sizes (64x32, 32x64, 32x32)
-   - 1D grid layout for better occupancy
-   - Fused operations: `x + (sigmoid(x) * scale)` computed in single expression
-
-3. **Memory Access Patterns**:
-   - Pre-compute masks to avoid repeated boundary checks
-   - Use contiguous memory with explicit checks
-   - Optimized pointer arithmetic
-
-4. **Autotune Configuration**:
-   - 4 configurations with varying block sizes
-   - Reduced `num_warps` for smaller blocks to avoid register spilling
-   - More `num_stages` for smaller blocks to improve memory latency hiding
-
-5. **Occupancy Optimization**:
-   - Maximum threads per block ≤ 1024 (4096 was invalid)
-   - Warp counts tuned for register usage
-   - Grid dimensions optimized for 128 SMs
-
-**Expected Improvements:**
-- 6-8x faster GEMM using TF32 Tensor Cores
-- Better occupancy from reduced register pressure
-- Improved memory coalescing from optimized block sizes

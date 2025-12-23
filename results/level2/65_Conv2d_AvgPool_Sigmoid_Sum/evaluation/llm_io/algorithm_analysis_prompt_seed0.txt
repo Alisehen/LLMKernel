@@ -1,0 +1,313 @@
+You are a GPU kernel optimization architect. Analyze the kernel and identify **ONE high-level algorithmic optimization**.
+
+# PyTorch Reference
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    This model performs a convolution, average pooling, applies sigmoid, and sums the result.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, pool_kernel_size):
+        super(Model, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.avg_pool = nn.AvgPool2d(pool_kernel_size)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.avg_pool(x)
+        x = torch.sigmoid(x)
+        x = torch.sum(x, dim=[1,2,3]) # Sum over all spatial dimensions
+        return x
+
+batch_size = 128
+in_channels = 8
+out_channels = 64
+height, width = 384, 384
+kernel_size = 3
+pool_kernel_size = 4
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, pool_kernel_size]
+```
+
+# Current Triton Kernel
+```python
+import torch, torch.nn as nn, triton, triton.language as tl
+
+
+@triton.jit
+def conv2d_nchw_kernel(
+    x_ptr, w_ptr, b_ptr, y_ptr,
+    N, C_in, H, W,
+    C_out, K, H_out, W_out,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_wo, stride_wi, stride_wkh, stride_wkw,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    BLOCK_H: tl.constexpr, BLOCK_WC: tl.constexpr,
+):
+    pid_n = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    pid_wc = tl.program_id(2)
+
+    offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    offs_wc = pid_wc * BLOCK_WC + tl.arange(0, BLOCK_WC)
+
+    oh = offs_h
+    oc = offs_wc // W_out
+    ow = offs_wc % W_out
+
+    mask_h = oh < H_out
+    mask_oc = oc < C_out
+    mask_ow = ow < W_out
+    mask = mask_h[:, None] & mask_oc[None, :] & mask_ow[None, :]
+
+    x_base = x_ptr + pid_n * stride_xn
+    y_base = y_ptr + pid_n * stride_yn
+
+    acc = tl.zeros((BLOCK_H, BLOCK_WC), dtype=tl.float32)
+
+    for ic in range(0, C_in):
+        x_ic_base = x_base + ic * stride_xc
+        for kh in range(0, K):
+            for kw in range(0, K):
+                h_in = oh[:, None] + kh
+                w_in = ow[None, :] + kw
+
+                x_ptrs = x_ic_base + h_in * stride_xh + w_in * stride_xw
+                w_ptrs = (
+                    w_ptr
+                    + oc[None, :] * stride_wo
+                    + ic * stride_wi
+                    + kh * stride_wkh
+                    + kw * stride_wkw
+                )
+
+                x_vals = tl.load(x_ptrs, mask=mask, other=0.0)
+                w_vals = tl.load(w_ptrs, mask=mask_oc[None, :], other=0.0)
+                acc += x_vals * w_vals
+
+    bias_vals = tl.load(b_ptr + oc, mask=mask_oc, other=0.0)
+    acc += bias_vals[None, :]
+
+    y_ptrs = (
+        y_base
+        + oc[None, :] * stride_yc
+        + oh[:, None] * stride_yh
+        + ow[None, :] * stride_yw
+    )
+    tl.store(y_ptrs, acc, mask=mask)
+
+
+def triton_conv2d_nchw(x, weight, bias, kernel_size):
+    x = x.contiguous()
+    weight = weight.contiguous()
+    bias = bias.contiguous()
+
+    N, C_in, H, W = x.shape
+    C_out, C_in_w, KH, KW = weight.shape
+    assert C_in_w == C_in
+    assert KH == KW == kernel_size
+
+    H_out = H - KH + 1
+    W_out = W - KW + 1
+
+    y = torch.empty((N, C_out, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    grid = lambda META: (
+        N,
+        triton.cdiv(H_out, META["BLOCK_H"]),
+        triton.cdiv(C_out * W_out, META["BLOCK_WC"]),
+    )
+
+    conv2d_nchw_kernel[grid](
+        x, weight, bias, y,
+        N, C_in, H, W,
+        C_out, KH, H_out, W_out,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        weight.stride(0), weight.stride(1), weight.stride(2), weight.stride(3),
+        y.stride(0), y.stride(1), y.stride(2), y.stride(3),
+        BLOCK_H=16, BLOCK_WC=128,
+    )
+    return y
+
+
+@triton.jit
+def avgpool_sigmoid_sum_kernel(
+    x_ptr, out_ptr,
+    N, C, H1, W1,
+    pool_k, H2, W2,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    BLOCK_C: tl.constexpr, BLOCK_HW: tl.constexpr,
+):
+    pid_n = tl.program_id(0)
+    pid_hw = tl.program_id(1)
+    pid_c = tl.program_id(2)
+
+    offs_hw = pid_hw * BLOCK_HW + tl.arange(0, BLOCK_HW)
+    offs_c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
+
+    total_hw = H2 * W2
+    mask_hw = offs_hw < total_hw
+    mask_c = offs_c < C
+
+    oh2 = offs_hw // W2
+    ow2 = offs_hw % W2
+
+    oh2_b = oh2[None, :]
+    ow2_b = ow2[None, :]
+    c_b = offs_c[:, None]
+
+    x_base = x_ptr + pid_n * stride_xn
+
+    pooled_sum = tl.zeros((BLOCK_C, BLOCK_HW), dtype=tl.float32)
+
+    for ph in range(0, pool_k):
+        for pw in range(0, pool_k):
+            oh1 = oh2_b * pool_k + ph
+            ow1 = ow2_b * pool_k + pw
+
+            x_ptrs = (
+                x_base
+                + c_b * stride_xc
+                + oh1 * stride_xh
+                + ow1 * stride_xw
+            )
+
+            mask = mask_c[:, None] & mask_hw[None, :]
+            vals = tl.load(x_ptrs, mask=mask, other=0.0)
+            pooled_sum += vals
+
+    scale = 1.0 / (pool_k * pool_k)
+    pooled = pooled_sum * scale
+
+    neg = -pooled
+    exp_neg = tl.exp(neg)
+    sigmoid = 1.0 / (1.0 + exp_neg)
+
+    partial = tl.sum(sigmoid, axis=0)
+    partial = tl.sum(partial, axis=0)
+
+    tl.atomic_add(out_ptr + pid_n, partial)
+
+
+def triton_avgpool_sigmoid_sum(x, pool_kernel_size):
+    x = x.contiguous()
+    N, C, H1, W1 = x.shape
+    k = pool_kernel_size
+    stride = k
+
+    H2 = (H1 - k) // stride + 1
+    W2 = (W1 - k) // stride + 1
+
+    out = torch.zeros((N,), device=x.device, dtype=x.dtype)
+
+    grid = lambda META: (
+        N,
+        triton.cdiv(H2 * W2, META["BLOCK_HW"]),
+        triton.cdiv(C, META["BLOCK_C"]),
+    )
+
+    avgpool_sigmoid_sum_kernel[grid](
+        x, out,
+        N, C, H1, W1,
+        k, H2, W2,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        BLOCK_C=32, BLOCK_HW=64,
+    )
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model: Conv2d + AvgPool2d + Sigmoid + Sum
+    implemented with high-performance Triton kernels.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, pool_kernel_size):
+        super(ModelNew, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.pool_kernel_size = pool_kernel_size
+
+        self.weight = nn.Parameter(
+            torch.randn(out_channels, in_channels, kernel_size, kernel_size)
+        )
+        self.bias = nn.Parameter(torch.randn(out_channels))
+
+    def forward(self, x):
+        x = x.to(self.weight.dtype)
+        conv_out = triton_conv2d_nchw(x, self.weight, self.bias, self.kernel_size)
+        out = triton_avgpool_sigmoid_sum(conv_out, self.pool_kernel_size)
+        return out
+```
+
+# Performance
+- **PyTorch baseline**: 26.36 ms
+- **Current Triton**: 172.24 ms
+- **Current speedup**: 0.15x (-553.4% vs baseline)
+
+
+---
+
+## Analysis Steps
+
+1. **Code Analysis**: Count kernels, identify operations, check for inefficiencies
+2. **Performance Diagnosis**: Use metrics/latency to identify bottleneck type
+3. **Root Cause**: Combine code + performance to find the core issue
+
+## Optimization Categories (pick ONE if worth optimizing):
+
+### 1. Operator Fusion
+Fuse consecutive ops into fewer kernels to reduce memory traffic and launch overhead.
+
+### 2. Algorithm Replacement
+Replace naive algorithm with optimized variant.
+- For Attention: Flash Attention, online softmax
+- For Convolution: Winograd, im2col
+- **For RNN/GRU/LSTM**: Persistent kernel with HYBRID computation
+  - **CRITICAL**: Use hybrid approach for best performance:
+    * Precompute input-side gates ONCE (outside kernel): `gates_x = (T*B, In) @ W_ih`
+    * Persistent kernel (inside): only recurrent-side: `for t: gates_h = h @ W_hh`
+  - Time loop `for t in range(T)` must be inside kernel, NOT in Python
+  - Launch kernel once per layer, not once per timestep
+  - Expected speedup: 10-100x (vs per-timestep launches)
+
+### 3. Kernel Launch Reduction
+Combine multiple small kernels to reduce overhead.
+- **For RNN/GRU/LSTM**: See "Algorithm Replacement" above for persistent kernel approach
+
+### 4. Memory Layout Optimization
+Use in-place operations, buffer reuse, or better layouts.
+
+## Should We Optimize?
+
+Before proposing optimization, determine if it's worthwhile:
+- **Not worth optimizing** if:
+  - Code is already near-optimal (expected speedup < 10%)
+  - Bottleneck cannot be addressed (hardware limited, already optimal algorithm)
+  - Optimization would add significant complexity with minimal gain
+
+- **Worth optimizing** if:
+  - Clear algorithmic inefficiency exists (multiple kernels, suboptimal algorithm)
+  - Expected speedup >= 20%
+  - Concrete optimization path available
+
+## Output (JSON)
+
+```json
+{
+  "worth_optimizing": "yes/no",
+  "reason": "<Why worth or not worth optimizing, 1 sentence>",
+  "bottleneck": "<Root cause in 1-2 sentences, empty if not worth optimizing>",
+  "optimisation method": "<Specific optimization in 1-2 sentences, empty if not worth optimizing>",
+  "modification plan": "<Implementation steps in 2-3 sentences, empty if not worth optimizing>",
+  "expected_speedup": "<e.g., '30-40%', empty if not worth optimizing>"
+}
+```
+
+Return JSON only.

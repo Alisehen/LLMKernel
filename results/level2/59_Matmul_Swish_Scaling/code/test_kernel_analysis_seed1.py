@@ -1,0 +1,102 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def swish_scale_bias_kernel(
+    y_ptr,        # *contiguous* [M, N] GEMM output, row-major
+    bias_ptr,     # [N]
+    total_elems,  # M * N
+    N,            # number of columns
+    scale,        # scalar float
+    BLOCK: tl.constexpr,
+):
+    # 1D grid over the *output* tensor, flattened
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < total_elems
+
+    # ---- Unified indexing & mask for all fused ops ----
+    # y is contiguous row-major: linear index == physical index
+    y = tl.load(y_ptr + offs, mask=mask, other=0.0)
+
+    # Column index for bias broadcasting (same offs/mask)
+    cols = offs % N
+    bias = tl.load(bias_ptr + cols, mask=mask, other=0.0)
+
+    x = y + bias
+
+    # Swish: x * sigmoid(x)  (manual sigmoid implementation)
+    neg_x = -x
+    sig = 1.0 / (1.0 + tl.exp(neg_x))
+    out = x * sig * scale
+
+    # Store result back to y (in-place epilogue), same offs/mask
+    tl.store(y_ptr + offs, out, mask=mask)
+
+
+def linear_swish_scale(x: torch.Tensor,
+                       weight: torch.Tensor,
+                       bias: torch.Tensor,
+                       scale: float) -> torch.Tensor:
+    """
+    x:      [M, K]
+    weight: [N, K]  (nn.Linear.weight, out_features x in_features)
+    bias:   [N]
+    scale:  scalar float
+
+    Returns:
+        y: [M, N] = (x @ weight.T + bias) * sigmoid(x @ weight.T + bias) * scale
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda, "All tensors must be on CUDA"
+
+    # GEMM using cuBLAS / PyTorch (highly optimized)
+    # x: [M, K], weight.t(): [K, N] -> y: [M, N]
+    y = torch.matmul(x, weight.t())
+
+    # Ensure contiguous memory for linear indexing in Triton
+    y = y.contiguous()
+    M, N = y.shape
+    total_elems = M * N
+
+    # 1D grid over flattened [M, N] for maximal occupancy and bandwidth
+    BLOCK = 256  # power-of-2, large tile for good bandwidth on 4090
+    grid = (triton.cdiv(total_elems, BLOCK),)
+
+    swish_scale_bias_kernel[grid](
+        y, bias,
+        total_elems, N,
+        float(scale),
+        BLOCK=BLOCK,
+        num_warps=8,   # high warp count to hide DRAM latency
+        num_stages=2,  # light pipeline, memory-bound kernel
+    )
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized version of the model:
+
+    forward(x):
+        y = x @ W^T + b
+        y = y * sigmoid(y)    # Swish
+        y = y * scaling_factor
+
+    Epilogue (bias + Swish + scale) is done in a
+    single, bandwidth-optimized Triton kernel.
+    """
+    def __init__(self, in_features, out_features, scaling_factor):
+        super(ModelNew, self).__init__()
+        self.linear = nn.Linear(in_features, out_features)
+        self.scaling_factor = float(scaling_factor)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return linear_swish_scale(
+            x,
+            self.linear.weight,
+            self.linear.bias,
+            self.scaling_factor,
+        )

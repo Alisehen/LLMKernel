@@ -1,5 +1,0 @@
-{
-  "critical_issue": "Matrix multiply in Triton kernel uses allow_tf32=True, reducing precision compared to PyTorch’s FP32 Linear reference.",
-  "why_it_matters": "TF32 matmul adds rounding error so GEMM outputs differ by ~1e-3, which Mish and GroupNorm amplify slightly, exceeding the strict atol/rtol comparison thresholds.",
-  "minimal_fix_hint": "Run tl.dot in full FP32 (remove or set allow_tf32=False) to match PyTorch Linear’s numerical behavior."
-}

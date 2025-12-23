@@ -1,0 +1,207 @@
+import torch, torch.nn as nn, triton, triton.language as tl
+
+
+@triton.jit
+def conv2d_nchw_kernel(
+    x_ptr, w_ptr, b_ptr, y_ptr,
+    N, C_in, H, W,
+    C_out, K, H_out, W_out,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_wo, stride_wi, stride_wkh, stride_wkw,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    BLOCK_H: tl.constexpr, BLOCK_WC: tl.constexpr,
+):
+    pid_n = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    pid_wc = tl.program_id(2)
+
+    offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    offs_wc = pid_wc * BLOCK_WC + tl.arange(0, BLOCK_WC)
+
+    oh = offs_h
+    oc = offs_wc // W_out
+    ow = offs_wc % W_out
+
+    mask_h = oh < H_out
+    mask_oc = oc < C_out
+    mask_ow = ow < W_out
+    mask = mask_h[:, None] & mask_oc[None, :] & mask_ow[None, :]
+
+    x_base = x_ptr + pid_n * stride_xn
+    y_base = y_ptr + pid_n * stride_yn
+
+    acc = tl.zeros((BLOCK_H, BLOCK_WC), dtype=tl.float32)
+
+    for ic in range(0, C_in):
+        x_ic_base = x_base + ic * stride_xc
+        for kh in range(0, K):
+            for kw in range(0, K):
+                h_in = oh[:, None] + kh
+                w_in = ow[None, :] + kw
+
+                x_ptrs = x_ic_base + h_in * stride_xh + w_in * stride_xw
+                w_ptrs = (
+                    w_ptr
+                    + oc[None, :] * stride_wo
+                    + ic * stride_wi
+                    + kh * stride_wkh
+                    + kw * stride_wkw
+                )
+
+                x_vals = tl.load(x_ptrs, mask=mask, other=0.0)
+                w_vals = tl.load(w_ptrs, mask=mask_oc[None, :], other=0.0)
+                acc += x_vals * w_vals
+
+    bias_vals = tl.load(b_ptr + oc, mask=mask_oc, other=0.0)
+    acc += bias_vals[None, :]
+
+    y_ptrs = (
+        y_base
+        + oc[None, :] * stride_yc
+        + oh[:, None] * stride_yh
+        + ow[None, :] * stride_yw
+    )
+    tl.store(y_ptrs, acc, mask=mask)
+
+
+def triton_conv2d_nchw(x, weight, bias, kernel_size):
+    x = x.contiguous()
+    weight = weight.contiguous()
+    bias = bias.contiguous()
+
+    N, C_in, H, W = x.shape
+    C_out, C_in_w, KH, KW = weight.shape
+    assert C_in_w == C_in
+    assert KH == KW == kernel_size
+
+    H_out = H - KH + 1
+    W_out = W - KW + 1
+
+    y = torch.empty((N, C_out, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    grid = lambda META: (
+        N,
+        triton.cdiv(H_out, META["BLOCK_H"]),
+        triton.cdiv(C_out * W_out, META["BLOCK_WC"]),
+    )
+
+    conv2d_nchw_kernel[grid](
+        x, weight, bias, y,
+        N, C_in, H, W,
+        C_out, KH, H_out, W_out,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        weight.stride(0), weight.stride(1), weight.stride(2), weight.stride(3),
+        y.stride(0), y.stride(1), y.stride(2), y.stride(3),
+        BLOCK_H=16, BLOCK_WC=128,
+    )
+    return y
+
+
+@triton.jit
+def avgpool_sigmoid_sum_kernel(
+    x_ptr, out_ptr,
+    N, C, H1, W1,
+    pool_k, H2, W2,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    BLOCK_C: tl.constexpr, BLOCK_HW: tl.constexpr,
+):
+    pid_n = tl.program_id(0)
+    pid_hw = tl.program_id(1)
+    pid_c = tl.program_id(2)
+
+    offs_hw = pid_hw * BLOCK_HW + tl.arange(0, BLOCK_HW)
+    offs_c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
+
+    total_hw = H2 * W2
+    mask_hw = offs_hw < total_hw
+    mask_c = offs_c < C
+
+    oh2 = offs_hw // W2
+    ow2 = offs_hw % W2
+
+    oh2_b = oh2[None, :]
+    ow2_b = ow2[None, :]
+    c_b = offs_c[:, None]
+
+    x_base = x_ptr + pid_n * stride_xn
+
+    pooled_sum = tl.zeros((BLOCK_C, BLOCK_HW), dtype=tl.float32)
+
+    for ph in range(0, pool_k):
+        for pw in range(0, pool_k):
+            oh1 = oh2_b * pool_k + ph
+            ow1 = ow2_b * pool_k + pw
+
+            x_ptrs = (
+                x_base
+                + c_b * stride_xc
+                + oh1 * stride_xh
+                + ow1 * stride_xw
+            )
+
+            mask = mask_c[:, None] & mask_hw[None, :]
+            vals = tl.load(x_ptrs, mask=mask, other=0.0)
+            pooled_sum += vals
+
+    scale = 1.0 / (pool_k * pool_k)
+    pooled = pooled_sum * scale
+
+    neg = -pooled
+    exp_neg = tl.exp(neg)
+    sigmoid = 1.0 / (1.0 + exp_neg)
+
+    partial = tl.sum(sigmoid, axis=0)
+    partial = tl.sum(partial, axis=0)
+
+    tl.atomic_add(out_ptr + pid_n, partial)
+
+
+def triton_avgpool_sigmoid_sum(x, pool_kernel_size):
+    x = x.contiguous()
+    N, C, H1, W1 = x.shape
+    k = pool_kernel_size
+    stride = k
+
+    H2 = (H1 - k) // stride + 1
+    W2 = (W1 - k) // stride + 1
+
+    out = torch.zeros((N,), device=x.device, dtype=x.dtype)
+
+    grid = lambda META: (
+        N,
+        triton.cdiv(H2 * W2, META["BLOCK_HW"]),
+        triton.cdiv(C, META["BLOCK_C"]),
+    )
+
+    avgpool_sigmoid_sum_kernel[grid](
+        x, out,
+        N, C, H1, W1,
+        k, H2, W2,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        BLOCK_C=32, BLOCK_HW=64,
+    )
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model: Conv2d + AvgPool2d + Sigmoid + Sum
+    implemented with high-performance Triton kernels.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, pool_kernel_size):
+        super(ModelNew, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.pool_kernel_size = pool_kernel_size
+
+        self.weight = nn.Parameter(
+            torch.randn(out_channels, in_channels, kernel_size, kernel_size)
+        )
+        self.bias = nn.Parameter(torch.randn(out_channels))
+
+    def forward(self, x):
+        x = x.to(self.weight.dtype)
+        conv_out = triton_conv2d_nchw(x, self.weight, self.bias, self.kernel_size)
+        out = triton_avgpool_sigmoid_sum(conv_out, self.pool_kernel_size)
+        return out

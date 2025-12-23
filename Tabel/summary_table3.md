@@ -6,7 +6,7 @@
 | 4_Matrix_vector_multiplication | 2.2 | ✅ |
 | 5_Matrix_scalar_multiplication | 1.01 | ✅ |
 | 6_Matmul_with_large_K_dimension | 1.26 | ✅ |
-| 7_Matmul_with_small_K_dimension | 0.7546 | ✅ |
+| 7_Matmul_with_small_K_dimension | 0.9650 | ✅ |
 | 8_Matmul_with_irregular_shapes | 1.04 | ✅ |
 | 9_Tall_skinny_matrix_multiplication | 1.09 | ✅ |
 | 10_3D_tensor_matrix_multiplication | 0.89 | ✅ |

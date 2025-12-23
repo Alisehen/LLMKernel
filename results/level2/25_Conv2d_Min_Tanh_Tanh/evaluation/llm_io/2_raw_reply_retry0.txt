@@ -1,5 +1,4 @@
 ```python
-import math
 import torch
 import torch.nn as nn
 import triton
@@ -8,170 +7,143 @@ import triton.language as tl
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_M': 32,  'OC_TILE': 4},  num_warps=2),
-        triton.Config({'BLOCK_M': 32,  'OC_TILE': 8},  num_warps=2),
-        triton.Config({'BLOCK_M': 64,  'OC_TILE': 4},  num_warps=4),
-        triton.Config({'BLOCK_M': 64,  'OC_TILE': 8},  num_warps=4),
-        triton.Config({'BLOCK_M': 64,  'OC_TILE': 16}, num_warps=4),
-        triton.Config({'BLOCK_M': 128, 'OC_TILE': 8},  num_warps=8),
-        triton.Config({'BLOCK_M': 128, 'OC_TILE': 16}, num_warps=8),
+        # Smaller, very safe config (lowest register pressure)
+        triton.Config({"BLOCK_P": 128, "BLOCK_C": 32}, num_warps=2, num_stages=2),
+        # Main configs targeting 4090: larger P tile with moderate channel tile
+        triton.Config({"BLOCK_P": 256, "BLOCK_C": 32}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_P": 512, "BLOCK_C": 32}, num_warps=8, num_stages=2),
     ],
-    key=['P', 'C_out'],
+    key=["P", "C"],
 )
 @triton.jit
-def conv_min_tanh2_kernel(
-    x_ptr, w_ptr, b_ptr, out_ptr,
-    N, C_in, H, W,
-    C_out, K, H_out, W_out,
-    stride_xn, stride_xc, stride_xh, stride_xw,
-    stride_wn, stride_wc, stride_wkh, stride_wkw,
-    stride_on, stride_oc, stride_oh, stride_ow,
+def channel_min_tanh2_kernel(
+    x_ptr, out_ptr,
+    N, C, H, W,
+    stride_x_n, stride_x_c, stride_x_h, stride_x_w,
+    stride_out_n, stride_out_c, stride_out_h, stride_out_w,
     P,
-    BLOCK_M: tl.constexpr,
-    OC_TILE: tl.constexpr,
+    BLOCK_P: tl.constexpr,  # number of (n, h, w) pixels per program
+    BLOCK_C: tl.constexpr,  # number of channels processed per iteration
 ):
     """
-    Fused kernel:
-      y = conv2d(x, w, b)           # N, C_out, H_out, W_out
-      y_min = min(y, dim=1)         # channel-wise min, shape (N, H_out, W_out)
-      out = tanh(tanh(y_min))       # final output stored as N,1,H_out,W_out
+    For input x of shape [N, C, H, W], compute:
+        y[n, 0, h, w] = tanh(tanh(min_c x[n, c, h, w]))
 
-    Grid: 1D over P = N * H_out * W_out
-    Each program instance processes BLOCK_M spatial positions and performs
-    a full reduction over C_out channels locally.
+    Grid & indexing:
+      - 1D grid over the flattened (n, h, w) output positions
+      - All fused ops (min + 2x tanh + store) share the SAME
+        offsets (offs_p -> n,h,w) and mask (mask_p).
     """
-
     pid = tl.program_id(0)
-    offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
-    mask_m = offs_m < P
 
-    # Map flat index -> (n, oh, ow)
-    HW_out = H_out * W_out
-    n_idx = offs_m // HW_out
-    rem = offs_m % HW_out
-    oh_idx = rem // W_out
-    ow_idx = rem % W_out
+    # Linear indices over the (n, h, w) positions
+    offs_p = pid * BLOCK_P + tl.arange(0, BLOCK_P)
+    mask_p = offs_p < P  # shared mask for all fused ops
 
-    # Base pointer for each (n, :, :, :) slice
-    x_n_base = x_ptr + n_idx * stride_xn
+    HW = H * W
+    # Map linear index -> (n, h, w)
+    n = offs_p // HW
+    rem = offs_p % HW
+    h = rem // W
+    w = rem % W
 
-    # Running minimum over output channels for each spatial position
-    inf = float("inf")
-    min_val = tl.full((BLOCK_M,), inf, dtype=tl.float32)
+    # Running minimum over channels for each (n, h, w)
+    inf = tl.full((BLOCK_P,), 1e30, dtype=tl.float32)
+    min_val = inf
 
-    # Loop over output channels in tiles
-    oc_start = 0
-    while oc_start < C_out:
-        oc_offsets = oc_start + tl.arange(0, OC_TILE)
-        oc_mask = oc_offsets < C_out
+    c_start = 0
+    while c_start < C:
+        c_offsets = c_start + tl.arange(0, BLOCK_C)
+        mask_c = c_offsets < C
 
-        # Accumulator for current output-channel tile: [OC_TILE, BLOCK_M]
-        acc_tile = tl.zeros((OC_TILE, BLOCK_M), dtype=tl.float32)
+        # Pointers to x[n, c, h, w] for this block of channels
+        x_ptrs = (
+            x_ptr
+            + n[:, None] * stride_x_n
+            + c_offsets[None, :] * stride_x_c
+            + h[:, None] * stride_x_h
+            + w[:, None] * stride_x_w
+        )
 
-        # Convolution over (C_in, K, K) reduction domain
-        ic = 0
-        while ic < C_in:
-            # Precompute base for this input channel
-            x_ic_base = x_n_base + ic * stride_xc
+        # Load a BLOCK_P x BLOCK_C tile; masked elements get +inf
+        vals = tl.load(
+            x_ptrs,
+            mask=mask_p[:, None] & mask_c[None, :],
+            other=1e30,
+        )
 
-            kh = 0
-            while kh < K:
-                h_in = oh_idx + kh  # broadcast over BLOCK_M
-                x_h_base = x_ic_base + h_in * stride_xh
+        # Accumulate reduction in fp32 for good numeric behavior
+        vals_f32 = vals.to(tl.float32)
 
-                kw = 0
-                while kw < K:
-                    w_in = ow_idx + kw  # broadcast over BLOCK_M
-                    x_ptrs = x_h_base + w_in * stride_xw
+        # Per-(n,h,w) minimum over this channel block
+        block_min = tl.min(vals_f32, axis=1)
+        # Update running minimum
+        min_val = tl.minimum(min_val, block_min)
 
-                    # Load input patch values for all BLOCK_M positions
-                    x_vals = tl.load(x_ptrs, mask=mask_m, other=0.0).to(tl.float32)
+        c_start += BLOCK_C
 
-                    # Load weights for all OC_TILE output channels at (ic, kh, kw)
-                    w_ptrs = (
-                        w_ptr
-                        + oc_offsets * stride_wn
-                        + ic * stride_wc
-                        + kh * stride_wkh
-                        + kw * stride_wkw
-                    )
-                    w_vals = tl.load(w_ptrs, mask=oc_mask, other=0.0).to(tl.float32)
+    # --- Fused elementwise: tanh(tanh(min_val)) ---
+    # Keep register pressure low by reusing variables in-place.
 
-                    # Outer product accumulation:
-                    # [OC_TILE, 1] * [1, BLOCK_M] -> [OC_TILE, BLOCK_M]
-                    acc_tile += w_vals[:, None] * x_vals[None, :]
+    # First tanh: min_val <- tanh(min_val)
+    e = tl.exp(2.0 * min_val)
+    min_val = (e - 1.0) / (e + 1.0)
 
-                    kw += 1
-                kh += 1
-            ic += 1
+    # Second tanh: min_val <- tanh(min_val)
+    e = tl.exp(2.0 * min_val)
+    min_val = (e - 1.0) / (e + 1.0)
 
-        # Add bias for this tile of output channels
-        b_ptrs = b_ptr + oc_offsets
-        bias_vals = tl.load(b_ptrs, mask=oc_mask, other=0.0).to(tl.float32)
-        acc_tile += bias_vals[:, None]
-
-        # Ignore contributions from oc_offsets >= C_out in the tile-min reduction
-        acc_tile = tl.where(oc_mask[:, None], acc_tile, inf)
-
-        # Reduce over OC_TILE for each spatial position
-        tile_min = tl.min(acc_tile, axis=0)  # shape [BLOCK_M]
-        min_val = tl.minimum(min_val, tile_min)
-
-        oc_start += OC_TILE
-
-    # Apply tanh twice: tanh(tanh(x))
-    tanh1 = tl.tanh(min_val)
-    tanh2 = tl.tanh(tanh1)
-
-    # Store result as N,1,H_out,W_out; channel index is always 0.
+    # Store result to output: shape [N, 1, H, W]
     out_ptrs = (
         out_ptr
-        + n_idx * stride_on
-        + 0 * stride_oc
-        + oh_idx * stride_oh
-        + ow_idx * stride_ow
+        + n * stride_out_n
+        + h * stride_out_h
+        + w * stride_out_w
     )
-    tl.store(out_ptrs, tanh2, mask=mask_m)
+    tl.store(out_ptrs, min_val, mask=mask_p)
 
 
 def conv_min_tanh2(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
     """
-    Fused operation:
-      y = conv2d(x, weight, bias)        # N, C_out, H_out, W_out
-      y_min = min(y, dim=1, keepdim=True)
-      out = tanh(tanh(y_min))
-    Implemented as a single Triton kernel.
-    Assumes stride=1, padding=0, dilation=1, groups=1, square kernel.
+    Fast implementation of:
+        y = conv2d(x, weight, bias, stride=1, padding=0)
+        y = torch.min(y, dim=1, keepdim=True)[0]
+        y = torch.tanh(y)
+        y = torch.tanh(y)
+
+    Convolution is delegated to PyTorch's backend (cuDNN / cuBLAS).
+    Channel-wise min and double tanh are fused into a single Triton kernel.
     """
-    assert x.ndim == 4
-    x = x.contiguous()
-    weight = weight.contiguous()
-    bias = bias.contiguous()
-
+    assert x.dim() == 4, "Input must be NCHW"
     N, C_in, H, W = x.shape
-    C_out, C_in_w, K_h, K_w = weight.shape
-    assert C_in_w == C_in
-    assert K_h == K_w
-    K = K_h
+    C_out, C_in_w, K_H, K_W = weight.shape
+    assert C_in == C_in_w, "Input channels must match weight"
 
-    H_out = H - K + 1
-    W_out = W - K + 1
-    assert H_out > 0 and W_out > 0
+    # Stride=1, padding=0, dilation=1, groups=1
+    y = torch.nn.functional.conv2d(
+        x, weight, bias, stride=1, padding=0, dilation=1, groups=1
+    )
+    N_y, C_y, H_out, W_out = y.shape
+    assert N_y == N and C_y == C_out, "Unexpected conv output shape"
 
+    # Make conv output contiguous to get predictable strides
+    y_ = y.contiguous()
     out = torch.empty((N, 1, H_out, W_out), device=x.device, dtype=x.dtype)
 
-    P = N * H_out * W_out
+    stride_y_n, stride_y_c, stride_y_h, stride_y_w = y_.stride()
+    stride_out_n, stride_out_c, stride_out_h, stride_out_w = out.stride()
+
+    P = N * H_out * W_out  # number of (n, h, w) positions
 
     def grid(meta):
-        return (triton.cdiv(P, meta['BLOCK_M']),)
+        # 1D grid over flattened (n,h,w); force grid size >= 1
+        return (max(1, triton.cdiv(P, meta["BLOCK_P"])),)
 
-    conv_min_tanh2_kernel[grid](
-        x, weight, bias, out,
-        N, C_in, H, W,
-        C_out, K, H_out, W_out,
-        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
-        weight.stride(0), weight.stride(1), weight.stride(2), weight.stride(3),
-        out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+    channel_min_tanh2_kernel[grid](
+        y_, out,
+        N, C_out, H_out, W_out,
+        stride_y_n, stride_y_c, stride_y_h, stride_y_w,
+        stride_out_n, stride_out_c, stride_out_h, stride_out_w,
         P,
     )
 
@@ -180,39 +152,17 @@ def conv_min_tanh2(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) ->
 
 class ModelNew(nn.Module):
     """
-    Triton implementation of:
-        conv2d -> channel-wise min (keepdim) -> tanh -> tanh
-    with stride=1, padding=0, dilation=1, groups=1.
+    Triton-accelerated version of:
+        x = conv2d(x)
+        x = torch.min(x, dim=1, keepdim=True)[0]
+        x = torch.tanh(x)
+        x = torch.tanh(x)
     """
-
     def __init__(self, in_channels, out_channels, kernel_size):
         super(ModelNew, self).__init__()
-        if isinstance(kernel_size, int):
-            k_h = k_w = kernel_size
-        else:
-            k_h, k_w = kernel_size
-        assert k_h == k_w, "Only square kernels are supported in this implementation."
-        k = k_h
-
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.kernel_size = k
-
-        self.weight = nn.Parameter(torch.empty(out_channels, in_channels, k, k))
-        self.bias = nn.Parameter(torch.empty(out_channels))
-
-        # Initialize as nn.Conv2d does (Kaiming uniform)
-        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
-        fan_in = in_channels * k * k
-        bound = 1 / math.sqrt(fan_in)
-        nn.init.uniform_(self.bias, -bound, bound)
+        # Keep the same structure/state_dict layout as the original model
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
 
     def forward(self, x):
-        # Fallback to PyTorch for non-CUDA tensors
-        if not x.is_cuda:
-            y = torch.nn.functional.conv2d(x, self.weight, self.bias, stride=1, padding=0)
-            y_min = torch.min(y, dim=1, keepdim=True)[0]
-            return torch.tanh(torch.tanh(y_min))
-
-        return conv_min_tanh2(x, self.weight, self.bias)
+        return conv_min_tanh2(x, self.conv.weight, self.conv.bias)
 ```

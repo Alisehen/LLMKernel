@@ -1,0 +1,229 @@
+You are optimizing a Triton kernel based on algorithmic analysis.
+
+# PyTorch Reference (Target Behavior)
+
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs a convolution, applies minimum operation, Tanh, and another Tanh.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size):
+        super(Model, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = torch.min(x, dim=1, keepdim=True)[0] # Apply minimum operation along the channel dimension
+        x = torch.tanh(x)
+        x = torch.tanh(x)
+        return x
+
+batch_size = 128
+in_channels = 16
+out_channels = 64
+height = width = 256
+kernel_size = 3
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size]
+```
+
+**CRITICAL**: Study the PyTorch code carefully to understand:
+- What does `forward()` return? (full output sequence vs final hidden state only)
+- What is the computational pattern?
+- What are the input/output shapes?
+
+Your optimized kernel MUST match this exact behavior.
+
+---
+
+# Analysis Results
+
+**Bottleneck**: The kernel launches one program per (n, h, w) point, each doing a scalar while-loop over C and scalar tanh math, leading to millions of tiny, underutilized programs, poor memory coalescing, and high launch overhead.
+
+**Optimization Strategy**: Replace the per-pixel, serial reduction over channels with a parallel reduction over C inside each program that processes a 2D tile of spatial positions (and optionally batch), using vectorized loads and tree-style reductions to fully utilize the GPU.
+
+**Implementation Plan**: Change the grid to tile over the spatial dimension, e.g., programs indexed by (n, hw_tile) where each program handles BLOCK_HW pixels and all C channels. Inside the kernel, form a [BLOCK_HW, BLOCK_C] tile, load x for that tile with vectorized, coalesced accesses, and use Triton’s reduction primitives (tl.min over channel axis) to compute channel-wise minima in parallel. Apply the fused tanh operations on the resulting BLOCK_HW minima and store them back, keeping the fusion but eliminating the scalar while-loop and per-pixel programs.
+
+**Expected Speedup**: 500-700% over the current Triton kernel (i.e., 5-8x), likely bringing performance to or better than the PyTorch baseline.
+
+---
+
+# Current Kernel (needs optimization)
+
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def min_tanh_tanh_kernel(
+    x_ptr, y_ptr,
+    B, C, H, W,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    BLOCK_C: tl.constexpr,
+):
+    # Program IDs for batch, height, width
+    pid_n = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    pid_w = tl.program_id(2)
+
+    # Guard against out-of-bounds in case grid is larger than tensor dims
+    mask_n = pid_n < B
+    mask_h = pid_h < H
+    mask_w = pid_w < W
+    in_bounds = mask_n & mask_h & mask_w
+
+    # If out of bounds, we still must not early-return; use masking
+    # Base pointer for this (n, h, w) location in the input tensor
+    x_base_offset = (
+        pid_n * stride_xn
+        + pid_h * stride_xh
+        + pid_w * stride_xw
+    )
+    x_base_ptr = x_ptr + x_base_offset
+
+    # Initialize running minimum (in float32 for numeric stability)
+    min_val = tl.full((), float("inf"), tl.float32)
+
+    # Reduce over channel dimension C in blocks of BLOCK_C
+    # Each iteration handles up to BLOCK_C channels
+    c = 0
+    while c < C:
+        offs_c = c + tl.arange(0, BLOCK_C)
+        mask_c = offs_c < C
+        # Only load if the (n,h,w) position is in bounds
+        mask = mask_c & in_bounds
+
+        x_ptrs = x_base_ptr + offs_c * stride_xc
+        x_vals = tl.load(x_ptrs, mask=mask, other=float("inf"))
+
+        # Accumulate minimum
+        block_min = tl.min(x_vals, axis=0)
+        min_val = tl.minimum(min_val, block_min)
+
+        c += BLOCK_C
+
+    # Apply two successive tanh operations:
+    # tanh(x) = (exp(2x) - 1) / (exp(2x) + 1)
+    # First tanh
+    t = 2.0 * min_val
+    e = tl.exp(t)
+    tanh1 = (e - 1.0) / (e + 1.0)
+    # Second tanh
+    t2 = 2.0 * tanh1
+    e2 = tl.exp(t2)
+    out_val = (e2 - 1.0) / (e2 + 1.0)
+
+    # Store result to output at channel index 0 (keepdim=True)
+    y_offset = (
+        pid_n * stride_yn
+        + 0 * stride_yc  # channel is always 0 due to keepdim=True
+        + pid_h * stride_yh
+        + pid_w * stride_yw
+    )
+
+    # Only store if within bounds
+    tl.store(y_ptr + y_offset, out_val, mask=in_bounds)
+
+
+def min_tanh_tanh(x: torch.Tensor) -> torch.Tensor:
+    """
+    Fused replacement for:
+        x = torch.min(x, dim=1, keepdim=True)[0]
+        x = torch.tanh(x)
+        x = torch.tanh(x)
+    Assumes x is NCHW and float32 on CUDA.
+    """
+    assert x.is_cuda, "Input must be on CUDA"
+    assert x.dtype == torch.float32, "Kernel currently assumes float32"
+
+    B, C, H, W = x.shape
+    y = torch.empty((B, 1, H, W), device=x.device, dtype=x.dtype)
+
+    grid = lambda META: (B, H, W)
+
+    min_tanh_tanh_kernel[grid](
+        x, y,
+        B, C, H, W,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        y.stride(0), y.stride(1), y.stride(2), y.stride(3),
+        BLOCK_C=64,
+        num_warps=4,
+        num_stages=2,
+    )
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized version of the original model using Triton for:
+      min over channels + tanh + tanh
+    Convolution is still performed via cuDNN (nn.Conv2d).
+    """
+    def __init__(self, in_channels, out_channels, kernel_size):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = min_tanh_tanh(x)
+        return x
+```
+
+---
+
+# Your Task
+
+Implement the optimization strategy above. Focus on the specific bottleneck identified.
+
+## Key Requirements
+
+1. **Preserve correctness**: Maintain the same input/output behavior
+2. **Apply the optimization**: Follow the implementation plan exactly
+3. **Use valid Triton syntax**:
+   - Every kernel MUST have `@triton.jit` decorator
+   - Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+   - BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+   - No `continue`, `break`, `return` inside kernels (use masking)
+   - Prefer `tl.dot(a, b, allow_tf32=True)` for matmul operations
+
+4. **CRITICAL for RNN/GRU/LSTM Persistent Kernels**:
+   - Time loop MUST be inside @triton.jit kernel, NOT in Python forward()
+   - **HYBRID computation strategy** (CRITICAL for performance):
+     * Precompute input-side gates OUTSIDE kernel: `gates_x = (T*B, In) @ W_ih` (ONE large GEMM)
+     * INSIDE kernel: only recurrent-side: `for t: gates_h = h @ W_hh` (T small GEMMs)
+   - CORRECT (FAST - use this):
+     ```python
+     # Python forward():
+     gates_x_all = x.reshape(T*B, In) @ W_ih + b_ih  # ONE large GEMM
+     gates_x_all = gates_x_all.view(T, B, 3*H)
+     gru_persistent_kernel[grid](gates_x_all, h0, W_hh, ...)  # Launch ONCE
+
+     @triton.jit
+     def gru_persistent_kernel(gates_x_ptr, h_ptr, W_hh_ptr, ...):
+         for t in range(T):  # Inside kernel
+             gates_x_t = tl.load(gates_x_ptr + t*...)  # Precomputed
+             gates_h = h @ W_hh  # Only recurrent GEMM
+             h = (1-z)*n + z*h   # Fuse and update
+     ```
+
+5. **Output format**:
+   - Imports: `import torch, torch.nn as nn, triton, triton.language as tl`
+   - `@triton.jit` kernel(s)
+   - Wrapper function(s)
+   - `class ModelNew(nn.Module)` — REQUIRED
+   - NO testing code, NO `if __name__ == "__main__"`
+
+---
+
+Generate the optimized kernel now. Output ONLY the complete Python code.

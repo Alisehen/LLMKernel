@@ -1,0 +1,10 @@
+```json
+{
+  "worth_optimizing": "yes",
+  "reason": "The custom Triton GEMM is slower than the PyTorch/cuBLAS baseline, so there is clear room for a >20% improvement by changing the high-level algorithm rather than just micro-tuning the kernel.",
+  "bottleneck": "The kernel reimplements GEMM in Triton instead of using a highly optimized vendor GEMM (cuBLAS), and this hand-written matmul is the dominant cost and currently slower than the baseline. The extra arithmetic intensity from fusing the epilogue (mul + LeakyReLU) does not compensate for the less efficient GEMM implementation.",
+  "optimisation method": "Replace the in-kernel GEMM loop with a call to an optimized GEMM (e.g., PyTorch’s `F.linear` / `torch.matmul` backed by cuBLAS) and use Triton only for a fused epilogue kernel that combines the scalar multiply and LeakyReLU, reducing to one matmul launch plus one cheap pointwise launch.",
+  "modification plan": "In `ModelNew.forward`, first compute the linear output via `torch.nn.functional.linear(x, self.weight, self.bias)` (cuBLAS-backed). Then write a small Triton kernel that reads this `[M, N]` output, applies `y = leaky_relu(y * multiplier, negative_slope)`, and writes back in-place. This algorithm keeps GEMM on the most optimized library path while still gaining from fusing the two post-GEMM pointwise ops into a single, memory-efficient Triton epilogue.",
+  "expected_speedup": "20-30% vs the current Triton kernel (and likely roughly match or slightly beat the PyTorch baseline by eliminating one pointwise kernel and one extra read/write of the intermediate)."
+}
+```

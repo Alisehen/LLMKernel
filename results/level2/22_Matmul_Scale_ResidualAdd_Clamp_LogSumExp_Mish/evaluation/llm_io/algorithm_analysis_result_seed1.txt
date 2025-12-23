@@ -1,0 +1,10 @@
+```json
+{
+  "worth_optimizing": "yes",
+  "reason": "The fused Triton kernel is ~245x slower than the PyTorch baseline, indicating a serious algorithmic under-utilization of the GPU.",
+  "bottleneck": "The kernel serializes almost all work over the N dimension inside a single program (only 16 CTAs for M=1024 with BLOCK_M=64), because logsumexp is computed 'online' during GEMM; this prevents 2D tiling over (M,N), yields very low occupancy, and replaces a highly-optimized GEMM (cuBLAS) with a slow custom matmul.",
+  "optimisation method": "Replace the current 'GEMM + streaming logsumexp' fused algorithm with a two-phase approach: (1) use a standard, highly-parallel GEMM (cuBLAS or Triton matmul) to compute the Linear output over both M and N, and (2) run a separate Triton kernel that applies scale + residual (folded as a single multiply), clamp, row-wise logsumexp, and Mish.",
+  "modification plan": "First, remove logsumexp and Mish from the matmul kernel and instead call a standard Linear/GEMM (e.g., torch.nn.functional.linear or a Triton matmul with a 2D grid over (M,N)) to produce the full (M,N) matrix. Second, implement a dedicated Triton reduction kernel that takes this matrix, applies the fused scale-and-residual and clamp elementwise, then performs a row-wise logsumexp followed by Mish and the final x*mish(x) multiplication to produce an (M,1) output. This restores full 2D parallelism to the GEMM, lets it use Tensor Cores/optimized tiling, and confines custom logic to a lightweight reduction kernel.",
+  "expected_speedup": "≥100x vs the current Triton kernel and likely 1.2–2x vs the PyTorch baseline after tuning."
+}
+```

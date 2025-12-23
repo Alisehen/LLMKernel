@@ -1,0 +1,10 @@
+```json
+{
+  "worth_optimizing": "yes",
+  "reason": "There is a mathematically redundant pair of MaxPool3d layers that can be collapsed into a single pooling operation, eliminating a full kernel and tensor round-trip.",
+  "bottleneck": "The pipeline runs two separate 3D max-pool kernels (k=2,s=2 then k=3,s=3) on the full ConvTranspose3d output; this doubles global memory traffic for pooling and adds kernel launch overhead, while the second pool is just re-pooling already non-overlapping maxima.",
+  "optimisation method": "Exploit the composition property of non-overlapping max pooling: MaxPool3d(kernel=2,stride=2) followed by MaxPool3d(kernel=3,stride=3) is exactly equivalent to a single MaxPool3d with kernel=6,stride=6, applied once to the ConvTranspose3d output.",
+  "modification plan": "Prove/accept the identity in each dimension: with stride=kernel, sequential max-pools compose as max over blocks of size (K1*K2) with stride (K1*K2). Replace the two calls to maxpool3d_triton(x, kernel_size=2, stride=2) and maxpool3d_triton(x, kernel_size=3, stride=3) by a single maxpool3d_triton(x, kernel_size=6, stride=6). Optionally, specialize the Triton maxpool kernel for this fixed K=6,S=6 case to further simplify the loops and indexing.",
+  "expected_speedup": "20-40%"
+}
+```

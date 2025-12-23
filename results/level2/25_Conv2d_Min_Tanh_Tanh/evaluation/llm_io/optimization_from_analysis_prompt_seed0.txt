@@ -1,0 +1,300 @@
+You are optimizing a Triton kernel based on algorithmic analysis.
+
+# PyTorch Reference (Target Behavior)
+
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs a convolution, applies minimum operation, Tanh, and another Tanh.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size):
+        super(Model, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = torch.min(x, dim=1, keepdim=True)[0] # Apply minimum operation along the channel dimension
+        x = torch.tanh(x)
+        x = torch.tanh(x)
+        return x
+
+batch_size = 128
+in_channels = 16
+out_channels = 64
+height = width = 256
+kernel_size = 3
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size]
+```
+
+**CRITICAL**: Study the PyTorch code carefully to understand:
+- What does `forward()` return? (full output sequence vs final hidden state only)
+- What is the computational pattern?
+- What are the input/output shapes?
+
+Your optimized kernel MUST match this exact behavior.
+
+---
+
+# Analysis Results
+
+**Bottleneck**: The kernel performs a naive per-pixel, per-output-channel convolution loop with many small dot-products and unstructured memory accesses instead of using a GEMM-style algorithm that can exploit tensor cores and high parallelism.
+
+**Optimization Strategy**: Replace the hand-rolled convolution with a GEMM-based implementation (e.g., im2col + matmul or Triton’s matmul template / cuBLAS-backed matmul), and then apply the channel-wise min and double tanh as a separate small fused kernel.
+
+**Implementation Plan**: Reshape the input into an im2col matrix of shape [N*H_out*W_out, C_in*K_H*K_W] and the weights into [C_out, C_in*K_H*K_W], and compute the convolution as a single large matrix multiplication using a highly-optimized backend (torch.matmul / cuBLAS or Triton’s matmul). After obtaining the [N, C_out, H_out, W_out] result, launch one lightweight fused kernel that reduces over the C_out dimension to compute the min and then applies tanh twice in-place on the reduced tensor. This preserves the fused post-processing while delegating the heavy convolution to an optimal GEMM algorithm.
+
+**Expected Speedup**: 20-40x vs the current Triton kernel (and at least on-par with, potentially modestly faster than, the PyTorch baseline).
+
+---
+
+# Current Kernel (needs optimization)
+
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def conv_min_tanh2_kernel(
+    x_ptr, w_ptr, b_ptr, out_ptr,
+    N, C_in, H, W,
+    C_out, K_H, K_W,
+    H_out, W_out,
+    stride_x_n, stride_x_c, stride_x_h, stride_x_w,
+    stride_w_cout, stride_w_cin, stride_w_kh, stride_w_kw,
+    stride_out_n, stride_out_c, stride_out_h, stride_out_w,
+    BLOCK_OC: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    P = N * H_out * W_out
+
+    # Mask for valid output pixels (some pids may be out-of-range)
+    mask_valid = pid < P
+
+    # Map linear index -> (n, h_out, w_out)
+    hw_size = H_out * W_out
+    n = pid // hw_size
+    rem = pid % hw_size
+    h_out_idx = rem // W_out
+    w_out_idx = rem % W_out
+
+    # Precompute total K = C_in * K_H * K_W
+    KH_KW = K_H * K_W
+    K_total = C_in * KH_KW
+
+    # Initialize running minimum over output channels for this pixel
+    min_val = tl.zeros((), dtype=tl.float32) + 1e30
+
+    oc_start = 0
+    while oc_start < C_out:
+        oc_offsets = oc_start + tl.arange(0, BLOCK_OC)
+        mask_oc = oc_offsets < C_out
+
+        # Accumulator for this OC block (float32 for precision)
+        acc = tl.zeros((BLOCK_OC,), dtype=tl.float32)
+
+        k_start = 0
+        while k_start < K_total:
+            k_offsets = k_start + tl.arange(0, BLOCK_K)
+            mask_k = k_offsets < K_total
+
+            # Map K index -> (c_in, kh, kw)
+            cin = k_offsets // KH_KW
+            khkw = k_offsets % KH_KW
+            kh = khkw // K_W
+            kw = khkw % K_W
+
+            # Load weights: shape [BLOCK_OC, BLOCK_K]
+            w_ptrs = (
+                w_ptr
+                + oc_offsets[:, None] * stride_w_cout
+                + cin[None, :] * stride_w_cin
+                + kh[None, :] * stride_w_kh
+                + kw[None, :] * stride_w_kw
+            )
+            w = tl.load(
+                w_ptrs,
+                mask=mask_oc[:, None] & mask_k[None, :],
+                other=0.0,
+            )
+
+            # Load input patch for this output pixel: shape [BLOCK_K]
+            x_ptrs = (
+                x_ptr
+                + n * stride_x_n
+                + cin * stride_x_c
+                + (h_out_idx + kh) * stride_x_h
+                + (w_out_idx + kw) * stride_x_w
+            )
+            x_vals = tl.load(
+                x_ptrs,
+                mask=mask_valid & mask_k,
+                other=0.0,
+            )
+
+            # FMA over K dimension using dot:
+            # w: [BLOCK_OC, BLOCK_K], x_vals[:, None]: [BLOCK_K, 1] -> prod: [BLOCK_OC, 1]
+            prod = tl.dot(w, x_vals[:, None], allow_tf32=True)
+            acc += tl.reshape(prod, (BLOCK_OC,))
+
+            k_start += BLOCK_K
+
+        # Add bias for this OC block
+        b_ptrs = b_ptr + oc_offsets
+        b_vals = tl.load(b_ptrs, mask=mask_oc, other=0.0)
+        acc += b_vals
+
+        # Compute block-wise minimum over valid OC entries
+        inf_like = 1e30
+        acc_masked = tl.where(mask_oc, acc, inf_like)
+        block_min = -tl.max(-acc_masked, axis=0)
+
+        # Update running minimum
+        min_val = tl.minimum(min_val, block_min)
+
+        oc_start += BLOCK_OC
+
+    # Apply tanh twice: tanh(x) = (exp(2x) - 1) / (exp(2x) + 1)
+    x1 = min_val
+    e2x1 = tl.exp(2.0 * x1)
+    tanh1 = (e2x1 - 1.0) / (e2x1 + 1.0)
+
+    e2x2 = tl.exp(2.0 * tanh1)
+    tanh2 = (e2x2 - 1.0) / (e2x2 + 1.0)
+
+    # Store result to output: shape (N, 1, H_out, W_out)
+    out_offset = (
+        n * stride_out_n
+        + 0 * stride_out_c
+        + h_out_idx * stride_out_h
+        + w_out_idx * stride_out_w
+    )
+    tl.store(out_ptr + out_offset, tanh2, mask=mask_valid)
+
+
+def conv_min_tanh2(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    Fused:
+      y = conv2d(x, weight, bias, stride=1, padding=0)
+      y = torch.min(y, dim=1, keepdim=True)[0]
+      y = torch.tanh(y)
+      y = torch.tanh(y)
+    Assumes NCHW layout, stride=1, padding=0, dilation=1.
+    """
+    assert x.dim() == 4, "Input must be NCHW"
+    N, C_in, H, W = x.shape
+    C_out, C_in_w, K_H, K_W = weight.shape
+    assert C_in == C_in_w, "Input channels must match weight"
+
+    # Compute output spatial size for stride=1, padding=0
+    H_out = H - K_H + 1
+    W_out = W - K_W + 1
+    assert H_out > 0 and W_out > 0, "Invalid kernel size for given input"
+
+    # Ensure contiguous and on same device
+    x_ = x.contiguous()
+    w_ = weight.contiguous()
+    b_ = bias.contiguous()
+
+    # Allocate output: N x 1 x H_out x W_out
+    out = torch.empty((N, 1, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    # Strides
+    stride_x_n, stride_x_c, stride_x_h, stride_x_w = x_.stride()
+    stride_w_cout, stride_w_cin, stride_w_kh, stride_w_kw = w_.stride()
+    stride_out_n, stride_out_c, stride_out_h, stride_out_w = out.stride()
+
+    P = N * H_out * W_out
+
+    def grid(meta):
+        # One program instance per output pixel
+        return (max(1, P),)
+
+    conv_min_tanh2_kernel[grid](
+        x_, w_, b_, out,
+        N, C_in, H, W,
+        C_out, K_H, K_W,
+        H_out, W_out,
+        stride_x_n, stride_x_c, stride_x_h, stride_x_w,
+        stride_w_cout, stride_w_cin, stride_w_kh, stride_w_kw,
+        stride_out_n, stride_out_c, stride_out_h, stride_out_w,
+        BLOCK_OC=64,
+        BLOCK_K=32,
+    )
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-accelerated version of:
+        x = conv2d(x)
+        x = torch.min(x, dim=1, keepdim=True)[0]
+        x = torch.tanh(x)
+        x = torch.tanh(x)
+    """
+    def __init__(self, in_channels, out_channels, kernel_size):
+        super(ModelNew, self).__init__()
+        # Keep the same structure/state_dict layout as the original model
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+
+    def forward(self, x):
+        return conv_min_tanh2(x, self.conv.weight, self.conv.bias)
+```
+
+---
+
+# Your Task
+
+Implement the optimization strategy above. Focus on the specific bottleneck identified.
+
+## Key Requirements
+
+1. **Preserve correctness**: Maintain the same input/output behavior
+2. **Apply the optimization**: Follow the implementation plan exactly
+3. **Use valid Triton syntax**:
+   - Every kernel MUST have `@triton.jit` decorator
+   - Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+   - BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+   - No `continue`, `break`, `return` inside kernels (use masking)
+   - Prefer `tl.dot(a, b, allow_tf32=True)` for matmul operations
+
+4. **CRITICAL for RNN/GRU/LSTM Persistent Kernels**:
+   - Time loop MUST be inside @triton.jit kernel, NOT in Python forward()
+   - **HYBRID computation strategy** (CRITICAL for performance):
+     * Precompute input-side gates OUTSIDE kernel: `gates_x = (T*B, In) @ W_ih` (ONE large GEMM)
+     * INSIDE kernel: only recurrent-side: `for t: gates_h = h @ W_hh` (T small GEMMs)
+   - CORRECT (FAST - use this):
+     ```python
+     # Python forward():
+     gates_x_all = x.reshape(T*B, In) @ W_ih + b_ih  # ONE large GEMM
+     gates_x_all = gates_x_all.view(T, B, 3*H)
+     gru_persistent_kernel[grid](gates_x_all, h0, W_hh, ...)  # Launch ONCE
+
+     @triton.jit
+     def gru_persistent_kernel(gates_x_ptr, h_ptr, W_hh_ptr, ...):
+         for t in range(T):  # Inside kernel
+             gates_x_t = tl.load(gates_x_ptr + t*...)  # Precomputed
+             gates_h = h @ W_hh  # Only recurrent GEMM
+             h = (1-z)*n + z*h   # Fuse and update
+     ```
+
+5. **Output format**:
+   - Imports: `import torch, torch.nn as nn, triton, triton.language as tl`
+   - `@triton.jit` kernel(s)
+   - Wrapper function(s)
+   - `class ModelNew(nn.Module)` — REQUIRED
+   - NO testing code, NO `if __name__ == "__main__"`
+
+---
+
+Generate the optimized kernel now. Output ONLY the complete Python code.

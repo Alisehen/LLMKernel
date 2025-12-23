@@ -1,0 +1,254 @@
+You are a GPU kernel optimization architect. Analyze the kernel and identify **ONE high-level algorithmic optimization**.
+
+# PyTorch Reference
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model implementing the pattern "Gemm_Sigmoid_Scaling_ResidualAdd".
+    """
+    def __init__(self, input_size, hidden_size, scaling_factor):
+        super(Model, self).__init__()
+        self.gemm = nn.Linear(input_size, hidden_size)
+        self.scaling_factor = scaling_factor
+
+    def forward(self, x):
+        """
+        Forward pass of the model.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, input_size).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, hidden_size).
+        """
+        x = self.gemm(x)
+        original_x = x
+        x = torch.sigmoid(x)
+        x = x * self.scaling_factor
+        x = x + original_x
+        return x
+
+batch_size = 1024
+input_size = 8192
+hidden_size = 8192
+scaling_factor = 2.0
+
+def get_inputs():
+    return [torch.rand(batch_size, input_size)]
+
+def get_init_inputs():
+    return [input_size, hidden_size, scaling_factor]
+```
+
+# Current Triton Kernel
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def fused_gemm_sigmoid_scale_residual_kernel(
+    a_ptr, b_ptr, bias_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    scaling_factor,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    # Program IDs for 2D tiling over M and N
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    # Offsets for the current block
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Pointer arithmetic for A (M x K) and B (K x N) with generic strides
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    # Accumulator in FP32 for better precision
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Loop over K dimension
+    for k in range(0, K, BLOCK_K):
+        k_remaining = K - k
+        k_mask = offs_k < k_remaining
+
+        a = tl.load(
+            a_ptrs,
+            mask=(offs_m[:, None] < M) & k_mask[None, :],
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptrs,
+            mask=k_mask[:, None] & (offs_n[None, :] < N),
+            other=0.0,
+        )
+        acc += tl.dot(a, b, allow_tf32=True)
+
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Add bias (broadcast over rows)
+    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc = acc + bias[None, :]
+
+    # Fused: y = z + scaling_factor * sigmoid(z)
+    # sigmoid(z) = 1 / (1 + exp(-z))
+    neg_acc = -acc
+    sig = 1.0 / (1.0 + tl.exp(neg_acc))
+    acc = acc + scaling_factor * sig
+
+    # Store result
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    tl.store(
+        c_ptrs,
+        acc,
+        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+    )
+
+
+def fused_gemm_sigmoid_scale_residual(x, weight, bias, scaling_factor: float):
+    """
+    x:       (M, K)
+    weight:  (N, K) or (N, K) logically (PyTorch Linear: (N, K) == (out_features, in_features))
+    bias:    (N,)
+    returns: (M, N) with y = Wx^T + b + s * sigmoid(Wx^T + b)
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+    M, K = x.shape
+    N = weight.shape[0]
+    assert weight.shape[1] == K, "weight shape must be (N, K)"
+
+    # Output tensor
+    c = torch.empty((M, N), device=x.device, dtype=x.dtype)
+
+    # Strides (row-major expected for typical PyTorch tensors)
+    stride_am, stride_ak = x.stride()
+    # Treat weight as B with logical shape (K, N), using strides accordingly
+    # B[k, n] = weight[n, k]
+    stride_bn, stride_bk = weight.stride()  # (stride_n, stride_k)
+    # For B(k, n): stride over k is weight.stride(1), over n is weight.stride(0)
+    stride_bk, stride_bn = stride_bk, stride_bn
+    stride_cm, stride_cn = c.stride()
+
+    # Grid: 2D over M and N
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta["BLOCK_M"]),
+            triton.cdiv(N, meta["BLOCK_N"]),
+        )
+
+    fused_gemm_sigmoid_scale_residual_kernel[grid](
+        x, weight, bias, c,
+        M, N, K,
+        stride_am, stride_ak,
+        stride_bk, stride_bn,
+        stride_cm, stride_cn,
+        float(scaling_factor),
+        BLOCK_M=128,
+        BLOCK_N=128,
+        BLOCK_K=32,
+        num_warps=8,
+        num_stages=3,
+    )
+    return c
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized version of:
+    x = Linear(x)
+    original_x = x
+    x = sigmoid(x)
+    x = scaling_factor * x
+    x = x + original_x
+    """
+
+    def __init__(self, input_size, hidden_size, scaling_factor):
+        super(ModelNew, self).__init__()
+        # Match nn.Linear(input_size, hidden_size)
+        self.weight = nn.Parameter(torch.randn(hidden_size, input_size))
+        self.bias = nn.Parameter(torch.randn(hidden_size))
+        self.scaling_factor = float(scaling_factor)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (batch_size, input_size)
+        return fused_gemm_sigmoid_scale_residual(
+            x, self.weight, self.bias, self.scaling_factor
+        )
+```
+
+# Performance
+- **PyTorch baseline**: 3.19 ms
+- **Current Triton**: 1.92 ms
+- **Current speedup**: 1.66x (+39.7% vs baseline)
+
+
+---
+
+## Analysis Steps
+
+1. **Code Analysis**: Count kernels, identify operations, check for inefficiencies
+2. **Performance Diagnosis**: Use metrics/latency to identify bottleneck type
+3. **Root Cause**: Combine code + performance to find the core issue
+
+## Optimization Categories (pick ONE if worth optimizing):
+
+### 1. Operator Fusion
+Fuse consecutive ops into fewer kernels to reduce memory traffic and launch overhead.
+
+### 2. Algorithm Replacement
+Replace naive algorithm with optimized variant.
+- For Attention: Flash Attention, online softmax
+- For Convolution: Winograd, im2col
+- **For RNN/GRU/LSTM**: Persistent kernel with HYBRID computation
+  - **CRITICAL**: Use hybrid approach for best performance:
+    * Precompute input-side gates ONCE (outside kernel): `gates_x = (T*B, In) @ W_ih`
+    * Persistent kernel (inside): only recurrent-side: `for t: gates_h = h @ W_hh`
+  - Time loop `for t in range(T)` must be inside kernel, NOT in Python
+  - Launch kernel once per layer, not once per timestep
+  - Expected speedup: 10-100x (vs per-timestep launches)
+
+### 3. Kernel Launch Reduction
+Combine multiple small kernels to reduce overhead.
+- **For RNN/GRU/LSTM**: See "Algorithm Replacement" above for persistent kernel approach
+
+### 4. Memory Layout Optimization
+Use in-place operations, buffer reuse, or better layouts.
+
+## Should We Optimize?
+
+Before proposing optimization, determine if it's worthwhile:
+- **Not worth optimizing** if:
+  - Code is already near-optimal (expected speedup < 10%)
+  - Bottleneck cannot be addressed (hardware limited, already optimal algorithm)
+  - Optimization would add significant complexity with minimal gain
+
+- **Worth optimizing** if:
+  - Clear algorithmic inefficiency exists (multiple kernels, suboptimal algorithm)
+  - Expected speedup >= 20%
+  - Concrete optimization path available
+
+## Output (JSON)
+
+```json
+{
+  "worth_optimizing": "yes/no",
+  "reason": "<Why worth or not worth optimizing, 1 sentence>",
+  "bottleneck": "<Root cause in 1-2 sentences, empty if not worth optimizing>",
+  "optimisation method": "<Specific optimization in 1-2 sentences, empty if not worth optimizing>",
+  "modification plan": "<Implementation steps in 2-3 sentences, empty if not worth optimizing>",
+  "expected_speedup": "<e.g., '30-40%', empty if not worth optimizing>"
+}
+```
+
+Return JSON only.

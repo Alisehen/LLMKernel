@@ -1,5 +1,0 @@
-{
-  "critical_issue": "The GEMM kernel uses tl.dot(..., allow_tf32=True), performing TensorFloat-32 matmul instead of full FP32, unlike the PyTorch reference.",
-  "why_it_matters": "TF32’s reduced mantissa causes large accumulation errors for long K=8192 dot-products, so post-activation and GroupNorm outputs deviate beyond the strict atol/rtol thresholds.",
-  "minimal_fix_hint": "Disable TF32 in the Triton matmul: call tl.dot without allow_tf32=True (or explicitly set allow_tf32=False) to match PyTorch’s float32 reference behavior."
-}

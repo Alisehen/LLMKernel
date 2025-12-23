@@ -1,0 +1,117 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_N": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_N": 256}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_N": 256}, num_warps=8, num_stages=2),
+    ],
+    key=["N"],
+)
+@triton.jit
+def swish_scale_bias_kernel_2d(
+    y_ptr,    # [M, N], row-major
+    bias_ptr, # [N]
+    M,        # rows
+    N,        # cols
+    scale,    # scalar float32
+    BLOCK_N: tl.constexpr,
+):
+    """
+    2D-tiled epilogue:
+        y[m, n] = (y[m, n] + bias[n]) * sigmoid(y[m, n] + bias[n]) * scale
+    """
+    pid_m = tl.program_id(0)  # row id
+    pid_n = tl.program_id(1)  # column block id
+
+    # Column indices this program handles
+    cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    col_mask = cols < N
+
+    # Base pointers for this row
+    row_offset = pid_m * N
+    y_ptrs = y_ptr + row_offset + cols
+    b_ptrs = bias_ptr + cols
+
+    # Load y and bias (coalesced)
+    y = tl.load(y_ptrs, mask=col_mask, other=0.0)
+    b = tl.load(b_ptrs, mask=col_mask, other=0.0)
+
+    # x = y + bias  (reuse y variable to keep register pressure low)
+    x = y + b
+
+    # Swish: x * sigmoid(x) with manual sigmoid implementation
+    # sigmoid(x) = 1 / (1 + exp(-x))
+    neg_x = -x
+    exp_neg_x = tl.exp(neg_x)
+    sig = 1.0 / (1.0 + exp_neg_x)
+
+    out = x * sig * scale
+
+    tl.store(y_ptrs, out, mask=col_mask)
+
+
+def linear_swish_scale(x: torch.Tensor,
+                       weight: torch.Tensor,
+                       bias: torch.Tensor,
+                       scale: float) -> torch.Tensor:
+    """
+    x:      [M, K]
+    weight: [N, K]  (nn.Linear.weight, out_features x in_features)
+    bias:   [N]
+    scale:  scalar float
+
+    Returns:
+        y: [M, N] = (x @ weight.T + bias) * sigmoid(x @ weight.T + bias) * scale
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda, "All tensors must be on CUDA"
+
+    # GEMM via cuBLAS / PyTorch
+    y = torch.matmul(x, weight.t())
+    y = y.contiguous()
+
+    M, N = y.shape
+
+    # 2D grid: one dimension over rows, one over column tiles
+    # BLOCK_N is a placeholder; autotune will select the best configuration.
+    BLOCK_N = 256
+    grid = (M, triton.cdiv(N, BLOCK_N))
+
+    swish_scale_bias_kernel_2d[grid](
+        y,
+        bias,
+        M,
+        N,
+        float(scale),
+        BLOCK_N=BLOCK_N,
+    )
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model with fused epilogue:
+
+    forward(x):
+        y = x @ W^T + b
+        y = y * sigmoid(y)    # Swish
+        y = y * scaling_factor
+
+    Bias + Swish + scale are fused into a single Triton kernel.
+    """
+    def __init__(self, in_features, out_features, scaling_factor):
+        super(ModelNew, self).__init__()
+        self.linear = nn.Linear(in_features, out_features)
+        self.scaling_factor = float(scaling_factor)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return linear_swish_scale(
+            x,
+            self.linear.weight,
+            self.linear.bias,
+            self.scaling_factor,
+        )

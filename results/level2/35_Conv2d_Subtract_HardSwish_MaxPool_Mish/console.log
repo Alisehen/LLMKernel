@@ -1,0 +1,183 @@
+[Seed] Generating seed kernel...
+[Seed 1/2] Generating...
+[92mFinish reason: stop[0m
+Usage: In=2197, Out=9870, Total=12067
+[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 536, in compare_and_bench
+    test_model = ModelNew(*init_args, **init_kwargs)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251223_081422_35_Conv2d_Subtract_HardSwish_MaxPool_Mish_openai_deepseek/35_Conv2d_Subtract_HardSwish_MaxPool_Mish/code/kernel_20251223_081544.py", line 241, in __init__
+    nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+                                            ^^^^
+NameError: name 'math' is not defined
+
+[seed_0] failed. See metrics.message for details.
+[seed_0] metrics saved to: /home/hyc/LLMKernel/run/20251223_081422_35_Conv2d_Subtract_HardSwish_MaxPool_Mish_openai_deepseek/35_Conv2d_Subtract_HardSwish_MaxPool_Mish/evaluation/eval_0000.json
+[Seed 1] Failed, attempting repair...
+[92mFinish reason: stop[0m
+Usage: In=2878, Out=4562, Total=7440
+[seed_0_repair_1] score=0.2558 (baseline=15.8244ms)
+[seed_0_repair_1] metrics saved to: /home/hyc/LLMKernel/run/20251223_081422_35_Conv2d_Subtract_HardSwish_MaxPool_Mish_openai_deepseek/35_Conv2d_Subtract_HardSwish_MaxPool_Mish/evaluation/eval_0001.json
+[Seed 1 Repair] Score: 0.2558 ✓
+[Seed 1] Final score: 0.2558 ✓
+[Seed 2/2] Generating...
+[92mFinish reason: stop[0m
+Usage: In=2197, Out=9068, Total=11265
+[seed_1] score=0.2806 (baseline=15.8988ms)
+[seed_1] metrics saved to: /home/hyc/LLMKernel/run/20251223_081422_35_Conv2d_Subtract_HardSwish_MaxPool_Mish_openai_deepseek/35_Conv2d_Subtract_HardSwish_MaxPool_Mish/evaluation/eval_0002.json
+[Seed 2] Final score: 0.2806 ✓
+
+================================================================================
+[Hybrid Strategy] Analyzing all seeds for algorithmic optimization...
+[Hybrid Strategy] - 2 seed(s) with score < 1.0 (rescue)
+================================================================================
+
+[Hybrid] Seed 1: score=0.2558 < 1.0
+[Hybrid] Attempting algorithm analysis rescue...
+[ncu] Using GPU device 6 (CUDA_VISIBLE_DEVICES=6)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_903203.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_903203.py /home/hyc/LLMKernel/KernelBench/level2/35_Conv2d_Subtract_HardSwish_MaxPool_Mish.py /home/hyc/LLMKernel/test_kernel_analysis_seed0.py --repeat 1
+[ncu stderr]: Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/bench_ref_inputs_903203.py", line 81, in <module>
+    main()
+  File "/home/hyc/LLMKernel/bench_ref_inputs_903203.py", line 54, in main
+    test_mod = load_module(args.candidate, "test_module")
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/bench_ref_inputs_903203.py", line 21, in load_module
+    spec.loader.exec_module(module)
+  File "<frozen importlib._bootstrap_external>", line 936, in exec_mo
+[93mWarning: NCU profiling failed: NCU CSV file is empty (benchmark script likely failed): /home/hyc/LLMKernel/ncu_temp_903203.csv[0m
+[Hybrid] Requesting LLM analysis for seed 1...
+[92mFinish reason: stop[0m
+Usage: In=3301, Out=897, Total=4198
+[Hybrid] Worth optimizing: yes
+[Hybrid] Reason: The convolution kernel is implemented as a naive direct loop over channels and kernel elements with no reduction blocking or reuse, which severely underutilizes the GPU compared to GEMM-style implementations.
+[Hybrid] Analysis complete for seed 1, generating optimized kernel...
+[Hybrid] Bottleneck: Each program instance iterates over C_in * K_H * K_W, repeatedly loading scalar ...
+[Hybrid] Optimization: Replace the current direct convolution loop with a GEMM-style implicit-im2col co...
+[Hybrid] Expected speedup: 3-6x vs the current Triton kernel (bringing it close to or faster than the PyTorch baseline, i.e., ~70-85% reduction in current Triton conv latency).
+[92mFinish reason: stop[0m
+Usage: In=3756, Out=7606, Total=11362
+[algorithm_optimized_seed0] score=2.0681 (baseline=15.8988ms)
+[algorithm_optimized_seed0] metrics saved to: /home/hyc/LLMKernel/run/20251223_081422_35_Conv2d_Subtract_HardSwish_MaxPool_Mish_openai_deepseek/35_Conv2d_Subtract_HardSwish_MaxPool_Mish/evaluation/eval_0003.json
+[Hybrid] ✓ Rescue successful: 0.2558 → 2.0681
+
+[Hybrid] Seed 2: score=0.2806 < 1.0
+[Hybrid] Attempting algorithm analysis rescue...
+[ncu] Using GPU device 6 (CUDA_VISIBLE_DEVICES=6)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_903203.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_903203.py /home/hyc/LLMKernel/KernelBench/level2/35_Conv2d_Subtract_HardSwish_MaxPool_Mish.py /home/hyc/LLMKernel/test_kernel_analysis_seed1.py --repeat 1
+[ncu stderr]: Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/bench_ref_inputs_903203.py", line 81, in <module>
+    main()
+  File "/home/hyc/LLMKernel/bench_ref_inputs_903203.py", line 54, in main
+    test_mod = load_module(args.candidate, "test_module")
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/bench_ref_inputs_903203.py", line 21, in load_module
+    spec.loader.exec_module(module)
+  File "<frozen importlib._bootstrap_external>", line 936, in exec_mo
+[93mWarning: NCU profiling failed: NCU CSV file is empty (benchmark script likely failed): /home/hyc/LLMKernel/ncu_temp_903203.csv[0m
+[Hybrid] Requesting LLM analysis for seed 2...
+[92mFinish reason: stop[0m
+Usage: In=3394, Out=1428, Total=4822
+[Hybrid] Worth optimizing: yes
+[Hybrid] Reason: The custom Triton convolution is a naive triple-loop implementation that is far slower than cuDNN, so replacing its algorithm can yield large gains.
+[Hybrid] Analysis complete for seed 2, generating optimized kernel...
+[Hybrid] Bottleneck: The conv2d_sub_hswish_kernel computes convolution via scalar loops over C_in, KH...
+[Hybrid] Optimization: Replace the naive direct convolution loops with a GEMM-style (matrix-multiplicat...
+[Hybrid] Expected speedup: 3-5x vs the current Triton implementation (bringing it to at least parity or better than the PyTorch baseline)
+[92mFinish reason: stop[0m
+Usage: In=3828, Out=5395, Total=9223
+[algorithm_optimized_seed1] score=0.8568 (baseline=15.8988ms)
+[algorithm_optimized_seed1] metrics saved to: /home/hyc/LLMKernel/run/20251223_081422_35_Conv2d_Subtract_HardSwish_MaxPool_Mish_openai_deepseek/35_Conv2d_Subtract_HardSwish_MaxPool_Mish/evaluation/eval_0004.json
+[Hybrid] ✓ Rescue successful: 0.2806 → 0.8568
+
+================================================================================
+[Hybrid] Candidate Selection
+================================================================================
+[Hybrid] Total candidates: 4
+  [1] seed 1: 0.2558
+  [2] seed 2: 0.2806
+  [3] algo-optimized (from seed 1): 2.0681
+  [4] algo-optimized (from seed 2): 0.8568
+
+[Hybrid] ★ Selected best candidate: score=2.0681
+
+[Optimization] Starting 3-stage optimization...
+
+================================================================================
+[Stage 1/3] grid_and_parallel
+Description: Optimize grid layout and parallel work distribution across SMs.
+Current candidates: 1, best score: 2.0681
+================================================================================
+[Stage 1] Profiling best candidate...
+[ncu] Using GPU device 6 (CUDA_VISIBLE_DEVICES=6)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_903203.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_903203.py /home/hyc/LLMKernel/KernelBench/level2/35_Conv2d_Subtract_HardSwish_MaxPool_Mish.py /home/hyc/LLMKernel/test_kernel_analysis_seed1.py --repeat 1
+[ncu stderr]: Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/bench_ref_inputs_903203.py", line 81, in <module>
+    main()
+  File "/home/hyc/LLMKernel/bench_ref_inputs_903203.py", line 54, in main
+    test_mod = load_module(args.candidate, "test_module")
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/bench_ref_inputs_903203.py", line 21, in load_module
+    spec.loader.exec_module(module)
+  File "<frozen importlib._bootstrap_external>", line 936, in exec_mo
+[93mWarning: NCU profiling failed: NCU CSV file is empty (benchmark script likely failed): /home/hyc/LLMKernel/ncu_temp_903203.csv[0m
+[Stage 1] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=3560, Out=7497, Total=11057
+[stage1_grid_and_parallel] score=2.1327 (baseline=15.8988ms)
+[stage1_grid_and_parallel] metrics saved to: /home/hyc/LLMKernel/run/20251223_081422_35_Conv2d_Subtract_HardSwish_MaxPool_Mish_openai_deepseek/35_Conv2d_Subtract_HardSwish_MaxPool_Mish/evaluation/eval_0005.json
+  Optimized kernel score: 2.1327 ✓
+[Stage 1] ★ New best score: 2.1327
+
+================================================================================
+[Stage 2/3] block_tiling
+Description: Tune BLOCK_M/N/K sizes for optimal register/memory balance.
+Current candidates: 1, best score: 2.1327
+================================================================================
+[Stage 2] Profiling best candidate...
+[ncu] Using GPU device 6 (CUDA_VISIBLE_DEVICES=6)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_903203.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_903203.py /home/hyc/LLMKernel/KernelBench/level2/35_Conv2d_Subtract_HardSwish_MaxPool_Mish.py /home/hyc/LLMKernel/test_kernel_analysis_seed1.py --repeat 1
+[ncu stderr]: Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/bench_ref_inputs_903203.py", line 81, in <module>
+    main()
+  File "/home/hyc/LLMKernel/bench_ref_inputs_903203.py", line 54, in main
+    test_mod = load_module(args.candidate, "test_module")
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/bench_ref_inputs_903203.py", line 21, in load_module
+    spec.loader.exec_module(module)
+  File "<frozen importlib._bootstrap_external>", line 936, in exec_mo
+[93mWarning: NCU profiling failed: NCU CSV file is empty (benchmark script likely failed): /home/hyc/LLMKernel/ncu_temp_903203.csv[0m
+[Stage 2] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=4211, Out=6790, Total=11001
+[stage2_block_tiling] score=2.1239 (baseline=15.8988ms)
+[stage2_block_tiling] metrics saved to: /home/hyc/LLMKernel/run/20251223_081422_35_Conv2d_Subtract_HardSwish_MaxPool_Mish_openai_deepseek/35_Conv2d_Subtract_HardSwish_MaxPool_Mish/evaluation/eval_0006.json
+  Optimized kernel score: 2.1239 ✓
+[Stage 2] Current: 2.1239 (global best: 2.1327)
+
+================================================================================
+[Stage 3/3] memory_and_tuning
+Description: Optimize memory access patterns and fine-tune num_stages/num_warps.
+Current candidates: 1, best score: 2.1327
+================================================================================
+[Stage 3] Profiling best candidate...
+[ncu] Using GPU device 6 (CUDA_VISIBLE_DEVICES=6)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_903203.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_903203.py /home/hyc/LLMKernel/KernelBench/level2/35_Conv2d_Subtract_HardSwish_MaxPool_Mish.py /home/hyc/LLMKernel/test_kernel_analysis_seed1.py --repeat 1
+[ncu stderr]: Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/bench_ref_inputs_903203.py", line 81, in <module>
+    main()
+  File "/home/hyc/LLMKernel/bench_ref_inputs_903203.py", line 54, in main
+    test_mod = load_module(args.candidate, "test_module")
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/bench_ref_inputs_903203.py", line 21, in load_module
+    spec.loader.exec_module(module)
+  File "<frozen importlib._bootstrap_external>", line 936, in exec_mo
+[93mWarning: NCU profiling failed: NCU CSV file is empty (benchmark script likely failed): /home/hyc/LLMKernel/ncu_temp_903203.csv[0m
+[Stage 3] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=4297, Out=8024, Total=12321
+[stage3_memory_and_tuning] score=2.0731 (baseline=15.8988ms)
+[stage3_memory_and_tuning] metrics saved to: /home/hyc/LLMKernel/run/20251223_081422_35_Conv2d_Subtract_HardSwish_MaxPool_Mish_openai_deepseek/35_Conv2d_Subtract_HardSwish_MaxPool_Mish/evaluation/eval_0007.json
+  Optimized kernel score: 2.0731 ✓
+[Stage 3] Current: 2.0731 (global best: 2.1327)
+[35_Conv2d_Subtract_HardSwish_MaxPool_Mish.py] Figure saved to: /home/hyc/LLMKernel/run/20251223_081422_35_Conv2d_Subtract_HardSwish_MaxPool_Mish_openai_deepseek/35_Conv2d_Subtract_HardSwish_MaxPool_Mish/figures/35_Conv2d_Subtract_HardSwish_MaxPool_Mish_score.png

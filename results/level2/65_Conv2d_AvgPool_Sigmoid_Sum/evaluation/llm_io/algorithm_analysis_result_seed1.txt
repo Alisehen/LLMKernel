@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The pipeline writes a huge conv2d output tensor to global memory only to immediately re-read it for pooling, sigmoid, and summation, even though the final result per sample is just a scalar.",
+  "bottleneck": "The dominant cost is unnecessary global memory traffic for the intermediate conv output: conv2d_triton produces an (N, C_out, H', W') tensor that avgpool_sigmoid_sum_triton fully reads again, making the workload memory-bound relative to the tiny final output.",
+  "optimisation method": "Fuse conv2d with avg pooling, sigmoid, and sum into a single Triton kernel that accumulates directly into per-sample scalars, never materializing the full conv output tensor in global memory.",
+  "modification plan": "Refactor the conv2d_nchw_kernel so that instead of writing y[n, oc, oh, ow] to memory, it immediately feeds those values into an in-kernel pooling+sigmoid+reduction path: (1) iterate over conv output positions grouped by pooling windows (given pool_kernel_size=stride, windows are non-overlapping), (2) for each window accumulate the convolution results for its constituent (oh, ow) positions, compute the average and apply sigmoid, and (3) sum these sigmoid values across channels and spatial positions into a per-batch scalar accumulator; at the end of the kernel, store only one scalar per batch element.",
+  "expected_speedup": "20-30%"
+}

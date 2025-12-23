@@ -1,0 +1,347 @@
+You are a GPU kernel optimization architect. Analyze the kernel and identify **ONE high-level algorithmic optimization**.
+
+# PyTorch Reference
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs a matrix multiplication, scales the result, adds a residual connection, clamps the output,
+    applies LogSumExp, and finally applies the Mish activation function.
+    """
+    def __init__(self, input_size, hidden_size, scale_factor, clamp_min, clamp_max):
+        super(Model, self).__init__()
+        self.matmul = nn.Linear(input_size, hidden_size)
+        self.scale_factor = scale_factor
+        self.clamp_min = clamp_min
+        self.clamp_max = clamp_max
+
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor of shape (batch_size, input_size).
+
+        Returns:
+            Output tensor of shape (batch_size, hidden_size).
+        """
+        x = self.matmul(x)
+        x = x * self.scale_factor
+        x = x + x
+        x = torch.clamp(x, self.clamp_min, self.clamp_max)
+        x = torch.logsumexp(x, dim=1, keepdim=True)
+        x = x * torch.nn.functional.mish(x)  # Mish activation
+        return x
+
+batch_size = 1024
+input_size = 8192
+hidden_size = 8192
+scale_factor = 2.0
+clamp_min = -10.0
+clamp_max = 10.0
+
+def get_inputs():
+    return [torch.rand(batch_size, input_size)]
+
+def get_init_inputs():
+    return [input_size, hidden_size, scale_factor, clamp_min, clamp_max]
+```
+
+# Current Triton Kernel
+```python
+import torch, torch.nn as nn, triton, triton.language as tl
+
+
+@triton.jit
+def linear_scale_clamp_kernel(
+    a_ptr, b_ptr, bias_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    scale, clamp_min, clamp_max,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """
+    Fused kernel:
+      C = clamp( (A @ B) + bias, clamp_min, clamp_max ) * scale
+
+    A: [M, K]
+    B: [K, N]  (weight^T, i.e., transposed weight)
+    bias: [N]
+    C: [M, N]
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Pointers for A and B tiles
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # K-loop
+    for k in range(0, K, BLOCK_K):
+        a = tl.load(
+            a_ptrs,
+            mask=(offs_m[:, None] < M) & (offs_k[None, :] < K - k),
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptrs,
+            mask=(offs_k[:, None] < K - k) & (offs_n[None, :] < N),
+            other=0.0,
+        )
+        acc += tl.dot(a, b, allow_tf32=True)
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Add bias
+    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc += bias[None, :]
+
+    # Scale (includes the residual x + x fused as factor 2*scale_factor)
+    acc = acc * scale
+
+    # Clamp
+    acc = tl.maximum(acc, clamp_min)
+    acc = tl.minimum(acc, clamp_max)
+
+    # Store
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    mask_store = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, acc, mask=mask_store)
+
+
+@triton.jit
+def logsumexp_mish_kernel(
+    x_ptr, out_ptr,
+    M, N,
+    stride_xm, stride_xn,
+    stride_outm, stride_outn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    """
+    For each row i:
+      y_i = logsumexp(x_i, dim=1)  (scalar)
+      out_i = y_i * mish(y_i)
+
+    mish(z) = z * tanh(softplus(z))
+    softplus(z) = log(1 + exp(z))
+    tanh(u) = (exp(2u) - 1) / (exp(2u) + 1)
+    """
+    pid_m = tl.program_id(0)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offs_m < M
+
+    # Initialize running max and sum for logsumexp
+    neg_large = -1.0e30
+    row_max = tl.full((BLOCK_M,), neg_large, dtype=tl.float32)
+    row_sum = tl.zeros((BLOCK_M,), dtype=tl.float32)
+
+    for n_start in range(0, N, BLOCK_N):
+        offs_n = n_start + tl.arange(0, BLOCK_N)
+        mask_n = offs_n < N
+
+        x_ptrs = x_ptr + offs_m[:, None] * stride_xm + offs_n[None, :] * stride_xn
+        x = tl.load(
+            x_ptrs,
+            mask=mask_m[:, None] & mask_n[None, :],
+            other=neg_large,
+        )
+
+        # Current tile max per row
+        tile_max = tl.max(x, axis=1)
+        new_max = tl.maximum(row_max, tile_max)
+
+        # Sum of exp(x - new_max) over this tile
+        x_shifted = x - new_max[:, None]
+        exp_x = tl.exp(x_shifted)
+        tile_sum = tl.sum(exp_x, axis=1)
+
+        # Update running sum with scaling to keep stability
+        scale_old = tl.exp(row_max - new_max)
+        row_sum = row_sum * scale_old + tile_sum
+        row_max = new_max
+
+    # Final logsumexp per row
+    lse = row_max + tl.log(row_sum)
+
+    # Mish activation on lse
+    exp_lse = tl.exp(lse)
+    softplus = tl.log(1.0 + exp_lse)
+    twice_sp = 2.0 * softplus
+    exp_twice_sp = tl.exp(twice_sp)
+    tanh_sp = (exp_twice_sp - 1.0) / (exp_twice_sp + 1.0)
+    mish_lse = lse * tanh_sp
+
+    out_val = lse * mish_lse
+
+    out_ptrs = out_ptr + offs_m * stride_outm  # single-column output
+    tl.store(out_ptrs, out_val, mask=mask_m)
+
+
+def fused_linear_scale_clamp(x, weight, bias, scale_total, clamp_min, clamp_max):
+    """
+    x: [M, K]
+    weight: [N, K]  (PyTorch Linear weight: [out_features, in_features])
+    bias: [N]
+    Returns: [M, N]
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda, "Inputs must be on CUDA"
+
+    M, K = x.shape
+    N = weight.shape[0]
+
+    # B is weight^T: [K, N]
+    b = weight.t().contiguous()
+
+    c = torch.empty((M, N), device=x.device, dtype=x.dtype)
+
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta["BLOCK_M"]),
+            triton.cdiv(N, meta["BLOCK_N"]),
+        )
+
+    linear_scale_clamp_kernel[grid](
+        x, b, bias, c,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        b.stride(0), b.stride(1),
+        c.stride(0), c.stride(1),
+        scale_total, clamp_min, clamp_max,
+        BLOCK_M=128, BLOCK_N=128, BLOCK_K=32,
+        num_warps=4, num_stages=2,
+    )
+    return c
+
+
+def fused_logsumexp_mish(x):
+    """
+    x: [M, N]
+    Returns: [M, 1] with y * mish(y), where y = logsumexp(x, dim=1, keepdim=True)
+    """
+    assert x.is_cuda, "Input must be on CUDA"
+
+    M, N = x.shape
+    out = torch.empty((M, 1), device=x.device, dtype=x.dtype)
+
+    def grid(meta):
+        return (triton.cdiv(M, meta["BLOCK_M"]),)
+
+    logsumexp_mish_kernel[grid](
+        x, out,
+        M, N,
+        x.stride(0), x.stride(1),
+        out.stride(0), out.stride(1),
+        BLOCK_M=64, BLOCK_N=128,
+        num_warps=4, num_stages=2,
+    )
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized version of the target model:
+      - Fused Linear (matmul + bias) + scale + residual + clamp
+      - Row-wise logsumexp
+      - Mish activation and final multiply
+    """
+    def __init__(self, input_size, hidden_size, scale_factor, clamp_min, clamp_max):
+        super(ModelNew, self).__init__()
+        # Initialize like nn.Linear for similar statistics
+        linear = nn.Linear(input_size, hidden_size)
+        self.weight = nn.Parameter(linear.weight.detach().clone())
+        self.bias = nn.Parameter(linear.bias.detach().clone())
+
+        # Fused scale factor (x * scale_factor; x + x  -> x * (2 * scale_factor))
+        self.scale_total = 2.0 * float(scale_factor)
+        self.clamp_min = float(clamp_min)
+        self.clamp_max = float(clamp_max)
+
+    def forward(self, x):
+        # Expect x on CUDA for Triton kernels
+        if not x.is_cuda:
+            x = x.cuda()
+
+        # Fused linear + scale + residual + clamp
+        x = fused_linear_scale_clamp(
+            x, self.weight, self.bias,
+            self.scale_total, self.clamp_min, self.clamp_max
+        )
+
+        # Fused logsumexp + mish + final multiply
+        x = fused_logsumexp_mish(x)
+        return x
+```
+
+# Performance
+- **PyTorch baseline**: 3.29 ms
+- **Current Triton**: 3.84 ms
+- **Current speedup**: 0.86x (-16.8% vs baseline)
+
+
+---
+
+## Analysis Steps
+
+1. **Code Analysis**: Count kernels, identify operations, check for inefficiencies
+2. **Performance Diagnosis**: Use metrics/latency to identify bottleneck type
+3. **Root Cause**: Combine code + performance to find the core issue
+
+## Optimization Categories (pick ONE if worth optimizing):
+
+### 1. Operator Fusion
+Fuse consecutive ops into fewer kernels to reduce memory traffic and launch overhead.
+
+### 2. Algorithm Replacement
+Replace naive algorithm with optimized variant.
+- For Attention: Flash Attention, online softmax
+- For Convolution: Winograd, im2col
+- **For RNN/GRU/LSTM**: Persistent kernel with HYBRID computation
+  - **CRITICAL**: Use hybrid approach for best performance:
+    * Precompute input-side gates ONCE (outside kernel): `gates_x = (T*B, In) @ W_ih`
+    * Persistent kernel (inside): only recurrent-side: `for t: gates_h = h @ W_hh`
+  - Time loop `for t in range(T)` must be inside kernel, NOT in Python
+  - Launch kernel once per layer, not once per timestep
+  - Expected speedup: 10-100x (vs per-timestep launches)
+
+### 3. Kernel Launch Reduction
+Combine multiple small kernels to reduce overhead.
+- **For RNN/GRU/LSTM**: See "Algorithm Replacement" above for persistent kernel approach
+
+### 4. Memory Layout Optimization
+Use in-place operations, buffer reuse, or better layouts.
+
+## Should We Optimize?
+
+Before proposing optimization, determine if it's worthwhile:
+- **Not worth optimizing** if:
+  - Code is already near-optimal (expected speedup < 10%)
+  - Bottleneck cannot be addressed (hardware limited, already optimal algorithm)
+  - Optimization would add significant complexity with minimal gain
+
+- **Worth optimizing** if:
+  - Clear algorithmic inefficiency exists (multiple kernels, suboptimal algorithm)
+  - Expected speedup >= 20%
+  - Concrete optimization path available
+
+## Output (JSON)
+
+```json
+{
+  "worth_optimizing": "yes/no",
+  "reason": "<Why worth or not worth optimizing, 1 sentence>",
+  "bottleneck": "<Root cause in 1-2 sentences, empty if not worth optimizing>",
+  "optimisation method": "<Specific optimization in 1-2 sentences, empty if not worth optimizing>",
+  "modification plan": "<Implementation steps in 2-3 sentences, empty if not worth optimizing>",
+  "expected_speedup": "<e.g., '30-40%', empty if not worth optimizing>"
+}
+```
+
+Return JSON only.

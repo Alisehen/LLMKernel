@@ -1,5 +1,4 @@
 ```python
-# <complete ModelNew code with optimized Triton kernels>
 import math
 import torch
 import torch.nn as nn
@@ -7,137 +6,181 @@ import triton
 import triton.language as tl
 
 
+# ----------------------------- Conv2D + HSwish kernel -----------------------------
+
+
+@triton.autotune(
+    configs=[
+        # Conservative baseline: good for high register pressure cases
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+        # Wider in N (C_out) dimension
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32},
+            num_warps=8,
+            num_stages=2,
+        ),
+        # Wider in M (N*H_out*W_out) dimension
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 32},
+            num_warps=8,
+            num_stages=2,
+        ),
+    ],
+    key=["N", "C_out", "H_out", "W_out"],
+)
 @triton.jit
-def conv2d_sub_hswish_kernel(
-    x_ptr, w_ptr, b_ptr, out_ptr,
-    N, H_out, W_out,
-    C_out,
+def conv2d_hswish_gemm_kernel(
+    x_ptr, w_ptr, b_ptr, y_ptr,
+    N, H_in, W_in,
+    C_out, H_out, W_out,
     subtract_value,
-    stride_x_n, stride_x_c, stride_x_h, stride_x_w,
-    stride_w_co, stride_w_ci, stride_w_kh, stride_w_kw,
-    stride_out_n, stride_out_c, stride_out_h, stride_out_w,
-    C_IN: tl.constexpr,
-    K_H: tl.constexpr,
-    K_W: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
+    # constexpr
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    C_IN: tl.constexpr, K_H: tl.constexpr, K_W: tl.constexpr,
 ):
-    # 2D grid over [P = N * H_out * W_out, C_out]
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    """
+    GEMM-style implicit-im2col conv2d fused with:
+      bias add, subtract_value, and HardSwish activation.
+    Grid covers output [M = N*H_out*W_out, C_out].
+    """
 
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    # ------------------------- Tile coordinates -------------------------
+    pid_m = tl.program_id(0)  # rows (M = N*H_out*W_out)
+    pid_n = tl.program_id(1)  # cols (C_out)
 
-    P = N * H_out * W_out
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # [BM]
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # [BN]
+
+    HW_out = H_out * W_out
+    P = N * HW_out  # total rows
+
     mask_m = offs_m < P
     mask_n = offs_n < C_out
 
-    # Decode flattened P index -> (n, oh, ow)
-    HW_out = H_out * W_out
+    tl.multiple_of(offs_n, BLOCK_N)
+    tl.multiple_of(offs_m, BLOCK_M)
+
+    # ------------------------- Decode m -> (n, oh, ow) -------------------------
     n_idx = offs_m // HW_out
     rem = offs_m % HW_out
     oh_idx = rem // W_out
     ow_idx = rem % W_out
 
-    # Base pointers (per output position / per output channel)
-    x_base = (
-        x_ptr
-        + n_idx * stride_x_n
-        + oh_idx * stride_x_h
-        + ow_idx * stride_x_w
-    )
-    w_base = w_ptr + offs_n * stride_w_co
+    # Broadcasted indices for [BM, BK] tiles
+    n_b = n_idx[:, None]   # [BM,1]
+    oh_b = oh_idx[:, None] # [BM,1]
+    ow_b = ow_idx[:, None] # [BM,1]
 
-    # Accumulator in FP32 for better precision
+    # Precompute factor that does not depend on K-tile:
+    # base_n = n * C_IN * H_in
+    base_n = (n_idx * (C_IN * H_in))[:, None]  # [BM,1]
+
+    # Accumulator in fp32
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    # Compute convolution: unrolled over input channels and kernel
-    for ic in tl.static_range(0, C_IN):
-        x_ic_off = ic * stride_x_c
-        w_ic_off = ic * stride_w_ci
-        for kh in tl.static_range(0, K_H):
-            x_kh_off = kh * stride_x_h
-            w_kh_off = kh * stride_w_kh
-            for kw in tl.static_range(0, K_W):
-                x_kw_off = kw * stride_x_w
-                w_kw_off = kw * stride_w_kw
+    # Total reduction dimension
+    K_TOTAL = C_IN * K_H * K_W
 
-                # Input: [BLOCK_M]
-                x_ptrs = x_base + x_ic_off + x_kh_off + x_kw_off
-                x_vals = tl.load(x_ptrs, mask=mask_m, other=0.0)
-                x_vals = x_vals.to(tl.float32)
+    # ------------------------- Reduction over K -------------------------
+    for k0 in range(0, K_TOTAL, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)  # [BK]
+        mask_k = offs_k < K_TOTAL
 
-                # Weights: [BLOCK_N]
-                w_ptrs = w_base + w_ic_off + w_kh_off + w_kw_off
-                w_vals = tl.load(w_ptrs, mask=mask_n, other=0.0)
-                w_vals = w_vals.to(tl.float32)
+        tl.multiple_of(offs_k, BLOCK_K)
 
-                # Outer-product accumulate: [BLOCK_M, BLOCK_N]
-                acc += x_vals[:, None] * w_vals[None, :]
+        # Decode K index -> (ic, kh, kw)
+        kk = offs_k
+        ic = kk // (K_H * K_W)
+        rem_k = kk % (K_H * K_W)
+        kh = rem_k // K_W
+        kw = rem_k % K_W
 
-    # Bias add (broadcast over BLOCK_M) using same channel offsets
-    bias = tl.load(b_ptr + offs_n, mask=mask_n, other=0.0)
-    bias = bias.to(tl.float32)
-    acc += bias[None, :]
+        ic_b = ic[None, :]  # [1,BK]
+        kh_b = kh[None, :]
+        kw_b = kw[None, :]
+
+        # Spatial positions for this tile [BM,BK]
+        ih = oh_b + kh_b  # [BM,BK]
+        iw = ow_b + kw_b  # [BM,BK]
+
+        # Compute flattened input index:
+        # idx = (((n*C_IN + ic)*H_in + ih)*W_in + iw)
+        # base_n:  n*C_IN*H_in (precomputed)  -> [BM,1]
+        # ic_h:    ic*H_in                   -> [1,BK]
+        ic_h = (ic * H_in)[None, :]  # [1,BK]
+        base_nc_h = base_n + ic_h    # [BM,BK]
+        tmp_in = base_nc_h + ih      # [BM,BK]
+        in_index = tmp_in * W_in + iw   # [BM,BK]
+
+        a_mask = mask_m[:, None] & mask_k[None, :]
+        a = tl.load(x_ptr + in_index, mask=a_mask, other=0.0)
+        a = a.to(tl.float32)  # [BM,BK]
+
+        # B tile: w_ptr is [K_TOTAL, C_out] row-major
+        b_index = offs_k[:, None] * C_out + offs_n[None, :]  # [BK,BN]
+        b_mask = mask_k[:, None] & mask_n[None, :]
+        b = tl.load(w_ptr + b_index, mask=b_mask, other=0.0)
+        b = b.to(tl.float32)  # [BK,BN]
+
+        # Matmul accumulate
+        acc += tl.dot(a, b, allow_tf32=True)
+
+    # ------------------------- Fused epilogue -------------------------
+    # Bias: broadcast over rows
+    bias_vals = tl.load(b_ptr + offs_n, mask=mask_n, other=0.0).to(tl.float32)  # [BN]
+    acc += bias_vals[None, :]  # broadcast along M
 
     # Subtract scalar
-    acc -= subtract_value
+    acc = acc - subtract_value
 
-    # HardSwish: x * relu6(x + 3) / 6
-    x_val = acc
-    tmp = x_val + 3.0
+    # HardSwish: x * clamp(x+3, 0, 6) / 6
+    tmp = acc + 3.0
     tmp = tl.maximum(tmp, 0.0)
     tmp = tl.minimum(tmp, 6.0)
-    acc = x_val * tmp * (1.0 / 6.0)
+    acc = acc * tmp * (1.0 / 6.0)
 
-    # Store output
-    out_ptrs = (
-        out_ptr
-        + n_idx[:, None] * stride_out_n
-        + offs_n[None, :] * stride_out_c
-        + oh_idx[:, None] * stride_out_h
-        + ow_idx[:, None] * stride_out_w
-    )
-    tl.store(out_ptrs, acc, mask=mask_m[:, None] & mask_n[None, :])
+    # ------------------------- Store -------------------------
+    n2 = n_idx[:, None]   # [BM,1]
+    oh2 = oh_idx[:, None] # [BM,1]
+    ow2 = ow_idx[:, None] # [BM,1]
+    oc2 = offs_n[None, :] # [1,BN]
+
+    out_index = (((n2 * C_out + oc2) * H_out + oh2) * W_out + ow2)  # [BM,BN]
+    out_mask = mask_m[:, None] & mask_n[None, :]
+
+    tl.store(y_ptr + out_index, acc, mask=out_mask)
 
 
-def conv2d_sub_hswish(x, weight, bias, subtract_value):
+def conv2d_hswish(x, weight, bias, subtract_value: float):
     """
-    x:        [N, C_in, H_in, W_in] (CUDA)
-    weight:   [C_out, C_in, K_H, K_W] (CUDA)
-    bias:     [C_out] (CUDA)
-    returns:  [N, C_out, H_out, W_out] with:
-              H_out = H_in - K_H + 1
-              W_out = W_in - K_W + 1
-              and fused: conv2d + bias - subtract_value + HardSwish
+    NCHW conv2d (stride=1, padding=0, dilation=1) fused with:
+      bias add, subtract_value, and HardSwish activation.
+    Implemented as GEMM with implicit im2col.
     """
     assert x.is_cuda and weight.is_cuda and bias.is_cuda
+    x = x.contiguous()
+    weight = weight.contiguous()
+    bias = bias.contiguous()
+
     N, C_in, H_in, W_in = x.shape
     C_out, C_in_w, K_H, K_W = weight.shape
     assert C_in == C_in_w
 
-    # Valid conv, stride=1, padding=0
+    # For stride=1, padding=0
     H_out = H_in - K_H + 1
     W_out = W_in - K_W + 1
 
-    x_contig = x.contiguous()
-    w_contig = weight.contiguous()
-    b_contig = bias.contiguous()
+    y = torch.empty((N, C_out, H_out, W_out), device=x.device, dtype=x.dtype)
 
-    out = torch.empty((N, C_out, H_out, W_out),
-                      device=x.device,
-                      dtype=x.dtype)
-
-    stride_x_n, stride_x_c, stride_x_h, stride_x_w = x_contig.stride()
-    stride_w_co, stride_w_ci, stride_w_kh, stride_w_kw = w_contig.stride()
-    stride_out_n, stride_out_c, stride_out_h, stride_out_w = out.stride()
+    # Pre-pack weight to [K_total, C_out] row-major
+    K_total = C_in * K_H * K_W
+    weight_2d = weight.view(C_out, K_total).transpose(0, 1).contiguous()
 
     P = N * H_out * W_out
-
-    # Tile sizes tuned for good occupancy and arithmetic intensity
-    BLOCK_M = 64
-    BLOCK_N = 64
 
     def grid(meta):
         return (
@@ -145,54 +188,193 @@ def conv2d_sub_hswish(x, weight, bias, subtract_value):
             triton.cdiv(C_out, meta["BLOCK_N"]),
         )
 
-    conv2d_sub_hswish_kernel[grid](
-        x_contig, w_contig, b_contig, out,
-        N, H_out, W_out,
-        C_out,
+    conv2d_hswish_gemm_kernel[grid](
+        x, weight_2d, bias, y,
+        N, H_in, W_in,
+        C_out, H_out, W_out,
         float(subtract_value),
-        stride_x_n, stride_x_c, stride_x_h, stride_x_w,
-        stride_w_co, stride_w_ci, stride_w_kh, stride_w_kw,
-        stride_out_n, stride_out_c, stride_out_h, stride_out_w,
-        C_IN=C_in,
-        K_H=K_H,
-        K_W=K_W,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        num_warps=4,
-        num_stages=3,
+        C_IN=C_in, K_H=K_H, K_W=K_W,
     )
-    return out
+
+    return y
+
+
+# ----------------------------- MaxPool2D + Mish kernel -----------------------------
+
+
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 64},
+            num_warps=4,
+            num_stages=2,
+        ),
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 64},
+            num_warps=8,
+            num_stages=2,
+        ),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 128},
+            num_warps=8,
+            num_stages=2,
+        ),
+    ],
+    key=["N", "C", "H_out", "W_out"],
+)
+@triton.jit
+def maxpool2d_mish_kernel(
+    x_ptr, y_ptr,
+    N, C, H_in, W_in,
+    H_out, W_out,
+    # constexpr
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    K_P: tl.constexpr,
+):
+    """
+    NCHW MaxPool2d with kernel_size=stride=K_P, padding=0, dilation=1,
+    fused with Mish activation.
+    Grid covers output [M = N*H_out*W_out, C].
+    """
+    pid_m = tl.program_id(0)  # flattened (N * H_out * W_out)
+    pid_n = tl.program_id(1)  # channels
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # [BM]
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # [BN]
+
+    P = N * H_out * W_out
+    mask_m = offs_m < P
+    mask_n = offs_n < C
+
+    tl.multiple_of(offs_m, BLOCK_M)
+    tl.multiple_of(offs_n, BLOCK_N)
+
+    HW_out = H_out * W_out
+    n_idx = offs_m // HW_out
+    rem = offs_m % HW_out
+    oh_idx = rem // W_out
+    ow_idx = rem % W_out
+
+    n = n_idx[:, None]   # [BM,1]
+    oh = oh_idx[:, None] # [BM,1]
+    ow = ow_idx[:, None] # [BM,1]
+    c = offs_n[None, :]  # [1,BN]
+
+    full_mask = mask_m[:, None] & mask_n[None, :]
+
+    # Precompute base offsets independent of kernel loop:
+    # plane_base = (n*C + c) * H_in * W_in  -> starting index of full HxW plane
+    plane_base = (n * C + c) * (H_in * W_in)  # [BM,BN]
+
+    # Pooling window top-left (in input coordinates)
+    oh_kp = oh * K_P  # [BM,1]
+    ow_kp = ow * K_P  # [BM,1]
+
+    # Initialize max accumulator
+    neg_inf = -1e30
+    acc = tl.full((BLOCK_M, BLOCK_N), neg_inf, dtype=tl.float32)
+
+    # MaxPool2d over K_P x K_P with stride=K_P, no padding
+    for kh in range(0, K_P):
+        ih = oh_kp + kh  # [BM,1]
+        for kw in range(0, K_P):
+            iw = ow_kp + kw  # [BM,1]
+            # offset within HxW plane
+            intra = ih * W_in + iw  # [BM,1]
+            in_index = plane_base + intra  # broadcast to [BM,BN]
+            x_vals = tl.load(
+                x_ptr + in_index,
+                mask=full_mask,
+                other=neg_inf,
+            )
+            acc = tl.maximum(acc, x_vals)
+
+    # Mish activation: x * tanh(softplus(x)), softplus(x) = log(1 + exp(x))
+    # tanh(z) = (e^{2z} - 1)/(e^{2z} + 1)
+    sp = tl.log(1.0 + tl.exp(acc))
+    e2 = tl.exp(2.0 * sp)
+    t = (e2 - 1.0) / (e2 + 1.0)
+    out_vals = acc * t
+
+    # Store using the same tile indices
+    out_index = (((n * C + c) * H_out + oh) * W_out + ow)  # [BM,BN]
+    tl.store(y_ptr + out_index, out_vals, mask=full_mask)
+
+
+def maxpool2d_mish(x, kernel_size: int):
+    """
+    NCHW MaxPool2d with kernel_size=stride=kernel_size (no padding),
+    fused with Mish activation.
+    """
+    assert x.is_cuda
+    x = x.contiguous()
+
+    N, C, H_in, W_in = x.shape
+    K_P = int(kernel_size)
+
+    H_out = H_in // K_P
+    W_out = W_in // K_P
+
+    y = torch.empty((N, C, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    P = N * H_out * W_out
+
+    def grid(meta):
+        return (
+            triton.cdiv(P, meta["BLOCK_M"]),
+            triton.cdiv(C, meta["BLOCK_N"]),
+        )
+
+    maxpool2d_mish_kernel[grid](
+        x, y,
+        N, C, H_in, W_in,
+        H_out, W_out,
+        K_P=K_P,
+    )
+
+    return y
+
+
+# ----------------------------- Model -----------------------------
 
 
 class ModelNew(nn.Module):
     """
-    Triton-accelerated model:
-        Conv2d -> subtract_value -> HardSwish -> MaxPool2d -> Mish
-
-    Fused in Triton:
-        Conv2d + bias - subtract_value + HardSwish
-    Remaining in PyTorch:
-        MaxPool2d, Mish
+    Triton-optimized model:
+      Conv2d -> subtract constant -> HardSwish -> MaxPool2d -> Mish
     """
     def __init__(self, in_channels, out_channels, kernel_size, subtract_value, pool_kernel_size):
         super(ModelNew, self).__init__()
+        k = int(kernel_size)
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = k
+        self.subtract_value = float(subtract_value)
+        self.pool_kernel_size = int(pool_kernel_size)
+
+        # Parameters equivalent to nn.Conv2d(in_channels, out_channels, kernel_size)
         self.weight = nn.Parameter(
-            torch.empty(out_channels, in_channels, kernel_size, kernel_size)
+            torch.empty(out_channels, in_channels, k, k)
         )
         self.bias = nn.Parameter(torch.empty(out_channels))
 
-        # Kaiming-like init (same as nn.Conv2d default)
-        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5.0))
+        # Kaiming uniform initialization similar to nn.Conv2d
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
         fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
-        bound = 1.0 / math.sqrt(fan_in)
+        bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
         nn.init.uniform_(self.bias, -bound, bound)
 
-        self.subtract_value = float(subtract_value)
-        self.pool = nn.MaxPool2d(pool_kernel_size)
-
     def forward(self, x):
-        x = conv2d_sub_hswish(x, self.weight, self.bias, self.subtract_value)
-        x = self.pool(x)
-        x = torch.nn.functional.mish(x)
+        if not x.is_cuda:
+            x = x.cuda()
+
+        device = x.device
+        if not self.weight.is_cuda:
+            self.weight.data = self.weight.data.to(device)
+        if not self.bias.is_cuda:
+            self.bias.data = self.bias.data.to(device)
+
+        x = conv2d_hswish(x, self.weight, self.bias, self.subtract_value)
+        x = maxpool2d_mish(x, self.pool_kernel_size)
         return x
 ```

@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The custom Triton convolution is a naive direct implementation and is orders of magnitude slower than highly-optimized GEMM-based/cuDNN convolutions.",
+  "bottleneck": "The conv2d_nchw_kernel computes convolution via explicit nested loops over input channels and KxK taps per output element without tiling or reuse, leading to poor memory locality, low utilization of tensor cores, and extremely low throughput compared to GEMM-based or cuDNN convs.",
+  "optimisation method": "Replace the naive sliding-window convolution with a GEMM-style convolution (implicit im2col + matmul) using Triton’s high-performance matmul patterns or directly call the backend-optimized cuDNN Conv2d, keeping the Triton kernel only for the lighter avgpool+sigmoid+sum stage if desired.",
+  "modification plan": "Reshape the convolution weights to a 2D matrix of shape [C_out, C_in * K * K], and treat each output spatial position as a column in an implicit im2col matrix of shape [C_in * K * K, H_out * W_out]. Implement a Triton matmul kernel that, for each output tile, dynamically loads the corresponding input patches (implicit im2col) into shared memory and multiplies them with the weight matrix using tensor-core-friendly tiling (e.g., BLOCK_M/BLOCK_N/BLOCK_K). Replace conv2d_nchw_kernel with this matmul-based convolution or, more simply, delegate convolution to torch.nn.functional.conv2d/cuDNN and keep only the custom pool+sigmoid+sum kernel.",
+  "expected_speedup": "70-90% vs current Triton implementation (bringing performance to at least parity with, and likely close to, the PyTorch/cuDNN baseline)"
+}

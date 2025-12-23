@@ -1,0 +1,108 @@
+[Seed] Generating seed kernel...
+[Seed 1/2] Generating...
+[92mFinish reason: stop[0m
+Usage: In=2878, Out=11043, Total=13921
+[seed_0] score=0.0818 (baseline=2.0625ms)
+[seed_0] metrics saved to: /home/hyc/LLMKernel/run/20251223_090359_7_GoogleNetInceptionV1_openai_deepseek/7_GoogleNetInceptionV1/evaluation/eval_0000.json
+[Seed 1] Final score: 0.0818 ✓
+[Seed 2/2] Generating...
+[92mFinish reason: stop[0m
+Usage: In=2878, Out=6129, Total=9007
+[seed_1] score=0.9650 (baseline=2.0625ms)
+[seed_1] metrics saved to: /home/hyc/LLMKernel/run/20251223_090359_7_GoogleNetInceptionV1_openai_deepseek/7_GoogleNetInceptionV1/evaluation/eval_0001.json
+[Seed 2] Final score: 0.9650 ✓
+
+================================================================================
+[Hybrid Strategy] Analyzing all seeds for algorithmic optimization...
+[Hybrid Strategy] - 2 seed(s) with score < 1.0 (rescue)
+================================================================================
+
+[Hybrid] Seed 1: score=0.0818 < 1.0
+[Hybrid] Attempting algorithm analysis rescue...
+[Hybrid] Requesting LLM analysis for seed 1...
+[92mFinish reason: stop[0m
+Usage: In=6486, Out=920, Total=7406
+[Hybrid] Worth optimizing: yes
+[Hybrid] Reason: Convolution dominates runtime and the current kernel is over 10x slower than the PyTorch/cuDNN baseline, indicating a major algorithmic inefficiency.
+[Hybrid] Analysis complete for seed 1, generating optimized kernel...
+[Hybrid] Bottleneck: The conv2d_nchw_kernel performs a fully nested loop over C_in, KH, KW with scala...
+[Hybrid] Optimization: Replace the direct-loop convolution with a GEMM-based convolution (im2col or imp...
+[Hybrid] Expected speedup: 5-10x (bringing Triton conv performance close to the PyTorch/cuDNN baseline)
+[92mFinish reason: stop[0m
+Usage: In=6831, Out=9682, Total=16513
+[algorithm_optimized_seed0] score=0.4852 (baseline=2.0625ms)
+[algorithm_optimized_seed0] metrics saved to: /home/hyc/LLMKernel/run/20251223_090359_7_GoogleNetInceptionV1_openai_deepseek/7_GoogleNetInceptionV1/evaluation/eval_0002.json
+[Hybrid] ✓ Rescue successful: 0.0818 → 0.4852
+
+[Hybrid] Seed 2: score=0.9650 < 1.0
+[Hybrid] Attempting algorithm analysis rescue...
+[Hybrid] Requesting LLM analysis for seed 2...
+[92mFinish reason: stop[0m
+Usage: In=4734, Out=1758, Total=6492
+[Hybrid] Worth optimizing: yes
+[Hybrid] Reason: Most FLOPs and memory traffic are in the Inception modules, while Triton is only used for light ops (ReLU, final FC), giving overhead without addressing the real hotspot.
+[Hybrid] Analysis complete for seed 2, generating optimized kernel...
+[Hybrid] Bottleneck: Each InceptionModule computes four branches (1x1, 1x1→3x3, 1x1→5x5, pool→1x1) as...
+[Hybrid] Optimization: Use operator fusion: implement a single Triton kernel per InceptionModule that l...
+[Hybrid] Expected speedup: 20-30%
+[92mFinish reason: stop[0m
+Usage: In=5059, Out=25214, Total=30273
+[algorithm_optimized_seed1] score=0.0043 (baseline=2.0625ms)
+[algorithm_optimized_seed1] metrics saved to: /home/hyc/LLMKernel/run/20251223_090359_7_GoogleNetInceptionV1_openai_deepseek/7_GoogleNetInceptionV1/evaluation/eval_0003.json
+[Hybrid] ✓ Rescue successful: 0.9650 → 0.0043
+
+================================================================================
+[Hybrid] Candidate Selection
+================================================================================
+[Hybrid] Total candidates: 4
+  [1] seed 1: 0.0818
+  [2] seed 2: 0.9650
+  [3] algo-optimized (from seed 1): 0.4852
+  [4] algo-optimized (from seed 2): 0.0043
+
+[Hybrid] ★ Selected best candidate: score=0.9650
+
+[Optimization] Starting 3-stage optimization...
+
+================================================================================
+[Stage 1/3] grid_and_parallel
+Description: Optimize grid layout and parallel work distribution across SMs.
+Current candidates: 1, best score: 0.9650
+================================================================================
+[Stage 1] Profiling best candidate...
+[Stage 1] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=3248, Out=6562, Total=9810
+[stage1_grid_and_parallel] score=0.9406 (baseline=2.0625ms)
+[stage1_grid_and_parallel] metrics saved to: /home/hyc/LLMKernel/run/20251223_090359_7_GoogleNetInceptionV1_openai_deepseek/7_GoogleNetInceptionV1/evaluation/eval_0004.json
+  Optimized kernel score: 0.9406 ✓
+[Stage 1] Current: 0.9406 (global best: 0.9650)
+
+================================================================================
+[Stage 2/3] block_tiling
+Description: Tune BLOCK_M/N/K sizes for optimal register/memory balance.
+Current candidates: 1, best score: 0.9650
+================================================================================
+[Stage 2] Profiling best candidate...
+[Stage 2] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=4182, Out=5897, Total=10079
+[stage2_block_tiling] score=0.9398 (baseline=2.0625ms)
+[stage2_block_tiling] metrics saved to: /home/hyc/LLMKernel/run/20251223_090359_7_GoogleNetInceptionV1_openai_deepseek/7_GoogleNetInceptionV1/evaluation/eval_0005.json
+  Optimized kernel score: 0.9398 ✓
+[Stage 2] Current: 0.9398 (global best: 0.9650)
+
+================================================================================
+[Stage 3/3] memory_and_tuning
+Description: Optimize memory access patterns and fine-tune num_stages/num_warps.
+Current candidates: 1, best score: 0.9650
+================================================================================
+[Stage 3] Profiling best candidate...
+[Stage 3] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=4326, Out=5784, Total=10110
+[stage3_memory_and_tuning] score=0.9352 (baseline=2.0625ms)
+[stage3_memory_and_tuning] metrics saved to: /home/hyc/LLMKernel/run/20251223_090359_7_GoogleNetInceptionV1_openai_deepseek/7_GoogleNetInceptionV1/evaluation/eval_0006.json
+  Optimized kernel score: 0.9352 ✓
+[Stage 3] Current: 0.9352 (global best: 0.9650)
+[7_GoogleNetInceptionV1.py] Figure saved to: /home/hyc/LLMKernel/run/20251223_090359_7_GoogleNetInceptionV1_openai_deepseek/7_GoogleNetInceptionV1/figures/7_GoogleNetInceptionV1_score.png

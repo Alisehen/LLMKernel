@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "Convolution dominates runtime and the current kernel is over 10x slower than the PyTorch/cuDNN baseline, indicating a major algorithmic inefficiency.",
+  "bottleneck": "The conv2d_nchw_kernel performs a fully nested loop over C_in, KH, KW with scalar loads and outer-product accumulation, which prevents tiling over the reduction dimension, yields poor memory reuse, and does not leverage GEMM-style compute or tensor cores.",
+  "optimisation method": "Replace the direct-loop convolution with a GEMM-based convolution (im2col or implicit-GEMM) so that each conv is expressed as a matrix multiplication over K = C_in * KH * KW, enabling a Triton matmul-style kernel (with BLOCK_K tiling and tl.dot) and fusion of bias/ReLU.",
+  "modification plan": "Reshape each convolution into y_mat = x_im2col @ w_mat, where x_im2col has shape [N * H_out * W_out, C_in * KH * KW] and w_mat has shape [C_in * KH * KW, C_out]; implement x_im2col either explicitly once per conv or implicitly inside a GEMM-like Triton kernel that tiles over M, N, and K with BLOCK_K chunks. Reuse or adapt the existing linear_triton matmul kernel to handle this GEMM, fusing bias and optional ReLU in the epilogue, and call this new GEMM-based path from conv2d_triton for all convolutions in ModelNew.",
+  "expected_speedup": "5-10x (bringing Triton conv performance close to the PyTorch/cuDNN baseline)"
+}

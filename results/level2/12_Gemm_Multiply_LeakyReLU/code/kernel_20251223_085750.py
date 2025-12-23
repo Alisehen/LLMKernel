@@ -1,0 +1,126 @@
+# <corrected code>
+import torch, torch.nn as nn, triton, triton.language as tl
+import math
+
+
+@triton.jit
+def epilogue_mul_bias_leakyrelu_kernel(
+    c_ptr, bias_ptr,
+    M, N,
+    stride_cm, stride_cn,
+    multiplier, negative_slope,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    """
+    Epilogue kernel:
+      C[M, N] = LeakyReLU((C[M, N] + bias[N]) * multiplier)
+
+    C is assumed to be the output of a high-performance GEMM (cuBLAS/cuBLASLt via PyTorch).
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+    mask = mask_m[:, None] & mask_n[None, :]
+
+    # Pointers into C
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+
+    # Load C tile
+    c = tl.load(c_ptrs, mask=mask, other=0.0)
+
+    # Load bias[N] and broadcast across rows
+    bias_ptrs = bias_ptr + offs_n
+    bias = tl.load(bias_ptrs, mask=mask_n, other=0.0)
+    bias = bias[None, :]  # [1, BLOCK_N] -> broadcast over BLOCK_M
+
+    # (C + bias) * multiplier
+    c = (c + bias) * multiplier
+
+    # LeakyReLU: x if x >= 0 else negative_slope * x
+    zero = tl.zeros((), dtype=c.dtype)
+    c = tl.where(c >= zero, c, c * negative_slope)
+
+    # Store result back to C
+    tl.store(c_ptrs, c, mask=mask)
+
+
+def fused_gemm_mul_leakyrelu(x, weight, bias, multiplier, negative_slope):
+    """
+    Compute:
+      y = x @ weight.T + bias
+      y = y * multiplier
+      y = LeakyReLU(y, negative_slope)
+
+    x:      [M, K]        (batch_size, in_features)
+    weight: [N, K]        (out_features, in_features)  -- same as nn.Linear.weight
+    bias:   [N]           (out_features)
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda, "Inputs must be CUDA tensors"
+
+    M, K = x.shape
+    N, Kw = weight.shape
+    assert Kw == K, "Incompatible shapes for matmul"
+
+    # High-performance GEMM via cuBLAS/cuBLASLt (through PyTorch)
+    # x @ weight.T -> [M, N]
+    out = x @ weight.t()
+
+    # Fused epilogue (bias + multiplier + LeakyReLU) in a Triton kernel
+    def grid(META):
+        return (
+            triton.cdiv(M, META["BLOCK_M"]),
+            triton.cdiv(N, META["BLOCK_N"]),
+        )
+
+    epilogue_mul_bias_leakyrelu_kernel[grid](
+        out, bias,
+        M, N,
+        out.stride(0), out.stride(1),
+        float(multiplier), float(negative_slope),
+        BLOCK_M=128, BLOCK_N=128,
+        num_warps=4,
+        num_stages=1,
+    )
+
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    High-performance replacement for:
+
+        nn.Linear(in_features, out_features)  # with bias
+        x = x * multiplier
+        x = nn.LeakyReLU(negative_slope)(x)
+
+    Forward:
+        x: [batch_size, in_features]
+        returns: [batch_size, out_features]
+    """
+
+    def __init__(self, in_features, out_features, multiplier, negative_slope):
+        super(ModelNew, self).__init__()
+        # Match nn.Linear layout: weight [out_features, in_features]
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias = nn.Parameter(torch.empty(out_features))
+
+        # Initialize exactly like nn.Linear(in_features, out_features)
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+        bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+        nn.init.uniform_(self.bias, -bound, bound)
+
+        self.multiplier = float(multiplier)
+        self.negative_slope = float(negative_slope)
+
+    def forward(self, x):
+        # x: [batch_size, in_features], must be CUDA tensor
+        return fused_gemm_mul_leakyrelu(
+            x, self.weight, self.bias,
+            self.multiplier, self.negative_slope,
+        )

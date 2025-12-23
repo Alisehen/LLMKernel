@@ -1,204 +1,231 @@
 ```python
-import torch
-import torch.nn as nn
-import triton
-import triton.language as tl
+import torch, torch.nn as nn, triton, triton.language as tl
 
 
 @triton.jit
-def matmul_scale_residual_clamp_kernel(
+def linear_scale_clamp_kernel(
     a_ptr, b_ptr, bias_ptr, c_ptr,
     M, N, K,
     stride_am, stride_ak,
     stride_bk, stride_bn,
     stride_cm, stride_cn,
-    scale_factor, clamp_min, clamp_max,
+    scale, clamp_min, clamp_max,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
-    # Program IDs for 2D tiling over (M, N)
+    """
+    Fused kernel:
+      C = clamp( (A @ B) + bias, clamp_min, clamp_max ) * scale
+
+    A: [M, K]
+    B: [K, N]  (weight^T, i.e., transposed weight)
+    bias: [N]
+    C: [M, N]
+    """
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
 
-    # Offsets for this program's tile
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, BLOCK_K)
 
-    # Create pointers for A and B tiles
+    # Pointers for A and B tiles
     a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
     b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
 
-    # Accumulator in FP32 for better accuracy
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    # GEMM loop over K
+    # K-loop
     for k in range(0, K, BLOCK_K):
-        k_remaining = K - k
-
-        a_mask = (offs_m[:, None] < M) & (offs_k[None, :] < k_remaining)
-        b_mask = (offs_k[:, None] < k_remaining) & (offs_n[None, :] < N)
-
-        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
-        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
-
-        acc += tl.dot(a, b)
-
+        a = tl.load(
+            a_ptrs,
+            mask=(offs_m[:, None] < M) & (offs_k[None, :] < K - k),
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptrs,
+            mask=(offs_k[:, None] < K - k) & (offs_n[None, :] < N),
+            other=0.0,
+        )
+        acc += tl.dot(a, b, allow_tf32=True)
         a_ptrs += BLOCK_K * stride_ak
         b_ptrs += BLOCK_K * stride_bk
 
-    # Add bias (broadcast over rows)
+    # Add bias
     bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
-    acc = acc + bias[None, :]
+    acc += bias[None, :]
 
-    # Scale, then residual connection (x = x * scale_factor; x = x + x)
-    acc = acc * scale_factor
-    acc = acc + acc
+    # Scale (includes the residual x + x fused as factor 2*scale_factor)
+    acc = acc * scale
 
     # Clamp
     acc = tl.maximum(acc, clamp_min)
     acc = tl.minimum(acc, clamp_max)
 
-    # Store result
+    # Store
     c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
-    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-    tl.store(c_ptrs, acc.to(tl.float32), mask=c_mask)
+    mask_store = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, acc, mask=mask_store)
 
 
 @triton.jit
-def row_logsumexp_mish_kernel(
+def logsumexp_mish_kernel(
     x_ptr, out_ptr,
     M, N,
     stride_xm, stride_xn,
-    stride_outm,
-    BLOCK_N: tl.constexpr,
+    stride_outm, stride_outn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
 ):
+    """
+    For each row i:
+      y_i = logsumexp(x_i, dim=1)  (scalar)
+      out_i = y_i * mish(y_i)
+
+    mish(z) = z * tanh(softplus(z))
+    softplus(z) = log(1 + exp(z))
+    tanh(u) = (exp(2u) - 1) / (exp(2u) + 1)
+    """
     pid_m = tl.program_id(0)
-    offs_n = tl.arange(0, BLOCK_N)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offs_m < M
 
-    # Row index
-    m = pid_m
+    # Initialize running max and sum for logsumexp
+    neg_large = -1.0e30
+    row_max = tl.full((BLOCK_M,), neg_large, dtype=tl.float32)
+    row_sum = tl.zeros((BLOCK_M,), dtype=tl.float32)
 
-    # Base pointer for this row
-    row_ptr = x_ptr + m * stride_xm + offs_n * stride_xn
+    for n_start in range(0, N, BLOCK_N):
+        offs_n = n_start + tl.arange(0, BLOCK_N)
+        mask_n = offs_n < N
 
-    # 1) Compute max over the row for numerical stability
-    max_val = tl.full((1,), -float("inf"), dtype=tl.float32)
-    for n in range(0, N, BLOCK_N):
-        cols = n + offs_n
-        mask = cols < N
-        x = tl.load(row_ptr + n * stride_xn, mask=mask, other=-float("inf"))
-        curr_max = tl.max(x, axis=0)
-        max_val = tl.maximum(max_val, curr_max)
+        x_ptrs = x_ptr + offs_m[:, None] * stride_xm + offs_n[None, :] * stride_xn
+        x = tl.load(
+            x_ptrs,
+            mask=mask_m[:, None] & mask_n[None, :],
+            other=neg_large,
+        )
 
-    # 2) Compute sum(exp(x - max)) over the row
-    sum_exp = tl.zeros((1,), dtype=tl.float32)
-    for n in range(0, N, BLOCK_N):
-        cols = n + offs_n
-        mask = cols < N
-        x = tl.load(row_ptr + n * stride_xn, mask=mask, other=-float("inf"))
-        x = x - max_val
-        exp_x = tl.exp(x)
-        sum_exp = sum_exp + tl.sum(exp_x, axis=0)
+        # Current tile max per row
+        tile_max = tl.max(x, axis=1)
+        new_max = tl.maximum(row_max, tile_max)
 
-    # LogSumExp: scalar per row
-    lse = max_val + tl.log(sum_exp)
-    y = lse[0]
+        # Sum of exp(x - new_max) over this tile
+        x_shifted = x - new_max[:, None]
+        exp_x = tl.exp(x_shifted)
+        tile_sum = tl.sum(exp_x, axis=1)
 
-    # Mish activation: mish(y) = y * tanh(softplus(y))
-    # Use a numerically stable softplus:
-    # softplus(y) = where(y > 0, y + log(1 + exp(-y)), log(1 + exp(y)))
-    pos = y > 0.0
-    softplus_pos = y + tl.log(1.0 + tl.exp(-y))
-    softplus_neg = tl.log(1.0 + tl.exp(y))
-    softplus = tl.where(pos, softplus_pos, softplus_neg)
+        # Update running sum with scaling to keep stability
+        scale_old = tl.exp(row_max - new_max)
+        row_sum = row_sum * scale_old + tile_sum
+        row_max = new_max
 
-    # tanh(z) = (exp(2z) - 1) / (exp(2z) + 1)
-    t2 = tl.exp(2.0 * softplus)
-    tanh_sp = (t2 - 1.0) / (t2 + 1.0)
+    # Final logsumexp per row
+    lse = row_max + tl.log(row_sum)
 
-    mish_y = y * tanh_sp
+    # Mish activation on lse
+    exp_lse = tl.exp(lse)
+    softplus = tl.log(1.0 + exp_lse)
+    twice_sp = 2.0 * softplus
+    exp_twice_sp = tl.exp(twice_sp)
+    tanh_sp = (exp_twice_sp - 1.0) / (exp_twice_sp + 1.0)
+    mish_lse = lse * tanh_sp
 
-    # Final: y * mish(y)
-    out_val = y * mish_y
+    out_val = lse * mish_lse
 
-    tl.store(out_ptr + m * stride_outm, out_val)
+    out_ptrs = out_ptr + offs_m * stride_outm  # single-column output
+    tl.store(out_ptrs, out_val, mask=mask_m)
 
 
-def fused_matmul_scale_residual_clamp(x, weight, bias, scale_factor, clamp_min, clamp_max):
+def fused_linear_scale_clamp(x, weight, bias, scale_total, clamp_min, clamp_max):
     """
-    x: (M, K)
-    weight: (N, K) from nn.Linear (out_features, in_features)
-    bias: (N,)
-    Returns: (M, N) after matmul, bias, scale, residual, clamp
+    x: [M, K]
+    weight: [N, K]  (PyTorch Linear weight: [out_features, in_features])
+    bias: [N]
+    Returns: [M, N]
     """
-    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda, "Inputs must be on CUDA"
+
     M, K = x.shape
     N = weight.shape[0]
 
-    # We want A(M,K) @ B(K,N) so transpose weight
-    b = weight.t().contiguous()  # (K, N)
+    # B is weight^T: [K, N]
+    b = weight.t().contiguous()
 
-    c = torch.empty((M, N), device=x.device, dtype=torch.float32)
+    c = torch.empty((M, N), device=x.device, dtype=x.dtype)
 
-    grid = lambda META: (
-        triton.cdiv(M, META["BLOCK_M"]),
-        triton.cdiv(N, META["BLOCK_N"]),
-    )
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta["BLOCK_M"]),
+            triton.cdiv(N, meta["BLOCK_N"]),
+        )
 
-    matmul_scale_residual_clamp_kernel[grid](
+    linear_scale_clamp_kernel[grid](
         x, b, bias, c,
         M, N, K,
         x.stride(0), x.stride(1),
         b.stride(0), b.stride(1),
         c.stride(0), c.stride(1),
-        scale_factor, clamp_min, clamp_max,
-        BLOCK_M=64, BLOCK_N=64, BLOCK_K=32,
+        scale_total, clamp_min, clamp_max,
+        BLOCK_M=128, BLOCK_N=128, BLOCK_K=32,
+        num_warps=4, num_stages=2,
     )
-
     return c
 
 
-def fused_row_logsumexp_mish(x):
+def fused_logsumexp_mish(x):
     """
-    x: (M, N) -> out: (M, 1)
-    Applies logsumexp over dim=1, then y * mish(y).
+    x: [M, N]
+    Returns: [M, 1] with y * mish(y), where y = logsumexp(x, dim=1, keepdim=True)
     """
-    assert x.is_cuda
+    assert x.is_cuda, "Input must be on CUDA"
+
     M, N = x.shape
-    out = torch.empty((M, 1), device=x.device, dtype=torch.float32)
+    out = torch.empty((M, 1), device=x.device, dtype=x.dtype)
 
-    grid = lambda META: (M,)
+    def grid(meta):
+        return (triton.cdiv(M, meta["BLOCK_M"]),)
 
-    row_logsumexp_mish_kernel[grid](
+    logsumexp_mish_kernel[grid](
         x, out,
         M, N,
         x.stride(0), x.stride(1),
-        out.stride(0),
-        BLOCK_N=256,
+        out.stride(0), out.stride(1),
+        BLOCK_M=64, BLOCK_N=128,
+        num_warps=4, num_stages=2,
     )
-
     return out
 
 
 class ModelNew(nn.Module):
+    """
+    Triton-optimized version of the target model:
+      - Fused Linear (matmul + bias) + scale + residual + clamp
+      - Row-wise logsumexp
+      - Mish activation and final multiply
+    """
     def __init__(self, input_size, hidden_size, scale_factor, clamp_min, clamp_max):
         super(ModelNew, self).__init__()
-        # Keep the same Linear module for easy state_dict compatibility
-        self.matmul = nn.Linear(input_size, hidden_size)
-        self.scale_factor = float(scale_factor)
+        # Initialize like nn.Linear for similar statistics
+        linear = nn.Linear(input_size, hidden_size)
+        self.weight = nn.Parameter(linear.weight.detach().clone())
+        self.bias = nn.Parameter(linear.bias.detach().clone())
+
+        # Fused scale factor (x * scale_factor; x + x  -> x * (2 * scale_factor))
+        self.scale_total = 2.0 * float(scale_factor)
         self.clamp_min = float(clamp_min)
         self.clamp_max = float(clamp_max)
 
     def forward(self, x):
-        # Use Triton kernels instead of nn.Linear + PyTorch ops
-        y = fused_matmul_scale_residual_clamp(
-            x,
-            self.matmul.weight,
-            self.matmul.bias,
-            self.scale_factor,
-            self.clamp_min,
-            self.clamp_max,
+        # Expect x on CUDA for Triton kernels
+        if not x.is_cuda:
+            x = x.cuda()
+
+        # Fused linear + scale + residual + clamp
+        x = fused_linear_scale_clamp(
+            x, self.weight, self.bias,
+            self.scale_total, self.clamp_min, self.clamp_max
         )
-        out = fused_row_logsumexp_mish(y)
-        return out
+
+        # Fused logsumexp + mish + final multiply
+        x = fused_logsumexp_mish(x)
+        return x
 ```

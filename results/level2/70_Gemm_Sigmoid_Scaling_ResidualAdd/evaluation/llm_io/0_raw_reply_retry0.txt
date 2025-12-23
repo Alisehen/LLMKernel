@@ -3,158 +3,140 @@ import torch
 import torch.nn as nn
 import triton
 import triton.language as tl
-import math
+
 
 @triton.jit
-def fused_gemm_sigmoid_scale_resadd_kernel(
-    # Pointers to matrices
+def fused_gemm_sigmoid_scale_residual_kernel(
     a_ptr, b_ptr, bias_ptr, c_ptr,
-    # Matrix dimensions
     M, N, K,
-    # Stride information
-    stride_am, stride_ak, 
+    stride_am, stride_ak,
     stride_bk, stride_bn,
     stride_cm, stride_cn,
-    # Block sizes
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    # Scaling factor
     scaling_factor,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
-    # Program ID: which block of C we're computing
+    # Program IDs for 2D tiling over M and N
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
-    
-    # Create block offsets
+
+    # Offsets for the current block
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, BLOCK_K)
-    
-    # Create pointers for the first blocks of A and B
+
+    # Pointer arithmetic for A (M x K) and B (K x N) with generic strides
     a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
     b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
-    
-    # Accumulator
-    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    
-    # Compute block of C = A * B
+
+    # Accumulator in FP32 for better precision
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Loop over K dimension
     for k in range(0, K, BLOCK_K):
-        # Load blocks from A and B with masking
-        a_mask = (offs_m[:, None] < M) & (offs_k[None, :] < K - k)
-        b_mask = (offs_k[:, None] < K - k) & (offs_n[None, :] < N)
-        
-        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
-        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
-        
-        # Accumulate
-        accumulator += tl.dot(a, b, allow_tf32=True)
-        
-        # Move pointers to next blocks
+        k_remaining = K - k
+        k_mask = offs_k < k_remaining
+
+        a = tl.load(
+            a_ptrs,
+            mask=(offs_m[:, None] < M) & k_mask[None, :],
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptrs,
+            mask=k_mask[:, None] & (offs_n[None, :] < N),
+            other=0.0,
+        )
+        acc += tl.dot(a, b, allow_tf32=True)
+
         a_ptrs += BLOCK_K * stride_ak
         b_ptrs += BLOCK_K * stride_bk
-    
-    # Add bias
-    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
-    accumulator += bias[None, :]
-    
-    # Store original output for residual connection
-    original_output = accumulator
-    
-    # Compute sigmoid: 1 / (1 + exp(-x))
-    # Use stable computation for exp(-x): exp(min(-x, 0))
-    neg_x = -accumulator
-    exp_neg_x = tl.exp(tl.minimum(neg_x, 0.0))
-    
-    # Handle positive and negative cases separately for numerical stability
-    # For x >= 0: sigmoid = 1 / (1 + exp(-x))
-    # For x < 0: sigmoid = exp(x) / (1 + exp(x))
-    pos_mask = accumulator >= 0.0
-    neg_mask = ~pos_mask
-    
-    # Compute sigmoid for positive x
-    sigmoid_pos = 1.0 / (1.0 + tl.where(pos_mask, exp_neg_x, 0.0))
-    
-    # Compute sigmoid for negative x
-    exp_x = tl.exp(tl.minimum(accumulator, 0.0))  # exp(min(x, 0)) for stability
-    sigmoid_neg = tl.where(neg_mask, exp_x / (1.0 + exp_x), 0.0)
-    
-    # Combine results
-    sigmoid_result = tl.where(pos_mask, sigmoid_pos, sigmoid_neg)
-    
-    # Scale by scaling factor
-    scaled_result = sigmoid_result * scaling_factor
-    
-    # Add residual: output = scaled_sigmoid + original_output
-    output = scaled_result + original_output
-    
-    # Store output to C
-    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
-    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-    tl.store(c_ptrs, output, mask=c_mask)
 
-def fused_gemm_sigmoid_scale_resadd(x, weight, bias, scaling_factor):
+    # Add bias (broadcast over rows)
+    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc = acc + bias[None, :]
+
+    # Fused: y = z + scaling_factor * sigmoid(z)
+    # sigmoid(z) = 1 / (1 + exp(-z))
+    neg_acc = -acc
+    sig = 1.0 / (1.0 + tl.exp(neg_acc))
+    acc = acc + scaling_factor * sig
+
+    # Store result
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    tl.store(
+        c_ptrs,
+        acc,
+        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+    )
+
+
+def fused_gemm_sigmoid_scale_residual(x, weight, bias, scaling_factor: float):
     """
-    Fused operation: GEMM -> Sigmoid -> Scaling -> Residual Add
-    
-    Args:
-        x: Input tensor of shape (M, K)
-        weight: Weight tensor of shape (N, K)
-        bias: Bias tensor of shape (N,)
-        scaling_factor: Scaling factor for sigmoid output
-        
-    Returns:
-        Output tensor of shape (M, N)
+    x:       (M, K)
+    weight:  (N, K) or (N, K) logically (PyTorch Linear: (N, K) == (out_features, in_features))
+    bias:    (N,)
+    returns: (M, N) with y = Wx^T + b + s * sigmoid(Wx^T + b)
     """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
     M, K = x.shape
-    N, K_w = weight.shape
-    assert K == K_w, f"Dimension mismatch: x has K={K}, weight has K={K_w}"
-    
-    # Allocate output tensor
-    output = torch.empty((M, N), device=x.device, dtype=x.dtype)
-    
-    # Transpose weight for column-major access
-    weight_t = weight.t().contiguous()
-    
-    # Grid dimensions
+    N = weight.shape[0]
+    assert weight.shape[1] == K, "weight shape must be (N, K)"
+
+    # Output tensor
+    c = torch.empty((M, N), device=x.device, dtype=x.dtype)
+
+    # Strides (row-major expected for typical PyTorch tensors)
+    stride_am, stride_ak = x.stride()
+    # Treat weight as B with logical shape (K, N), using strides accordingly
+    # B[k, n] = weight[n, k]
+    stride_bn, stride_bk = weight.stride()  # (stride_n, stride_k)
+    # For B(k, n): stride over k is weight.stride(1), over n is weight.stride(0)
+    stride_bk, stride_bn = stride_bk, stride_bn
+    stride_cm, stride_cn = c.stride()
+
+    # Grid: 2D over M and N
     def grid(meta):
         return (
-            triton.cdiv(M, meta['BLOCK_M']),
-            triton.cdiv(N, meta['BLOCK_N']),
+            triton.cdiv(M, meta["BLOCK_M"]),
+            triton.cdiv(N, meta["BLOCK_N"]),
         )
-    
-    # Launch kernel
-    fused_gemm_sigmoid_scale_resadd_kernel[grid](
-        x, weight_t, bias, output,
+
+    fused_gemm_sigmoid_scale_residual_kernel[grid](
+        x, weight, bias, c,
         M, N, K,
-        x.stride(0), x.stride(1),
-        weight_t.stride(0), weight_t.stride(1),
-        output.stride(0), output.stride(1),
-        BLOCK_M=64, BLOCK_N=64, BLOCK_K=32,
-        scaling_factor=scaling_factor,
+        stride_am, stride_ak,
+        stride_bk, stride_bn,
+        stride_cm, stride_cn,
+        float(scaling_factor),
+        BLOCK_M=128,
+        BLOCK_N=128,
+        BLOCK_K=32,
+        num_warps=8,
+        num_stages=3,
     )
-    
-    return output
+    return c
+
 
 class ModelNew(nn.Module):
     """
-    Model implementing the pattern "Gemm_Sigmoid_Scaling_ResidualAdd".
+    Triton-optimized version of:
+    x = Linear(x)
+    original_x = x
+    x = sigmoid(x)
+    x = scaling_factor * x
+    x = x + original_x
     """
+
     def __init__(self, input_size, hidden_size, scaling_factor):
         super(ModelNew, self).__init__()
+        # Match nn.Linear(input_size, hidden_size)
         self.weight = nn.Parameter(torch.randn(hidden_size, input_size))
         self.bias = nn.Parameter(torch.randn(hidden_size))
-        self.scaling_factor = scaling_factor
+        self.scaling_factor = float(scaling_factor)
 
-    def forward(self, x):
-        """
-        Forward pass of the model.
-
-        Args:
-            x (torch.Tensor): Input tensor of shape (batch_size, input_size).
-
-        Returns:
-            torch.Tensor: Output tensor of shape (batch_size, hidden_size).
-        """
-        return fused_gemm_sigmoid_scale_resadd(
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (batch_size, input_size)
+        return fused_gemm_sigmoid_scale_residual(
             x, self.weight, self.bias, self.scaling_factor
         )
 ```

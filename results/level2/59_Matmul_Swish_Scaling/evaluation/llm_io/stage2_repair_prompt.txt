@@ -1,0 +1,182 @@
+Fix the Triton kernel errors. Generate correct code.
+
+## ERROR LOG
+```
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 554, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251223_085823_59_Matmul_Swish_Scaling_openai_deepseek/59_Matmul_Swish_Scaling/code/kernel_20251223_090527.py", line 112, in forward
+    return linear_swish_scale(
+           ^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251223_085823_59_Matmul_Swish_Scaling_openai_deepseek/59_Matmul_Swish_Scaling/code/kernel_20251223_090527.py", line 84, in linear_swish_scale
+    swish_scale_bias_kernel_2d[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 419, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 238, in run
+    benchmark()
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 227, in benchmark
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 227, in <dictcomp>
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 137, in _bench
+    raise ValueError(f"Conflicting meta-parameters: {', '.join(conflicts)}."
+ValueError: Conflicting meta-parameters: BLOCK_N. Make sure that you don't re-define auto-tuned symbols.
+```
+
+## Broken Code
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_N": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_N": 256}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_N": 256}, num_warps=8, num_stages=2),
+    ],
+    key=["N"],
+)
+@triton.jit
+def swish_scale_bias_kernel_2d(
+    y_ptr,    # [M, N], row-major
+    bias_ptr, # [N]
+    M,        # rows
+    N,        # cols
+    scale,    # scalar float32
+    BLOCK_N: tl.constexpr,
+):
+    """
+    2D-tiled epilogue:
+        y[m, n] = (y[m, n] + bias[n]) * sigmoid(y[m, n] + bias[n]) * scale
+    """
+    pid_m = tl.program_id(0)  # row id
+    pid_n = tl.program_id(1)  # column block id
+
+    # Column indices this program handles
+    cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    col_mask = cols < N
+
+    # Base pointers for this row
+    row_offset = pid_m * N
+    y_ptrs = y_ptr + row_offset + cols
+    b_ptrs = bias_ptr + cols
+
+    # Load y and bias (coalesced)
+    y = tl.load(y_ptrs, mask=col_mask, other=0.0)
+    b = tl.load(b_ptrs, mask=col_mask, other=0.0)
+
+    # x = y + bias  (reuse y variable to keep register pressure low)
+    x = y + b
+
+    # Swish: x * sigmoid(x) with manual sigmoid implementation
+    # sigmoid(x) = 1 / (1 + exp(-x))
+    neg_x = -x
+    exp_neg_x = tl.exp(neg_x)
+    sig = 1.0 / (1.0 + exp_neg_x)
+
+    out = x * sig * scale
+
+    tl.store(y_ptrs, out, mask=col_mask)
+
+
+def linear_swish_scale(x: torch.Tensor,
+                       weight: torch.Tensor,
+                       bias: torch.Tensor,
+                       scale: float) -> torch.Tensor:
+    """
+    x:      [M, K]
+    weight: [N, K]  (nn.Linear.weight, out_features x in_features)
+    bias:   [N]
+    scale:  scalar float
+
+    Returns:
+        y: [M, N] = (x @ weight.T + bias) * sigmoid(x @ weight.T + bias) * scale
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda, "All tensors must be on CUDA"
+
+    # GEMM via cuBLAS / PyTorch
+    y = torch.matmul(x, weight.t())
+    y = y.contiguous()
+
+    M, N = y.shape
+
+    # 2D grid: one dimension over rows, one over column tiles
+    # BLOCK_N is a placeholder; autotune will select the best configuration.
+    BLOCK_N = 256
+    grid = (M, triton.cdiv(N, BLOCK_N))
+
+    swish_scale_bias_kernel_2d[grid](
+        y,
+        bias,
+        M,
+        N,
+        float(scale),
+        BLOCK_N=BLOCK_N,
+    )
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model with fused epilogue:
+
+    forward(x):
+        y = x @ W^T + b
+        y = y * sigmoid(y)    # Swish
+        y = y * scaling_factor
+
+    Bias + Swish + scale are fused into a single Triton kernel.
+    """
+    def __init__(self, in_features, out_features, scaling_factor):
+        super(ModelNew, self).__init__()
+        self.linear = nn.Linear(in_features, out_features)
+        self.scaling_factor = float(scaling_factor)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return linear_swish_scale(
+            x,
+            self.linear.weight,
+            self.linear.bias,
+            self.scaling_factor,
+        )
+```
+
+## CRITICAL — These cause 60%+ of failures:
+1. EVERY kernel function MUST have `@triton.jit` decorator — MANDATORY
+2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+3. BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+4. `tl.program_id(axis)` only supports axis = 0, 1, 2
+5. No `continue`, `break`, `return` inside loops — use masking
+6. No tensor indexing with loop vars: `x[:, i]` is INVALID
+7. mask shape MUST match data shape in tl.load/tl.store
+
+## Missing Triton Functions (implement manually):
+- tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+## OUTPUT FORMAT (STRICT):
+1. Imports: torch, torch.nn, triton, triton.language as tl (and math if needed)
+2. @triton.jit decorated kernel function(s)
+3. Wrapper function(s) for grid calculation and kernel launch
+4. class ModelNew(nn.Module) — REQUIRED
+
+Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <corrected code>
+```

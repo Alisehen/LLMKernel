@@ -1,0 +1,240 @@
+You are optimizing a Triton kernel based on algorithmic analysis.
+
+# PyTorch Reference (Target Behavior)
+
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs a Gemm, multiplies the result, and applies LeakyReLU.
+    """
+    def __init__(self, in_features, out_features, multiplier, negative_slope):
+        super(Model, self).__init__()
+        self.gemm = nn.Linear(in_features, out_features)
+        self.multiplier = multiplier
+        self.leaky_relu = nn.LeakyReLU(negative_slope)
+
+    def forward(self, x):
+        x = self.gemm(x)
+        x = x * self.multiplier
+        x = self.leaky_relu(x)
+        return x
+
+batch_size = 1024
+in_features  = 8192  
+out_features = 8192
+multiplier = 2.0
+negative_slope = 0.1
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features)]
+
+def get_init_inputs():
+    return [in_features, out_features, multiplier, negative_slope]
+```
+
+**CRITICAL**: Study the PyTorch code carefully to understand:
+- What does `forward()` return? (full output sequence vs final hidden state only)
+- What is the computational pattern?
+- What are the input/output shapes?
+
+Your optimized kernel MUST match this exact behavior.
+
+---
+
+# Analysis Results
+
+**Bottleneck**: Most of the time is spent in the hand-written tiled matmul loop, which cannot match the performance of vendor-optimized GEMM (cuBLAS/cuBLASLt) for this large 8192x8192x8192 case; the extra epilogue math is negligible in comparison.
+
+**Optimization Strategy**: Replace the custom GEMM implementation with a high-performance GEMM primitive that supports fused epilogues (e.g., cuBLASLt or Triton’s matmul template), and implement multiplier + bias + LeakyReLU purely as an epilogue on the accumulator, instead of reimplementing the matmul body.
+
+**Implementation Plan**: Use cuBLASLt (via PyTorch or a small C++/CUDA extension) to perform a single GEMM with a fused epilogue that applies bias, scaling by `multiplier`, and a LeakyReLU-like activation; alternatively, use Triton’s built-in matmul kernel generator (e.g., `triton.ops.matmul`) and customize only its epilogue to apply bias + multiplier + LeakyReLU. Keep the memory layout compatible with the chosen GEMM primitive (no manual `weight.t().contiguous()` in the hot path), so the main computation leverages Tensor Cores and optimal tiling while the epilogue remains a simple, register-resident pointwise transform.
+
+**Expected Speedup**: 30-50% vs the current Triton kernel (and at least parity or modest speedup vs the PyTorch baseline)
+
+---
+
+# Current Kernel (needs optimization)
+
+```python
+# Optimized Triton implementation replacing Gemm + Multiply + LeakyReLU
+
+import torch, torch.nn as nn, triton, triton.language as tl
+
+
+@triton.jit
+def fused_gemm_mul_leakyrelu_kernel(
+    a_ptr, b_ptr, bias_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    multiplier, negative_slope,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    # Program IDs for 2D tiling over (M, N)
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    # Offsets for each tile
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Create pointers for A and B tiles
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    # Accumulator in FP32
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Tiled matmul: A[M, K] @ B[K, N]
+    for k in range(0, K, BLOCK_K):
+        k_remaining = K - k
+
+        a_mask = (offs_m[:, None] < M) & (offs_k[None, :] < k_remaining)
+        b_mask = (offs_k[:, None] < k_remaining) & (offs_n[None, :] < N)
+
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+        acc += tl.dot(a, b, allow_tf32=True)
+
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Add bias: bias is [N]
+    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc += bias[None, :]
+
+    # Fused multiply by scalar
+    acc = acc * multiplier
+
+    # Fused LeakyReLU: x if x >= 0 else negative_slope * x
+    # Implemented as: max(x, 0) + negative_slope * min(x, 0)
+    zero = 0.0
+    pos = tl.maximum(acc, zero)
+    neg = tl.minimum(acc, zero) * negative_slope
+    acc = pos + neg
+
+    # Store result
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, acc, mask=c_mask)
+
+
+def fused_gemm_mul_leakyrelu(x, weight, bias, multiplier, negative_slope):
+    """
+    x: [M, K]
+    weight: [N, K] (nn.Linear weight, out_features x in_features)
+    bias: [N]
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda, "Inputs must be CUDA tensors"
+
+    M, K = x.shape
+    N = weight.shape[0]
+
+    # Prepare output
+    out = torch.empty((M, N), device=x.device, dtype=x.dtype)
+
+    # B = W^T to get [K, N] for A[M,K] @ B[K,N]
+    b = weight.t().contiguous()
+
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_M"]),
+        triton.cdiv(N, META["BLOCK_N"]),
+    )
+
+    fused_gemm_mul_leakyrelu_kernel[grid](
+        x, b, bias, out,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        b.stride(0), b.stride(1),
+        out.stride(0), out.stride(1),
+        float(multiplier), float(negative_slope),
+        BLOCK_M=128, BLOCK_N=128, BLOCK_K=64,
+        num_warps=8,
+        num_stages=2,
+    )
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized replacement for:
+      Linear -> multiply by scalar -> LeakyReLU
+    """
+
+    def __init__(self, in_features, out_features, multiplier, negative_slope):
+        super(ModelNew, self).__init__()
+        # Match nn.Linear(in_features, out_features)
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias = nn.Parameter(torch.empty(out_features))
+        # Initialize like nn.Linear
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+        bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+        nn.init.uniform_(self.bias, -bound, bound)
+
+        self.multiplier = float(multiplier)
+        self.negative_slope = float(negative_slope)
+
+    def forward(self, x):
+        # Expect x to be on CUDA device
+        return fused_gemm_mul_leakyrelu(
+            x, self.weight, self.bias, self.multiplier, self.negative_slope
+        )
+
+
+import math
+```
+
+---
+
+# Your Task
+
+Implement the optimization strategy above. Focus on the specific bottleneck identified.
+
+## Key Requirements
+
+1. **Preserve correctness**: Maintain the same input/output behavior
+2. **Apply the optimization**: Follow the implementation plan exactly
+3. **Use valid Triton syntax**:
+   - Every kernel MUST have `@triton.jit` decorator
+   - Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+   - BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+   - No `continue`, `break`, `return` inside kernels (use masking)
+   - Prefer `tl.dot(a, b, allow_tf32=True)` for matmul operations
+
+4. **CRITICAL for RNN/GRU/LSTM Persistent Kernels**:
+   - Time loop MUST be inside @triton.jit kernel, NOT in Python forward()
+   - **HYBRID computation strategy** (CRITICAL for performance):
+     * Precompute input-side gates OUTSIDE kernel: `gates_x = (T*B, In) @ W_ih` (ONE large GEMM)
+     * INSIDE kernel: only recurrent-side: `for t: gates_h = h @ W_hh` (T small GEMMs)
+   - CORRECT (FAST - use this):
+     ```python
+     # Python forward():
+     gates_x_all = x.reshape(T*B, In) @ W_ih + b_ih  # ONE large GEMM
+     gates_x_all = gates_x_all.view(T, B, 3*H)
+     gru_persistent_kernel[grid](gates_x_all, h0, W_hh, ...)  # Launch ONCE
+
+     @triton.jit
+     def gru_persistent_kernel(gates_x_ptr, h_ptr, W_hh_ptr, ...):
+         for t in range(T):  # Inside kernel
+             gates_x_t = tl.load(gates_x_ptr + t*...)  # Precomputed
+             gates_h = h @ W_hh  # Only recurrent GEMM
+             h = (1-z)*n + z*h   # Fuse and update
+     ```
+
+5. **Output format**:
+   - Imports: `import torch, torch.nn as nn, triton, triton.language as tl`
+   - `@triton.jit` kernel(s)
+   - Wrapper function(s)
+   - `class ModelNew(nn.Module)` — REQUIRED
+   - NO testing code, NO `if __name__ == "__main__"`
+
+---
+
+Generate the optimized kernel now. Output ONLY the complete Python code.

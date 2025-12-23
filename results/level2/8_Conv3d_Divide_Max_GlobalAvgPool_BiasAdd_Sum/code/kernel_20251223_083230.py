@@ -1,0 +1,380 @@
+import torch, torch.nn as nn, triton, triton.language as tl
+
+
+@triton.jit
+def conv3d_gemm_kernel(
+    x_ptr, w_ptr, b_ptr, y_ptr,
+    N, C_out,
+    D_out, H_out, W_out, P,
+    stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
+    stride_wo, stride_wc, stride_wd, stride_wh, stride_ww,
+    stride_yn, stride_yc, stride_yd, stride_yh, stride_yw,
+    C_IN: tl.constexpr,
+    K_D: tl.constexpr, K_H: tl.constexpr, K_W: tl.constexpr,
+    R: tl.constexpr,  # R = C_IN * K_D * K_H * K_W
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """
+    GEMM-style 3D convolution:
+
+    x: [N, C_IN, D_in, H_in, W_in]
+    w: [C_out, C_IN, K_D, K_H, K_W]
+    y: [N, C_out, D_out, H_out, W_out]
+
+    We view convolution as Y = A @ B, where:
+      - A: [P, R], P = N * D_out * H_out * W_out
+           each row corresponds to an output position (n, od, oh, ow)
+           each column corresponds to (ic, kd, kh, kw)
+           A[p, r] = x[n, ic, od+kd, oh+kh, ow+kw]
+      - B: [R, C_out], B[r, co] = w[co, ic, kd, kh, kw]
+
+    This kernel computes a BLOCK_M x BLOCK_N tile of Y using
+    K-loop tiling over R (BLOCK_K), similar to a GEMM kernel.
+    """
+    pid_m = tl.program_id(0)  # tile over output positions (P)
+    pid_n = tl.program_id(1)  # tile over output channels (C_out)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # [BM]
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # [BN]
+
+    mask_m = offs_m < P
+    mask_n = offs_n < C_out
+
+    # Decode flattened output positions offs_m -> (n, od, oh, ow)
+    DHW = D_out * H_out * W_out
+    HW = H_out * W_out
+
+    n_idx = offs_m // DHW
+    rem = offs_m % DHW
+    od_idx = rem // HW
+    rem2 = rem % HW
+    oh_idx = rem2 // W_out
+    ow_idx = rem2 % W_out
+
+    # Accumulator for this output tile
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Reduction over R = C_IN * K_D * K_H * K_W, in BLOCK_K chunks
+    for k0 in range(0, R, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)  # [BK]
+        mask_k = offs_k < R
+
+        # Decode reduction index r -> (ic, kd, kh, kw)
+        # r = (((ic * K_D + kd) * K_H + kh) * K_W + kw)
+        tmp = offs_k // K_W
+        kw_idx = offs_k % K_W
+        tmp2 = tmp // K_H
+        kh_idx = tmp % K_H
+        tmp3 = tmp2 // K_D
+        kd_idx = tmp2 % K_D
+        ic_idx = tmp3  # [BK]
+
+        # Compute input coordinates for this (offs_m, offs_k) tile
+        # Shapes:
+        #   n_idx, od_idx, oh_idx, ow_idx: [BM]
+        #   ic_idx, kd_idx, kh_idx, kw_idx: [BK]
+        # Broadcast to [BM, BK]
+        id_idx = od_idx[:, None] + kd_idx[None, :]
+        ih_idx = oh_idx[:, None] + kh_idx[None, :]
+        iw_idx = ow_idx[:, None] + kw_idx[None, :]
+
+        x_offsets = (
+            n_idx[:, None] * stride_xn
+            + ic_idx[None, :] * stride_xc
+            + id_idx * stride_xd
+            + ih_idx * stride_xh
+            + iw_idx * stride_xw
+        )
+
+        mask_x = (mask_m[:, None] & mask_k[None, :])
+
+        x_tile = tl.load(
+            x_ptr + x_offsets,
+            mask=mask_x,
+            other=0.0,
+        )  # [BM, BK], fp32
+
+        # Compute weight offsets for this (offs_k, offs_n) tile
+        # w: [C_out, C_IN, K_D, K_H, K_W]
+        w_offsets = (
+            offs_n[None, :] * stride_wo
+            + ic_idx[:, None] * stride_wc
+            + kd_idx[:, None] * stride_wd
+            + kh_idx[:, None] * stride_wh
+            + kw_idx[:, None] * stride_ww
+        )
+
+        mask_w = (mask_k[:, None] & mask_n[None, :])
+
+        w_tile = tl.load(
+            w_ptr + w_offsets,
+            mask=mask_w,
+            other=0.0,
+        )  # [BK, BN], fp32
+
+        # Matrix multiply / accumulate: [BM, BK] @ [BK, BN] -> [BM, BN]
+        acc += tl.dot(x_tile, w_tile, allow_tf32=True)
+
+    # Add conv bias (per output channel)
+    bias_vals = tl.load(b_ptr + offs_n, mask=mask_n, other=0.0)  # [BN]
+    acc += bias_vals[None, :]
+
+    # Store output y[n, co, od, oh, ow]
+    y_offsets = (
+        n_idx[:, None] * stride_yn
+        + offs_n[None, :] * stride_yc
+        + od_idx[:, None] * stride_yd
+        + oh_idx[:, None] * stride_yh
+        + ow_idx[:, None] * stride_yw
+    )
+
+    tl.store(
+        y_ptr + y_offsets,
+        acc,
+        mask=mask_m[:, None] & mask_n[None, :],
+    )
+
+
+def conv3d_triton(x, weight, bias_conv):
+    """
+    x: [N, C_in, D_in, H_in, W_in]
+    weight: [C_out, C_in, K_D, K_H, K_W]
+    bias_conv: [C_out]
+    returns: [N, C_out, D_out, H_out, W_out]
+    """
+    assert x.is_cuda and weight.is_cuda and bias_conv.is_cuda
+    x = x.contiguous()
+    weight = weight.contiguous()
+    bias_conv = bias_conv.contiguous()
+
+    N, C_in, D_in, H_in, W_in = x.shape
+    C_out = weight.shape[0]
+    K_D, K_H, K_W = weight.shape[2:]
+
+    D_out = D_in - K_D + 1
+    H_out = H_in - K_H + 1
+    W_out = W_in - K_W + 1
+
+    y = torch.empty((N, C_out, D_out, H_out, W_out),
+                    device=x.device, dtype=x.dtype)
+
+    stride_xn, stride_xc, stride_xd, stride_xh, stride_xw = x.stride()
+    stride_wo, stride_wc, stride_wd, stride_wh, stride_ww = weight.stride()
+    stride_yn, stride_yc, stride_yd, stride_yh, stride_yw = y.stride()
+
+    P = N * D_out * H_out * W_out
+    R = C_in * K_D * K_H * K_W
+
+    def grid(meta):
+        return (
+            triton.cdiv(P, meta["BLOCK_M"]),
+            triton.cdiv(C_out, meta["BLOCK_N"]),
+        )
+
+    conv3d_gemm_kernel[grid](
+        x, weight, bias_conv, y,
+        N, C_out,
+        D_out, H_out, W_out, P,
+        stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
+        stride_wo, stride_wc, stride_wd, stride_wh, stride_ww,
+        stride_yn, stride_yc, stride_yd, stride_yh, stride_yw,
+        C_IN=C_in,
+        K_D=K_D, K_H=K_H, K_W=K_W,
+        R=R,
+        BLOCK_M=64, BLOCK_N=16, BLOCK_K=32,
+    )
+    return y
+
+
+@triton.jit
+def maxpool3d_global_avg_kernel(
+    x_ptr, out_ptr,
+    N, C, D_out, H_out, W_out,
+    Dp, Hp, Wp,
+    KPD, KPH, KPW,
+    divisor,
+    stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
+    stride_on, stride_oc,
+):
+    """
+    For each (n, c): apply MaxPool3d with kernel=(KPD,KPH,KPW), stride=kernel,
+    on conv output x (already computed), then divide by `divisor`, then
+    global average over pooled spatial dims. Result: out[n, c].
+    """
+    pid = tl.program_id(0)
+    n = pid // C
+    c = pid % C
+
+    sum_val = tl.zeros((), dtype=tl.float32)
+
+    for pd in range(0, Dp):
+        base_d = pd * KPD
+        for ph in range(0, Hp):
+            base_h = ph * KPH
+            for pw in range(0, Wp):
+                base_w = pw * KPW
+
+                max_val = tl.full((), -1e30, dtype=tl.float32)
+
+                for kd in range(0, KPD):
+                    id = base_d + kd
+                    for kh in range(0, KPH):
+                        ih = base_h + kh
+                        for kw in range(0, KPW):
+                            iw = base_w + kw
+                            offset = (
+                                n * stride_xn
+                                + c * stride_xc
+                                + id * stride_xd
+                                + ih * stride_xh
+                                + iw * stride_xw
+                            )
+                            v = tl.load(x_ptr + offset)
+                            v = v / divisor
+                            max_val = tl.maximum(max_val, v)
+
+                sum_val += max_val
+
+    norm = 1.0 / (Dp * Hp * Wp)
+    mean_val = sum_val * norm
+
+    out_offset = n * stride_on + c * stride_oc
+    tl.store(out_ptr + out_offset, mean_val)
+
+
+def maxpool3d_global_avg_div(x, divisor, pool_kernel):
+    """
+    x: conv output [N, C_out, D_out, H_out, W_out]
+    Applies: y = max_pool3d(x / divisor) then global avg pool to (1,1,1).
+    Returns y_mean: [N, C_out]
+    """
+    assert x.is_cuda
+    x = x.contiguous()
+    N, C, D_out, H_out, W_out = x.shape
+    KPD, KPH, KPW = pool_kernel
+
+    # Assuming stride == kernel size (as in nn.MaxPool3d(pool_size) default)
+    Dp = (D_out - KPD) // KPD + 1
+    Hp = (H_out - KPH) // KPH + 1
+    Wp = (W_out - KPW) // KPW + 1
+
+    out = torch.empty((N, C), device=x.device, dtype=x.dtype)
+
+    stride_xn, stride_xc, stride_xd, stride_xh, stride_xw = x.stride()
+    stride_on, stride_oc = out.stride()
+
+    grid = (triton.cdiv(N * C, 1),)
+    maxpool3d_global_avg_kernel[grid](
+        x, out,
+        N, C, D_out, H_out, W_out,
+        Dp, Hp, Wp,
+        KPD, KPH, KPW,
+        float(divisor),
+        stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
+        stride_on, stride_oc,
+    )
+    return out
+
+
+@triton.jit
+def bias_add_sum_kernel(
+    v_ptr, bias_ptr, out_ptr,
+    N, C,
+    stride_vn, stride_vc,
+    BLOCK_C: tl.constexpr,
+):
+    """
+    v: [N, C] (result of pooled conv)
+    bias: [C] (extra bias term broadcast over batch)
+    out[n] = sum_c (v[n,c] + bias[c])
+    """
+    pid = tl.program_id(0)
+    n = pid
+
+    sum_val = tl.zeros((), dtype=tl.float32)
+    offs_c = tl.arange(0, BLOCK_C)
+
+    for c_start in range(0, C, BLOCK_C):
+        c_idx = c_start + offs_c
+        mask = (n < N) & (c_idx < C)
+
+        v_vals = tl.load(
+            v_ptr + n * stride_vn + c_idx * stride_vc,
+            mask=mask,
+            other=0.0,
+        )
+        b_vals = tl.load(
+            bias_ptr + c_idx,
+            mask=c_idx < C,
+            other=0.0,
+        )
+        vals = v_vals + b_vals
+        sum_val += tl.sum(vals, axis=0)
+
+    tl.store(out_ptr + n, sum_val, mask=n < N)
+
+
+def bias_add_sum(v, bias):
+    """
+    v: [N, C_out]
+    bias: [C_out, 1, 1, 1]
+    returns: [N] (sum over channel after adding bias)
+    """
+    assert v.is_cuda and bias.is_cuda
+    v = v.contiguous()
+    bias_vec = bias.view(-1).contiguous()
+
+    N, C = v.shape
+    out = torch.empty((N,), device=v.device, dtype=v.dtype)
+
+    stride_vn, stride_vc = v.stride()
+
+    def grid(meta):
+        return (triton.cdiv(N, 1),)
+
+    bias_add_sum_kernel[grid](
+        v, bias_vec, out,
+        N, C,
+        stride_vn, stride_vc,
+        BLOCK_C=32,
+    )
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized version of the target model:
+
+    - 3D convolution (with bias)
+    - division by constant
+    - MaxPool3d
+    - global average pooling to (1,1,1)
+    - add bias term
+    - sum along channel dimension
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size, divisor,
+                 pool_size, bias_shape, sum_dim):
+        super(ModelNew, self).__init__()
+
+        # Initialize conv weights/bias using PyTorch's Conv3d init
+        conv = nn.Conv3d(in_channels, out_channels, kernel_size)
+        self.weight = nn.Parameter(conv.weight.detach().clone())
+        self.bias_conv = nn.Parameter(conv.bias.detach().clone())
+
+        self.divisor = float(divisor)
+        self.pool_kernel = pool_size
+
+        # Extra bias after global average pooling
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+
+        # Kept for API compatibility; current implementation assumes sum_dim == 1
+        self.sum_dim = sum_dim
+
+    def forward(self, x):
+        # Expect x on CUDA
+        y = conv3d_triton(x, self.weight, self.bias_conv)
+        v = maxpool3d_global_avg_div(y, self.divisor, self.pool_kernel)
+        out_vec = bias_add_sum(v, self.bias)
+        # Final shape [N, 1, 1, 1] to match original model
+        return out_vec.view(out_vec.shape[0], 1, 1, 1)

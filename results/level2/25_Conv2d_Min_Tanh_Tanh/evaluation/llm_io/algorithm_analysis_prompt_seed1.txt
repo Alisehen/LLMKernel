@@ -1,0 +1,224 @@
+You are a GPU kernel optimization architect. Analyze the kernel and identify **ONE high-level algorithmic optimization**.
+
+# PyTorch Reference
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs a convolution, applies minimum operation, Tanh, and another Tanh.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size):
+        super(Model, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = torch.min(x, dim=1, keepdim=True)[0] # Apply minimum operation along the channel dimension
+        x = torch.tanh(x)
+        x = torch.tanh(x)
+        return x
+
+batch_size = 128
+in_channels = 16
+out_channels = 64
+height = width = 256
+kernel_size = 3
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size]
+```
+
+# Current Triton Kernel
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def min_tanh_tanh_kernel(
+    x_ptr, y_ptr,
+    B, C, H, W,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    BLOCK_C: tl.constexpr,
+):
+    # Program IDs for batch, height, width
+    pid_n = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    pid_w = tl.program_id(2)
+
+    # Guard against out-of-bounds in case grid is larger than tensor dims
+    mask_n = pid_n < B
+    mask_h = pid_h < H
+    mask_w = pid_w < W
+    in_bounds = mask_n & mask_h & mask_w
+
+    # If out of bounds, we still must not early-return; use masking
+    # Base pointer for this (n, h, w) location in the input tensor
+    x_base_offset = (
+        pid_n * stride_xn
+        + pid_h * stride_xh
+        + pid_w * stride_xw
+    )
+    x_base_ptr = x_ptr + x_base_offset
+
+    # Initialize running minimum (in float32 for numeric stability)
+    min_val = tl.full((), float("inf"), tl.float32)
+
+    # Reduce over channel dimension C in blocks of BLOCK_C
+    # Each iteration handles up to BLOCK_C channels
+    c = 0
+    while c < C:
+        offs_c = c + tl.arange(0, BLOCK_C)
+        mask_c = offs_c < C
+        # Only load if the (n,h,w) position is in bounds
+        mask = mask_c & in_bounds
+
+        x_ptrs = x_base_ptr + offs_c * stride_xc
+        x_vals = tl.load(x_ptrs, mask=mask, other=float("inf"))
+
+        # Accumulate minimum
+        block_min = tl.min(x_vals, axis=0)
+        min_val = tl.minimum(min_val, block_min)
+
+        c += BLOCK_C
+
+    # Apply two successive tanh operations:
+    # tanh(x) = (exp(2x) - 1) / (exp(2x) + 1)
+    # First tanh
+    t = 2.0 * min_val
+    e = tl.exp(t)
+    tanh1 = (e - 1.0) / (e + 1.0)
+    # Second tanh
+    t2 = 2.0 * tanh1
+    e2 = tl.exp(t2)
+    out_val = (e2 - 1.0) / (e2 + 1.0)
+
+    # Store result to output at channel index 0 (keepdim=True)
+    y_offset = (
+        pid_n * stride_yn
+        + 0 * stride_yc  # channel is always 0 due to keepdim=True
+        + pid_h * stride_yh
+        + pid_w * stride_yw
+    )
+
+    # Only store if within bounds
+    tl.store(y_ptr + y_offset, out_val, mask=in_bounds)
+
+
+def min_tanh_tanh(x: torch.Tensor) -> torch.Tensor:
+    """
+    Fused replacement for:
+        x = torch.min(x, dim=1, keepdim=True)[0]
+        x = torch.tanh(x)
+        x = torch.tanh(x)
+    Assumes x is NCHW and float32 on CUDA.
+    """
+    assert x.is_cuda, "Input must be on CUDA"
+    assert x.dtype == torch.float32, "Kernel currently assumes float32"
+
+    B, C, H, W = x.shape
+    y = torch.empty((B, 1, H, W), device=x.device, dtype=x.dtype)
+
+    grid = lambda META: (B, H, W)
+
+    min_tanh_tanh_kernel[grid](
+        x, y,
+        B, C, H, W,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        y.stride(0), y.stride(1), y.stride(2), y.stride(3),
+        BLOCK_C=64,
+        num_warps=4,
+        num_stages=2,
+    )
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized version of the original model using Triton for:
+      min over channels + tanh + tanh
+    Convolution is still performed via cuDNN (nn.Conv2d).
+    """
+    def __init__(self, in_channels, out_channels, kernel_size):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = min_tanh_tanh(x)
+        return x
+```
+
+# Performance
+- **PyTorch baseline**: 14.21 ms
+- **Current Triton**: 84.08 ms
+- **Current speedup**: 0.17x (-491.8% vs baseline)
+
+
+---
+
+## Analysis Steps
+
+1. **Code Analysis**: Count kernels, identify operations, check for inefficiencies
+2. **Performance Diagnosis**: Use metrics/latency to identify bottleneck type
+3. **Root Cause**: Combine code + performance to find the core issue
+
+## Optimization Categories (pick ONE if worth optimizing):
+
+### 1. Operator Fusion
+Fuse consecutive ops into fewer kernels to reduce memory traffic and launch overhead.
+
+### 2. Algorithm Replacement
+Replace naive algorithm with optimized variant.
+- For Attention: Flash Attention, online softmax
+- For Convolution: Winograd, im2col
+- **For RNN/GRU/LSTM**: Persistent kernel with HYBRID computation
+  - **CRITICAL**: Use hybrid approach for best performance:
+    * Precompute input-side gates ONCE (outside kernel): `gates_x = (T*B, In) @ W_ih`
+    * Persistent kernel (inside): only recurrent-side: `for t: gates_h = h @ W_hh`
+  - Time loop `for t in range(T)` must be inside kernel, NOT in Python
+  - Launch kernel once per layer, not once per timestep
+  - Expected speedup: 10-100x (vs per-timestep launches)
+
+### 3. Kernel Launch Reduction
+Combine multiple small kernels to reduce overhead.
+- **For RNN/GRU/LSTM**: See "Algorithm Replacement" above for persistent kernel approach
+
+### 4. Memory Layout Optimization
+Use in-place operations, buffer reuse, or better layouts.
+
+## Should We Optimize?
+
+Before proposing optimization, determine if it's worthwhile:
+- **Not worth optimizing** if:
+  - Code is already near-optimal (expected speedup < 10%)
+  - Bottleneck cannot be addressed (hardware limited, already optimal algorithm)
+  - Optimization would add significant complexity with minimal gain
+
+- **Worth optimizing** if:
+  - Clear algorithmic inefficiency exists (multiple kernels, suboptimal algorithm)
+  - Expected speedup >= 20%
+  - Concrete optimization path available
+
+## Output (JSON)
+
+```json
+{
+  "worth_optimizing": "yes/no",
+  "reason": "<Why worth or not worth optimizing, 1 sentence>",
+  "bottleneck": "<Root cause in 1-2 sentences, empty if not worth optimizing>",
+  "optimisation method": "<Specific optimization in 1-2 sentences, empty if not worth optimizing>",
+  "modification plan": "<Implementation steps in 2-3 sentences, empty if not worth optimizing>",
+  "expected_speedup": "<e.g., '30-40%', empty if not worth optimizing>"
+}
+```
+
+Return JSON only.

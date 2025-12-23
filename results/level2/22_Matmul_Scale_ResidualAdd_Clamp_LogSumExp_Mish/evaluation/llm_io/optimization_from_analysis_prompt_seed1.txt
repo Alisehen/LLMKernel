@@ -1,0 +1,287 @@
+You are optimizing a Triton kernel based on algorithmic analysis.
+
+# PyTorch Reference (Target Behavior)
+
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs a matrix multiplication, scales the result, adds a residual connection, clamps the output,
+    applies LogSumExp, and finally applies the Mish activation function.
+    """
+    def __init__(self, input_size, hidden_size, scale_factor, clamp_min, clamp_max):
+        super(Model, self).__init__()
+        self.matmul = nn.Linear(input_size, hidden_size)
+        self.scale_factor = scale_factor
+        self.clamp_min = clamp_min
+        self.clamp_max = clamp_max
+
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor of shape (batch_size, input_size).
+
+        Returns:
+            Output tensor of shape (batch_size, hidden_size).
+        """
+        x = self.matmul(x)
+        x = x * self.scale_factor
+        x = x + x
+        x = torch.clamp(x, self.clamp_min, self.clamp_max)
+        x = torch.logsumexp(x, dim=1, keepdim=True)
+        x = x * torch.nn.functional.mish(x)  # Mish activation
+        return x
+
+batch_size = 1024
+input_size = 8192
+hidden_size = 8192
+scale_factor = 2.0
+clamp_min = -10.0
+clamp_max = 10.0
+
+def get_inputs():
+    return [torch.rand(batch_size, input_size)]
+
+def get_init_inputs():
+    return [input_size, hidden_size, scale_factor, clamp_min, clamp_max]
+```
+
+**CRITICAL**: Study the PyTorch code carefully to understand:
+- What does `forward()` return? (full output sequence vs final hidden state only)
+- What is the computational pattern?
+- What are the input/output shapes?
+
+Your optimized kernel MUST match this exact behavior.
+
+---
+
+# Analysis Results
+
+**Bottleneck**: The kernel serializes almost all work over the N dimension inside a single program (only 16 CTAs for M=1024 with BLOCK_M=64), because logsumexp is computed 'online' during GEMM; this prevents 2D tiling over (M,N), yields very low occupancy, and replaces a highly-optimized GEMM (cuBLAS) with a slow custom matmul.
+
+**Optimization Strategy**: Replace the current 'GEMM + streaming logsumexp' fused algorithm with a two-phase approach: (1) use a standard, highly-parallel GEMM (cuBLAS or Triton matmul) to compute the Linear output over both M and N, and (2) run a separate Triton kernel that applies scale + residual (folded as a single multiply), clamp, row-wise logsumexp, and Mish.
+
+**Implementation Plan**: First, remove logsumexp and Mish from the matmul kernel and instead call a standard Linear/GEMM (e.g., torch.nn.functional.linear or a Triton matmul with a 2D grid over (M,N)) to produce the full (M,N) matrix. Second, implement a dedicated Triton reduction kernel that takes this matrix, applies the fused scale-and-residual and clamp elementwise, then performs a row-wise logsumexp followed by Mish and the final x*mish(x) multiplication to produce an (M,1) output. This restores full 2D parallelism to the GEMM, lets it use Tensor Cores/optimized tiling, and confines custom logic to a lightweight reduction kernel.
+
+**Expected Speedup**: ≥100x vs the current Triton kernel and likely 1.2–2x vs the PyTorch baseline after tuning.
+
+---
+
+# Current Kernel (needs optimization)
+
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def fused_linear_scale_clamp_logsumexp_mish_kernel(
+    x_ptr, w_ptr, b_ptr, out_ptr,
+    M, N, K,
+    stride_xm, stride_xk,
+    stride_wn, stride_wk,
+    stride_om,
+    scale, clamp_min, clamp_max,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    # Program id along batch (M) dimension
+    pid_m = tl.program_id(0)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offs_m < M
+
+    # Row-wise running max and sum for streaming logsumexp
+    neg_inf = -1.0e30
+    row_max = tl.full((BLOCK_M,), neg_inf, dtype=tl.float32)
+    row_sum = tl.zeros((BLOCK_M,), dtype=tl.float32)
+
+    # Iterate over N dimension in tiles
+    for start_n in range(0, N, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        mask_n = offs_n < N
+
+        # GEMM tile: [BLOCK_M, BLOCK_N]
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+        offs_k = tl.arange(0, BLOCK_K)
+        x_ptrs = x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk
+        # w_ptr is [N, K] (row-major), but we need [K, N] for dot -> transpose on-the-fly
+        w_ptrs = w_ptr + offs_n[None, :] * stride_wn + offs_k[:, None] * stride_wk
+
+        for k in range(0, K, BLOCK_K):
+            k_remaining = K - k
+            k_mask = offs_k < k_remaining
+
+            x = tl.load(
+                x_ptrs,
+                mask=mask_m[:, None] & k_mask[None, :],
+                other=0.0,
+            )
+            w = tl.load(
+                w_ptrs,
+                mask=k_mask[:, None] & mask_n[None, :],
+                other=0.0,
+            )
+
+            acc += tl.dot(x, w, allow_tf32=True)
+
+            x_ptrs += BLOCK_K * stride_xk
+            w_ptrs += BLOCK_K * stride_wk
+
+        # Add bias
+        bias = tl.load(b_ptr + offs_n, mask=mask_n, other=0.0)
+        acc += bias[None, :]
+
+        # Fused scaling (includes residual x + x -> factor 2) and clamp
+        acc = acc * scale
+        acc = tl.maximum(acc, clamp_min)
+        acc = tl.minimum(acc, clamp_max)
+
+        # Mask out invalid columns before reduction so they don't affect max/sum
+        valid_acc = tl.where(mask_n[None, :], acc, neg_inf)
+
+        # Tile-wise row max
+        tile_max = tl.max(valid_acc, axis=1)
+        tile_max = tl.where(mask_m, tile_max, row_max)
+
+        # Streaming logsumexp update:
+        # m_new = max(m_old, tile_max)
+        # s_new = s_old * exp(m_old - m_new) + sum(exp(tile - m_new))
+        m_old = row_max
+        s_old = row_sum
+        m_new = tl.maximum(m_old, tile_max)
+
+        acc_shift = valid_acc - m_new[:, None]
+        exp_tile = tl.exp(acc_shift)
+        sum_tile = tl.sum(exp_tile, axis=1)
+
+        row_sum = s_old * tl.exp(m_old - m_new) + sum_tile
+        row_max = m_new
+
+    # Final logsumexp per row: logsumexp = log(row_sum) + row_max
+    lse = tl.log(row_sum) + row_max
+
+    # Mish activation: mish(x) = x * tanh(softplus(x)),
+    # softplus(x) = log(1 + exp(x)), tanh(z) = (exp(2z) - 1) / (exp(2z) + 1)
+    sp = tl.log(1.0 + tl.exp(lse))
+    t = tl.exp(2.0 * sp)
+    tanh_sp = (t - 1.0) / (t + 1.0)
+    mish_lse = lse * tanh_sp
+
+    out_val = lse * mish_lse  # x * mish(x)
+
+    # Store result with keepdim=True shape (M, 1)
+    out_ptrs = out_ptr + offs_m * stride_om
+    tl.store(out_ptrs, out_val, mask=mask_m)
+
+
+def fused_linear_scale_clamp_logsumexp_mish(x, weight, bias, scale_factor, clamp_min, clamp_max):
+    """
+    x:       (M, K)
+    weight:  (N, K)  -- same as nn.Linear(out_features=N, in_features=K).weight
+    bias:    (N,)
+    returns: (M, 1)
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+    M, K = x.shape
+    N = weight.shape[0]
+
+    # Output: logsumexp over dim=1 with keepdim=True
+    out = torch.empty((M, 1), device=x.device, dtype=x.dtype)
+
+    # Fold "x * scale_factor; x = x + x" into a single constant multiplier
+    total_scale = float(scale_factor) * 2.0
+
+    grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]),)
+
+    fused_linear_scale_clamp_logsumexp_mish_kernel[grid](
+        x, weight, bias, out,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        weight.stride(0), weight.stride(1),
+        out.stride(0),
+        total_scale, clamp_min, clamp_max,
+        BLOCK_M=64, BLOCK_N=64, BLOCK_K=32,
+        num_warps=4,
+        num_stages=2,
+    )
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized version of the target model.
+    Fuses: Linear (matmul + bias) + scale + residual add + clamp + logsumexp + Mish + multiply.
+    """
+    def __init__(self, input_size, hidden_size, scale_factor, clamp_min, clamp_max):
+        super(ModelNew, self).__init__()
+        # Keep original structure / initialization via nn.Linear
+        self.matmul = nn.Linear(input_size, hidden_size)
+        self.scale_factor = scale_factor
+        self.clamp_min = clamp_min
+        self.clamp_max = clamp_max
+
+    def forward(self, x):
+        # x: (batch_size, input_size)
+        # Use Triton kernel with the linear layer's parameters
+        return fused_linear_scale_clamp_logsumexp_mish(
+            x,
+            self.matmul.weight,
+            self.matmul.bias,
+            self.scale_factor,
+            self.clamp_min,
+            self.clamp_max,
+        )
+```
+
+---
+
+# Your Task
+
+Implement the optimization strategy above. Focus on the specific bottleneck identified.
+
+## Key Requirements
+
+1. **Preserve correctness**: Maintain the same input/output behavior
+2. **Apply the optimization**: Follow the implementation plan exactly
+3. **Use valid Triton syntax**:
+   - Every kernel MUST have `@triton.jit` decorator
+   - Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+   - BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+   - No `continue`, `break`, `return` inside kernels (use masking)
+   - Prefer `tl.dot(a, b, allow_tf32=True)` for matmul operations
+
+4. **CRITICAL for RNN/GRU/LSTM Persistent Kernels**:
+   - Time loop MUST be inside @triton.jit kernel, NOT in Python forward()
+   - **HYBRID computation strategy** (CRITICAL for performance):
+     * Precompute input-side gates OUTSIDE kernel: `gates_x = (T*B, In) @ W_ih` (ONE large GEMM)
+     * INSIDE kernel: only recurrent-side: `for t: gates_h = h @ W_hh` (T small GEMMs)
+   - CORRECT (FAST - use this):
+     ```python
+     # Python forward():
+     gates_x_all = x.reshape(T*B, In) @ W_ih + b_ih  # ONE large GEMM
+     gates_x_all = gates_x_all.view(T, B, 3*H)
+     gru_persistent_kernel[grid](gates_x_all, h0, W_hh, ...)  # Launch ONCE
+
+     @triton.jit
+     def gru_persistent_kernel(gates_x_ptr, h_ptr, W_hh_ptr, ...):
+         for t in range(T):  # Inside kernel
+             gates_x_t = tl.load(gates_x_ptr + t*...)  # Precomputed
+             gates_h = h @ W_hh  # Only recurrent GEMM
+             h = (1-z)*n + z*h   # Fuse and update
+     ```
+
+5. **Output format**:
+   - Imports: `import torch, torch.nn as nn, triton, triton.language as tl`
+   - `@triton.jit` kernel(s)
+   - Wrapper function(s)
+   - `class ModelNew(nn.Module)` — REQUIRED
+   - NO testing code, NO `if __name__ == "__main__"`
+
+---
+
+Generate the optimized kernel now. Output ONLY the complete Python code.

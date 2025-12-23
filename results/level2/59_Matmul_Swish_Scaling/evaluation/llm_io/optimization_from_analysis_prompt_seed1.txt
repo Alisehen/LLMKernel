@@ -1,0 +1,233 @@
+You are optimizing a Triton kernel based on algorithmic analysis.
+
+# PyTorch Reference (Target Behavior)
+
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs a matrix multiplication, applies Swish activation, and scales the result.
+    """
+    def __init__(self, in_features, out_features, scaling_factor):
+        super(Model, self).__init__()
+        self.matmul = nn.Linear(in_features, out_features)
+        self.scaling_factor = scaling_factor
+
+    def forward(self, x):
+        x = self.matmul(x)
+        x = x * torch.sigmoid(x)  # Swish activation
+        x = x * self.scaling_factor
+        return x
+
+batch_size = 128
+in_features = 32768
+out_features = 32768
+scaling_factor = 2.0
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features)]
+
+def get_init_inputs():
+    return [in_features, out_features, scaling_factor]
+```
+
+**CRITICAL**: Study the PyTorch code carefully to understand:
+- What does `forward()` return? (full output sequence vs final hidden state only)
+- What is the computational pattern?
+- What are the input/output shapes?
+
+Your optimized kernel MUST match this exact behavior.
+
+---
+
+# Analysis Results
+
+**Bottleneck**: The kernel implements a naive tiled K-loop matmul instead of using a tensor-core-optimized GEMM like cuBLAS or Triton’s tuned matmul template; for these dimensions the GEMM dominates runtime, and the current implementation leaves huge hardware throughput on the table.
+
+**Optimization Strategy**: Algorithm replacement: swap the hand-written matmul loop with a high-performance GEMM (e.g., Triton’s `matmul` template or a CUTLASS-style tensor-core kernel) and keep Swish+scale as a fused epilogue in the same kernel.
+
+**Implementation Plan**: Refactor the kernel to use Triton’s standard matmul building block (from the matmul tutorial / `triton.ops.matmul`), which has proper tiling, double-buffering, and tensor-core utilization for large K. Integrate bias addition, Swish activation, and scaling into the epilogue of that matmul kernel so the output tiles are transformed in registers before the final store. Keep the weight in [K, N] layout (or pre-transpose once at initialization) so the GEMM is in the native [M,K]×[K,N] form without per-forward transposes.
+
+**Expected Speedup**: 80-90% (5-10x vs current Triton, bringing performance to at least parity with or better than the PyTorch baseline)
+
+---
+
+# Current Kernel (needs optimization)
+
+```python
+import torch, torch.nn as nn, triton, triton.language as tl
+
+
+@triton.jit
+def fused_linear_swish_scale_kernel(
+    a_ptr, b_ptr, bias_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    scaling_factor,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    # Program ids for 2D tiling over M and N
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    # Offsets for this program instance
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Pointers to first K-tile of A and B
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    # Accumulator in FP32 for better precision
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Loop over K dimension
+    for k in range(0, K, BLOCK_K):
+        k_remaining = K - k
+
+        a_mask = (offs_m[:, None] < M) & (offs_k[None, :] < k_remaining)
+        b_mask = (offs_k[:, None] < k_remaining) & (offs_n[None, :] < N)
+
+        a_tile = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b_tile = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+        # Matrix multiply accumulate
+        acc += tl.dot(a_tile, b_tile, allow_tf32=True)
+
+        # Advance pointers to next K-tile
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Add bias (broadcast over M)
+    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc += bias[None, :]
+
+    # Swish activation: x * sigmoid(x), sigmoid(x) = 1 / (1 + exp(-x))
+    neg_acc = -acc
+    exp_neg = tl.exp(neg_acc)
+    sig = 1.0 / (1.0 + exp_neg)
+    acc = acc * sig
+
+    # Scale by scalar factor
+    acc = acc * scaling_factor
+
+    # Store result
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    out_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, acc, mask=out_mask)
+
+
+def fused_linear_swish_scale(x: torch.Tensor,
+                             weight: torch.Tensor,
+                             bias: torch.Tensor,
+                             scaling_factor: float) -> torch.Tensor:
+    """
+    x:      [M, K]
+    weight: [N, K] (same layout as nn.Linear.weight)
+    bias:   [N]
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda, "All tensors must be on CUDA"
+    M, K = x.shape
+    N = weight.shape[0]
+    # Ensure dimensions agree
+    assert weight.shape[1] == K
+    assert bias.shape[0] == N
+
+    # Convert weight to [K, N] for GEMM (A: [M,K], B: [K,N])
+    b = weight.t().contiguous()
+
+    # Output tensor
+    c = torch.empty((M, N), device=x.device, dtype=x.dtype)
+
+    # Grid: 2D over M and N
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta["BLOCK_M"]),
+            triton.cdiv(N, meta["BLOCK_N"])
+        )
+
+    fused_linear_swish_scale_kernel[grid](
+        x, b, bias, c,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        b.stride(0), b.stride(1),
+        c.stride(0), c.stride(1),
+        scaling_factor,
+        BLOCK_M=64, BLOCK_N=64, BLOCK_K=32,
+        num_warps=8,
+        num_stages=4,
+    )
+    return c
+
+
+class ModelNew(nn.Module):
+    """
+    Fused implementation of:
+      y = (x @ W^T + b)
+      y = y * sigmoid(y)   # Swish
+      y = y * scaling_factor
+    using a high-performance Triton kernel.
+    """
+    def __init__(self, in_features, out_features, scaling_factor):
+        super(ModelNew, self).__init__()
+        # Match nn.Linear parameter shapes: weight [out_features, in_features], bias [out_features]
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.bias = nn.Parameter(torch.randn(out_features))
+        self.scaling_factor = float(scaling_factor)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return fused_linear_swish_scale(x, self.weight, self.bias, self.scaling_factor)
+```
+
+---
+
+# Your Task
+
+Implement the optimization strategy above. Focus on the specific bottleneck identified.
+
+## Key Requirements
+
+1. **Preserve correctness**: Maintain the same input/output behavior
+2. **Apply the optimization**: Follow the implementation plan exactly
+3. **Use valid Triton syntax**:
+   - Every kernel MUST have `@triton.jit` decorator
+   - Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+   - BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+   - No `continue`, `break`, `return` inside kernels (use masking)
+   - Prefer `tl.dot(a, b, allow_tf32=True)` for matmul operations
+
+4. **CRITICAL for RNN/GRU/LSTM Persistent Kernels**:
+   - Time loop MUST be inside @triton.jit kernel, NOT in Python forward()
+   - **HYBRID computation strategy** (CRITICAL for performance):
+     * Precompute input-side gates OUTSIDE kernel: `gates_x = (T*B, In) @ W_ih` (ONE large GEMM)
+     * INSIDE kernel: only recurrent-side: `for t: gates_h = h @ W_hh` (T small GEMMs)
+   - CORRECT (FAST - use this):
+     ```python
+     # Python forward():
+     gates_x_all = x.reshape(T*B, In) @ W_ih + b_ih  # ONE large GEMM
+     gates_x_all = gates_x_all.view(T, B, 3*H)
+     gru_persistent_kernel[grid](gates_x_all, h0, W_hh, ...)  # Launch ONCE
+
+     @triton.jit
+     def gru_persistent_kernel(gates_x_ptr, h_ptr, W_hh_ptr, ...):
+         for t in range(T):  # Inside kernel
+             gates_x_t = tl.load(gates_x_ptr + t*...)  # Precomputed
+             gates_h = h @ W_hh  # Only recurrent GEMM
+             h = (1-z)*n + z*h   # Fuse and update
+     ```
+
+5. **Output format**:
+   - Imports: `import torch, torch.nn as nn, triton, triton.language as tl`
+   - `@triton.jit` kernel(s)
+   - Wrapper function(s)
+   - `class ModelNew(nn.Module)` — REQUIRED
+   - NO testing code, NO `if __name__ == "__main__"`
+
+---
+
+Generate the optimized kernel now. Output ONLY the complete Python code.

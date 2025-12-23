@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The current design materializes a large [M, N] intermediate tensor to global memory, then immediately re-reads it for a row-wise reduction, which is an avoidable bandwidth cost.",
+  "bottleneck": "Two separate kernels force the [M, N] result of the GEMM+scale+clamp to be written (≈32 MB) and then read back (≈32 MB) before being reduced to [M, 1], making the workload memory-bandwidth bound and leaving cuBLAS’ highly optimized GEMM hard to beat.",
+  "optimisation method": "Fuse the linear_scale_clamp and logsumexp_mish into a single Triton kernel that performs the matmul, scaling, residual, clamping, and a row-wise online logsumexp directly on the computed tiles, then applies Mish and writes only the final [M, 1] result, never storing the full [M, N] intermediate to global memory.",
+  "modification plan": "Redesign the main Triton kernel so that each program instance owns one (or a small set of) row(s), iterates over N in BLOCK_N tiles and over K in BLOCK_K tiles to compute the GEMM tile, immediately applies scale+clamp to that tile, and updates per-row running max and sum for logsumexp using a numerically stable online reduction. After all N tiles are processed, compute the per-row logsumexp scalar, apply Mish and the final y * mish(y) transformation, and store only this scalar per row to out_ptr. Replace the current two-kernel pipeline in ModelNew.forward with this single fused kernel, removing the allocation and use of the intermediate [M, N] buffer entirely.",
+  "expected_speedup": "25-35%"
+}

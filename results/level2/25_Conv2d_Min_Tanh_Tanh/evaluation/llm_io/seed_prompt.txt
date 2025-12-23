@@ -1,83 +1,46 @@
 
-Write a correct and reasonably fast Triton kernel to replace the given PyTorch operator.
-This is a SEED implementation: prioritize correctness and stable compilation.
+Write high-performance Triton kernels to replace PyTorch operators.
+Generate the FASTEST kernel while maintaining correctness.
 
-Rules:
-- Use `tl.program_id(axis)` (axis=0/1/2 only)
-- Use `tl.arange()` for block indices
-- Operate on blocks (no CUDA thread model)
-- No manual shared memory or synchronization
+## CRITICAL — These cause 60%+ of failures:
+1. EVERY kernel function MUST have `@triton.jit` decorator — MANDATORY
+2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+3. BLOCK sizes MUST be power-of-2 constexpr: 16, 32, 64, 128, 256
+4. `tl.program_id(axis)` only supports axis = 0, 1, 2 (max 3D grid)
 
-Hard Constraints:
-- All BLOCK_* are `tl.constexpr` and powers of 2
-- `tl.arange(0, BLOCK)` requires BLOCK to be power-of-2
-- No dynamic `tl.reshape()` or view
-- `tl.load` / `tl.store`: scalar ptr → scalar, block ptr → block
-- No Python control flow on `tl.tensor` or BLOCK_*
-- Triton does NOT support `continue`, `break`, or `return` inside loops — use masking instead
-- Import ALL modules you use (e.g., `import math` if using `math.sqrt`)
-- Do NOT index tensors with loop variables: `tensor[:, i]` or `tensor[i, :]` where i is a loop var is INVALID
-- Shared memory limit ~100KB: for matmul, BLOCK_M*BLOCK_K + BLOCK_K*BLOCK_N < 25000 floats
-- Triton has NO: tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
-- @triton.autotune: use at most 2-3 configs to reduce compilation time
+## Triton Syntax Rules:
+- For matmul/conv/linear ops, prefer `tl.dot(a, b, allow_tf32=True)` over element-wise multiply-add
+- No `continue`, `break`, `return` inside loops — use masking instead
+- No tensor indexing with loop vars: `x[:, i]` or `x[i, :]` is INVALID
+- No tuple unpacking inside kernel: `a, b = tl.load(...)` is INVALID
+- No nested functions inside @triton.jit
+- No Python control flow on tl.tensor or BLOCK_* values
+- No dynamic `tl.reshape()` or view operations
 
-## Conv Fusion Pattern (CRITICAL for Conv2d/Conv3d)
+## Missing Triton Functions (implement manually):
+- tl.tanh → `(tl.exp(2*x) - 1) / (tl.exp(2*x) + 1)`
+- tl.sigmoid → `1 / (1 + tl.exp(-x))`
+- tl.gelu, tl.silu, tl.softmax, tl.mish → implement from definition
 
-Triton grid is limited to 3 dimensions. For Conv with 4D+ output, you MUST flatten:
+## Load/Store Rules:
+- Pointer + scalar offset → scalar value
+- Pointer + block offset (via tl.arange) → block of values
+- mask shape MUST match data shape exactly
 
-**Conv2d: Output [N, OC, H_out, W_out] → Flatten to 2D grid**
-```python
-P = N * H_out * W_out  # flatten spatial + batch
-grid = (cdiv(P, BLOCK_M), cdiv(OC, BLOCK_N))
+## Output Format (STRICT):
+1. Imports: `import torch, torch.nn as nn, triton, triton.language as tl` (and math if needed)
+2. `@triton.jit` kernel(s) — MUST have this decorator
+3. Wrapper function with grid calculation
+4. `class ModelNew(nn.Module)` — REQUIRED
 
-# In kernel: decode flat index back to (n, oh, ow)
-offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-n_idx = offs_m // (H_out * W_out)
-rem = offs_m % (H_out * W_out)
-oh_idx = rem // W_out
-ow_idx = rem % W_out
+Do NOT include: testing code, `if __name__ == "__main__"`, get_inputs, get_init_inputs
 
-# Accumulator: simple 2D
-acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-# Conv loop: broadcast 1D vectors to 2D
-for ic in range(C_in):
-    for kh in range(K_H):
-        for kw in range(K_W):
-            x_vals = tl.load(...)  # [BLOCK_M]
-            w_vals = tl.load(...)  # [BLOCK_N]
-            acc += x_vals[:, None] * w_vals[None, :]  # [BLOCK_M, BLOCK_N]
-```
+## Full-Network Optimization Guidance
+- Target is a **complete nn.Module**, not a single operator.
+- Preserve module structure and forward() control flow.
+- Allow fusion **within a branch or module**, but NOT across branches.
 
-**Conv3d: Output [N, OC, D_out, H_out, W_out] → Same pattern**
-```python
-P = N * D_out * H_out * W_out  # flatten spatial + batch
-grid = (cdiv(P, BLOCK_M), cdiv(OC, BLOCK_N))
-
-# Decode: n, od, oh, ow from flat index
-DHW = D_out * H_out * W_out
-HW = H_out * W_out
-n_idx = offs_m // DHW
-rem = offs_m % DHW
-od_idx = rem // HW
-rem2 = rem % HW
-oh_idx = rem2 // W_out
-ow_idx = rem2 % W_out
-```
-
-**Key Rules:**
-- NEVER use 4D grid (program_id only supports 0,1,2)
-- ALWAYS flatten output positions to 1 dimension
-- Use simple 2D accumulator [BLOCK_M, BLOCK_N]
-- Broadcast: x[:, None] * w[None, :] for clean 2D matmul-like pattern
-
-Output Format (STRICT):
-1. Imports (torch, torch.nn, triton, triton.language, and any other needed modules like math)
-2. `@triton.jit` kernel(s)
-3. Wrapper function(s)
-4. `class ModelNew(nn.Module)` — this class is REQUIRED
-
-Do NOT include testing code or `if __name__ == "__main__"`.
 
 Example PyTorch:
 '''
@@ -175,22 +138,6 @@ class ModelNew(nn.Module):
     def forward(self, x):
         return fused_gemm_add_relu(x, self.weight, self.bias)
 '''
-
-Hardware:
-• Compute Capability: 8.9
-• Number of SMs: 128
-• Memory Bandwidth: 1008 GB/s
-• TF32 Tensor Core TFLOPS: 82.6 with dense
-• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
-• FP16 Tensor Core TFLOPS: 165.2 with dense
-• Maximum number of registers per thread: 255
-• Maximum threads per block: 1024
-• Maximum threads per SM: 1536
-• Warp size: 32
-• Maximum concurrent warps per SM: 48
-• Shared memory capacity per SM: 100 KB
-• Maximum shared memory per thread block: 99 KB
-• L2 cache (global, all SM shared): 72 MB
 
 Target:
 ```python

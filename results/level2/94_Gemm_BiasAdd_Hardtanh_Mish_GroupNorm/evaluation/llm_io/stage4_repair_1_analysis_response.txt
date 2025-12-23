@@ -1,5 +1,0 @@
-{
-  "critical_issue": "The GEMM kernel calls tl.dot with allow_tf32=True, while the PyTorch reference uses full FP32 matmul.",
-  "why_it_matters": "TF32’s reduced precision accumulates noticeable rounding error over large 8192×8192 GEMMs, pushing max_abs_err above the strict 1e-3 tolerance despite otherwise matching math.",
-  "minimal_fix_hint": "Use full FP32 precision in tl.dot (set allow_tf32=False or match PyTorch’s matmul precision configuration)."
-}

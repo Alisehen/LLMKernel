@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The custom Triton GEMM is much slower than PyTorch’s highly tuned matmul, indicating a major algorithmic inefficiency.",
+  "bottleneck": "The kernel reimplements matrix multiplication with a naive block–K loop and tl.dot, which does not fully exploit Tensor Cores or cuBLAS-level tiling/pipe-lining; the GEMM dominates runtime, so its inefficiency drives the 6x slowdown.",
+  "optimisation method": "Replace the hand-written matmul loop with a library-quality GEMM (e.g., PyTorch/cublas matmul or triton.ops.matmul) and treat bias+Swish+scale as a lightweight epilogue, instead of trying to fuse everything into a custom GEMM.",
+  "modification plan": "First, compute y = x @ W.T using torch.matmul or triton.ops.matmul in FP16/BF16 with Tensor Cores, ensuring weight is laid out to match the chosen GEMM API. Then implement a simple Triton pointwise kernel (or PyTorch op) that takes y and applies bias addition, Swish, and scaling in one pass over memory. Finally, benchmark and tune only the GEMM’s datatype/layout and the pointwise kernel’s grid, rather than the full fused matmul loop.",
+  "expected_speedup": "400-600% vs current Triton kernel (bringing it near or above the PyTorch baseline)"
+}

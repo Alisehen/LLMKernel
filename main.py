@@ -651,7 +651,7 @@ def _profile_kernel_ncu(
                 out_csv=f"ncu_temp_{proc_id}.csv",
                 device_idx=device_idx,
                 ref_file=str(task_path),
-                test_file=str(test_kernel_path.name),
+                test_file=str(test_kernel_path),  # 使用完整路径而不是文件名
             )
             metrics_df = load_ncu_metrics(
                 csv_path, extra_keep=("Kernel Name",),
@@ -915,9 +915,9 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
             print(f"[Seed] Level1 task detected, using 1 seed instead of {num_seeds} (seed quality is stable)")
     elif args.model == MODEL_FUSION:
         # Level2: fused operations, seed quality fairly stable
-        num_seeds_actual = 1
-        if num_seeds > 1:
-            print(f"[Seed] Level2 task detected, using 1 seed instead of {num_seeds} (seed quality is stable)")
+        num_seeds_actual = num_seeds
+        # if num_seeds > 1:
+        #     print(f"[Seed] Level2 task detected, using 1 seed instead of {num_seeds} (seed quality is stable)")
     else:
         # Level3: full network, seed quality has high variance
         num_seeds_actual = num_seeds
@@ -1208,7 +1208,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                         optimized_score = optimized_kernel.score if (optimized_kernel.score is not None and runnable) else 0.0
 
                         # Repair if algorithm-optimized kernel failed
-                        max_algo_repair = 3
+                        max_algo_repair = 1
                         algo_repair_attempt = 0
                         while (not runnable or optimized_score == 0) and algo_repair_attempt < max_algo_repair:
                             algo_repair_attempt += 1

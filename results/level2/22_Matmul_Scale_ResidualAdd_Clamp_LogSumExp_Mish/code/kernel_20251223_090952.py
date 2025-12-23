@@ -1,0 +1,217 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        # Conservative baseline: lowest register pressure
+        triton.Config(
+            {
+                "BLOCK_M": 16,
+                "BLOCK_N": 128,
+            },
+            num_warps=4,
+            num_stages=2,
+        ),
+        # Balanced config: usually best for wide rows on 4090
+        triton.Config(
+            {
+                "BLOCK_M": 32,
+                "BLOCK_N": 128,
+            },
+            num_warps=4,
+            num_stages=2,
+        ),
+        # Higher ILP for compute-heavy / long rows
+        triton.Config(
+            {
+                "BLOCK_M": 32,
+                "BLOCK_N": 128,
+            },
+            num_warps=8,
+            num_stages=3,
+        ),
+        # Alternative for smaller N or when register pressure is high
+        triton.Config(
+            {
+                "BLOCK_M": 32,
+                "BLOCK_N": 64,
+            },
+            num_warps=4,
+            num_stages=2,
+        ),
+    ],
+    key=["N"],
+)
+@triton.jit
+def rowwise_scale_clamp_logsumexp_mish_kernel(
+    x_ptr,   # (M, N) fp16/fp32
+    out_ptr, # (M, 1)
+    M, N,
+    stride_xm, stride_xn,
+    stride_om,
+    total_scale,  # scalar fp32
+    clamp_min, clamp_max,  # scalars fp32
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """
+    For each row i:
+      y = clamp(x * total_scale, clamp_min, clamp_max)
+      lse = logsumexp_j y_ij
+      out[i] = lse * mish(lse),  where mish(z) = z * tanh(softplus(z))
+
+    - Streams over N in tiles of BLOCK_N, keeping all intermediates in registers.
+    - Only one global store: final out[i].
+    """
+
+    pid_m = tl.program_id(0)
+
+    # Row indices handled by this program
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offs_m < M
+
+    # Initialize streaming logsumexp state per row
+    neg_inf = -1.0e30
+    row_max = tl.full((BLOCK_M,), neg_inf, dtype=tl.float32)
+    row_sum = tl.zeros((BLOCK_M,), dtype=tl.float32)
+
+    # Scalar params as fp32 (avoid repeated type promotions)
+    scale = tl.full((), total_scale, dtype=tl.float32)
+    cmin = tl.full((), clamp_min, dtype=tl.float32)
+    cmax = tl.full((), clamp_max, dtype=tl.float32)
+
+    # Loop over N dimension in BLOCK_N chunks
+    for start_n in range(0, N, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        mask_n = offs_n < N
+
+        # 2D mask [BLOCK_M, BLOCK_N]
+        mask = mask_m[:, None] & mask_n[None, :]
+
+        # Pointer for current tile
+        x_ptrs = x_ptr + offs_m[:, None] * stride_xm + offs_n[None, :] * stride_xn
+
+        # Load tile, upcast to fp32
+        x = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+        # Fused scale + clamp in-place
+        x = x * scale
+        x = tl.maximum(x, cmin)
+        x = tl.minimum(x, cmax)
+
+        # For masked-out elements, force -inf so they don't affect max/sum
+        x = tl.where(mask, x, neg_inf)
+
+        # Tile-wise max across N for each row: [BLOCK_M]
+        tile_max = tl.max(x, axis=1)
+
+        # Update running max
+        m_old = row_max
+        m_new = tl.maximum(m_old, tile_max)
+        row_max = m_new
+
+        # Compute exp(x - m_new) and tile sum along N.
+        # Reuse x in-place to keep registers low.
+        x = x - m_new[:, None]
+        x = tl.exp(x)
+        sum_tile = tl.sum(x, axis=1)
+
+        # Streaming logsumexp sum update:
+        # new_sum = old_sum * exp(m_old - m_new) + sum_tile
+        scale_old = tl.exp(m_old - m_new)
+        row_sum = row_sum * scale_old + sum_tile
+
+    # Final logsumexp per row
+    lse = tl.log(row_sum) + row_max  # [BLOCK_M], fp32
+
+    # Mish(lse) in a numerically stable way:
+    # softplus(z) = log(1 + exp(-|z|)) + max(z, 0)
+    abs_lse = tl.abs(lse)
+    sp = tl.log(1.0 + tl.exp(-abs_lse)) + tl.maximum(lse, 0.0)
+
+    # tanh(sp) via exp(-2*sp): tanh(x) = (1 - e^{-2x}) / (1 + e^{-2x})
+    e_neg2sp = tl.exp(-2.0 * sp)
+    tanh_sp = (1.0 - e_neg2sp) / (1.0 + e_neg2sp)
+
+    mish_lse = lse * tanh_sp        # mish(lse)
+    out_val = lse * mish_lse        # lse * mish(lse)
+
+    # Write result (M, 1)
+    out_ptrs = out_ptr + offs_m * stride_om
+    tl.store(out_ptrs, out_val, mask=mask_m)
+
+
+def linear_scale_clamp_logsumexp_mish(x, weight, bias, scale_factor, clamp_min, clamp_max):
+    """
+    x:       (M, K)
+    weight:  (N, K)  -- nn.Linear(out_features=N, in_features=K).weight
+    bias:    (N,)
+    returns: (M, 1)
+
+    Phase 1: Matmul + bias via cuBLAS-backed torch.nn.functional.linear.
+    Phase 2: Fused scale + clamp + row-wise logsumexp + Mish + final lse * mish(lse)
+             via Triton reduction kernel.
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+    M, K = x.shape
+    N = weight.shape[0]
+
+    # Matmul + bias via cuBLAS (highly optimized)
+    y = torch.nn.functional.linear(x, weight, bias)  # (M, N), row-major
+
+    # Output buffer
+    out = torch.empty((M, 1), device=x.device, dtype=y.dtype)
+
+    # Fold residual add (x + x) and scale into single multiply for the kernel
+    total_scale = float(scale_factor) * 2.0
+    clamp_min_val = float(clamp_min)
+    clamp_max_val = float(clamp_max)
+
+    # Grid: one program per BLOCK_M rows (BLOCK_M chosen by autotuner)
+    def grid(meta):
+        return (triton.cdiv(M, meta["BLOCK_M"]),)
+
+    rowwise_scale_clamp_logsumexp_mish_kernel[grid](
+        y,
+        out,
+        M,
+        N,
+        y.stride(0),
+        y.stride(1),
+        out.stride(0),
+        total_scale,
+        clamp_min_val,
+        clamp_max_val,
+    )
+
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized model:
+
+    Phase 1: Linear (matmul + bias) via cuBLAS-backed torch.nn.functional.linear.
+    Phase 2: Fused scale + clamp + row-wise logsumexp + Mish + final lse * mish(lse)
+             via a tuned Triton reduction kernel.
+    """
+
+    def __init__(self, input_size, hidden_size, scale_factor, clamp_min, clamp_max):
+        super(ModelNew, self).__init__()
+        self.matmul = nn.Linear(input_size, hidden_size)
+        self.scale_factor = scale_factor
+        self.clamp_min = clamp_min
+        self.clamp_max = clamp_max
+
+    def forward(self, x):
+        return linear_scale_clamp_logsumexp_mish(
+            x,
+            self.matmul.weight,
+            self.matmul.bias,
+            self.scale_factor,
+            self.clamp_min,
+            self.clamp_max,
+        )
