@@ -1,0 +1,229 @@
+# <complete ModelNew code with optimized Triton kernels>
+
+import math
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 32}, num_warps=4, num_stages=4),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32}, num_warps=4, num_stages=4),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64}, num_warps=4, num_stages=4),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64}, num_warps=8, num_stages=4),
+    ],
+    key=["M", "N", "K"],
+)
+@triton.jit
+def linear_kernel(
+    x_ptr,  # [M, K]
+    w_ptr,  # [K, N] = weight.T (K major)
+    b_ptr,  # [N]
+    y_ptr,  # [M, N]
+    M, N, K,
+    stride_xm, stride_xk,
+    stride_wk, stride_wn,
+    stride_ym, stride_yn,
+    # Meta-parameters
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # 2D grid over output [M, N]
+    pid_m = tl.program_id(0)  # along M
+    pid_n = tl.program_id(1)  # along N
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    # Alignment hints to help Triton generate better code
+    tl.multiple_of(offs_m, BLOCK_M)
+    tl.multiple_of(offs_n, BLOCK_N)
+
+    # Boundary masks derived once and reused for all fused ops
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+
+    # Accumulator in FP32 for numeric stability and TF32 tensor cores
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # K-loop: always use the same (offs_m, offs_n) + masks for all iterations
+    for k0 in range(0, K, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+        tl.multiple_of(offs_k, BLOCK_K)
+        mask_k = offs_k < K
+
+        x_ptrs = x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk
+        w_ptrs = w_ptr + offs_k[:, None] * stride_wk + offs_n[None, :] * stride_wn
+
+        # Loads share the same base masks (mask_m, mask_n, mask_k),
+        # reshaped with explicit broadcasting only.
+        x = tl.load(
+            x_ptrs,
+            mask=mask_m[:, None] & mask_k[None, :],
+            other=0.0,
+        )
+        w = tl.load(
+            w_ptrs,
+            mask=mask_k[:, None] & mask_n[None, :],
+            other=0.0,
+        )
+
+        acc += tl.dot(x, w, allow_tf32=True)
+
+    # FUSED BIAS ADD
+    # Bias indexing/mask depends only on offs_n and mask_n, which are the
+    # same grid coordinates and boundary condition as the output tile.
+    bias_ptrs = b_ptr + offs_n
+    bias = tl.load(bias_ptrs, mask=mask_n, other=0.0)
+    acc += bias[None, :]
+
+    # Store result; mask derived from the same mask_m, mask_n used above
+    y_ptrs = y_ptr + offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn
+    mask_out = mask_m[:, None] & mask_n[None, :]
+    tl.store(y_ptrs, acc, mask=mask_out)
+
+
+def triton_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    x:      [M, K]
+    weight: [N, K]  (same layout as nn.Linear.weight)
+    bias:   [N]
+    returns y = x @ weight.T + bias
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda, "All tensors must be on CUDA device"
+    M, K = x.shape
+    N = weight.shape[0]
+    assert weight.shape[1] == K, "Incompatible shapes for x and weight"
+
+    # Make sure data is contiguous for coalesced accesses
+    x_contig = x.contiguous()
+    # Kernel expects [K, N] layout for W to get K-major access
+    w_t = weight.t().contiguous()
+    y = torch.empty((M, N), device=x.device, dtype=x.dtype)
+
+    def grid(meta):
+        return (
+            max(1, triton.cdiv(M, meta["BLOCK_M"])),
+            max(1, triton.cdiv(N, meta["BLOCK_N"])),
+        )
+
+    linear_kernel[grid](
+        x_contig,
+        w_t,
+        bias,
+        y,
+        M,
+        N,
+        K,
+        x_contig.stride(0),
+        x_contig.stride(1),
+        w_t.stride(0),
+        w_t.stride(1),
+        y.stride(0),
+        y.stride(1),
+    )
+    return y
+
+
+class TritonLinear(nn.Module):
+    def __init__(self, in_features, out_features, bias=True):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_features))
+        else:
+            self.bias = None
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.bias is None:
+            b = torch.zeros(self.out_features, device=x.device, dtype=x.dtype)
+        else:
+            b = self.bias
+        return triton_linear(x, self.weight, b)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, num_classes=1000):
+        """
+        VGG16-style model with Triton-accelerated linear layers.
+        """
+        super(ModelNew, self).__init__()
+
+        # Convolutional feature extractor (cuDNN-optimized)
+        self.features = nn.Sequential(
+            # Block 1
+            nn.Conv2d(3, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+
+            # Block 2
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 128, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+
+            # Block 3
+            nn.Conv2d(128, 256, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 256, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 256, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+
+            # Block 4
+            nn.Conv2d(256, 512, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 512, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 512, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+
+            # Block 5
+            nn.Conv2d(512, 512, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 512, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 512, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+        )
+
+        # Fully connected classifier with TritonLinear
+        self.classifier = nn.Sequential(
+            TritonLinear(512 * 7 * 7, 4096),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.0),
+            TritonLinear(4096, 4096),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.0),
+            TritonLinear(4096, num_classes),
+        )
+
+    def forward(self, x):
+        """
+        x:  (batch_size, 3, 224, 224)
+        returns: (batch_size, num_classes)
+        """
+        x = self.features(x)
+        x = torch.flatten(x, 1)
+        x = self.classifier(x)
+        return x

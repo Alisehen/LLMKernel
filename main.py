@@ -23,13 +23,14 @@ from scripts.individual import KernelIndividual  # adjust path if needed
 from prompts.error import build_error_prompt
 from prompts.optimization import build_optimization_prompt
 from prompts.judger_optimization import build_judger_optimization_prompts
+from prompts.algorithm_analysis import build_algorithm_analysis_prompt
 _INVOCATION_SPLITTER = "Invoked with:"
 
 
-# ---------------------- Beam Search Data Structure -----------------
+# ---------------------- Candidate Data Structure -----------------
 @dataclass
 class BeamCandidate:
-    """A candidate in beam search, holding kernel and its evaluation results."""
+    """A kernel candidate holding kernel code and its evaluation results."""
     kernel: Any  # KernelIndividual
     score: float = float("-inf")
     metrics_df: Any = None  # pandas DataFrame with NCU metrics
@@ -46,6 +47,32 @@ def _sanitize_error_message(exc: Exception) -> str:
     if _INVOCATION_SPLITTER in msg:
         msg = msg.split(_INVOCATION_SPLITTER, 1)[0].rstrip()
     return msg
+
+def is_persistent_kernel(kernel_code: str) -> bool:
+    """
+    Detect persistent kernel patterns (e.g., RNN/GRU/LSTM with time loop inside kernel).
+    Returns True if the kernel appears to be a persistent kernel that should skip 3-stage optimization.
+    """
+    patterns = [
+        # Time loop patterns
+        r'for\s+t\s+in\s+range\s*\(\s*T\s*\)',
+        r'for\s+\w+\s+in\s+range\s*\([^)]*[Tt]ime',
+        # Loop-carried state dependencies
+        r'h_t\s*=.*h_t',
+        r'h_state.*=.*h_state',
+        r'c_t\s*=.*c_t',  # LSTM cell state
+        # RNN-specific kernel names
+        r'def\s+\w*[gG][rR][uU]\w*_kernel',
+        r'def\s+\w*[lL][sS][tT][mM]\w*_kernel',
+        r'def\s+\w*[rR][nN][nN]\w*_kernel',
+        r'def\s+\w*persistent\w*_kernel',
+    ]
+
+    # Count matching patterns
+    matches = sum(1 for p in patterns if re.search(p, kernel_code, re.IGNORECASE))
+
+    # Consider it persistent if at least 2 patterns match
+    return matches >= 2
 
 # ------------------------- CLI -------------------------
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -83,13 +110,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--num_steps", type=int, default=4, help="Number of optimization steps (stages)")
     p.add_argument("--max_repair_attempts", type=int, default=3, help="Max repair attempts per failure")
 
-    # Search parameters
+    # Seed generation parameter
     p.add_argument("--num_seeds", type=int, default=2, help="Number of seed candidates to generate (default 2)")
-    p.add_argument("--elimination_threshold", type=float, default=0.02, help="Soft elimination threshold τ: keep both if gap ≤ τ (default 0.02 = 2%)")
-
-    # Legacy beam search parameters (deprecated, kept for backward compatibility)
-    p.add_argument("--beam_width", type=int, default=1, help="[Deprecated] Use --num_seeds instead")
-    p.add_argument("--beam_temperature", type=float, default=0.5, help="[Deprecated]")
 
     # Fusion operator flag
     p.add_argument("--fusion", action="store_true", help="Enable fusion operator mode (for level2 multi-op kernels)")
@@ -198,10 +220,10 @@ def _make_llm_caller(args):
         log_path: Optional[Path] = None,
         call_type: str = "unknown",
         round_idx: int = -1,
-        temperature_override: Optional[float] = None,  # For beam search diversity
+        temperature_override: Optional[float] = None,  # For diversity
     ) -> str:
         sp = default_system_prompt if sys_prompt is None else sys_prompt
-        # Use override temperature if provided (for beam search), otherwise use args.temperature
+        # Use override temperature if provided, otherwise use args.temperature
         temp = temperature_override if temperature_override is not None else args.temperature
         res = query_server(
             prompt=prompt,
@@ -233,7 +255,7 @@ def _llm_to_kernel(
     log_path: Optional[Path] = None,
     call_type: str = "unknown",
     max_retries: int = 1,  # Retry once on truncation
-    temperature_override: Optional[float] = None,  # For beam search diversity
+    temperature_override: Optional[float] = None,  # For diversity
 ) -> KernelIndividual:
     """LLM → code → save → KernelIndividual (no evaluation)."""
 
@@ -599,7 +621,7 @@ def _should_skip_stage(stage_name: str, metrics_df) -> tuple[bool, str]:
     return (False, "")
 
 
-# ---------------------- Beam Search Helper Functions -------------------
+# ---------------------- Helper Functions -------------------
 def _profile_kernel_ncu(
     kernel: Any,
     test_kernel_path: Path,
@@ -668,8 +690,8 @@ def _optimize_stage_single(
         io_dir: Directory to save prompts/responses
         log_path: Path to usage log
         stage_round: Current round number
-        temperature: Temperature override for LLM (for beam search diversity)
-        beam_idx: Beam candidate index (for logging)
+        temperature: Temperature override for LLM (for diversity)
+        beam_idx: Candidate index (for logging)
 
     Returns:
         KernelIndividual: The optimized kernel (not yet benchmarked)
@@ -684,14 +706,14 @@ def _optimize_stage_single(
         model=args.model,
     )
 
-    # Save prompt with beam index if using beam search
-    suffix = f"_beam{beam_idx}" if beam_idx > 0 else ""
+    # Save prompt with candidate index
+    suffix = f"_cand{beam_idx}" if beam_idx > 0 else ""
     prompt_file = io_dir / f"stage{stage_idx + 1}_{stage_name}{suffix}_prompt.txt"
     prompt_file.write_text(opt_prompt, encoding="utf-8")
 
     call_type = f"stage{stage_idx + 1}_{stage_name}"
     if beam_idx > 0:
-        call_type += f"_beam{beam_idx}"
+        call_type += f"_cand{beam_idx}"
 
     kernel = _llm_to_kernel(
         opt_prompt, code_dir, call_llm, io_dir, stage_round,
@@ -878,18 +900,34 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
 
     # ====== Step 1: Generate Multiple Seed Programs ======
     num_seeds = args.num_seeds
-    elimination_threshold = args.elimination_threshold
     pytorch_baseline_ms = None
 
-    print(f"[Seed] Generating {num_seeds} seed candidates...")
+    # Adjust seed count based on task complexity
+    # Level1/2 tasks have stable seed quality, only need 1 seed
+    # Level3 tasks have high variance, benefit from multiple seeds
+    if args.model == MODEL_SINGLE:
+        # Level1: single operation, seed quality very stable
+        num_seeds_actual = 1
+        if num_seeds > 1:
+            print(f"[Seed] Level1 task detected, using 1 seed instead of {num_seeds} (seed quality is stable)")
+    elif args.model == MODEL_FUSION:
+        # Level2: fused operations, seed quality fairly stable
+        num_seeds_actual = 1
+        if num_seeds > 1:
+            print(f"[Seed] Level2 task detected, using 1 seed instead of {num_seeds} (seed quality is stable)")
+    else:
+        # Level3: full network, seed quality has high variance
+        num_seeds_actual = num_seeds
+
+    print(f"[Seed] Generating seed kernel...")
     seed_prompt = build_seed_prompt(arch_path=task_path, gpu_name=args.gpu, fusion=args.fusion, model=args.model)
     prompt_file = io_dir / "seed_prompt.txt"
     prompt_file.write_text(seed_prompt, encoding="utf-8")
 
     # Generate multiple seeds (rely on model's inherent randomness for diversity)
     seed_candidates: List[BeamCandidate] = []
-    for seed_idx in range(num_seeds):
-        print(f"[Seed {seed_idx + 1}/{num_seeds}] Generating...")
+    for seed_idx in range(num_seeds_actual):
+        print(f"[Seed {seed_idx + 1}/{num_seeds_actual}] Generating...")
 
         current_kernel = _llm_to_kernel(
             seed_prompt, code_dir, call_llm, io_dir,
@@ -930,6 +968,12 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                 with open(test_kernel, "w") as f:
                     f.write(best_kernel.code)
             print(f"[Seed {seed_idx + 1}] Score: {this_score:.4f} ✓")
+
+            # Early stop: if this seed already beats PyTorch, no need to generate more
+            if this_score >= 1.0 and seed_idx < num_seeds_actual - 1:
+                print(f"[Seed] Early stop: seed {seed_idx + 1} already beats PyTorch ({this_score:.4f} >= 1.0)")
+                print(f"[Seed] Skipping remaining {num_seeds_actual - seed_idx - 1} seed(s) and algorithm analysis")
+                break
         else:
             scores.append(0.0)
             err_flags.append(True)
@@ -1025,76 +1069,250 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
     if not runnable_seeds:
         print(f"[ERROR] No runnable seeds after repair. Stopping.")
     else:
-        # ====== Step 3: Three-stage Optimization with Soft Elimination ======
-        # Strategy: Multi-Seed + Stage1 Elimination + Greedy Stage2/3
-        # - All seeds → Stage 1 (parallel optimization)
-        # - After Stage 1: soft elimination based on gap threshold
-        #   - gap > τ: keep only top-1
-        #   - gap ≤ τ: keep top-2, eliminate after Stage 2
-        # - Stage 2: optimize remaining candidates
-        # - Stage 3: greedy on single best
+        # ====== Step 3: Hybrid Strategy - Algorithm Analysis for sub-1.0 seeds ======
+        # All candidates pool: original seeds + algorithm-optimized seeds
+        all_candidates = list(runnable_seeds)
 
-        print(f"\n[Optimization] Starting 3-stage optimization with Soft Elimination...")
-        print(f"  - {len(runnable_seeds)} seed(s) → Stage 1")
-        print(f"  - Elimination threshold τ = {elimination_threshold:.1%}")
-        print(f"  - Stage 2/3: greedy on selected candidate(s)")
+        if args.model == MODEL_NETWORK or args.model == MODEL_FUSION:
+            # Check if any seed needs algorithm analysis
+            seeds_need_analysis = [s for s in runnable_seeds if s.score < 1.0]
 
-        stage_round = 0
-        score_history = [best_score]
-
-        # Initialize beam with all runnable seeds
-        beam: List[BeamCandidate] = runnable_seeds.copy()
-
-        # Setup bench script once
-        bench_template_source = root_dir / "bench_ref_inputs_template.py"
-        bench_script = root_dir / f"bench_ref_inputs_{proc_id}.py"
-        if not bench_script.exists() or proc_id != 0:
-            import shutil
-            if bench_template_source.exists():
-                shutil.copy(bench_template_source, bench_script)
+            if not seeds_need_analysis:
+                print(f"\n{'='*80}")
+                print(f"[Hybrid Strategy] All seeds already beat PyTorch (>= 1.0)")
+                print(f"[Hybrid Strategy] Skipping algorithm analysis")
+                print(f"{'='*80}")
             else:
-                raise FileNotFoundError(f"Bench template not found: {bench_template_source}")
+                print(f"\n{'='*80}")
+                print(f"[Hybrid Strategy] Analyzing seeds with score < 1.0 for algorithmic optimization...")
+                print(f"{'='*80}")
 
-        for stage_idx in range(len(OPTIMIZATION_STAGES)):
-            stage = OPTIMIZATION_STAGES[stage_idx]
-            stage_name = stage["name"]
-            stage_description = stage["description"]
+                # Setup bench script once
+                bench_template_source = root_dir / "bench_ref_inputs_template.py"
+                bench_script = root_dir / f"bench_ref_inputs_{proc_id}.py"
+                if not bench_script.exists() or proc_id != 0:
+                    import shutil
+                    if bench_template_source.exists():
+                        shutil.copy(bench_template_source, bench_script)
+                    else:
+                        raise FileNotFoundError(f"Bench template not found: {bench_template_source}")
 
+                # Analyze each seed with score < 1.0
+                for seed_idx, seed_candidate in enumerate(runnable_seeds):
+                    if seed_candidate.score >= 1.0:
+                        print(f"[Hybrid] Seed {seed_idx + 1}: {seed_candidate.score:.4f} >= 1.0, skipping analysis (already beats PyTorch)")
+                        continue
+
+                    print(f"\n[Hybrid] Seed {seed_idx + 1}: score={seed_candidate.score:.4f} < 1.0")
+                    print(f"[Hybrid] Attempting algorithm analysis rescue...")
+
+                    # Profile the seed to get NCU metrics
+                    test_kernel = code_dir / f"test_kernel_analysis_seed{seed_idx}.py"
+                    with open(test_kernel, "w") as f:
+                        f.write(seed_candidate.kernel.code)
+
+                    metrics_df, ncu_block = _profile_kernel_ncu(
+                        seed_candidate.kernel, test_kernel, f"bench_ref_inputs_{proc_id}.py",
+                        task_path, args.device, args.model, proc_id
+                        )
+
+                    # Get latency information from seed
+                    seed_latency_ms = None
+                    if hasattr(seed_candidate.kernel, 'metrics') and seed_candidate.kernel.metrics:
+                        test_latency = seed_candidate.kernel.metrics.get('test_latency_ms', {})
+                        if isinstance(test_latency, dict) and 'avg' in test_latency:
+                            seed_latency_ms = test_latency['avg']
+
+                    # Build analysis prompt using algorithm_analysis
+                    analysis_prompt = build_algorithm_analysis_prompt(
+                        arch_path=task_path,
+                        gpu_name=args.gpu,
+                        cuda_code=seed_candidate.kernel.code,
+                        ncu_metrics_block=ncu_block if ncu_block != "No NCU metrics available" else "",
+                        current_latency_ms=seed_latency_ms,
+                        baseline_latency_ms=pytorch_baseline_ms,
+                    )
+
+                    # Save analysis prompt
+                    analysis_prompt_file = io_dir / f"algorithm_analysis_prompt_seed{seed_idx}.txt"
+                    analysis_prompt_file.write_text(analysis_prompt, encoding="utf-8")
+
+                    # Call LLM for algorithm analysis
+                    print(f"[Hybrid] Requesting LLM analysis for seed {seed_idx + 1}...")
+                    analysis_result = call_llm(
+                        analysis_prompt,
+                        sys_prompt="You are an expert GPU kernel optimization architect. Analyze the kernel's algorithmic structure and identify high-level optimization opportunities.",
+                        log_path=log_path,
+                        call_type=f"algorithm_analysis_seed{seed_idx}",
+                        round_idx=1000 + seed_idx,
+                    )
+
+                    # Save analysis result
+                    analysis_result_file = io_dir / f"algorithm_analysis_result_seed{seed_idx}.txt"
+                    analysis_result_file.write_text(analysis_result, encoding="utf-8")
+
+                    print(f"[Hybrid] Analysis complete for seed {seed_idx + 1}, generating optimized kernel...")
+
+                    # Extract analysis and generate optimized seed
+                    try:
+                        # Parse JSON analysis result
+                        analysis_json = extract_json(analysis_result)
+                        if analysis_json:
+                            print(f"[Hybrid] Bottleneck: {analysis_json.get('bottleneck', 'N/A')[:80]}...")
+                            print(f"[Hybrid] Optimization: {analysis_json.get('optimisation method', 'N/A')[:80]}...")
+                            print(f"[Hybrid] Expected speedup: {analysis_json.get('expected_speedup', 'N/A')}")
+
+                            # Build prompt for generating optimized seed based on analysis
+                            optimization_instruction = f"""
+                        Based on algorithmic analysis:
+
+                        **Bottleneck**: {analysis_json.get('bottleneck', 'N/A')}
+                        **Optimization**: {analysis_json.get('optimisation method', 'N/A')}
+                        **Plan**: {analysis_json.get('modification plan', 'N/A')}
+
+                        Implement this optimization in the kernel below.
+
+                        Original Kernel:
+                        ```python
+                        {seed_candidate.kernel.code}
+                        ```
+
+                        {seed_prompt}
+                        """
+
+                            # Generate optimized seed
+                            optimized_kernel = _llm_to_kernel(
+                                optimization_instruction, code_dir, call_llm, io_dir,
+                                2000 + seed_idx, log_path=log_path, call_type=f"algorithm_optimized_seed{seed_idx}",
+                            )
+
+                            # Benchmark optimized seed
+                            baseline_result = _bench_and_score(
+                                optimized_kernel,
+                                ref_py=task_path,
+                                device_idx=args.device,
+                                warmup=args.warmup,
+                                repeat=args.repeat,
+                                tol=args.tol,
+                                rtol=args.rtol,
+                                phase=f"algorithm_optimized_seed{seed_idx}",
+                                metrics_dir=eval_dir,
+                                cached_baseline_ms=pytorch_baseline_ms,
+                            )
+
+                            runnable = bool(getattr(optimized_kernel, "metrics", {}).get("runnable", False))
+                            optimized_score = optimized_kernel.score if (optimized_kernel.score is not None and runnable) else 0.0
+
+                            if runnable and optimized_score > 0:
+                                print(f"[Hybrid] ✓ Rescue successful: {seed_candidate.score:.4f} → {optimized_score:.4f}")
+                                # Add to all candidates pool
+                                all_candidates.append(BeamCandidate(
+                                    kernel=optimized_kernel,
+                                    score=optimized_score,
+                                    runnable=True,
+                                ))
+                                if optimized_score > best_score:
+                                    best_score = optimized_score
+                                    best_kernel = optimized_kernel
+                            else:
+                                print(f"[Hybrid] ✗ Rescue failed, keeping original seed")
+
+                    except Exception as e:
+                        print(f"[Hybrid] ✗ Algorithm analysis failed for seed {seed_idx + 1}: {e}")
+                        print(f"[Hybrid] Continuing with original seed...")
+
+        # ====== Step 4: Select Best Candidate from All (seeds + algo-optimized) ======
+        print(f"\n{'='*80}")
+        print(f"[Hybrid] Candidate Selection")
+        print(f"{'='*80}")
+        print(f"[Hybrid] Total candidates: {len(all_candidates)}")
+        for idx, cand in enumerate(all_candidates):
+            if idx < len(runnable_seeds):
+                kernel_type = f"seed {idx + 1}"
+            else:
+                # Algorithm-optimized kernels
+                original_seed_idx = idx - len(runnable_seeds)
+                kernel_type = f"algo-optimized (from seed {original_seed_idx + 1})"
+            print(f"  [{idx + 1}] {kernel_type}: {cand.score:.4f}")
+
+        # Select best candidate
+        best_candidate = max(all_candidates, key=lambda c: c.score)
+        print(f"\n[Hybrid] ★ Selected best candidate: score={best_candidate.score:.4f}")
+
+        # Update best_score and best_kernel
+        if best_candidate.score > best_score:
+            best_score = best_candidate.score
+            best_kernel = best_candidate.kernel
+
+        # ====== Step 5: Three-stage Optimization (with persistent kernel check) ======
+        # Check if the best candidate is a persistent kernel
+        if is_persistent_kernel(best_candidate.kernel.code):
             print(f"\n{'='*80}")
-            print(f"[Stage {stage_idx + 1}/{len(OPTIMIZATION_STAGES)}] {stage_name}")
-            print(f"Description: {stage_description}")
-            print(f"Current candidates: {len(beam)}, best score: {best_score:.4f}")
+            print(f"[3-Stage] Persistent kernel detected!")
+            print(f"[3-Stage] Skipping 3-stage optimization to preserve performance.")
+            print(f"[3-Stage] Final score: {best_candidate.score:.4f}")
             print(f"{'='*80}")
 
-            # Filter beam to only runnable candidates
-            beam = [c for c in beam if c.runnable]
-            if not beam:
-                print(f"[ERROR] No runnable candidates at stage {stage_idx + 1}. Stopping.")
-                break
+            # Use the best candidate as final result
+            stage_round = 0
+            score_history = [best_score]
+            candidates: List[BeamCandidate] = [best_candidate]
 
-            # Stage 3 (last stage): always greedy, use single best
-            if stage_idx == len(OPTIMIZATION_STAGES) - 1 and len(beam) > 1:
-                beam = [max(beam)]
-                print(f"[Stage {stage_idx + 1}] Final stage: using best candidate (score={beam[0].score:.4f})")
+        else:
+            print(f"\n[Optimization] Starting 3-stage optimization...")
 
-            # Profile all candidates in beam to get NCU metrics
-            print(f"[Stage {stage_idx + 1}] Profiling {len(beam)} candidate(s)...")
-            for candidate in beam:
-                if candidate.ncu_block:  # Already profiled
-                    continue
-                metrics_df, metrics_block = _profile_kernel_ncu(
-                    candidate.kernel, test_kernel, f"bench_ref_inputs_{proc_id}.py",
-                    task_path, args.device, args.model, proc_id
-                )
-                candidate.metrics_df = metrics_df
-                candidate.ncu_block = metrics_block
+            stage_round = 0
+            score_history = [best_score]
 
-            # Generate new candidates: one optimization per beam candidate
-            new_candidates: List[BeamCandidate] = []
-            stage_round += 1
+            # Initialize with best candidate only (greedy)
+            candidates: List[BeamCandidate] = [best_candidate]
 
-            for beam_idx, base_candidate in enumerate(beam):
-                print(f"[Stage {stage_idx + 1}] Optimizing candidate {beam_idx + 1}/{len(beam)}...")
+            # Setup bench script once
+            bench_template_source = root_dir / "bench_ref_inputs_template.py"
+            bench_script = root_dir / f"bench_ref_inputs_{proc_id}.py"
+            if not bench_script.exists() or proc_id != 0:
+                import shutil
+                if bench_template_source.exists():
+                    shutil.copy(bench_template_source, bench_script)
+                else:
+                    raise FileNotFoundError(f"Bench template not found: {bench_template_source}")
+
+            for stage_idx in range(len(OPTIMIZATION_STAGES)):
+                stage = OPTIMIZATION_STAGES[stage_idx]
+                stage_name = stage["name"]
+                stage_description = stage["description"]
+
+                print(f"\n{'='*80}")
+                print(f"[Stage {stage_idx + 1}/{len(OPTIMIZATION_STAGES)}] {stage_name}")
+                print(f"Description: {stage_description}")
+                print(f"Current candidates: {len(candidates)}, best score: {best_score:.4f}")
+                print(f"{'='*80}")
+
+                # Filter to only runnable candidates
+                candidates = [c for c in candidates if c.runnable]
+                if not candidates:
+                    print(f"[ERROR] No runnable candidates at stage {stage_idx + 1}. Stopping.")
+                    break
+
+                # Final stage: use single best candidate (greedy)
+                if stage_idx == len(OPTIMIZATION_STAGES) - 1 and len(candidates) > 1:
+                    candidates = [max(candidates)]
+                    print(f"[Stage {stage_idx + 1}] Final stage: using best candidate (score={candidates[0].score:.4f})")
+
+                # Profile the best candidate to get NCU metrics
+                base_candidate = candidates[0]
+                if not base_candidate.ncu_block:
+                    print(f"[Stage {stage_idx + 1}] Profiling best candidate...")
+                    metrics_df, metrics_block = _profile_kernel_ncu(
+                        base_candidate.kernel, test_kernel, f"bench_ref_inputs_{proc_id}.py",
+                        task_path, args.device, args.model, proc_id
+                    )
+                    base_candidate.metrics_df = metrics_df
+                    base_candidate.ncu_block = metrics_block
+
+                # Optimize the best candidate
+                stage_round += 1
+                print(f"[Stage {stage_idx + 1}] Generating optimized kernel...")
 
                 # Generate optimized kernel
                 new_kernel = _optimize_stage_single(
@@ -1108,8 +1326,8 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                     code_dir=code_dir,
                     io_dir=io_dir,
                     log_path=log_path,
-                    stage_round=stage_round + beam_idx,
-                    beam_idx=beam_idx,
+                    stage_round=stage_round,
+                    beam_idx=0,
                 )
 
                 # Benchmark the new kernel
@@ -1121,7 +1339,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                     repeat=args.repeat,
                     tol=args.tol,
                     rtol=args.rtol,
-                    phase=f"stage{stage_idx + 1}_{stage_name}_cand{beam_idx}",
+                    phase=f"stage{stage_idx + 1}_{stage_name}",
                     metrics_dir=eval_dir,
                     cached_baseline_ms=pytorch_baseline_ms,
                 )
@@ -1130,28 +1348,28 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                 is_runnable = bool(getattr(new_kernel, "metrics", {}).get("runnable", False))
                 new_score = new_kernel.score if (new_kernel.score is not None and is_runnable) else float("-inf")
 
-                # If optimization failed, try repair (max 1 attempt per candidate)
+                # If optimization failed, try repair (max 1 attempt)
                 if not is_runnable:
-                    print(f"  Candidate {beam_idx + 1}: failed, attempting repair...")
+                    print(f"  Optimization failed, attempting repair...")
                     error_log = _last_n_lines(getattr(new_kernel, "metrics", {}).get("message", ""))
 
-                    # Generate repair directly (no separate analysis step)
+                    # Generate repair directly
                     repair_prompt = build_error_prompt(
                         old_code=new_kernel.code,
                         error_log=error_log,
-                        problem=None,  # No analysis step
+                        problem=None,
                         gpu_name=args.gpu,
-                        error_history="",  # Stage repair is single-attempt, no history
+                        error_history="",
                         arch_path=task_path,
                     )
-                    prompt_file = io_dir / f"stage{stage_idx + 1}_repair_cand{beam_idx}_prompt.txt"
+                    prompt_file = io_dir / f"stage{stage_idx + 1}_repair_prompt.txt"
                     prompt_file.write_text(repair_prompt, encoding="utf-8")
 
                     new_kernel = _llm_to_kernel(
                         repair_prompt, code_dir, call_llm, io_dir,
-                        stage_round + beam_idx + 100,
+                        stage_round + 100,
                         log_path=log_path,
-                        call_type=f"stage{stage_idx + 1}_repair_beam{beam_idx}",
+                        call_type=f"stage{stage_idx + 1}_repair",
                     )
 
                     # Re-benchmark repaired kernel
@@ -1163,7 +1381,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                         repeat=args.repeat,
                         tol=args.tol,
                         rtol=args.rtol,
-                        phase=f"stage{stage_idx + 1}_{stage_name}_repair_beam{beam_idx}",
+                        phase=f"stage{stage_idx + 1}_{stage_name}_repair",
                         metrics_dir=eval_dir,
                         cached_baseline_ms=pytorch_baseline_ms,
                     )
@@ -1171,72 +1389,36 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                     is_runnable = bool(getattr(new_kernel, "metrics", {}).get("runnable", False))
                     new_score = new_kernel.score if (new_kernel.score is not None and is_runnable) else float("-inf")
 
-                # Only add to candidates if runnable (skip failed ones)
+                # Update candidates based on optimization result
                 if is_runnable:
-                    new_candidates.append(BeamCandidate(
+                    # Use new optimized kernel
+                    candidates = [BeamCandidate(
                         kernel=new_kernel,
                         score=new_score,
                         runnable=True,
                         ncu_block="",  # Will be profiled in next stage if needed
-                    ))
+                    )]
                     last_score_for_curve = new_score
                     scores.append(new_score)
                     err_flags.append(False)
-                    print(f"  Candidate {beam_idx + 1}: score={new_score:.4f} ✓")
+                    print(f"  Optimized kernel score: {new_score:.4f} ✓")
                 else:
+                    # Keep previous candidate if optimization failed
                     scores.append(last_score_for_curve)
                     err_flags.append(True)
-                    print(f"  Candidate {beam_idx + 1}: failed (after repair attempt) ✗")
+                    print(f"  Optimization failed, keeping previous candidate ✗")
 
-            # Select top-k candidates for next stage
-            # Include previous beam candidates to allow "no improvement" path
-            all_candidates = new_candidates + beam
-            all_candidates = [c for c in all_candidates if c.runnable]
-
-            if not all_candidates:
-                print(f"[Stage {stage_idx + 1}] All candidates failed. Keeping previous beam.")
-                continue
-
-            # Sort by score (descending) and apply soft elimination
-            all_candidates.sort(reverse=True)
-
-            # Soft elimination logic:
-            # Stage 1: Keep both if gap <= threshold, else keep top-1
-            # Stage 2+: Always keep top-1 (greedy)
-            if stage_idx == 0 and len(all_candidates) >= 2:
-                top1_score = all_candidates[0].score
-                top2_score = all_candidates[1].score
-                if top1_score > 0:
-                    gap = (top1_score - top2_score) / top1_score
+                # Update global best
+                if candidates[0].score > best_score:
+                    best_score = candidates[0].score
+                    best_kernel = candidates[0].kernel
+                    with open(test_kernel, "w") as f:
+                        f.write(best_kernel.code)
+                    print(f"[Stage {stage_idx + 1}] ★ New best score: {best_score:.4f}")
                 else:
-                    gap = float("inf")  # Cannot compare with non-positive scores
+                    print(f"[Stage {stage_idx + 1}] Current: {candidates[0].score:.4f} (global best: {best_score:.4f})")
 
-                if gap <= args.elimination_threshold:
-                    # Soft elimination: keep both candidates
-                    beam = all_candidates[:2]
-                    print(f"[Stage {stage_idx + 1}] Soft elimination: gap={gap:.4f} <= τ={args.elimination_threshold}, keeping 2 candidates")
-                else:
-                    # Hard elimination: keep only top-1
-                    beam = all_candidates[:1]
-                    print(f"[Stage {stage_idx + 1}] Hard elimination: gap={gap:.4f} > τ={args.elimination_threshold}, keeping top-1")
-            else:
-                # Stage 2+: always greedy (keep top-1)
-                beam = all_candidates[:1]
-
-            # Update global best
-            if beam[0].score > best_score:
-                best_score = beam[0].score
-                best_kernel = beam[0].kernel
-                with open(test_kernel, "w") as f:
-                    f.write(best_kernel.code)
-                print(f"[Stage {stage_idx + 1}] ★ New best score: {best_score:.4f}")
-            else:
-                print(f"[Stage {stage_idx + 1}] Best in beam: {beam[0].score:.4f} (global best: {best_score:.4f})")
-
-            # Log beam status
-            print(f"[Stage {stage_idx + 1}] Beam after selection: {[f'{c.score:.4f}' for c in beam]}")
-
-            score_history.append(best_score)
+                score_history.append(best_score)
 
     # plot per-task curve
     fig_path = fig_dir / f"{task_path.stem}_score.png"

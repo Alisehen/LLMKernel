@@ -1,0 +1,211 @@
+
+Write high-performance Triton kernels to replace PyTorch operators.
+Generate the FASTEST kernel while maintaining correctness.
+
+## CRITICAL — These cause 60%+ of failures:
+1. EVERY kernel function MUST have `@triton.jit` decorator — MANDATORY
+2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+3. BLOCK sizes MUST be power-of-2 constexpr: 16, 32, 64, 128, 256
+4. `tl.program_id(axis)` only supports axis = 0, 1, 2 (max 3D grid)
+
+## Triton Syntax Rules:
+- For matmul/conv/linear ops, prefer `tl.dot(a, b, allow_tf32=True)` over element-wise multiply-add
+- No `continue`, `break`, `return` inside loops — use masking instead
+- No tensor indexing with loop vars: `x[:, i]` or `x[i, :]` is INVALID
+- No tuple unpacking inside kernel: `a, b = tl.load(...)` is INVALID
+- No nested functions inside @triton.jit
+- No Python control flow on tl.tensor or BLOCK_* values
+- No dynamic `tl.reshape()` or view operations
+
+## Missing Triton Functions (implement manually):
+- tl.tanh → `(tl.exp(2*x) - 1) / (tl.exp(2*x) + 1)`
+- tl.sigmoid → `1 / (1 + tl.exp(-x))`
+- tl.gelu, tl.silu, tl.softmax, tl.mish → implement from definition
+
+## Load/Store Rules:
+- Pointer + scalar offset → scalar value
+- Pointer + block offset (via tl.arange) → block of values
+- mask shape MUST match data shape exactly
+
+## Output Format (STRICT):
+1. Imports: `import torch, torch.nn as nn, triton, triton.language as tl` (and math if needed)
+2. `@triton.jit` kernel(s) — MUST have this decorator
+3. Wrapper function with grid calculation
+4. `class ModelNew(nn.Module)` — REQUIRED
+
+Do NOT include: testing code, `if __name__ == "__main__"`, get_inputs, get_init_inputs
+
+
+## Full-Network Optimization Guidance
+- Target is a **complete nn.Module**, not a single operator.
+- Preserve module structure and forward() control flow.
+- Allow fusion **within a branch or module**, but NOT across branches.
+
+
+Example PyTorch:
+'''
+import torch
+import torch.nn as nn
+
+
+class Model(nn.Module):
+    """
+    Fusion example: Gemm + Add + ReLU
+    Three operations fused together.
+    """
+    def __init__(self, in_features, out_features, bias_shape):
+        super(Model, self).__init__()
+        self.gemm = nn.Linear(in_features, out_features)
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+
+    def forward(self, x):
+        x = self.gemm(x)
+        x = x + self.bias
+        x = torch.relu(x)
+        return x
+
+
+def get_inputs():
+    return [torch.randn(128, 512).cuda()]
+
+
+def get_init_inputs():
+    return [512, 512, (512,)]
+'''
+
+Example Triton:
+'''
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def fused_gemm_add_relu_kernel(
+    a_ptr, b_ptr, bias_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k in range(0, K, BLOCK_K):
+        a = tl.load(a_ptrs, mask=(offs_m[:, None] < M) & (offs_k[None, :] < K - k), other=0.0)
+        b = tl.load(b_ptrs, mask=(offs_k[:, None] < K - k) & (offs_n[None, :] < N), other=0.0)
+        acc += tl.dot(a, b, allow_tf32=True)
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Fused: add bias
+    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc += bias[None, :]
+
+    # Fused: ReLU
+    acc = tl.maximum(acc, 0.0)
+
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    tl.store(c_ptrs, acc, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+
+
+def fused_gemm_add_relu(x, weight, bias):
+    M, K = x.shape
+    N = weight.shape[0]
+    c = torch.empty((M, N), device=x.device, dtype=x.dtype)
+    b = weight.t().contiguous()
+    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']), triton.cdiv(N, META['BLOCK_N']))
+    fused_gemm_add_relu_kernel[grid](
+        x, b, bias, c, M, N, K,
+        x.stride(0), x.stride(1), b.stride(0), b.stride(1), c.stride(0), c.stride(1),
+    )
+    return c
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, bias_shape):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+
+    def forward(self, x):
+        return fused_gemm_add_relu(x, self.weight, self.bias)
+'''
+
+Target:
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class Model(nn.Module):
+    def __init__(self, in_channels, out_1x1, reduce_3x3, out_3x3, reduce_5x5, out_5x5, pool_proj):
+        """
+        :param in_channels: Number of input channels
+        :param out_1x1: Number of output channels for the 1x1 convolution
+        :param reduce_3x3: Number of output channels for the 1x1 reduction before 3x3 convolution
+        :param out_3x3: Number of output channels for the 3x3 convolution
+        :param reduce_5x5: Number of output channels for the 1x1 reduction before 5x5 convolution
+        :param out_5x5: Number of output channels for the 5x5 convolution
+        :param pool_proj: Number of output channels for the pooling projection
+        """
+        super(Model, self).__init__()
+        
+        # 1x1 convolution branch
+        self.branch1x1 = nn.Conv2d(in_channels, out_1x1, kernel_size=1)
+        
+        # 3x3 convolution branch
+        self.branch3x3 = nn.Sequential(
+            nn.Conv2d(in_channels, reduce_3x3, kernel_size=1),
+            nn.Conv2d(reduce_3x3, out_3x3, kernel_size=3, padding=1)
+        )
+        
+        # 5x5 convolution branch
+        self.branch5x5 = nn.Sequential(
+            nn.Conv2d(in_channels, reduce_5x5, kernel_size=1),
+            nn.Conv2d(reduce_5x5, out_5x5, kernel_size=5, padding=2)
+        )
+        
+        # Max pooling branch
+        self.branch_pool = nn.Sequential(
+            nn.MaxPool2d(kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(in_channels, pool_proj, kernel_size=1)
+        )
+    
+    def forward(self, x):
+        """
+        :param x: Input tensor, shape (batch_size, in_channels, height, width)
+        :return: Output tensor, shape (batch_size, out_channels, height, width)
+        """
+        branch1x1 = self.branch1x1(x)
+        branch3x3 = self.branch3x3(x)
+        branch5x5 = self.branch5x5(x)
+        branch_pool = self.branch_pool(x)
+        
+        outputs = [branch1x1, branch3x3, branch5x5, branch_pool]
+        return torch.cat(outputs, 1)
+
+# Test code
+in_channels = 480
+out_1x1 = 192
+reduce_3x3 = 96
+out_3x3 = 208
+reduce_5x5 = 16
+out_5x5 = 48
+pool_proj = 64
+batch_size = 10
+height = 224
+width = 224
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_1x1, reduce_3x3, out_3x3, reduce_5x5, out_5x5, pool_proj]

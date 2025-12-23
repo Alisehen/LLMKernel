@@ -1,0 +1,382 @@
+```python
+import math
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+# =========================
+#  GEMM + Bias Kernel (Autotuned, Memory-Optimized)
+# =========================
+
+@triton.autotune(
+    configs=[
+        # Conservative baseline for multi-input fusion
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32},
+                      num_warps=4, num_stages=2),
+        # More warps for compute-bound cases, still 2 stages for 3-input matmul
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32},
+                      num_warps=8, num_stages=2),
+        # Slightly deeper pipeline if registers allow
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32},
+                      num_warps=4, num_stages=3),
+    ],
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def linear_gemm_bias_kernel(
+    x_ptr, w_ptr, b_ptr, y_ptr,
+    M, N, K,
+    stride_xm, stride_xk,
+    stride_wn, stride_wk,
+    stride_ym, stride_yn,
+    HAS_BIAS: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """
+    Compute: Y[M, N] = X[M, K] @ W[N, K]^T + bias[N]
+
+    X: [M, K], row-major    offset = m*stride_xm + k*stride_xk
+    W: [N, K], row-major    offset = n*stride_wn + k*stride_wk
+    Y: [M, N], row-major    offset = m*stride_ym + n*stride_yn
+    """
+
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Alignment / contiguity hints
+    tl.multiple_of(offs_m, BLOCK_M)
+    tl.multiple_of(offs_n, BLOCK_N)
+    tl.multiple_of(offs_k, BLOCK_K)
+
+    # Base pointers for current (M, N) tile
+    a_ptrs = x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk
+    b_ptrs = w_ptr + offs_n[None, :] * stride_wn + offs_k[:, None] * stride_wk
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    m_mask = offs_m < M
+    n_mask = offs_n < N
+
+    k = 0
+    while k < K:
+        k_remaining = K - k
+        k_mask = offs_k < k_remaining
+
+        a = tl.load(
+            a_ptrs,
+            mask=m_mask[:, None] & k_mask[None, :],
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptrs,
+            mask=k_mask[:, None] & n_mask[None, :],
+            other=0.0,
+        )
+
+        # Accumulate in FP32; inputs kept in their original dtype
+        acc += tl.dot(a, b, out_dtype=tl.float32, allow_tf32=True)
+
+        a_ptrs += BLOCK_K * stride_xk
+        b_ptrs += BLOCK_K * stride_wk
+        k += BLOCK_K
+
+    # Fused bias add (broadcast over M)
+    if HAS_BIAS:
+        bias = tl.load(b_ptr + offs_n, mask=n_mask, other=0.0).to(tl.float32)
+        acc += bias[None, :]
+
+    # Single final store (no intermediate stores anywhere above)
+    y_ptrs = y_ptr + offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn
+    tl.store(
+        y_ptrs,
+        acc,
+        mask=m_mask[:, None] & n_mask[None, :],
+    )
+
+
+def linear_gemm_bias(x, weight, bias):
+    """
+    x:      [M, K]
+    weight: [N, K]   (same as nn.Linear.weight)
+    bias:   [N] or None
+    returns: [M, N]
+    """
+    assert x.is_cuda and weight.is_cuda
+    M, K = x.shape
+    N = weight.shape[0]
+    y = torch.empty((M, N), device=x.device, dtype=x.dtype)
+
+    has_bias = bias is not None
+    if bias is None:
+        bias = x.new_empty(0)
+
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta['BLOCK_M']),
+            triton.cdiv(N, meta['BLOCK_N']),
+        )
+
+    linear_gemm_bias_kernel[grid](
+        x, weight, bias, y,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        weight.stride(0), weight.stride(1),
+        y.stride(0), y.stride(1),
+        HAS_BIAS=has_bias,
+    )
+    return y
+
+
+# =========================
+#  GRU Pointwise Kernel (2D Grid, Fully Fused)
+# =========================
+
+@triton.autotune(
+    configs=[
+        # Baseline: moderate tiles, conservative warp count
+        triton.Config({'BLOCK_B': 16, 'BLOCK_H': 64},
+                      num_warps=4, num_stages=2),
+        # Larger H tile to better use vector units
+        triton.Config({'BLOCK_B': 16, 'BLOCK_H': 128},
+                      num_warps=4, num_stages=2),
+        # More warps if register pressure allows
+        triton.Config({'BLOCK_B': 16, 'BLOCK_H': 64},
+                      num_warps=8, num_stages=2),
+    ],
+    key=['B', 'H'],
+)
+@triton.jit
+def gru_pointwise_kernel_2d(
+    gi_ptr, gh_ptr, h_prev_ptr, h_new_ptr,
+    B, H,
+    stride_gib, stride_gig,   # gi: [B, 3H]
+    stride_ghb, stride_ghg,   # gh: [B, 3H]
+    stride_hb, stride_hh,     # h_prev: [B, H]
+    stride_onb, stride_onh,   # h_new: [B, H]
+    BLOCK_B: tl.constexpr, BLOCK_H: tl.constexpr,
+):
+    """
+    Fully fused GRU pointwise update over [B, H] using a 2D grid.
+
+    Shapes:
+      gi:    [B, 3H]
+      gh:    [B, 3H]
+      h_prev:[B, H]
+      h_new: [B, H]
+
+    Gate layout along last dim (size 3H): [r(0:H), i(H:2H), n(2H:3H)]
+    """
+
+    pid_b = tl.program_id(0)
+    pid_h = tl.program_id(1)
+
+    offs_b = pid_b * BLOCK_B + tl.arange(0, BLOCK_B)
+    offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+
+    b_mask = offs_b < B
+    h_mask = offs_h < H
+    mask = b_mask[:, None] & h_mask[None, :]
+
+    # Hints
+    tl.multiple_of(offs_b, BLOCK_B)
+    tl.multiple_of(offs_h, BLOCK_H)
+
+    # Base pointers for gi / gh reset gate slice
+    gi_r_ptrs = gi_ptr + offs_b[:, None] * stride_gib + offs_h[None, :] * stride_gig
+    gh_r_ptrs = gh_ptr + offs_b[:, None] * stride_ghb + offs_h[None, :] * stride_ghg
+
+    # Offsets for input/next gates along last dimension
+    off_H_gi = H * stride_gig
+    off_2H_gi = 2 * H * stride_gig
+    off_H_gh = H * stride_ghg
+    off_2H_gh = 2 * H * stride_ghg
+
+    # ---- Load input-linear gates gi: [B, 3H] ----
+    gi_r = tl.load(gi_r_ptrs, mask=mask, other=0.0)
+    gi_i = tl.load(gi_r_ptrs + off_H_gi, mask=mask, other=0.0)
+    gi_n = tl.load(gi_r_ptrs + off_2H_gi, mask=mask, other=0.0)
+
+    # ---- Load hidden-linear gates gh: [B, 3H] ----
+    gh_r = tl.load(gh_r_ptrs, mask=mask, other=0.0)
+    gh_i = tl.load(gh_r_ptrs + off_H_gh, mask=mask, other=0.0)
+    gh_n = tl.load(gh_r_ptrs + off_2H_gh, mask=mask, other=0.0)
+
+    gi_r = gi_r.to(tl.float32)
+    gi_i = gi_i.to(tl.float32)
+    gi_n = gi_n.to(tl.float32)
+    gh_r = gh_r.to(tl.float32)
+    gh_i = gh_i.to(tl.float32)
+    gh_n = gh_n.to(tl.float32)
+
+    # ---- Load previous hidden state h_{t-1}: [B, H] ----
+    h_prev_ptrs = h_prev_ptr + offs_b[:, None] * stride_hb + offs_h[None, :] * stride_hh
+    h_prev = tl.load(h_prev_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+    # GRU equations (PyTorch-compatible):
+    # resetgate = sigmoid(i_r + h_r)
+    # inputgate = sigmoid(i_i + h_i)
+    # newgate = tanh(i_n + resetgate * h_n)
+    # h_new = newgate + inputgate * (h_prev - newgate)
+
+    x_r = gi_r + gh_r
+    x_i = gi_i + gh_i
+
+    # sigmoid(x) = 1 / (1 + exp(-x))
+    resetgate = 1.0 / (1.0 + tl.exp(-x_r))
+    inputgate = 1.0 / (1.0 + tl.exp(-x_i))
+
+    x_n = gi_n + resetgate * gh_n
+
+    # tanh(x) = (exp(2x) - 1) / (exp(2x) + 1)
+    two_x_n = 2.0 * x_n
+    exp_2x = tl.exp(two_x_n)
+    newgate = (exp_2x - 1.0) / (exp_2x + 1.0)
+
+    h_new = newgate + inputgate * (h_prev - newgate)
+
+    # Single final store
+    h_new_ptrs = h_new_ptr + offs_b[:, None] * stride_onb + offs_h[None, :] * stride_onh
+    tl.store(h_new_ptrs, h_new, mask=mask)
+
+
+def gru_pointwise(gi, gh, h_prev, hidden_size):
+    """
+    gi: [B, 3H]  from input linear
+    gh: [B, 3H]  from hidden linear
+    h_prev: [B, H]
+    returns: h_new [B, H]
+    """
+    assert gi.is_cuda and gh.is_cuda and h_prev.is_cuda
+    B = h_prev.shape[0]
+    H = hidden_size
+    h_new = torch.empty_like(h_prev)
+
+    def grid(meta):
+        return (
+            triton.cdiv(B, meta['BLOCK_B']),
+            triton.cdiv(H, meta['BLOCK_H']),
+        )
+
+    gru_pointwise_kernel_2d[grid](
+        gi, gh, h_prev, h_new,
+        B, H,
+        gi.stride(0), gi.stride(1),
+        gh.stride(0), gh.stride(1),
+        h_prev.stride(0), h_prev.stride(1),
+        h_new.stride(0), h_new.stride(1),
+    )
+    return h_new
+
+
+# =========================
+#  Model Definition
+# =========================
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers=3, bias=True, batch_first=False):
+        super(ModelNew, self).__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.batch_first = batch_first
+        self.use_bias = bias
+
+        self.weight_ih = nn.ParameterList()
+        self.weight_hh = nn.ParameterList()
+        self.bias_ih = nn.ParameterList()
+        self.bias_hh = nn.ParameterList()
+
+        for layer in range(num_layers):
+            layer_input_size = input_size if layer == 0 else hidden_size
+            w_ih = nn.Parameter(torch.empty(3 * hidden_size, layer_input_size))
+            w_hh = nn.Parameter(torch.empty(3 * hidden_size, hidden_size))
+            self.weight_ih.append(w_ih)
+            self.weight_hh.append(w_hh)
+
+            # Always allocate bias; if bias=False, initialize to zero
+            b_ih = nn.Parameter(torch.empty(3 * hidden_size))
+            b_hh = nn.Parameter(torch.empty(3 * hidden_size))
+            self.bias_ih.append(b_ih)
+            self.bias_hh.append(b_hh)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        stdv = 1.0 / math.sqrt(self.hidden_size)
+        for param in self.parameters():
+            if self.use_bias:
+                nn.init.uniform_(param, -stdv, stdv)
+            else:
+                if param.ndim == 1:
+                    nn.init.zeros_(param)
+                else:
+                    nn.init.uniform_(param, -stdv, stdv)
+
+    def forward(self, x, h0):
+        """
+        x: (seq_len, batch, input_size) if batch_first=False
+           (batch, seq_len, input_size) if batch_first=True
+        h0: (num_layers, batch, hidden_size)
+        returns: output (same layout as x, hidden_size as feature dim)
+        """
+        if not x.is_cuda:
+            raise RuntimeError("ModelNew expects CUDA tensors for Triton kernels.")
+        if not h0.is_cuda:
+            raise RuntimeError("ModelNew expects CUDA tensors for Triton kernels.")
+
+        if self.batch_first:
+            # (B, T, C) -> (T, B, C)
+            x = x.transpose(0, 1).contiguous()
+
+        seq_len, batch_size, _ = x.shape
+        device = x.device
+        dtype = x.dtype
+
+        input_l = x
+        h_n_layers = []
+
+        for layer in range(self.num_layers):
+            w_ih = self.weight_ih[layer]
+            w_hh = self.weight_hh[layer]
+            b_ih = self.bias_ih[layer]
+            b_hh = self.bias_hh[layer] if self.use_bias else None
+
+            T = seq_len
+            H = self.hidden_size
+            input_dim = input_l.shape[2]
+
+            # Precompute input linear for all timesteps: gi_all: [T, B, 3H]
+            x2d = input_l.reshape(T * batch_size, input_dim)
+            gi2d = linear_gemm_bias(x2d, w_ih, b_ih if self.use_bias else None)
+            gi_all = gi2d.reshape(T, batch_size, 3 * H)
+
+            # Hidden state for this layer: [B, H]
+            h_prev = h0[layer].to(device=device, dtype=dtype).contiguous()
+
+            layer_outputs = torch.empty(T, batch_size, H, device=device, dtype=dtype)
+
+            for t in range(T):
+                gi_t = gi_all[t]  # [B, 3H]
+                gh_t = linear_gemm_bias(h_prev, w_hh, b_hh if self.use_bias else None)  # [B, 3H]
+                h_prev = gru_pointwise(gi_t, gh_t, h_prev, H)
+                layer_outputs[t] = h_prev
+
+            h_n_layers.append(h_prev)
+            input_l = layer_outputs  # next layer input
+
+        output = input_l
+        h_n = torch.stack(h_n_layers, dim=0)
+
+        if self.batch_first:
+            # (T, B, H) -> (B, T, H)
+            output = output.transpose(0, 1).contiguous()
+
+        # Match original behavior: return only output
+        return output
+```

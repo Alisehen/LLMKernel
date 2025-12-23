@@ -1,0 +1,307 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def gru_cell_kernel(
+    x_ptr, h_prev_ptr,
+    w_ir_ptr, w_iz_ptr, w_in_ptr,
+    w_hr_ptr, w_hz_ptr, w_hn_ptr,
+    b_ir_ptr, b_iz_ptr, b_in_ptr,
+    b_hr_ptr, b_hz_ptr, b_hn_ptr,
+    h_new_ptr,
+    B, Kx, H,
+    stride_xb, stride_xk,
+    stride_hb, stride_hh,
+    stride_wirk, stride_wirh,
+    stride_wizk, stride_wizh,
+    stride_wink, stride_winh,
+    stride_whrk, stride_whrh,
+    stride_whzk, stride_whzh,
+    stride_whnk, stride_whnh,
+    stride_hnewb, stride_hnewh,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    mask_m = offs_m < B
+    mask_n = offs_n < H
+    mask_mn = mask_m[:, None] & mask_n[None, :]
+
+    # Accumulators for input contributions (x * W_ih)
+    acc_ir = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc_iz = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc_in = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Accumulators for hidden contributions (h_prev * W_hh)
+    acc_hr = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc_hz = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc_hn = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # ----- Input-to-hidden matmuls: x @ W_ir, x @ W_iz, x @ W_in -----
+    k = 0
+    while k < Kx:
+        offs_k = k + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < Kx
+
+        # [BLOCK_M, BLOCK_K]
+        x_ptrs = x_ptr + (offs_m[:, None] * stride_xb) + (offs_k[None, :] * stride_xk)
+        x = tl.load(x_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0)
+        x = x.to(tl.float32)
+
+        # [BLOCK_K, BLOCK_N] for each gate
+        wir_ptrs = w_ir_ptr + (offs_k[:, None] * stride_wirk) + (offs_n[None, :] * stride_wirh)
+        wiz_ptrs = w_iz_ptr + (offs_k[:, None] * stride_wizk) + (offs_n[None, :] * stride_wizh)
+        win_ptrs = w_in_ptr + (offs_k[:, None] * stride_wink) + (offs_n[None, :] * stride_winh)
+
+        wir = tl.load(wir_ptrs, mask=mask_k[:, None] & mask_n[None, :], other=0.0)
+        wiz = tl.load(wiz_ptrs, mask=mask_k[:, None] & mask_n[None, :], other=0.0)
+        win = tl.load(win_ptrs, mask=mask_k[:, None] & mask_n[None, :], other=0.0)
+
+        wir = wir.to(tl.float32)
+        wiz = wiz.to(tl.float32)
+        win = win.to(tl.float32)
+
+        acc_ir += tl.dot(x, wir, allow_tf32=True)
+        acc_iz += tl.dot(x, wiz, allow_tf32=True)
+        acc_in += tl.dot(x, win, allow_tf32=True)
+
+        k += BLOCK_K
+
+    # ----- Hidden-to-hidden matmuls: h_prev @ W_hr, h_prev @ W_hz, h_prev @ W_hn -----
+    k_h = 0
+    while k_h < H:
+        offs_kh = k_h + tl.arange(0, BLOCK_K)
+        mask_kh = offs_kh < H
+
+        # [BLOCK_M, BLOCK_K]
+        h_ptrs = h_prev_ptr + (offs_m[:, None] * stride_hb) + (offs_kh[None, :] * stride_hh)
+        h_block = tl.load(h_ptrs, mask=mask_m[:, None] & mask_kh[None, :], other=0.0)
+        h_block = h_block.to(tl.float32)
+
+        # [BLOCK_K, BLOCK_N] for each gate
+        whr_ptrs = w_hr_ptr + (offs_kh[:, None] * stride_whrk) + (offs_n[None, :] * stride_whrh)
+        whz_ptrs = w_hz_ptr + (offs_kh[:, None] * stride_whzk) + (offs_n[None, :] * stride_whzh)
+        whn_ptrs = w_hn_ptr + (offs_kh[:, None] * stride_whnk) + (offs_n[None, :] * stride_whnh)
+
+        whr = tl.load(whr_ptrs, mask=mask_kh[:, None] & mask_n[None, :], other=0.0)
+        whz = tl.load(whz_ptrs, mask=mask_kh[:, None] & mask_n[None, :], other=0.0)
+        whn = tl.load(whn_ptrs, mask=mask_kh[:, None] & mask_n[None, :], other=0.0)
+
+        whr = whr.to(tl.float32)
+        whz = whz.to(tl.float32)
+        whn = whn.to(tl.float32)
+
+        acc_hr += tl.dot(h_block, whr, allow_tf32=True)
+        acc_hz += tl.dot(h_block, whz, allow_tf32=True)
+        acc_hn += tl.dot(h_block, whn, allow_tf32=True)
+
+        k_h += BLOCK_K
+
+    # ----- Add biases -----
+    b_ir = tl.load(b_ir_ptr + offs_n, mask=mask_n, other=0.0).to(tl.float32)
+    b_iz = tl.load(b_iz_ptr + offs_n, mask=mask_n, other=0.0).to(tl.float32)
+    b_in = tl.load(b_in_ptr + offs_n, mask=mask_n, other=0.0).to(tl.float32)
+
+    b_hr = tl.load(b_hr_ptr + offs_n, mask=mask_n, other=0.0).to(tl.float32)
+    b_hz = tl.load(b_hz_ptr + offs_n, mask=mask_n, other=0.0).to(tl.float32)
+    b_hn = tl.load(b_hn_ptr + offs_n, mask=mask_n, other=0.0).to(tl.float32)
+
+    gi_r = acc_ir + b_ir[None, :]
+    gi_z = acc_iz + b_iz[None, :]
+    gi_n = acc_in + b_in[None, :]
+
+    gh_r = acc_hr + b_hr[None, :]
+    gh_z = acc_hz + b_hz[None, :]
+    gh_n = acc_hn + b_hn[None, :]
+
+    # ----- GRU gate equations -----
+    # r = sigmoid(gi_r + gh_r)
+    # z = sigmoid(gi_z + gh_z)
+    # n_tilde = tanh(gi_n + r * gh_n)
+    # h_new = (1 - z) * n_tilde + z * h_prev
+
+    # reset and update gates
+    r_pre = gi_r + gh_r
+    z_pre = gi_z + gh_z
+
+    r = 1.0 / (1.0 + tl.exp(-r_pre))
+    z = 1.0 / (1.0 + tl.exp(-z_pre))
+
+    n_pre = gi_n + r * gh_n
+    e2 = tl.exp(2.0 * n_pre)
+    n_tilde = (e2 - 1.0) / (e2 + 1.0)
+
+    # load previous hidden for this tile
+    h_prev_tile_ptrs = h_prev_ptr + (offs_m[:, None] * stride_hb) + (offs_n[None, :] * stride_hh)
+    h_prev_tile = tl.load(h_prev_tile_ptrs, mask=mask_mn, other=0.0).to(tl.float32)
+
+    h_new = (1.0 - z) * n_tilde + z * h_prev_tile
+
+    # store result
+    h_new_ptrs = h_new_ptr + (offs_m[:, None] * stride_hnewb) + (offs_n[None, :] * stride_hnewh)
+    tl.store(h_new_ptrs, h_new.to(h_prev_tile.dtype), mask=mask_mn)
+
+
+def gru_cell_triton(x, h_prev, w_ih, w_hh, b_ih, b_hh):
+    """
+    x:      [B, Kx]
+    h_prev: [B, H]
+    w_ih:   [3H, Kx]
+    w_hh:   [3H, H]
+    b_ih:   [3H] or None
+    b_hh:   [3H] or None
+    returns h_new: [B, H]
+    """
+    assert x.is_cuda and h_prev.is_cuda, "Inputs must be CUDA tensors for Triton kernels"
+
+    B, Kx = x.shape
+    B_h, H = h_prev.shape
+    assert B == B_h, "Batch dimension mismatch between x and h_prev"
+
+    # Split gate weights: [3H, K] -> three [H, K]
+    w_ir, w_iz, w_in = w_ih.split(H, dim=0)
+    w_hr, w_hz, w_hn = w_hh.split(H, dim=0)
+
+    # Transpose to [K, H] for efficient matmul
+    w_ir_t = w_ir.t().contiguous()
+    w_iz_t = w_iz.t().contiguous()
+    w_in_t = w_in.t().contiguous()
+
+    w_hr_t = w_hr.t().contiguous()
+    w_hz_t = w_hz.t().contiguous()
+    w_hn_t = w_hn.t().contiguous()
+
+    # Biases per gate
+    if b_ih is None:
+        b_ir = torch.zeros(H, device=x.device, dtype=x.dtype)
+        b_iz = torch.zeros(H, device=x.device, dtype=x.dtype)
+        b_in = torch.zeros(H, device=x.device, dtype=x.dtype)
+    else:
+        b_ir, b_iz, b_in = b_ih.split(H, dim=0)
+
+    if b_hh is None:
+        b_hr = torch.zeros(H, device=x.device, dtype=x.dtype)
+        b_hz = torch.zeros(H, device=x.device, dtype=x.dtype)
+        b_hn = torch.zeros(H, device=x.device, dtype=x.dtype)
+    else:
+        b_hr, b_hz, b_hn = b_hh.split(H, dim=0)
+
+    x_c = x.contiguous()
+    h_prev_c = h_prev.contiguous()
+
+    h_new = torch.empty_like(h_prev_c)
+
+    grid = lambda META: (
+        triton.cdiv(B, META["BLOCK_M"]),
+        triton.cdiv(H, META["BLOCK_N"]),
+    )
+
+    gru_cell_kernel[grid](
+        x_c, h_prev_c,
+        w_ir_t, w_iz_t, w_in_t,
+        w_hr_t, w_hz_t, w_hn_t,
+        b_ir, b_iz, b_in,
+        b_hr, b_hz, b_hn,
+        h_new,
+        B, Kx, H,
+        x_c.stride(0), x_c.stride(1),
+        h_prev_c.stride(0), h_prev_c.stride(1),
+        w_ir_t.stride(0), w_ir_t.stride(1),
+        w_iz_t.stride(0), w_iz_t.stride(1),
+        w_in_t.stride(0), w_in_t.stride(1),
+        w_hr_t.stride(0), w_hr_t.stride(1),
+        w_hz_t.stride(0), w_hz_t.stride(1),
+        w_hn_t.stride(0), w_hn_t.stride(1),
+        h_new.stride(0), h_new.stride(1),
+        BLOCK_M=32, BLOCK_N=64, BLOCK_K=32,
+    )
+
+    return h_new
+
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers=3, bias=True, batch_first=False):
+        super(ModelNew, self).__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.bias = bias
+        self.batch_first = batch_first
+
+        self.weight_ih_l = nn.ParameterList()
+        self.weight_hh_l = nn.ParameterList()
+        if bias:
+            self.bias_ih_l = nn.ParameterList()
+            self.bias_hh_l = nn.ParameterList()
+        else:
+            self.bias_ih_l = None
+            self.bias_hh_l = None
+
+        for layer in range(num_layers):
+            layer_input_size = input_size if layer == 0 else hidden_size
+
+            w_ih = nn.Parameter(torch.empty(3 * hidden_size, layer_input_size))
+            w_hh = nn.Parameter(torch.empty(3 * hidden_size, hidden_size))
+            nn.init.xavier_uniform_(w_ih)
+            nn.init.orthogonal_(w_hh)
+
+            self.weight_ih_l.append(w_ih)
+            self.weight_hh_l.append(w_hh)
+
+            if bias:
+                b_ih = nn.Parameter(torch.zeros(3 * hidden_size))
+                b_hh = nn.Parameter(torch.zeros(3 * hidden_size))
+                self.bias_ih_l.append(b_ih)
+                self.bias_hh_l.append(b_hh)
+
+    def forward(self, x, h0):
+        # x: (T, B, input) if not batch_first else (B, T, input)
+        # h0: (num_layers, B, H)
+        if self.batch_first:
+            x_seq = x.transpose(0, 1).contiguous()
+        else:
+            x_seq = x.contiguous()
+
+        T, B, _ = x_seq.shape
+        assert h0.shape[0] == self.num_layers
+        assert h0.shape[1] == B
+        assert h0.shape[2] == self.hidden_size
+
+        layer_input = x_seq
+        h_n_list = []
+
+        for layer in range(self.num_layers):
+            h_prev = h0[layer].contiguous()
+            w_ih = self.weight_ih_l[layer]
+            w_hh = self.weight_hh_l[layer]
+            b_ih = self.bias_ih_l[layer] if self.bias else None
+            b_hh = self.bias_hh_l[layer] if self.bias else None
+
+            # output sequence for this layer (for stacking GRU layers)
+            layer_output = torch.empty(
+                T, B, self.hidden_size,
+                device=x_seq.device,
+                dtype=x_seq.dtype,
+            )
+
+            for t in range(T):
+                x_t = layer_input[t]
+                h_prev = gru_cell_triton(x_t, h_prev, w_ih, w_hh, b_ih, b_hh)
+                layer_output[t] = h_prev
+
+            h_n_list.append(h_prev)
+            layer_input = layer_output
+
+        h_n = torch.stack(h_n_list, dim=0)
+
+        # Original target Model.forward returns only h_n
+        return h_n
+```

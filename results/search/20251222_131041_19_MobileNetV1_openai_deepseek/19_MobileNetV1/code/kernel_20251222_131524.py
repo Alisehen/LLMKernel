@@ -1,0 +1,562 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+# =========================
+#  Linear (GEMM) kernel
+# =========================
+
+@triton.jit
+def linear_kernel(
+    x_ptr, w_ptr, b_ptr, y_ptr,
+    M, N, K,
+    stride_xm, stride_xk,
+    stride_wk, stride_wn,
+    stride_ym, stride_yn,
+    HAS_BIAS: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    k = 0
+    while k < K:
+        k_ids = k + offs_k
+        mask_k = k_ids < K
+
+        x_ptrs = x_ptr + offs_m[:, None] * stride_xm + k_ids[None, :] * stride_xk
+        w_ptrs = w_ptr + k_ids[:, None] * stride_wk + offs_n[None, :] * stride_wn
+
+        a = tl.load(x_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0)
+        b = tl.load(w_ptrs, mask=mask_k[:, None] & mask_n[None, :], other=0.0)
+
+        acc += tl.dot(a, b, allow_tf32=True)
+
+        k += BLOCK_K
+
+    if HAS_BIAS:
+        bias = tl.load(b_ptr + offs_n, mask=mask_n, other=0.0)
+        acc += bias[None, :]
+
+    y_ptrs = y_ptr + offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn
+    tl.store(y_ptrs, acc, mask=mask_m[:, None] & mask_n[None, :])
+
+
+def linear_triton(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor = None) -> torch.Tensor:
+    """
+    x: [B, in_features]
+    weight: [out_features, in_features]
+    bias: [out_features] or None
+    """
+    assert x.is_cuda and weight.is_cuda
+    x = x.contiguous()
+    w = weight.contiguous()
+    B, K = x.shape
+    N = w.shape[0]
+
+    y = torch.empty((B, N), device=x.device, dtype=x.dtype)
+
+    BLOCK_M = 128
+    BLOCK_N = 128
+    BLOCK_K = 32
+
+    grid = lambda META: (
+        triton.cdiv(B, META['BLOCK_M']),
+        triton.cdiv(N, META['BLOCK_N']),
+    )
+
+    has_bias = bias is not None
+    b_ptr = bias if has_bias else x  # dummy pointer, never used when HAS_BIAS=False
+
+    linear_kernel[grid](
+        x, w, b_ptr, y,
+        B, N, K,
+        x.stride(0), x.stride(1),
+        w.stride(1), w.stride(0),
+        y.stride(0), y.stride(1),
+        HAS_BIAS=has_bias,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+    )
+    return y
+
+
+# =========================
+#  1x1 Conv kernel (groups=1)
+# =========================
+
+@triton.jit
+def conv1x1_kernel(
+    x_ptr, w_ptr, y_ptr,
+    N, C_in, H, W, C_out,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_wco, stride_wci,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    M = N * H * W
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_m = offs_m < M
+    mask_n = offs_n < C_out
+
+    # map linear index -> (n, h, w)
+    HW = H * W
+    n_idx = offs_m // HW
+    rem = offs_m % HW
+    h_idx = rem // W
+    w_idx = rem % W
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    k = 0
+    while k < C_in:
+        ci = k + offs_k
+        mask_k = ci < C_in
+
+        x_ptrs = (
+            x_ptr
+            + n_idx[:, None] * stride_xn
+            + ci[None, :] * stride_xc
+            + h_idx[:, None] * stride_xh
+            + w_idx[:, None] * stride_xw
+        )
+        w_ptrs = (
+            w_ptr
+            + offs_n[None, :] * stride_wco
+            + ci[:, None] * stride_wci
+        )
+
+        x_block = tl.load(
+            x_ptrs,
+            mask=mask_m[:, None] & mask_k[None, :],
+            other=0.0,
+        )
+        w_block = tl.load(
+            w_ptrs,
+            mask=mask_k[:, None] & mask_n[None, :],
+            other=0.0,
+        )
+
+        acc += tl.dot(x_block, w_block, allow_tf32=True)
+        k += BLOCK_K
+
+    y_ptrs = (
+        y_ptr
+        + n_idx[:, None] * stride_yn
+        + offs_n[None, :] * stride_yc
+        + h_idx[:, None] * stride_yh
+        + w_idx[:, None] * stride_yw
+    )
+    tl.store(y_ptrs, acc, mask=mask_m[:, None] & mask_n[None, :])
+
+
+def conv1x1_triton(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """
+    x: [N, C_in, H, W]
+    weight: [C_out, C_in] or [C_out, C_in, 1, 1]
+    """
+    assert x.is_cuda and weight.is_cuda
+    x = x.contiguous()
+    if weight.ndim == 4:
+        w = weight.view(weight.shape[0], weight.shape[1])
+    else:
+        w = weight
+    w = w.contiguous()
+
+    N, C_in, H, W = x.shape
+    C_out = w.shape[0]
+
+    y = torch.empty((N, C_out, H, W), device=x.device, dtype=x.dtype)
+
+    BLOCK_M = 64
+    BLOCK_N = 64
+    BLOCK_K = 32
+
+    grid = lambda META: (
+        triton.cdiv(N * H * W, META['BLOCK_M']),
+        triton.cdiv(C_out, META['BLOCK_N']),
+    )
+
+    conv1x1_kernel[grid](
+        x, w, y,
+        N, C_in, H, W, C_out,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        w.stride(0), w.stride(1),
+        y.stride(0), y.stride(1), y.stride(2), y.stride(3),
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+    )
+    return y
+
+
+# =========================
+#  3x3 Conv kernel (groups=1)
+# =========================
+
+@triton.jit
+def conv3x3_kernel(
+    x_ptr, w_ptr, y_ptr,
+    N, C_in, H, W,
+    C_out, OH, OW,
+    stride_h, stride_w, pad_h, pad_w,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_wco, stride_wci, stride_wkh, stride_wkw,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    M = N * OH * OW
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_m = offs_m < M
+    mask_n = offs_n < C_out
+
+    # map linear index -> (n, oh, ow)
+    OW_tot = OW
+    OHOW = OH * OW_tot
+    n_idx = offs_m // OHOW
+    rem = offs_m % OHOW
+    oh_idx = rem // OW_tot
+    ow_idx = rem % OW_tot
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # loop over kernel positions
+    for kh in range(3):
+        for kw in range(3):
+            ih = oh_idx * stride_h + kh - pad_h
+            iw = ow_idx * stride_w + kw - pad_w
+
+            valid_h = (ih >= 0) & (ih < H)
+            valid_w = (iw >= 0) & (iw < W)
+            valid_in = valid_h & valid_w
+
+            k = 0
+            while k < C_in:
+                ci = k + offs_k
+                mask_k = ci < C_in
+
+                x_ptrs = (
+                    x_ptr
+                    + n_idx[:, None] * stride_xn
+                    + ci[None, :] * stride_xc
+                    + ih[:, None] * stride_xh
+                    + iw[:, None] * stride_xw
+                )
+                w_ptrs = (
+                    w_ptr
+                    + offs_n[None, :] * stride_wco
+                    + ci[:, None] * stride_wci
+                    + kh * stride_wkh
+                    + kw * stride_wkw
+                )
+
+                x_block = tl.load(
+                    x_ptrs,
+                    mask=mask_m[:, None] & mask_k[None, :] & valid_in[:, None],
+                    other=0.0,
+                )
+                w_block = tl.load(
+                    w_ptrs,
+                    mask=mask_k[:, None] & mask_n[None, :],
+                    other=0.0,
+                )
+
+                acc += tl.dot(x_block, w_block, allow_tf32=True)
+                k += BLOCK_K
+
+    y_ptrs = (
+        y_ptr
+        + n_idx[:, None] * stride_yn
+        + offs_n[None, :] * stride_yc
+        + oh_idx[:, None] * stride_yh
+        + ow_idx[:, None] * stride_yw
+    )
+    tl.store(y_ptrs, acc, mask=mask_m[:, None] & mask_n[None, :])
+
+
+def conv3x3_triton(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    stride: int = 1,
+    padding: int = 1,
+) -> torch.Tensor:
+    """
+    3x3 conv with groups=1, padding=1, stride=1 or 2 (as used in MobileNetV1).
+    x: [N, C_in, H, W]
+    weight: [C_out, C_in, 3, 3]
+    """
+    assert x.is_cuda and weight.is_cuda
+    x = x.contiguous()
+    w = weight.contiguous()
+    N, C_in, H, W = x.shape
+    C_out = w.shape[0]
+
+    assert w.shape[2] == 3 and w.shape[3] == 3
+    assert padding == 1
+
+    OH = (H + 2 * padding - 3) // stride + 1
+    OW = (W + 2 * padding - 3) // stride + 1
+
+    y = torch.empty((N, C_out, OH, OW), device=x.device, dtype=x.dtype)
+
+    BLOCK_M = 64
+    BLOCK_N = 64
+    BLOCK_K = 32
+
+    grid = lambda META: (
+        triton.cdiv(N * OH * OW, META['BLOCK_M']),
+        triton.cdiv(C_out, META['BLOCK_N']),
+    )
+
+    conv3x3_kernel[grid](
+        x, w, y,
+        N, C_in, H, W,
+        C_out, OH, OW,
+        stride, stride, padding, padding,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        w.stride(0), w.stride(1), w.stride(2), w.stride(3),
+        y.stride(0), y.stride(1), y.stride(2), y.stride(3),
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+    )
+    return y
+
+
+# =========================
+#  3x3 Depthwise Conv kernel (groups = C_in)
+# =========================
+
+@triton.jit
+def depthwise_conv3x3_kernel(
+    x_ptr, w_ptr, y_ptr,
+    N, C, H, W,
+    OH, OW,
+    stride_h, stride_w, pad_h, pad_w,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_wc, stride_wkh, stride_wkw,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    BLOCK_M: tl.constexpr, BLOCK_C: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_c = tl.program_id(1)
+
+    M = N * OH * OW
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
+
+    mask_m = offs_m < M
+    mask_c = offs_c < C
+
+    OW_tot = OW
+    OHOW = OH * OW_tot
+    n_idx = offs_m // OHOW
+    rem = offs_m % OHOW
+    oh_idx = rem // OW_tot
+    ow_idx = rem % OW_tot
+
+    acc = tl.zeros((BLOCK_M, BLOCK_C), dtype=tl.float32)
+
+    for kh in range(3):
+        for kw in range(3):
+            ih = oh_idx * stride_h + kh - pad_h
+            iw = ow_idx * stride_w + kw - pad_w
+
+            valid_h = (ih >= 0) & (ih < H)
+            valid_w = (iw >= 0) & (iw < W)
+            valid_in = valid_h & valid_w
+
+            x_ptrs = (
+                x_ptr
+                + n_idx[:, None] * stride_xn
+                + offs_c[None, :] * stride_xc
+                + ih[:, None] * stride_xh
+                + iw[:, None] * stride_xw
+            )
+            w_ptrs = (
+                w_ptr
+                + offs_c[None, :] * stride_wc
+                + kh * stride_wkh
+                + kw * stride_wkw
+            )
+
+            x_block = tl.load(
+                x_ptrs,
+                mask=mask_m[:, None] & mask_c[None, :] & valid_in[:, None],
+                other=0.0,
+            )
+            w_block = tl.load(
+                w_ptrs,
+                mask=mask_c[None, :],
+                other=0.0,
+            )
+
+            acc += x_block * w_block  # broadcast over BLOCK_M
+
+    y_ptrs = (
+        y_ptr
+        + n_idx[:, None] * stride_yn
+        + offs_c[None, :] * stride_yc
+        + oh_idx[:, None] * stride_yh
+        + ow_idx[:, None] * stride_yw
+    )
+    tl.store(y_ptrs, acc, mask=mask_m[:, None] & mask_c[None, :])
+
+
+def depthwise_conv3x3_triton(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    stride: int = 1,
+    padding: int = 1,
+) -> torch.Tensor:
+    """
+    Depthwise 3x3 conv with groups = in_channels.
+    x: [N, C, H, W]
+    weight: [C, 1, 3, 3] (PyTorch depthwise Conv2d format)
+    """
+    assert x.is_cuda and weight.is_cuda
+    x = x.contiguous()
+    w = weight.contiguous()
+
+    N, C, H, W = x.shape
+    assert w.shape[0] == C
+    assert w.shape[2] == 3 and w.shape[3] == 3
+    assert padding == 1
+
+    OH = (H + 2 * padding - 3) // stride + 1
+    OW = (W + 2 * padding - 3) // stride + 1
+
+    y = torch.empty((N, C, OH, OW), device=x.device, dtype=x.dtype)
+
+    BLOCK_M = 64
+    BLOCK_C = 64
+
+    grid = lambda META: (
+        triton.cdiv(N * OH * OW, META['BLOCK_M']),
+        triton.cdiv(C, META['BLOCK_C']),
+    )
+
+    depthwise_conv3x3_kernel[grid](
+        x, w, y,
+        N, C, H, W,
+        OH, OW,
+        stride, stride, padding, padding,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        w.stride(0), w.stride(2), w.stride(3),
+        y.stride(0), y.stride(1), y.stride(2), y.stride(3),
+        BLOCK_M=BLOCK_M, BLOCK_C=BLOCK_C,
+    )
+    return y
+
+
+# =========================
+#  High-level MobileNetV1 using Triton ops
+# =========================
+
+class ConvBNReLU(nn.Module):
+    """
+    3x3 Conv (groups=1) + BatchNorm2d + ReLU, using Triton conv.
+    """
+    def __init__(self, in_ch, out_ch, stride):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(out_ch, in_ch, 3, 3))
+        nn.init.kaiming_normal_(self.weight, mode="fan_out", nonlinearity="relu")
+        self.bn = nn.BatchNorm2d(out_ch)
+        self.relu = nn.ReLU(inplace=True)
+        self.stride = stride
+
+    def forward(self, x):
+        x = conv3x3_triton(x, self.weight, stride=self.stride, padding=1)
+        x = self.bn(x)
+        x = self.relu(x)
+        return x
+
+
+class DepthwiseSeparableConv(nn.Module):
+    """
+    Depthwise 3x3 + Pointwise 1x1, each followed by BN + ReLU.
+    Uses Triton depthwise and 1x1 conv kernels.
+    """
+    def __init__(self, in_ch, out_ch, stride):
+        super().__init__()
+        # depthwise: groups = in_ch
+        self.dw_weight = nn.Parameter(torch.empty(in_ch, 1, 3, 3))
+        nn.init.kaiming_normal_(self.dw_weight, mode="fan_out", nonlinearity="relu")
+        self.dw_bn = nn.BatchNorm2d(in_ch)
+        self.dw_relu = nn.ReLU(inplace=True)
+        self.dw_stride = stride
+
+        # pointwise: 1x1
+        self.pw_weight = nn.Parameter(torch.empty(out_ch, in_ch, 1, 1))
+        nn.init.kaiming_normal_(self.pw_weight, mode="fan_out", nonlinearity="relu")
+        self.pw_bn = nn.BatchNorm2d(out_ch)
+        self.pw_relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        # depthwise 3x3
+        x = depthwise_conv3x3_triton(x, self.dw_weight, stride=self.dw_stride, padding=1)
+        x = self.dw_bn(x)
+        x = self.dw_relu(x)
+        # pointwise 1x1
+        x = conv1x1_triton(x, self.pw_weight)
+        x = self.pw_bn(x)
+        x = self.pw_relu(x)
+        return x
+
+
+class ModelNew(nn.Module):
+    def __init__(self, num_classes=1000, input_channels=3, alpha=1.0):
+        super(ModelNew, self).__init__()
+        def c(v):
+            return int(v * alpha)
+
+        self.model = nn.Sequential(
+            ConvBNReLU(input_channels, c(32), stride=2),
+            DepthwiseSeparableConv(c(32), c(64), stride=1),
+            DepthwiseSeparableConv(c(64), c(128), stride=2),
+            DepthwiseSeparableConv(c(128), c(128), stride=1),
+            DepthwiseSeparableConv(c(128), c(256), stride=2),
+            DepthwiseSeparableConv(c(256), c(256), stride=1),
+            DepthwiseSeparableConv(c(256), c(512), stride=2),
+            DepthwiseSeparableConv(c(512), c(512), stride=1),
+            DepthwiseSeparableConv(c(512), c(512), stride=1),
+            DepthwiseSeparableConv(c(512), c(512), stride=1),
+            DepthwiseSeparableConv(c(512), c(512), stride=1),
+            DepthwiseSeparableConv(c(512), c(512), stride=1),
+            DepthwiseSeparableConv(c(512), c(1024), stride=2),
+            DepthwiseSeparableConv(c(1024), c(1024), stride=1),
+            nn.AvgPool2d(7),
+        )
+
+        self.fc_weight = nn.Parameter(torch.empty(num_classes, c(1024)))
+        self.fc_bias = nn.Parameter(torch.empty(num_classes))
+        nn.init.kaiming_uniform_(self.fc_weight, a=math.sqrt(5))
+        fan_in = c(1024)
+        bound = 1 / math.sqrt(fan_in)
+        nn.init.uniform_(self.fc_bias, -bound, bound)
+
+    def forward(self, x):
+        x = self.model(x)
+        x = x.view(x.size(0), -1)
+        x = linear_triton(x, self.fc_weight, self.fc_bias)
+        return x
+
+
+# Needed for fc initialization
+import math

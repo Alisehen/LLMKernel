@@ -1,0 +1,368 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+# =========================
+# Triton Conv2D (NCHW, stride=1, generic KxK, padding)
+# =========================
+@triton.jit
+def conv2d_nchw_kernel(
+    x_ptr, w_flat_ptr, b_ptr, y_ptr,
+    N, C_in, H_in, W_in,
+    H_out, W_out,
+    C_out,
+    KH, KW,
+    pad_h, pad_w,
+    stride_x_n, stride_x_c, stride_x_h, stride_x_w,
+    stride_y_n, stride_y_c, stride_y_h, stride_y_w,
+    stride_wk, stride_wo,
+    M, K,  # M = N * H_out * W_out, K = C_in * KH * KW
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    m_mask = offs_m < M
+    n_mask = offs_n < C_out
+
+    # Map linear M index -> (n, h_out, w_out)
+    HW_out = H_out * W_out
+    n_idx = offs_m // HW_out
+    rem = offs_m % HW_out
+    h_out_idx = rem // W_out
+    w_out_idx = rem % W_out
+
+    # Initialize accumulator in fp32
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Loop over K dimension (C_in * KH * KW)
+    for k0 in range(0, K, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+        k_mask = offs_k < K
+
+        # Map linear K index -> (c_in, kh, kw)
+        tmp = offs_k // C_in
+        c_idx = offs_k % C_in
+        kh_idx = tmp // KW
+        kw_idx = tmp % KW
+
+        # Broadcasted indices for input
+        n = n_idx[:, None]
+        h_out = h_out_idx[:, None]
+        w_out = w_out_idx[:, None]
+
+        c = c_idx[None, :]
+        kh = kh_idx[None, :]
+        kw = kw_idx[None, :]
+
+        h_in = h_out + kh - pad_h
+        w_in = w_out + kw - pad_w
+
+        # Bounds / masks
+        in_bounds = (
+            m_mask[:, None]
+            & k_mask[None, :]
+            & (n < N)
+            & (c < C_in)
+            & (h_in >= 0)
+            & (h_in < H_in)
+            & (w_in >= 0)
+            & (w_in < W_in)
+        )
+
+        x_ptrs = (
+            x_ptr
+            + n * stride_x_n
+            + c * stride_x_c
+            + h_in * stride_x_h
+            + w_in * stride_x_w
+        )
+
+        a = tl.load(x_ptrs, mask=in_bounds, other=0.0)
+        a = a.to(tl.float32)
+
+        # Weights: w_flat shape [K, C_out]
+        w_ptrs = (
+            w_flat_ptr
+            + offs_k[:, None] * stride_wk
+            + offs_n[None, :] * stride_wo
+        )
+        w_mask = k_mask[:, None] & n_mask[None, :]
+        b = tl.load(w_ptrs, mask=w_mask, other=0.0)
+        b = b.to(tl.float32)
+
+        acc += tl.dot(a, b, allow_tf32=True)
+
+    # Add bias
+    bias = tl.load(b_ptr + offs_n, mask=n_mask, other=0.0)
+    bias = bias.to(tl.float32)
+    acc += bias[None, :]
+
+    # Store back to y (NCHW layout)
+    n = n_idx[:, None]
+    h_out = h_out_idx[:, None]
+    w_out = w_out_idx[:, None]
+    oc = offs_n[None, :]
+
+    y_ptrs = (
+        y_ptr
+        + n * stride_y_n
+        + oc * stride_y_c
+        + h_out * stride_y_h
+        + w_out * stride_y_w
+    )
+
+    out_mask = m_mask[:, None] & n_mask[None, :]
+    tl.store(y_ptrs, acc, mask=out_mask)
+
+
+def conv2d_triton(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, padding: int):
+    """
+    High-performance NCHW Conv2d with stride=1, arbitrary square kernel, and symmetric padding.
+    x: (N, C_in, H_in, W_in)
+    weight: (C_out, C_in, KH, KW)
+    bias: (C_out,)
+    padding: int or tuple of (pad_h, pad_w)
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+    x = x.contiguous()
+    weight = weight.contiguous()
+    N, C_in, H_in, W_in = x.shape
+    C_out, C_in_w, KH, KW = weight.shape
+    assert C_in_w == C_in, "C_in mismatch"
+
+    if isinstance(padding, int):
+        pad_h = pad_w = padding
+    else:
+        pad_h, pad_w = padding
+
+    stride_h = stride_w = 1
+    H_out = (H_in + 2 * pad_h - KH) // stride_h + 1
+    W_out = (W_in + 2 * pad_w - KW) // stride_w + 1
+
+    y = torch.empty((N, C_out, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    # Flatten weights to [K, C_out]
+    K = C_in * KH * KW
+    M = N * H_out * W_out
+    w_flat = weight.view(C_out, K).transpose(0, 1).contiguous()
+
+    stride_x_n, stride_x_c, stride_x_h, stride_x_w = x.stride()
+    stride_y_n, stride_y_c, stride_y_h, stride_y_w = y.stride()
+    stride_wk, stride_wo = w_flat.stride()
+
+    BLOCK_M = 32
+    BLOCK_N = 64
+    BLOCK_K = 32
+
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_M"]),
+        triton.cdiv(C_out, META["BLOCK_N"]),
+    )
+
+    conv2d_nchw_kernel[grid](
+        x, w_flat, bias, y,
+        N, C_in, H_in, W_in,
+        H_out, W_out,
+        C_out,
+        KH, KW,
+        pad_h, pad_w,
+        stride_x_n, stride_x_c, stride_x_h, stride_x_w,
+        stride_y_n, stride_y_c, stride_y_h, stride_y_w,
+        stride_wk, stride_wo,
+        M, K,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        num_warps=4,
+        num_stages=2,
+    )
+
+    return y
+
+
+# =========================
+# Triton MaxPool2d 3x3, stride=1, padding=1 (NCHW)
+# =========================
+@triton.jit
+def maxpool2d_3x3_s1_p1_nchw_kernel(
+    x_ptr, y_ptr,
+    N, C, H, W,
+    stride_x_n, stride_x_c, stride_x_h, stride_x_w,
+    stride_y_n, stride_y_c, stride_y_h, stride_y_w,
+    P, Q,  # P = N*C, Q = H*W
+    BLOCK_P: tl.constexpr, BLOCK_Q: tl.constexpr,
+):
+    pid_p = tl.program_id(0)
+    pid_q = tl.program_id(1)
+
+    offs_p = pid_p * BLOCK_P + tl.arange(0, BLOCK_P)
+    offs_q = pid_q * BLOCK_Q + tl.arange(0, BLOCK_Q)
+
+    p_mask = offs_p < P
+    q_mask = offs_q < Q
+
+    # Map P index -> (n, c)
+    n_idx = offs_p // C
+    c_idx = offs_p % C
+
+    # Map Q index -> (h, w)
+    h_idx = offs_q // W
+    w_idx = offs_q % W
+
+    n = n_idx[:, None]
+    c = c_idx[:, None]
+    h = h_idx[None, :]
+    w = w_idx[None, :]
+
+    base_mask = p_mask[:, None] & q_mask[None, :]
+
+    # Initialize max accumulator
+    max_val = tl.full((BLOCK_P, BLOCK_Q), -float("inf"), dtype=tl.float32)
+
+    # 3x3 window offsets
+    for dh in (-1, 0, 1):
+        for dw in (-1, 0, 1):
+            h_in = h + dh
+            w_in = w + dw
+
+            in_bounds = (
+                base_mask
+                & (h_in >= 0)
+                & (h_in < H)
+                & (w_in >= 0)
+                & (w_in < W)
+            )
+
+            x_ptrs = (
+                x_ptr
+                + n * stride_x_n
+                + c * stride_x_c
+                + h_in * stride_x_h
+                + w_in * stride_x_w
+            )
+
+            vals = tl.load(x_ptrs, mask=in_bounds, other=-float("inf"))
+            vals = vals.to(tl.float32)
+            max_val = tl.maximum(max_val, vals)
+
+    y_ptrs = (
+        y_ptr
+        + n * stride_y_n
+        + c * stride_y_c
+        + h * stride_y_h
+        + w * stride_y_w
+    )
+
+    tl.store(y_ptrs, max_val, mask=base_mask)
+
+
+def maxpool2d_3x3_s1_p1_triton(x: torch.Tensor):
+    """
+    High-performance MaxPool2d with kernel_size=3, stride=1, padding=1 for NCHW.
+    x: (N, C, H, W)
+    """
+    assert x.is_cuda
+    x = x.contiguous()
+    N, C, H, W = x.shape
+    y = torch.empty_like(x)
+
+    stride_x_n, stride_x_c, stride_x_h, stride_x_w = x.stride()
+    stride_y_n, stride_y_c, stride_y_h, stride_y_w = y.stride()
+
+    P = N * C
+    Q = H * W
+
+    BLOCK_P = 32
+    BLOCK_Q = 64
+
+    grid = lambda META: (
+        triton.cdiv(P, META["BLOCK_P"]),
+        triton.cdiv(Q, META["BLOCK_Q"]),
+    )
+
+    maxpool2d_3x3_s1_p1_nchw_kernel[grid](
+        x, y,
+        N, C, H, W,
+        stride_x_n, stride_x_c, stride_x_h, stride_x_w,
+        stride_y_n, stride_y_c, stride_y_h, stride_y_w,
+        P, Q,
+        BLOCK_P=BLOCK_P, BLOCK_Q=BLOCK_Q,
+        num_warps=4,
+        num_stages=1,
+    )
+
+    return y
+
+
+# =========================
+# Full Model using Triton kernels
+# =========================
+class ModelNew(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        out_1x1,
+        reduce_3x3,
+        out_3x3,
+        reduce_5x5,
+        out_5x5,
+        pool_proj,
+    ):
+        super(ModelNew, self).__init__()
+
+        # Keep the same module structure / parameter layout as the original
+        # so state_dicts are compatible, but we do NOT use these modules' forward.
+        self.branch1x1 = nn.Conv2d(in_channels, out_1x1, kernel_size=1)
+
+        self.branch3x3 = nn.Sequential(
+            nn.Conv2d(in_channels, reduce_3x3, kernel_size=1),
+            nn.Conv2d(reduce_3x3, out_3x3, kernel_size=3, padding=1),
+        )
+
+        self.branch5x5 = nn.Sequential(
+            nn.Conv2d(in_channels, reduce_5x5, kernel_size=1),
+            nn.Conv2d(reduce_5x5, out_5x5, kernel_size=5, padding=2),
+        )
+
+        self.branch_pool = nn.Sequential(
+            nn.MaxPool2d(kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(in_channels, pool_proj, kernel_size=1),
+        )
+
+    def forward(self, x):
+        # 1x1 convolution branch
+        w1 = self.branch1x1.weight
+        b1 = self.branch1x1.bias
+        branch1x1 = conv2d_triton(x, w1, b1, padding=0)
+
+        # 3x3 convolution branch: 1x1 reduce -> 3x3 conv
+        w3r = self.branch3x3[0].weight
+        b3r = self.branch3x3[0].bias
+        reduce3x3 = conv2d_triton(x, w3r, b3r, padding=0)
+
+        w3 = self.branch3x3[1].weight
+        b3 = self.branch3x3[1].bias
+        branch3x3 = conv2d_triton(reduce3x3, w3, b3, padding=1)
+
+        # 5x5 convolution branch: 1x1 reduce -> 5x5 conv
+        w5r = self.branch5x5[0].weight
+        b5r = self.branch5x5[0].bias
+        reduce5x5 = conv2d_triton(x, w5r, b5r, padding=0)
+
+        w5 = self.branch5x5[1].weight
+        b5 = self.branch5x5[1].bias
+        branch5x5 = conv2d_triton(reduce5x5, w5, b5, padding=2)
+
+        # Max pooling branch: 3x3 maxpool -> 1x1 conv
+        pool = maxpool2d_3x3_s1_p1_triton(x)
+        wp = self.branch_pool[1].weight
+        bp = self.branch_pool[1].bias
+        branch_pool = conv2d_triton(pool, wp, bp, padding=0)
+
+        outputs = [branch1x1, branch3x3, branch5x5, branch_pool]
+        return torch.cat(outputs, dim=1)
+```
