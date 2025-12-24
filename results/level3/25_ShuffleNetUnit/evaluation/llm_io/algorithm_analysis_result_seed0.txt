@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "A full-tensor channel_shuffle kernel sits between depthwise and 1x1 group conv, adding an extra global read/write and launch that can be eliminated algebraically.",
+  "bottleneck": "The current pipeline does `depthwise_conv3x3 -> channel_shuffle -> 1x1 group conv`, where channel_shuffle is a pure data permutation that materializes an entire [B, C, H, W] tensor in global memory and costs one kernel launch. Since the subsequent 1x1 group convolution is linear in channels, this permutation can be absorbed into its weights, making the explicit shuffle redundant.",
+  "optimisation method": "Eliminate the explicit ChannelShuffle kernel by folding the shuffle permutation into the input-channel dimension of the second 1x1 group convolution’s weights, i.e., computing `Conv(Shuffle(x))` as a single `Conv'(x)` with appropriately permuted weights. This replaces the `shuffle + conv` pair with one fused conv kernel reading the unshuffled tensor, cutting one global tensor read/write and one launch.",
+  "modification plan": "Offline (or at module init), precompute a permuted version of `conv3.weight` such that `W'[cout, cin, 1, 1] = W[cout, shuffle(cin), 1, 1]` according to the channel_shuffle mapping for the given groups, and use `W'` in the Triton `conv1x1_group_bn_relu_triton` instead of invoking `self.shuffle`. Remove the `channel_shuffle_triton` call from `ModelNew.forward` and adjust the conv3 call to directly consume the depthwise output. Ensure the same permutation is applied consistently for any training/backward path (or restrict this optimization to inference where BN is already in inference mode).",
+  "expected_speedup": "20-25%"
+}

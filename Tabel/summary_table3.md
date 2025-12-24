@@ -13,7 +13,7 @@
 | 11 | 0.7896 | ✅ |
 | 12_Matmul_with_diagonal_matrices | 1.01 | ✅ |
 | 13_Matmul_for_symmetric_matrices | 2.12 | ✅ |
-| 14_Matmul_for_upper_triangular_matrices | 1.038 | ✅ |
+| 14_Matmul_for_upper_triangular_matrices | 1.1871 | ✅ |
 | 15_Matmul_for_lower_triangular_matrices | 1.05 | ✅ |
 | 16_Matmul_with_transposed_A | 1.2 | ✅ |
 | 17_Matmul_with_transposed_B | 1.9308 | ✅ |
@@ -24,13 +24,13 @@
 | 22_Tanh | 0.835 | ✅ |
 | 23_Softmax | 1.05 | ✅ |
 | 24_LogSoftmax | 1.05 | ✅ |
-| 25_Swish | 1.05 | ✅ |
+| 25_Swish | 1.3452 | ✅ |
 | 26_GELU | 1.01 | ✅ |
 | 27_SELU | 1.08 | ✅ |
 | 28_HardSigmoid | 1.01 | ✅ |
 | 29_Softplus | 1.14 | ✅ |
 | 30_Softsign | 1.216 | ✅ |
-| 31 | 1.08 | ✅ |
+| 31 | 3.539 | ✅ |
 | 32 | 1.02 | ✅ |
 | 33 | 1.4 | ✅ |
 | 34 | 3.05 | ✅ |

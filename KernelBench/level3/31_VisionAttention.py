@@ -30,8 +30,8 @@ embed_dim = 128
 num_heads = 4
 batch_size = 2
 num_channels = embed_dim
-image_height = 128
-image_width = 128
+image_height = 64
+image_width = 64
 
 def get_inputs():
     return [torch.rand(batch_size, num_channels, image_height, image_width)]

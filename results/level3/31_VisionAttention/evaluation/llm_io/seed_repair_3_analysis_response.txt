@@ -1,5 +1,0 @@
-{
-  "critical_issue": "The reference nn.MultiheadAttention builds a dense [B*num_heads, S, S] attention matrix with S=H*W=16384, which alone requires ~8 GiB and exhausts GPU memory.",
-  "why_it_matters": "torch.bmm(q_scaled, k.transpose(-2, -1)) allocates this huge S×S tensor, matching the 8.00 GiB allocation in the traceback, so the run OOMs before the Triton kernel is used.",
-  "minimal_fix_hint": "Avoid dense S×S attention in the reference path—use a memory-efficient (FlashAttention-style) implementation or reduce H*W so S² comfortably fits GPU memory."
-}

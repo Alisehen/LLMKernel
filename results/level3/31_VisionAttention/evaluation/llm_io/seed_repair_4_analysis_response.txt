@@ -1,5 +1,0 @@
-{
-  "critical_issue": "Reference Model uses nn.MultiheadAttention that materializes full S×S attention weights for vision-sized sequences, causing an 8 GiB allocation and CUDA OOM.",
-  "why_it_matters": "The benchmarking script calls the PyTorch MHA baseline first; its dense attention weight tensor exceeds available GPU memory, so execution fails before your Triton kernel even runs.",
-  "minimal_fix_hint": "Change the reference forward to call MultiheadAttention with need_weights=False (and avoid returning attn_output_weights) so the S×S attention matrix is never allocated."
-}

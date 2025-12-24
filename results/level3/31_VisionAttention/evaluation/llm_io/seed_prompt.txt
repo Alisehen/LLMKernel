@@ -1,36 +1,46 @@
 
-Write a correct and reasonably fast Triton kernel to replace the given PyTorch operator.
-This is a SEED implementation: prioritize correctness and stable compilation.
+Write high-performance Triton kernels to replace PyTorch operators.
+Generate the FASTEST kernel while maintaining correctness.
 
-Rules:
-- Use `tl.program_id(axis)` (axis=0/1/2 only)
-- Use `tl.arange()` for block indices
-- Operate on blocks (no CUDA thread model)
-- No manual shared memory or synchronization
+## CRITICAL — These cause 60%+ of failures:
+1. EVERY kernel function MUST have `@triton.jit` decorator — MANDATORY
+2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+3. BLOCK sizes MUST be power-of-2 constexpr: 16, 32, 64, 128, 256
+4. `tl.program_id(axis)` only supports axis = 0, 1, 2 (max 3D grid)
 
-Hard Constraints:
-- All BLOCK_* are `tl.constexpr` and powers of 2
-- `tl.arange(0, BLOCK)` requires BLOCK to be power-of-2
-- No dynamic `tl.reshape()` or view
-- `tl.load` / `tl.store`: scalar ptr → scalar, block ptr → block
-- No Python control flow on `tl.tensor` or BLOCK_*
-- Triton does NOT support `continue`, `break`, or `return` inside loops — use masking instead
-- Import ALL modules you use (e.g., `import math` if using `math.sqrt`)
-- Do NOT index tensors with loop variables: `tensor[:, i]` or `tensor[i, :]` where i is a loop var is INVALID
-- Triton has NO: tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
-- @triton.autotune: use at most 2-3 configs to reduce compilation time
+## Triton Syntax Rules:
+- For matmul/conv/linear ops, prefer `tl.dot(a, b, allow_tf32=True)` over element-wise multiply-add
+- No `continue`, `break`, `return` inside loops — use masking instead
+- No tensor indexing with loop vars: `x[:, i]` or `x[i, :]` is INVALID
+- No tuple unpacking inside kernel: `a, b = tl.load(...)` is INVALID
+- No nested functions inside @triton.jit
+- No Python control flow on tl.tensor or BLOCK_* values
+- No dynamic `tl.reshape()` or view operations
 
-## Full Network Optimization
-- Preserve model structure (helper classes, Sequential, ModuleList)
-- Fuse adjacent ops in forward() where beneficial
+## Missing Triton Functions (implement manually):
+- tl.tanh → `(tl.exp(2*x) - 1) / (tl.exp(2*x) + 1)`
+- tl.sigmoid → `1 / (1 + tl.exp(-x))`
+- tl.gelu, tl.silu, tl.softmax, tl.mish → implement from definition
 
-Output Format (STRICT):
-1. Imports (torch, torch.nn, triton, triton.language, and any other needed modules like math)
-2. `@triton.jit` kernel(s)
-3. Wrapper function(s)
-4. `class ModelNew(nn.Module)` — this class is REQUIRED
+## Load/Store Rules:
+- Pointer + scalar offset → scalar value
+- Pointer + block offset (via tl.arange) → block of values
+- mask shape MUST match data shape exactly
 
-Do NOT include testing code or `if __name__ == "__main__"`.
+## Output Format (STRICT):
+1. Imports: `import torch, torch.nn as nn, triton, triton.language as tl` (and math if needed)
+2. `@triton.jit` kernel(s) — MUST have this decorator
+3. Wrapper function with grid calculation
+4. `class ModelNew(nn.Module)` — REQUIRED
+
+Do NOT include: testing code, `if __name__ == "__main__"`, get_inputs, get_init_inputs
+
+
+## Full-Network Optimization Guidance
+- Target is a **complete nn.Module**, not a single operator.
+- Preserve module structure and forward() control flow.
+- Allow fusion **within a branch or module**, but NOT across branches.
+
 
 Example PyTorch:
 '''
@@ -129,22 +139,6 @@ class ModelNew(nn.Module):
         return fused_gemm_add_relu(x, self.weight, self.bias)
 '''
 
-Hardware:
-• Compute Capability: 8.9
-• Number of SMs: 128
-• Memory Bandwidth: 1008 GB/s
-• TF32 Tensor Core TFLOPS: 82.6 with dense
-• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
-• FP16 Tensor Core TFLOPS: 165.2 with dense
-• Maximum number of registers per thread: 255
-• Maximum threads per block: 1024
-• Maximum threads per SM: 1536
-• Warp size: 32
-• Maximum concurrent warps per SM: 48
-• Shared memory capacity per SM: 100 KB
-• Maximum shared memory per thread block: 99 KB
-• L2 cache (global, all SM shared): 72 MB
-
 Target:
 ```python
 import torch
@@ -179,8 +173,8 @@ embed_dim = 128
 num_heads = 4
 batch_size = 2
 num_channels = embed_dim
-image_height = 128
-image_width = 128
+image_height = 64
+image_width = 64
 
 def get_inputs():
     return [torch.rand(batch_size, num_channels, image_height, image_width)]

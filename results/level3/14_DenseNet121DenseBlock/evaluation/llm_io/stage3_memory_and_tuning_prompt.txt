@@ -1,0 +1,328 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU: 4090
+
+[OPTIMIZATION STAGE]
+
+## Current Optimization Stage
+
+Focus: Memory pattern and parameter tuning for fused operations.
+
+Key Principle:
+- Fusion benefit = eliminated INTERMEDIATE stores
+- Multiple input loads are OK; intermediate stores are NOT
+
+Memory Rules:
+- ✅ Multiple tl.load() for different inputs (x, weight, bias) - OK
+- ❌ tl.store() for intermediate results - NEVER (this is what fusion eliminates)
+- ✅ Single tl.store() for final output - required
+
+Verification:
+- Count tl.store() calls: should equal number of OUTPUT tensors (usually 1)
+- Intermediate values: must stay in registers between ops
+- If you see store-then-load pattern for same data → BUG, refactor
+
+Parameters to tune:
+- num_warps ∈ {4, 8}
+- num_stages ∈ {2, 3}
+
+Conditional Tuning Rules:
+
+IF register pressure LOW (regs < 96, no spill):
+  - Try num_warps=8 for compute-bound fusion
+  - num_stages=3 may help hide latency
+
+IF register pressure HIGH (regs > 128 or occupancy_limit_registers):
+  - Use num_warps=4 (fewer warps = more registers per warp)
+  - Keep num_stages=2 (higher stages need more registers)
+
+IF multi-input fusion (3+ distinct loads):
+  - num_stages=2 preferred (each stage buffers all inputs)
+  - num_warps=4 often better than 8
+
+Autotune:
+- Max 3-4 configs combining num_stages and num_warps
+- Always include conservative baseline (num_warps=4, num_stages=2)
+- Revert if gain < 2%
+
+
+
+[CURRENT CODE]
+```python
+# Optimized Triton-based 3x3 Conv + ReLU for 4090
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        # Conservative, low register pressure
+        triton.Config(
+            {"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_KC": 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+        # Larger tile in M, better for large N*H*W if registers allow
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 32, "BLOCK_KC": 32},
+            num_warps=8,
+            num_stages=2,
+        ),
+        # Larger tile in N (C_out), good when C_out large
+        triton.Config(
+            {"BLOCK_M": 32, "BLOCK_N": 64, "BLOCK_KC": 32},
+            num_warps=8,
+            num_stages=2,
+        ),
+    ],
+    key=["N", "C_in", "H", "W", "C_out"],
+)
+@triton.jit
+def conv3x3_relu_kernel(
+    x_ptr, w_ptr, y_ptr,
+    N, C_in, H, W, C_out,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_wo, stride_wc, stride_wh, stride_ww,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    BLOCK_M: tl.constexpr,   # tile over M = N * H * W
+    BLOCK_N: tl.constexpr,   # tile over C_out
+    BLOCK_KC: tl.constexpr,  # tile over input channels (C_in)
+):
+    # Program IDs: 2D launch grid over (M, C_out)
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    # Offsets within tiles
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # [BM]
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # [BN]
+
+    M = N * H * W
+    hw = H * W
+
+    # Masks for bounds
+    mask_m = offs_m < M            # [BM]
+    mask_n = offs_n < C_out        # [BN]
+    mask_m_b = mask_m[:, None]     # [BM, 1]
+    mask_n_b = mask_n[None, :]     # [1, BN]
+
+    # Decode flattened spatial index: (n, h, w) from offs_m
+    n_idx = offs_m // hw           # [BM]
+    rem_hw = offs_m % hw           # [BM]
+    h_idx = rem_hw // W            # [BM]
+    w_idx = rem_hw % W             # [BM]
+
+    # Accumulator in FP32: [BM, BN]
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Channel-tile offsets
+    offs_kc = tl.arange(0, BLOCK_KC)  # [BK]
+
+    # Pre-broadcasted spatial indices for pointer arithmetic
+    n_b = n_idx[:, None]  # [BM, 1]
+    h_b = h_idx[:, None]  # [BM, 1]
+    w_b = w_idx[:, None]  # [BM, 1]
+    o_b = offs_n[None, :]  # [1, BN]
+
+    # Main loop over input channels (K dimension)
+    for c0 in range(0, C_in, BLOCK_KC):
+        c_idx = c0 + offs_kc          # [BK]
+        c_mask = c_idx < C_in         # [BK]
+
+        c_row = c_idx[None, :]        # [1, BK]
+        c_col = c_idx[:, None]        # [BK, 1]
+
+        # Base pointers for X and W tiles, without 3x3 kernel offsets
+        # X: [N, C_in, H, W]
+        x_base = (
+            x_ptr
+            + n_b * stride_xn         # [BM, 1]
+            + c_row * stride_xc       # [1, BK]
+            + h_b * stride_xh         # [BM, 1]
+            + w_b * stride_xw         # [BM, 1]
+        )  # -> [BM, BK]
+
+        # W: [C_out, C_in, 3, 3]
+        w_base = (
+            w_ptr
+            + o_b * stride_wo         # [1, BN]
+            + c_col * stride_wc       # [BK, 1]
+        )  # -> [BK, BN]
+
+        # Weight mask is independent of (kh, kw), only depends on c_mask & mask_n
+        w_mask = c_mask[:, None] & mask_n_b  # [BK, BN]
+
+        # Unroll 3x3 spatial kernel
+        for kh in tl.static_range(3):
+            h_off = kh - 1
+
+            # H bounds for this kernel row
+            h_in = h_idx + h_off                  # [BM]
+            h_in_bounds = (h_in >= 0) & (h_in < H)  # [BM]
+            h_in_bounds_b = h_in_bounds[:, None]  # [BM, 1]
+
+            # Update X and W base for this kh
+            x_base_h = x_base + h_off * stride_xh
+            w_base_h = w_base + kh * stride_wh
+
+            for kw in tl.static_range(3):
+                w_off = kw - 1
+
+                # W bounds for this kernel col
+                w_in = w_idx + w_off                  # [BM]
+                w_in_bounds = (w_in >= 0) & (w_in < W)  # [BM]
+                w_in_bounds_b = w_in_bounds[:, None]  # [BM, 1]
+
+                # Combined mask for X load
+                x_mask = (
+                    mask_m_b &                  # [BM, 1]
+                    c_mask[None, :] &           # [1, BK]
+                    h_in_bounds_b &             # [BM, 1]
+                    w_in_bounds_b               # [BM, 1]
+                )  # -> [BM, BK]
+
+                # Final X and W pointers for this (kh, kw)
+                x_ptrs = x_base_h + w_off * stride_xw   # [BM, BK]
+                w_ptrs = w_base_h + kw * stride_ww      # [BK, BN]
+
+                # Load X tile, apply ReLU, cast to fp32
+                x_vals = tl.load(x_ptrs, mask=x_mask, other=0.0)
+                x_vals = tl.maximum(x_vals, 0.0)  # ReLU on input
+                x_vals = x_vals.to(tl.float32)
+
+                # Load W tile and cast to fp32
+                w_vals = tl.load(w_ptrs, mask=w_mask, other=0.0)
+                w_vals = w_vals.to(tl.float32)
+
+                # Accumulate GEMM
+                acc += tl.dot(x_vals, w_vals, allow_tf32=True)
+
+    # Store result Y: [N, C_out, H, W]
+    y_ptrs = (
+        y_ptr
+        + n_b * stride_yn
+        + o_b * stride_yc
+        + h_b * stride_yh
+        + w_b * stride_yw
+    )  # [BM, BN]
+
+    out_mask = mask_m_b & mask_n_b
+    tl.store(y_ptrs, acc, mask=out_mask)
+
+
+def conv3x3_relu(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """
+    3x3 Conv2d (padding=1, stride=1, bias=False) with ReLU applied to the input.
+    x:      (N, C_in, H, W)
+    weight: (C_out, C_in, 3, 3)
+    returns y: (N, C_out, H, W)
+    """
+    assert x.is_cuda and weight.is_cuda, "Triton kernels require CUDA tensors"
+    N, C_in, H, W = x.shape
+    C_out = weight.shape[0]
+    assert weight.shape[1] == C_in and weight.shape[2] == 3 and weight.shape[3] == 3
+
+    # Accumulate in fp32
+    y = torch.empty((N, C_out, H, W), device=x.device, dtype=torch.float32)
+
+    M = N * H * W
+
+    def grid(META):
+        return (
+            triton.cdiv(M, META["BLOCK_M"]),
+            triton.cdiv(C_out, META["BLOCK_N"]),
+        )
+
+    conv3x3_relu_kernel[grid](
+        x, weight, y,
+        N, C_in, H, W, C_out,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        weight.stride(0), weight.stride(1), weight.stride(2), weight.stride(3),
+        y.stride(0), y.stride(1), y.stride(2), y.stride(3),
+    )
+
+    # Match original input dtype
+    if y.dtype != x.dtype:
+        y = y.to(x.dtype)
+    return y
+
+
+class DenseLayerNew(nn.Module):
+    """
+    Single dense layer:
+    BatchNorm2d -> ReLU (inside Triton conv) -> Conv2d(3x3, padding=1, bias=False) -> Dropout(0.0)
+    """
+    def __init__(self, in_features: int, growth_rate: int):
+        super().__init__()
+        self.bn = nn.BatchNorm2d(in_features)
+        self.weight = nn.Parameter(torch.empty(growth_rate, in_features, 3, 3))
+        # Use precomputed sqrt(5) to avoid extra imports
+        nn.init.kaiming_uniform_(self.weight, a=2.23606797749979)
+        self.dropout = nn.Dropout(0.0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.bn(x)
+        out = conv3x3_relu(x, self.weight)
+        out = self.dropout(out)
+        return out
+
+
+class ModelNew(nn.Module):
+    def __init__(self, num_layers: int, num_input_features: int, growth_rate: int):
+        """
+        Dense block with Triton-accelerated 3x3 convolutions.
+
+        :param num_layers: The number of layers in the dense block
+        :param num_input_features: The number of input feature maps
+        :param growth_rate: The growth rate for the dense block (new features added per layer)
+        """
+        super(ModelNew, self).__init__()
+        layers = []
+        for i in range(num_layers):
+            in_features = num_input_features + i * growth_rate
+            layers.append(DenseLayerNew(in_features, growth_rate))
+        self.layers = nn.ModuleList(layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        :param x: Input tensor of shape (batch_size, num_input_features, height, width)
+        :return: Concatenated output tensor with shape (batch_size, num_output_features, height, width)
+        """
+        features = [x]
+        for layer in self.layers:
+            new_feature = layer(x)
+            features.append(new_feature)
+            x = torch.cat(features, dim=1)
+        return x
+```
+
+[NCU PROFILING METRICS]
+No NCU metrics available
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+## CRITICAL — Code MUST compile and run:
+1. EVERY kernel function MUST have `@triton.jit` decorator
+2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+3. BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+4. `tl.program_id(axis)` only supports axis = 0, 1, 2
+5. No `continue`, `break`, `return` inside loops — use masking
+6. No tensor indexing with loop vars: `x[:, i]` is INVALID
+7. mask shape MUST match data shape in tl.load/tl.store
+
+## Missing Triton Functions (implement manually):
+- tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+## OUTPUT FORMAT (STRICT):
+1. Imports: torch, torch.nn, triton, triton.language as tl
+2. @triton.jit decorated kernel function(s)
+3. Wrapper function(s) for grid calculation and kernel launch
+4. class ModelNew(nn.Module) that calls your kernels
+
+Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

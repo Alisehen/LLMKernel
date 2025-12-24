@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The current Triton kernel uses a direct 3x3 convolution, leaving substantial arithmetic savings on the table for this fixed 3x3, stride=1, padding=1 case.",
+  "bottleneck": "The kernel performs standard spatial convolution with 9 MACs per output element, making it compute-bound for large H,W and wasting arithmetic intensity that a specialized algorithm for 3x3 could exploit.",
+  "optimisation method": "Replace the direct 3x3 convolution with a Winograd 3x3 convolution (e.g., F(2x2,3x3)), which reduces the number of multiplications per output tile while maintaining the same semantics.",
+  "modification plan": "Implement a Winograd-based Triton kernel that: (1) pre-transforms the 3x3 weights once per layer into the Winograd domain, (2) processes the input in 4x4 tiles with an input transform to the Winograd domain, (3) performs elementwise multiplications and accumulations in the Winograd domain across channels, and (4) applies the inverse Winograd transform to produce 2x2 output patches, writing them back to the standard (N, C_out, H, W) layout. Integrate this kernel into DenseLayerNew in place of conv3x3_relu, keeping the BN and dropout logic unchanged at first for correctness, then optionally re-fusing ReLU inside the Winograd kernel.",
+  "expected_speedup": "30-50%"
+}

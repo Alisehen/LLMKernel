@@ -1,34 +1,12 @@
 You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
 
-# Target GPU
-GPU Name: 4090
-Architecture: Ada Lovelace
-• Compute Capability: 8.9
-• Number of SMs: 128
-• Memory Bandwidth: 1008 GB/s
-• TF32 Tensor Core TFLOPS: 82.6 with dense
-• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
-• FP16 Tensor Core TFLOPS: 165.2 with dense
-• Maximum number of registers per thread: 255
-• Maximum threads per block: 1024
-• Maximum threads per SM: 1536
-• Warp size: 32
-• Maximum concurrent warps per SM: 48
-• Shared memory capacity per SM: 100 KB
-• Maximum shared memory per thread block: 99 KB
-• L2 cache (global, all SM shared): 72 MB
+# Target GPU: 4090
 
-[OPTIMIZATION STAGE]f
+[OPTIMIZATION STAGE]
 
 ## Current Optimization Stage
 
 Focus: Grid layout & indexing for FUSED operations.
-
-⚠️ FUSION EXCLUSIONS (do NOT apply fusion rules to these):
-- Reduction ops (sum, mean, softmax along axis)
-- Atomic operations
-- Irregular/data-dependent access patterns
-- Cross-block dependencies
 
 Key Principle:
 - All fused ops share the SAME grid AND the SAME (offsets, mask) tuple
@@ -50,211 +28,242 @@ Verification:
 
 [CURRENT CODE]
 ```python
+import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import triton
 import triton.language as tl
 
 
 @triton.jit
-def conv2d_3x3_kernel(
+def conv3x3_relu_kernel(
     x_ptr, w_ptr, y_ptr,
     N, C_in, H, W, C_out,
     stride_xn, stride_xc, stride_xh, stride_xw,
-    stride_wn, stride_wc, stride_wh, stride_ww,
+    stride_wo, stride_wc, stride_wh, stride_ww,
     stride_yn, stride_yc, stride_yh, stride_yw,
-    BLOCK_NHW: tl.constexpr,
-    BLOCK_OC: tl.constexpr,
+    BLOCK_M: tl.constexpr,  # over N*H*W
+    BLOCK_N: tl.constexpr,  # over C_out
+    BLOCK_K: tl.constexpr,  # over C_in * 9
 ):
-    # Program IDs
-    pid_nhw = tl.program_id(axis=0)  # over N*H*W
-    pid_oc = tl.program_id(axis=1)   # over C_out
+    # Program ids for 2D launch grid
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
 
-    # Offsets for flattened (N,H,W) and output channels
-    offs_nhw = pid_nhw * BLOCK_NHW + tl.arange(0, BLOCK_NHW)
-    offs_oc = pid_oc * BLOCK_OC + tl.arange(0, BLOCK_OC)
+    # Offsets in flattened M = N * H * W and N-dim (output channels)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
 
-    NHW = N * H * W
-    mask_nhw = offs_nhw < NHW
-    mask_oc = offs_oc < C_out
-
-    # Compute (n, h, w) from flattened index
+    M = N * H * W
     hw = H * W
-    n_idx = offs_nhw // hw
-    rem = offs_nhw - n_idx * hw
-    h_idx = rem // W
-    w_idx = rem - h_idx * W
 
-    # Accumulator for output
-    acc = tl.zeros((BLOCK_NHW, BLOCK_OC), dtype=tl.float32)
+    mask_m = offs_m < M
+    mask_n = offs_n < C_out
 
-    # 3x3 convolution: iterate over input channels and kernel positions
-    for c in range(0, C_in):
-        for kh in range(3):
-            for kw in range(3):
-                h_in = h_idx + kh - 1
-                w_in = w_idx + kw - 1
+    # Decode flattened spatial index: (n, h, w) from offs_m
+    n_idx = offs_m // hw
+    rem_hw = offs_m % hw
+    h_idx = rem_hw // W
+    w_idx = rem_hw % W
 
-                in_bounds = (h_in >= 0) & (h_in < H) & (w_in >= 0) & (w_in < W)
-                mask_x = mask_nhw & in_bounds
+    # Accumulator in FP32 for better numerical stability
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-                # Input pointers and load
-                x_ptrs = (
-                    x_ptr
-                    + n_idx * stride_xn
-                    + c * stride_xc
-                    + h_in * stride_xh
-                    + w_in * stride_xw
-                )
-                x_vals = tl.load(x_ptrs, mask=mask_x, other=0.0)  # [BLOCK_NHW]
+    K = C_in * 9
+    offs_k_vec = tl.arange(0, BLOCK_K)
 
-                # Weight pointers and load
-                w_ptrs = (
-                    w_ptr
-                    + offs_oc * stride_wn
-                    + c * stride_wc
-                    + kh * stride_wh
-                    + kw * stride_ww
-                )
-                w_vals = tl.load(w_ptrs, mask=mask_oc, other=0.0)  # [BLOCK_OC]
+    for k0 in range(0, K, BLOCK_K):
+        offs_k = k0 + offs_k_vec
+        k_mask = offs_k < K
 
-                # FMA into accumulator
-                acc += x_vals[:, None] * w_vals[None, :]
+        # Map K index -> (c, kh, kw)
+        c_idx = offs_k // 9
+        rem = offs_k % 9
+        kh = rem // 3 - 1  # -1, 0, 1
+        kw = rem % 3 - 1   # -1, 0, 1
 
-    # Store result
+        # Compute input spatial coords for this (h, w, kh, kw)
+        h_in = h_idx[:, None] + kh[None, :]
+        w_in = w_idx[:, None] + kw[None, :]
+
+        n_b = n_idx[:, None]
+        c_b = c_idx[None, :]
+
+        # Bounds for input (with padding = 1)
+        in_bounds = (
+            (n_b < N) &
+            (c_b < C_in) &
+            (h_in >= 0) & (h_in < H) &
+            (w_in >= 0) & (w_in < W) &
+            mask_m[:, None] &
+            k_mask[None, :]
+        )
+
+        # Pointers into input x: [N, C_in, H, W]
+        x_ptrs = (
+            x_ptr +
+            n_b * stride_xn +
+            c_b * stride_xc +
+            h_in * stride_xh +
+            w_in * stride_xw
+        )
+        x_vals = tl.load(x_ptrs, mask=in_bounds, other=0.0)
+        # Fused ReLU on BN output
+        x_vals = tl.maximum(x_vals, 0.0)
+
+        # Pointers into weights w: [C_out, C_in, 3, 3]
+        kh_w = kh + 1  # map -1..1 -> 0..2
+        kw_w = kw + 1
+        c_w = c_idx
+
+        kh_b = kh_w[:, None]
+        kw_b = kw_w[:, None]
+        c_w_b = c_w[:, None]
+        offs_n_b = offs_n[None, :]
+
+        w_in_bounds = (
+            (c_w_b < C_in) &
+            (offs_n_b < C_out) &
+            k_mask[:, None] &
+            mask_n[None, :]
+        )
+
+        w_ptrs = (
+            w_ptr +
+            offs_n_b * stride_wo +
+            c_w_b * stride_wc +
+            kh_b * stride_wh +
+            kw_b * stride_ww
+        )
+        w_vals = tl.load(w_ptrs, mask=w_in_bounds, other=0.0)
+
+        acc += tl.dot(x_vals.to(tl.float32), w_vals.to(tl.float32), allow_tf32=True)
+
+    # Store result to y: [N, C_out, H, W]
     y_ptrs = (
-        y_ptr
-        + n_idx[:, None] * stride_yn
-        + offs_oc[None, :] * stride_yc
-        + h_idx[:, None] * stride_yh
-        + w_idx[:, None] * stride_yw
+        y_ptr +
+        n_idx[:, None] * stride_yn +
+        offs_n[None, :] * stride_yc +
+        h_idx[:, None] * stride_yh +
+        w_idx[:, None] * stride_yw
     )
-    mask_store = mask_nhw[:, None] & mask_oc[None, :]
-    tl.store(y_ptrs, acc, mask=mask_store)
+    out_bounds = mask_m[:, None] & (offs_n[None, :] < C_out)
+    tl.store(y_ptrs, acc, mask=out_bounds)
 
 
-def conv2d_3x3_triton(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+def conv3x3_relu(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """
-    Compute 2D convolution with:
-      - kernel_size = 3x3
-      - stride = 1
-      - padding = 1 (same spatial size)
-      - dilation = 1
-      - groups = 1
-      - bias = False (handled outside if needed)
+    High-performance 3x3 Conv2d (padding=1, stride=1, bias=False) fused with ReLU on input.
 
     Args:
-        x: (N, C_in, H, W) float32 CUDA tensor
-        weight: (C_out, C_in, 3, 3) float32 CUDA tensor
-
+        x:      (N, C_in, H, W) tensor, typically output of BatchNorm2d
+        weight: (C_out, C_in, 3, 3) convolution weights
     Returns:
-        y: (N, C_out, H, W) float32 CUDA tensor
+        y:      (N, C_out, H, W)
     """
-    assert x.is_cuda and weight.is_cuda, "Inputs must be CUDA tensors"
-    assert x.dtype == torch.float32 and weight.dtype == torch.float32, "Only float32 supported"
-    assert x.dim() == 4 and weight.dim() == 4, "Expected 4D tensors"
+    assert x.is_cuda and weight.is_cuda, "Triton kernels require CUDA tensors"
     N, C_in, H, W = x.shape
-    C_out, C_in_w, KH, KW = weight.shape
-    assert C_in == C_in_w, "Channel mismatch between input and weight"
-    assert KH == 3 and KW == 3, "Kernel size must be 3x3"
-
-    # Ensure contiguity (simplifies stride handling, safe for DenseNet pattern)
-    x_c = x.contiguous()
-    w_c = weight.contiguous()
+    C_out = weight.shape[0]
+    assert weight.shape[1] == C_in and weight.shape[2] == 3 and weight.shape[3] == 3
 
     y = torch.empty((N, C_out, H, W), device=x.device, dtype=x.dtype)
 
-    stride_xn, stride_xc, stride_xh, stride_xw = x_c.stride()
-    stride_wn, stride_wc, stride_wh, stride_ww = w_c.stride()
-    stride_yn, stride_yc, stride_yh, stride_yw = y.stride()
-
-    BLOCK_NHW = 32  # power-of-2
-    BLOCK_OC = 32   # power-of-2
-
     grid = lambda META: (
-        triton.cdiv(N * H * W, META["BLOCK_NHW"]),
-        triton.cdiv(C_out, META["BLOCK_OC"]),
+        triton.cdiv(N * H * W, META["BLOCK_M"]),
+        triton.cdiv(C_out, META["BLOCK_N"]),
     )
 
-    conv2d_3x3_kernel[grid](
-        x_c, w_c, y,
+    conv3x3_relu_kernel[grid](
+        x, weight, y,
         N, C_in, H, W, C_out,
-        stride_xn, stride_xc, stride_xh, stride_xw,
-        stride_wn, stride_wc, stride_wh, stride_ww,
-        stride_yn, stride_yc, stride_yh, stride_yw,
-        BLOCK_NHW=BLOCK_NHW,
-        BLOCK_OC=BLOCK_OC,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        weight.stride(0), weight.stride(1), weight.stride(2), weight.stride(3),
+        y.stride(0), y.stride(1), y.stride(2), y.stride(3),
+        BLOCK_M=64,
+        BLOCK_N=32,
+        BLOCK_K=32,
+        num_warps=4,
+        num_stages=2,
     )
-
     return y
+
+
+class DenseLayerNew(nn.Module):
+    """
+    Single dense layer with:
+    BatchNorm2d -> ReLU (inside Triton conv) -> Conv2d(3x3, padding=1, bias=False) -> Dropout(0.0)
+    """
+    def __init__(self, in_features: int, growth_rate: int):
+        super().__init__()
+        self.bn = nn.BatchNorm2d(in_features)
+        self.weight = nn.Parameter(torch.empty(growth_rate, in_features, 3, 3))
+        # Match Conv2d default initialization approximately
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        self.dropout = nn.Dropout(0.0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # BatchNorm in PyTorch for correctness (handles running stats / training vs eval)
+        x = self.bn(x)
+        # Fused ReLU + Conv2d(3x3) in Triton
+        out = conv3x3_relu(x, self.weight)
+        # Dropout with p=0.0 (no-op but kept for structural parity)
+        out = self.dropout(out)
+        return out
 
 
 class ModelNew(nn.Module):
     def __init__(self, num_layers: int, num_input_features: int, growth_rate: int):
         """
-        Triton-accelerated version of the given Dense block model.
-        Conv2d(3x3) layers are computed via a Triton kernel.
+        Dense block with Triton-accelerated 3x3 convolutions.
+
+        :param num_layers: The number of layers in the dense block
+        :param num_input_features: The number of input feature maps
+        :param growth_rate: The growth rate for the dense block (new features added per layer)
         """
         super(ModelNew, self).__init__()
         layers = []
         for i in range(num_layers):
             in_features = num_input_features + i * growth_rate
-            layers.append(self._make_layer(in_features, growth_rate))
+            layers.append(DenseLayerNew(in_features, growth_rate))
         self.layers = nn.ModuleList(layers)
 
-    def _make_layer(self, in_features: int, growth_rate: int):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Same structure as original:
-        BatchNorm2d -> ReLU -> Conv2d(3x3, padding=1, bias=False) -> Dropout
-        Conv2d weights are later used by the Triton kernel in forward().
-        """
-        return nn.Sequential(
-            nn.BatchNorm2d(in_features),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(in_features, growth_rate, kernel_size=3, padding=1, bias=False),
-            nn.Dropout(0.0),
-        )
-
-    def forward(self, x):
-        """
-        :param x: (batch_size, num_input_features, height, width)
-        :return: (batch_size, num_output_features, height, width)
+        :param x: Input tensor of shape (batch_size, num_input_features, height, width)
+        :return: Concatenated output tensor with shape (batch_size, num_output_features, height, width)
         """
         features = [x]
         for layer in self.layers:
-            bn = layer[0]
-            relu = layer[1]
-            conv = layer[2]
-            dropout = layer[3]
-
-            out = bn(x)
-            out = relu(out)
-            # Triton-accelerated 3x3 convolution (bias=False)
-            out = conv2d_3x3_triton(out, conv.weight)
-            if dropout.p > 0.0:
-                out = F.dropout(out, p=dropout.p, training=self.training)
-
-            features.append(out)
+            new_feature = layer(x)
+            features.append(new_feature)
             x = torch.cat(features, dim=1)
         return x
 ```
 
 [NCU PROFILING METRICS]
-No NCU metrics available (skipped for network-level model)
+No NCU metrics available
 
 **Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
 
-TRITON API CONSTRAINTS (CRITICAL):
-- Triton has NO: tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+## CRITICAL — Code MUST compile and run:
+1. EVERY kernel function MUST have `@triton.jit` decorator
+2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+3. BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+4. `tl.program_id(axis)` only supports axis = 0, 1, 2
+5. No `continue`, `break`, `return` inside loops — use masking
+6. No tensor indexing with loop vars: `x[:, i]` is INVALID
+7. mask shape MUST match data shape in tl.load/tl.store
 
-OUTPUT RULES (STRICT):
-1. Follow this exact order:
-   1. Imports: torch, torch.nn, triton, triton.language as tl
-   2. @triton.jit decorated kernel function(s)
-   3. Wrapper function(s) for grid calculation and kernel launch
-   4. class ModelNew(nn.Module) that calls your kernels
-2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+## Missing Triton Functions (implement manually):
+- tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+## OUTPUT FORMAT (STRICT):
+1. Imports: torch, torch.nn, triton, triton.language as tl
+2. @triton.jit decorated kernel function(s)
+3. Wrapper function(s) for grid calculation and kernel launch
+4. class ModelNew(nn.Module) that calls your kernels
+
+Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
 
 ```python
 # <optimized Triton code>

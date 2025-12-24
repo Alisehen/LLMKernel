@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The attention block materializes large Q, K, V and context tensors in global memory between kernels, which is bandwidth-inefficient for typical attention sizes.",
+  "bottleneck": "QKV projection, SDPA, and output projection are implemented as separate kernels with full-sized intermediates (qkv: (L*B, 3E), q/k/v: (BH, L, Dh), context: (BH, L, Dh)), causing multiple global memory round-trips and launch overhead across the main attention subgraph.",
+  "optimisation method": "Fuse the QKV linear projection with the SDPA kernel into a single Triton kernel that takes the input sequence and in-proj weights/bias, computes Q, K, V on the fly inside the attention loop, and immediately consumes them for the online softmax and p·V computation without ever storing Q/K/V to global memory.",
+  "modification plan": "Redesign `sdpa_triton_kernel` to accept the original input `x_lin` (or a suitably laid out [BH, S, Dh] view) along with `in_proj_weight` and `in_proj_bias`, and perform: (1) per-tile GEMMs to form Q, K, V for the current block directly from x; (2) flash-attention-style online softmax over those tiles using the just-computed Q/K; and (3) accumulation of the weighted V into the output, all within the same kernel. Adjust the host-side code to skip the standalone `triton_linear_bias` call for QKV and pass the raw input and projection parameters into the fused kernel, keeping the existing out-projection and layernorm path unchanged initially.",
+  "expected_speedup": "30-50%"
+}

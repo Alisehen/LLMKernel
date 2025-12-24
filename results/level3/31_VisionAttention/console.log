@@ -1,0 +1,100 @@
+[Seed] Generating seed kernel...
+[Seed 1/2] Generating...
+[92mFinish reason: stop[0m
+Usage: In=1826, Out=13246, Total=15072
+[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 644, in compare_and_bench
+    raise ValueError(
+ValueError: Outputs are not close (atol=1, rtol=1). max_abs_err=2.140e+00, mean_abs_err=5.489e-01
+
+[seed_0] failed. See metrics.message for details.
+[seed_0] metrics saved to: /home/hyc/LLMKernel/run/20251224_033632_31_VisionAttention_openai_deepseek/31_VisionAttention/evaluation/eval_0000.json
+[Seed 1] Failed, attempting repair...
+[92mFinish reason: stop[0m
+Usage: In=4191, Out=13401, Total=17592
+[seed_0_repair_1] score=3.5390 (baseline=3.5891ms)
+[seed_0_repair_1] metrics saved to: /home/hyc/LLMKernel/run/20251224_033632_31_VisionAttention_openai_deepseek/31_VisionAttention/evaluation/eval_0001.json
+[Seed 1 Repair] Score: 3.5390 ✓
+[Seed 1] Final score: 3.5390 ✓
+[Seed] Early stop: seed 1 already beats PyTorch (3.5390 >= 1.0)
+[Seed] Skipping remaining 1 seed(s)
+[Seed] Will proceed to algorithm analysis to attempt further optimization
+
+================================================================================
+[Hybrid Strategy] Analyzing all seeds for algorithmic optimization...
+[Hybrid Strategy] - 1 seed(s) with score >= 1.0 (further optimization)
+================================================================================
+
+[Hybrid] Seed 1: score=3.5390 >= 1.0
+[Hybrid] Attempting algorithm analysis for further optimization...
+[Hybrid] Requesting LLM analysis for seed 1...
+[92mFinish reason: stop[0m
+Usage: In=4903, Out=1047, Total=5950
+[Hybrid] Worth optimizing: yes
+[Hybrid] Reason: The attention block materializes large Q, K, V and context tensors in global memory between kernels, which is bandwidth-inefficient for typical attention sizes.
+[Hybrid] Analysis complete for seed 1, generating optimized kernel...
+[Hybrid] Bottleneck: QKV projection, SDPA, and output projection are implemented as separate kernels ...
+[Hybrid] Optimization: Fuse the QKV linear projection with the SDPA kernel into a single Triton kernel ...
+[Hybrid] Expected speedup: 30-50%
+[92mFinish reason: stop[0m
+Usage: In=5303, Out=20556, Total=25859
+[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 554, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251224_033632_31_VisionAttention_openai_deepseek/31_VisionAttention/code/kernel_20251224_034246.py", line 492, in forward
+    context = triton_fused_qkv_sdpa(
+              ^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251224_033632_31_VisionAttention_openai_deepseek/31_VisionAttention/code/kernel_20251224_034246.py", line 395, in triton_fused_qkv_sdpa
+    fused_qkv_sdpa_triton_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 419, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 756, in run
+    launch_metadata = kernel.launch_metadata(grid, stream, *bound_args.values())
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 490, in launch_metadata
+    self._init_handles()
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 464, in _init_handles
+    raise_(OutOfResources(self.metadata.shared, max_shared, "shared memory"))
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 456, in raise_
+    raise err
+triton.runtime.errors.OutOfResources: out of resource: shared memory, Required: 147456, Hardware limit: 101376. Reducing block sizes or `num_stages` may help.
+
+[algorithm_optimized_seed0] failed. See metrics.message for details.
+[algorithm_optimized_seed0] metrics saved to: /home/hyc/LLMKernel/run/20251224_033632_31_VisionAttention_openai_deepseek/31_VisionAttention/evaluation/eval_0002.json
+[Hybrid] Algorithm-optimized kernel failed, attempting repair...
+[92mFinish reason: stop[0m
+Usage: In=6092, Out=11579, Total=17671
+[algorithm_optimized_seed0_repair1] score=1.0952 (baseline=3.5723ms)
+[algorithm_optimized_seed0_repair1] metrics saved to: /home/hyc/LLMKernel/run/20251224_033632_31_VisionAttention_openai_deepseek/31_VisionAttention/evaluation/eval_0003.json
+[Hybrid] ✓ Repair successful for algorithm-optimized seed 1
+[Hybrid] ✓ Rescue successful: 3.5390 → 1.0952
+
+================================================================================
+[Hybrid] Candidate Selection
+================================================================================
+[Hybrid] Total candidates: 2
+  [1] seed 1: 3.5390
+  [2] algo-optimized (from seed 1): 1.0952
+
+[Hybrid] ★ Selected best candidate: score=3.5390
+
+[Optimization] Starting 3-stage optimization...
+
+================================================================================
+[Stage 1/3] grid_and_parallel
+Description: Optimize grid layout and parallel work distribution across SMs.
+Current candidates: 1, best score: 3.5390
+================================================================================
+[Stage 1] Profiling best candidate...
+[Stage 1] Generating optimized kernel...

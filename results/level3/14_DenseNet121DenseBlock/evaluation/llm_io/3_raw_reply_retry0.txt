@@ -7,296 +7,243 @@ import triton.language as tl
 
 @triton.autotune(
     configs=[
+        # Baseline, conservative
         triton.Config(
-            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32},
+            {"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_KC": 32},
             num_warps=4,
             num_stages=2,
         ),
+        # Larger M tile, more reuse along H*W, moderate warps
         triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 32},
-            num_warps=8,
-            num_stages=2,
-        ),
-        triton.Config(
-            {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32},
-            num_warps=8,
-            num_stages=2,
-        ),
-        triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32},
-            num_warps=8,
-            num_stages=2,
-        ),
-        triton.Config(
-            {"BLOCK_M": 32, "BLOCK_N": 128, "BLOCK_K": 32},
+            {"BLOCK_M": 64, "BLOCK_N": 32, "BLOCK_KC": 32},
             num_warps=4,
+            num_stages=3,
+        ),
+        # Larger N tile (C_out), good when C_out large
+        triton.Config(
+            {"BLOCK_M": 32, "BLOCK_N": 64, "BLOCK_KC": 32},
+            num_warps=8,
             num_stages=2,
+        ),
+        # Aggressive: large tiles in both M and N
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_KC": 32},
+            num_warps=8,
+            num_stages=3,
         ),
     ],
-    key=["H", "W", "C_in", "C_out"],
+    key=["N", "C_in", "H", "W", "C_out"],
 )
 @triton.jit
-def conv2d_3x3_implicit_gemm_kernel(
-    x_ptr,  # *f32, [N, C_in, H, W]
-    w_ptr,  # *f32, [C_in, 3, 3, C_out] (contiguous)
-    y_ptr,  # *f32, [N, C_out, H, W]
-    N: tl.int32,
-    C_in: tl.int32,
-    H: tl.int32,
-    W: tl.int32,
-    C_out: tl.int32,
-    M: tl.int32,  # N * H * W
-    stride_xn: tl.int32,
-    stride_xc: tl.int32,
-    stride_xh: tl.int32,
-    stride_xw: tl.int32,
-    stride_wc: tl.int32,
-    stride_wkh: tl.int32,
-    stride_wkw: tl.int32,
-    stride_wo: tl.int32,
-    stride_yn: tl.int32,
-    stride_yc: tl.int32,
-    stride_yh: tl.int32,
-    stride_yw: tl.int32,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
+def conv3x3_relu_kernel(
+    x_ptr, w_ptr, y_ptr,
+    N, C_in, H, W, C_out,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_wo, stride_wc, stride_wh, stride_ww,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    BLOCK_M: tl.constexpr,   # tile over M = N * H * W
+    BLOCK_N: tl.constexpr,   # tile over C_out
+    BLOCK_KC: tl.constexpr,  # tile over input channels (C_in)
 ):
-    """
-    High-performance implicit-GEMM 3x3 conv:
+    # 2D launch grid over (M, C_out)
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
 
-      - Treat output as Y[M, C_out], where M = N*H*W
-      - Accumulate over K = C_in * 3 * 3 via:
-            for ci_chunk in chunks of BLOCK_K:
-              for kh in 0..2:
-                for kw in 0..2:
-                    A[M_tile, ci_chunk] x B[ci_chunk, C_out_tile]
-      - Input:  X[N, C_in, H, W]
-      - Weights: W[C_in, 3, 3, C_out]  (pre-permuted & contiguous)
-      - Output: Y[N, C_out, H, W]
+    # Flattened output index M = N * H * W
+    M = N * H * W
+    HW = H * W
 
-    Memory / fusion constraints:
-      - Multiple tl.load() from inputs/weights are allowed.
-      - NO intermediate tl.store(): only a single final tl.store() to y_ptr.
-      - All intermediates (im2col tiles, partial sums) stay in registers.
-    """
-
-    # -----------------------------
-    # Tile coordinates (M, C_out)
-    # -----------------------------
-    pid_m = tl.program_id(axis=0)  # along flattened M = N*H*W
-    pid_n = tl.program_id(axis=1)  # along output channels
-
+    # Offsets within tiles
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # [BM]
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # [BN]
 
-    mask_m = offs_m < M
-    mask_n = offs_n < C_out
+    # Bounds masks
+    mask_m = offs_m < M          # [BM]
+    mask_n = offs_n < C_out      # [BN]
+    mask_m_b = mask_m[:, None]   # [BM, 1]
+    mask_n_b = mask_n[None, :]   # [1, BN]
 
-    # Decode (n, h, w) from flattened index M = N * H * W
-    HW = H * W
-    n_idx = offs_m // HW
-    rem_hw = offs_m - n_idx * HW
-    h_idx = rem_hw // W
-    w_idx = rem_hw - h_idx * W
+    # Decode (n, h, w) from flattened M index
+    n_idx = offs_m // HW         # [BM]
+    rem_hw = offs_m % HW         # [BM]
+    h_idx = rem_hw // W          # [BM]
+    w_idx = rem_hw % W           # [BM]
 
-    # -----------------------------
-    # Accumulator tile in registers
-    # -----------------------------
+    # Broadcasted for pointer arithmetic
+    n_b = n_idx[:, None]         # [BM, 1]
+    h_b = h_idx[:, None]         # [BM, 1]
+    w_b = w_idx[:, None]         # [BM, 1]
+    o_b = offs_n[None, :]        # [1, BN]
+
+    # Accumulator in FP32: [BM, BN]
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    # -----------------------------
-    # Loop over input channels (C_in) in chunks of BLOCK_K,
-    # and unroll 3x3 kernel positions (kh, kw).
-    # No intermediate stores.
-    # -----------------------------
-    c_base = 0
-    while c_base < C_in:
-        offs_c = c_base + tl.arange(0, BLOCK_K)  # [BK] input channels chunk
-        mask_c = offs_c < C_in
+    # Channel-tile offsets
+    offs_kc = tl.arange(0, BLOCK_KC)  # [BK]
 
-        # For each kernel position (kh, kw) in 3x3
-        # These loops are statically unrolled by Triton.
-        for kh in range(3):
-            # input h-coordinate with padding=1 -> (h + kh - 1)
-            h_in = h_idx[:, None] + (kh - 1)
-            in_h_ok = (h_in >= 0) & (h_in < H)
+    # Main loop over input channels (K dimension)
+    for c0 in range(0, C_in, BLOCK_KC):
+        c_idx = c0 + offs_kc          # [BK]
+        c_mask = c_idx < C_in         # [BK]
 
-            for kw in range(3):
-                # input w-coordinate with padding=1 -> (w + kw - 1)
-                w_in = w_idx[:, None] + (kw - 1)
-                in_w_ok = (w_in >= 0) & (w_in < W)
+        c_row = c_idx[None, :]        # [1, BK]
+        c_col = c_idx[:, None]        # [BK, 1]
 
-                in_bounds = in_h_ok & in_w_ok  # [BM,1] broadcast
+        # Base X tile pointer (no 3x3 offsets yet)
+        # X: [N, C_in, H, W]
+        x_base = (
+            x_ptr
+            + n_b * stride_xn         # [BM, 1]
+            + c_row * stride_xc       # [1, BK]
+            + h_b * stride_xh         # [BM, 1]
+            + w_b * stride_xw         # [BM, 1]
+        )  # -> [BM, BK]
 
-                # -----------------------------
-                # Load A tile: X[n, ci, h_in, w_in]
-                # -----------------------------
-                x_ptrs = (
-                    x_ptr
-                    + n_idx[:, None] * stride_xn
-                    + offs_c[None, :] * stride_xc
-                    + h_in * stride_xh
-                    + w_in * stride_xw
-                )
-                mask_a = mask_m[:, None] & mask_c[None, :] & in_bounds
-                a = tl.load(x_ptrs, mask=mask_a, other=0.0)  # [BM, BK]
+        # Base W tile pointer (no 3x3 offsets yet)
+        # W: [C_out, C_in, 3, 3]
+        w_base = (
+            w_ptr
+            + o_b * stride_wo         # [1, BN]
+            + c_col * stride_wc       # [BK, 1]
+        )  # -> [BK, BN]
 
-                # -----------------------------
-                # Load B tile: W[ci, kh, kw, co]
-                # -----------------------------
-                w_ptrs = (
-                    w_ptr
-                    + offs_c[:, None] * stride_wc
-                    + kh * stride_wkh
-                    + kw * stride_wkw
-                    + offs_n[None, :] * stride_wo
-                )
-                mask_b = mask_c[:, None] & mask_n[None, :]
-                b = tl.load(w_ptrs, mask=mask_b, other=0.0)  # [BK, BN]
+        # Weight mask only depends on channel and C_out bounds
+        w_mask = c_mask[:, None] & mask_n_b  # [BK, BN]
 
-                # -----------------------------
-                # Fused matmul-accumulate in registers
-                # -----------------------------
-                acc += tl.dot(a, b)
+        # Unrolled 3x3 kernel over spatial offsets
+        for kh in tl.static_range(3):
+            h_off = kh - 1
 
-        c_base += BLOCK_K
+            h_in = h_idx + h_off                    # [BM]
+            h_in_bounds = (h_in >= 0) & (h_in < H)  # [BM]
+            h_in_bounds_b = h_in_bounds[:, None]    # [BM, 1]
 
-    # -----------------------------
-    # Single final store: Y[n, co, h, w]
-    # -----------------------------
+            x_base_h = x_base + h_off * stride_xh   # [BM, BK]
+            w_base_h = w_base + kh * stride_wh      # [BK, BN]
+
+            for kw in tl.static_range(3):
+                w_off = kw - 1
+
+                w_in = w_idx + w_off                    # [BM]
+                w_in_bounds = (w_in >= 0) & (w_in < W)  # [BM]
+                w_in_bounds_b = w_in_bounds[:, None]    # [BM, 1]
+
+                # Combined mask for X load
+                x_mask = (
+                    mask_m_b &                  # [BM, 1]
+                    c_mask[None, :] &           # [1, BK]
+                    h_in_bounds_b &             # [BM, 1]
+                    w_in_bounds_b               # [BM, 1]
+                )  # -> [BM, BK]
+
+                # Final X and W pointers for this (kh, kw)
+                x_ptrs = x_base_h + w_off * stride_xw   # [BM, BK]
+                w_ptrs = w_base_h + kw * stride_ww      # [BK, BN]
+
+                # Load X tile, apply ReLU in-place
+                x_vals = tl.load(x_ptrs, mask=x_mask, other=0.0)
+                x_vals = tl.maximum(x_vals, 0.0)
+
+                # Load W tile
+                w_vals = tl.load(w_ptrs, mask=w_mask, other=0.0)
+
+                # Accumulate GEMM
+                # For fp16/bf16 inputs this uses tensor cores with fp32 accumulate.
+                acc += tl.dot(x_vals, w_vals, allow_tf32=True)
+
+    # Store result Y: [N, C_out, H, W]
     y_ptrs = (
         y_ptr
-        + n_idx[:, None] * stride_yn
-        + offs_n[None, :] * stride_yc
-        + h_idx[:, None] * stride_yh
-        + w_idx[:, None] * stride_yw
-    )
-    mask_y = mask_m[:, None] & mask_n[None, :]
-    tl.store(y_ptrs, acc, mask=mask_y)
+        + n_b * stride_yn
+        + o_b * stride_yc
+        + h_b * stride_yh
+        + w_b * stride_yw
+    )  # [BM, BN]
+
+    out_mask = mask_m_b & mask_n_b
+    tl.store(y_ptrs, acc, mask=out_mask)
 
 
-def conv2d_3x3_triton(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+def conv3x3_relu(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """
-    3x3 conv2d with:
-      - stride = 1
-      - padding = 1
-      - dilation = 1
-      - groups = 1
-      - bias = False
-
-    Implemented as an implicit-GEMM Triton kernel optimized for Ada (RTX 4090):
-      - Reorders weights to [C_in, 3, 3, C_out] for simple, division-free indexing
-      - Tiles over output pixels (M = N*H*W) and output channels C_out
-      - Loops over input channels in BLOCK_K chunks, unrolling 3x3 kernel
-      - Uses only a single tl.store() for the final output; all intermediates
-        (im2col tiles and partial accumulators) stay in registers.
+    3x3 Conv2d (padding=1, stride=1, bias=False) with ReLU applied to the input.
+    x:      (N, C_in, H, W)
+    weight: (C_out, C_in, 3, 3)
+    returns y: (N, C_out, H, W), same dtype as x
     """
-    assert x.is_cuda and weight.is_cuda, "Inputs must be CUDA tensors"
-    assert x.dtype == torch.float32 and weight.dtype == torch.float32, "Only float32 supported"
-    assert x.dim() == 4 and weight.dim() == 4, "Expected 4D tensors"
-
+    assert x.is_cuda and weight.is_cuda, "Triton kernels require CUDA tensors"
     N, C_in, H, W = x.shape
-    C_out, C_in_w, KH, KW = weight.shape
-    assert C_in == C_in_w, "Channel mismatch between input and weight"
-    assert KH == 3 and KW == 3, "Kernel size must be 3x3"
-    assert weight.stride()[-1] == 1, "Conv weight must be contiguous"
+    C_out = weight.shape[0]
+    assert weight.shape[1] == C_in and weight.shape[2] == 3 and weight.shape[3] == 3
 
-    # Ensure predictable, coalesced layout for input
-    x_c = x.contiguous()
+    # Accumulate in fp32 internally; output buffer is fp32, then cast to x.dtype
+    y = torch.empty((N, C_out, H, W), device=x.device, dtype=torch.float32)
 
-    # Reorder weights to [C_in, 3, 3, C_out] for cheap indexing:
-    #   original: [C_out, C_in, 3, 3]
-    #   permuted: [C_in, 3, 3, C_out]
-    w_4d = weight.permute(1, 2, 3, 0).contiguous()
+    M = N * H * W
 
-    y = torch.empty((N, C_out, H, W), device=x.device, dtype=x.dtype)
-
-    # Strides
-    stride_xn, stride_xc, stride_xh, stride_xw = x_c.stride()
-    stride_wc, stride_wkh, stride_wkw, stride_wo = w_4d.stride()
-    stride_yn, stride_yc, stride_yh, stride_yw = y.stride()
-
-    M = N * H * W  # flattened output positions
-
-    def grid(meta):
+    def grid(META):
         return (
-            triton.cdiv(M, meta["BLOCK_M"]),
-            triton.cdiv(C_out, meta["BLOCK_N"]),
+            triton.cdiv(M, META["BLOCK_M"]),
+            triton.cdiv(C_out, META["BLOCK_N"]),
         )
 
-    conv2d_3x3_implicit_gemm_kernel[grid](
-        x_c,
-        w_4d,
-        y,
-        N,
-        C_in,
-        H,
-        W,
-        C_out,
-        M,
-        stride_xn,
-        stride_xc,
-        stride_xh,
-        stride_xw,
-        stride_wc,
-        stride_wkh,
-        stride_wkw,
-        stride_wo,
-        stride_yn,
-        stride_yc,
-        stride_yh,
-        stride_yw,
+    conv3x3_relu_kernel[grid](
+        x, weight, y,
+        N, C_in, H, W, C_out,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        weight.stride(0), weight.stride(1), weight.stride(2), weight.stride(3),
+        y.stride(0), y.stride(1), y.stride(2), y.stride(3),
     )
 
+    if y.dtype != x.dtype:
+        y = y.to(x.dtype)
     return y
+
+
+class DenseLayerNew(nn.Module):
+    """
+    Single dense layer:
+    BatchNorm2d -> ReLU (inside Triton conv) -> Conv2d(3x3, padding=1, bias=False) -> Dropout(0.0)
+    """
+    def __init__(self, in_features: int, growth_rate: int):
+        super().__init__()
+        self.bn = nn.BatchNorm2d(in_features)
+        self.weight = nn.Parameter(torch.empty(growth_rate, in_features, 3, 3))
+        nn.init.kaiming_uniform_(self.weight, a=2.23606797749979)
+        self.dropout = nn.Dropout(0.0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.bn(x)
+        out = conv3x3_relu(x, self.weight)
+        out = self.dropout(out)
+        return out
 
 
 class ModelNew(nn.Module):
     def __init__(self, num_layers: int, num_input_features: int, growth_rate: int):
         """
-        Triton-accelerated Dense block:
-        Conv2d(3x3) layers are computed via a high-performance Triton kernel.
+        Dense block with Triton-accelerated 3x3 convolutions.
+
+        :param num_layers: The number of layers in the dense block
+        :param num_input_features: The number of input feature maps
+        :param growth_rate: The growth rate for the dense block (new features added per layer)
         """
         super(ModelNew, self).__init__()
         layers = []
         for i in range(num_layers):
             in_features = num_input_features + i * growth_rate
-            layers.append(self._make_layer(in_features, growth_rate))
+            layers.append(DenseLayerNew(in_features, growth_rate))
         self.layers = nn.ModuleList(layers)
 
-    def _make_layer(self, in_features: int, growth_rate: int):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        BatchNorm2d -> ReLU -> Conv2d(3x3, padding=1, bias=False) -> Dropout
-        Conv2d weights are later used by the Triton kernel in forward().
-        """
-        return nn.Sequential(
-            nn.BatchNorm2d(in_features),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(in_features, growth_rate, kernel_size=3, padding=1, bias=False),
-            nn.Dropout(0.0),
-        )
-
-    def forward(self, x):
-        """
-        :param x: (batch_size, num_input_features, height, width)
-        :return: (batch_size, num_output_features, height, width)
+        :param x: Input tensor of shape (batch_size, num_input_features, height, width)
+        :return: Concatenated output tensor with shape (batch_size, num_output_features, height, width)
         """
         features = [x]
         for layer in self.layers:
-            bn = layer[0]
-            relu = layer[1]
-            conv = layer[2]
-            dropout = layer[3]
-
-            out = bn(x)
-            out = relu(out)
-            # Triton-accelerated 3x3 convolution (bias=False)
-            out = conv2d_3x3_triton(out, conv.weight)
-            if dropout.p > 0.0:
-                out = torch.nn.functional.dropout(out, p=dropout.p, training=self.training)
-
-            features.append(out)
+            new_feature = layer(x)
+            features.append(new_feature)
             x = torch.cat(features, dim=1)
         return x
 ```

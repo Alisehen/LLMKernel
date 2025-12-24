@@ -1,0 +1,532 @@
+```python
+import math
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+# ----------------------------
+# Winograd weight transform
+# ----------------------------
+
+def winograd_weight_transform_3x3(weight: torch.Tensor) -> torch.Tensor:
+    """
+    Transform 3x3 conv weights to Winograd F(2x2, 3x3) domain.
+
+    Args:
+        weight: (C_out, C_in, 3, 3)
+
+    Returns:
+        U: (C_out, C_in, 4, 4)
+    """
+    assert weight.dim() == 4 and weight.size(2) == 3 and weight.size(3) == 3
+
+    C_out, C_in, _, _ = weight.shape
+    device = weight.device
+    dtype = weight.dtype
+
+    # Standard F(2x2,3x3) G matrix:
+    # G = [[1,    0,   0],
+    #      [1/2,  1/2, 1/2],
+    #      [1/2, -1/2, 1/2],
+    #      [0,    0,   1]]
+    G = torch.tensor(
+        [
+            [1.0, 0.0, 0.0],
+            [0.5, 0.5, 0.5],
+            [0.5, -0.5, 0.5],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=dtype,
+        device=device,
+    )
+    GT = G.t()  # (3, 4)
+
+    g = weight.view(C_out * C_in, 3, 3)  # (OC*IC, 3, 3)
+
+    # U = G @ g @ G^T
+    tmp = torch.einsum("ij,bjk->bik", G, g)         # (OC*IC, 4, 3)
+    U_flat = torch.einsum("bij,jk->bik", tmp, GT)   # (OC*IC, 4, 4)
+
+    U = U_flat.view(C_out, C_in, 4, 4)
+    return U
+
+
+# -----------------------------------
+# Winograd F(2x2,3x3) Triton kernel
+# -----------------------------------
+
+@triton.jit
+def conv3x3_winograd_relu_kernel(
+    x_ptr,  # [N, C_in, H, W]
+    u_ptr,  # [C_out, C_in, 4, 4]  (Winograd-transformed weights)
+    y_ptr,  # [N, C_out, H, W]
+    N, C_in, H, W, C_out,
+    tiles_h, tiles_w,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_uo, stride_uc, stride_uh, stride_uw,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    BLOCK_M: tl.constexpr,  # over N * tiles_h * tiles_w (output tiles)
+    BLOCK_N: tl.constexpr,  # over C_out
+):
+    # 2D launch grid
+    pid_m = tl.program_id(0)  # over tiles * batch
+    pid_n = tl.program_id(1)  # over output channels
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    tiles_per_n = tiles_h * tiles_w
+    total_tiles = N * tiles_per_n
+
+    mask_m = offs_m < total_tiles
+    mask_n = offs_n < C_out
+
+    # Decode tile index -> (n, tile_h, tile_w)
+    n_idx = offs_m // tiles_per_n
+    rem = offs_m % tiles_per_n
+    th_idx = rem // tiles_w
+    tw_idx = rem % tiles_w
+
+    # Base output coordinates for this 2x2 tile
+    h_base = th_idx * 2
+    w_base = tw_idx * 2
+
+    # Accumulator in Winograd domain: 16 separate [BLOCK_M, BLOCK_N] tiles
+    acc00 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc01 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc02 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc03 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    acc10 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc11 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc12 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc13 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    acc20 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc21 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc22 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc23 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    acc30 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc31 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc32 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc33 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Common masks for N and spatial bounds
+    valid_n = mask_m & (n_idx < N)
+
+    ci = 0
+    while ci < C_in:
+        # -------------------------
+        # Load 4x4 input tile d
+        # with implicit padding=1
+        # and ReLU on BN output
+        # -------------------------
+        h_in0 = h_base - 1
+        h_in1 = h_base + 0
+        h_in2 = h_base + 1
+        h_in3 = h_base + 2
+
+        w_in0 = w_base - 1
+        w_in1 = w_base + 0
+        w_in2 = w_base + 1
+        w_in3 = w_base + 2
+
+        # Precompute masks for rows / cols
+        mh0 = valid_n & (h_in0 >= 0) & (h_in0 < H)
+        mh1 = valid_n & (h_in1 >= 0) & (h_in1 < H)
+        mh2 = valid_n & (h_in2 >= 0) & (h_in2 < H)
+        mh3 = valid_n & (h_in3 >= 0) & (h_in3 < H)
+
+        mw0 = (w_in0 >= 0) & (w_in0 < W)
+        mw1 = (w_in1 >= 0) & (w_in1 < W)
+        mw2 = (w_in2 >= 0) & (w_in2 < W)
+        mw3 = (w_in3 >= 0) & (w_in3 < W)
+
+        # Helper to load one position
+        def load_pos(h_in, w_in, mh, mw):
+            m = mh & mw
+            x_ptrs = (
+                x_ptr
+                + n_idx * stride_xn
+                + ci * stride_xc
+                + h_in * stride_xh
+                + w_in * stride_xw
+            )
+            vals = tl.load(x_ptrs, mask=m, other=0.0)
+            vals = vals.to(tl.float32)
+            vals = tl.maximum(vals, 0.0)
+            return vals
+
+        # d rows: 0..3, cols: 0..3
+        d00 = load_pos(h_in0, w_in0, mh0, mw0)
+        d01 = load_pos(h_in0, w_in1, mh0, mw1)
+        d02 = load_pos(h_in0, w_in2, mh0, mw2)
+        d03 = load_pos(h_in0, w_in3, mh0, mw3)
+
+        d10 = load_pos(h_in1, w_in0, mh1, mw0)
+        d11 = load_pos(h_in1, w_in1, mh1, mw1)
+        d12 = load_pos(h_in1, w_in2, mh1, mw2)
+        d13 = load_pos(h_in1, w_in3, mh1, mw3)
+
+        d20 = load_pos(h_in2, w_in0, mh2, mw0)
+        d21 = load_pos(h_in2, w_in1, mh2, mw1)
+        d22 = load_pos(h_in2, w_in2, mh2, mw2)
+        d23 = load_pos(h_in2, w_in3, mh2, mw3)
+
+        d30 = load_pos(h_in3, w_in0, mh3, mw0)
+        d31 = load_pos(h_in3, w_in1, mh3, mw1)
+        d32 = load_pos(h_in3, w_in2, mh3, mw2)
+        d33 = load_pos(h_in3, w_in3, mh3, mw3)
+
+        # -------------------------
+        # Winograd input transform:
+        # V = B^T d B
+        # -------------------------
+
+        # Vertical transform: tmp = B^T * d
+        # column 0
+        t0c0 = d00 - d20
+        t1c0 = d10 + d20
+        t2c0 = -d10 + d20
+        t3c0 = d10 - d30
+
+        tmp00 = t0c0
+        tmp10 = t1c0
+        tmp20 = t2c0
+        tmp30 = t3c0
+
+        # column 1
+        t0c1 = d01 - d21
+        t1c1 = d11 + d21
+        t2c1 = -d11 + d21
+        t3c1 = d11 - d31
+
+        tmp01 = t0c1
+        tmp11 = t1c1
+        tmp21 = t2c1
+        tmp31 = t3c1
+
+        # column 2
+        t0c2 = d02 - d22
+        t1c2 = d12 + d22
+        t2c2 = -d12 + d22
+        t3c2 = d12 - d32
+
+        tmp02 = t0c2
+        tmp12 = t1c2
+        tmp22 = t2c2
+        tmp32 = t3c2
+
+        # column 3
+        t0c3 = d03 - d23
+        t1c3 = d13 + d23
+        t2c3 = -d13 + d23
+        t3c3 = d13 - d33
+
+        tmp03 = t0c3
+        tmp13 = t1c3
+        tmp23 = t2c3
+        tmp33 = t3c3
+
+        # Horizontal transform: V = tmp * B
+        # row 0
+        v00 = tmp00 - tmp02
+        v01 = tmp01 + tmp02
+        v02 = -tmp01 + tmp02
+        v03 = tmp01 - tmp03
+
+        # row 1
+        v10 = tmp10 - tmp12
+        v11 = tmp11 + tmp12
+        v12 = -tmp11 + tmp12
+        v13 = tmp11 - tmp13
+
+        # row 2
+        v20 = tmp20 - tmp22
+        v21 = tmp21 + tmp22
+        v22 = -tmp21 + tmp22
+        v23 = tmp21 - tmp23
+
+        # row 3
+        v30 = tmp30 - tmp32
+        v31 = tmp31 + tmp32
+        v32 = -tmp31 + tmp32
+        v33 = tmp31 - tmp33
+
+        # -------------------------
+        # Multiply-accumulate:
+        # M(rc) += V(rc) * U(oc,ci,rc)
+        # -------------------------
+
+        # Helper to MAC one (r,c)
+        def mac(v_rc, r, c, acc_rc):
+            u_ptrs = (
+                u_ptr
+                + offs_n * stride_uo
+                + ci * stride_uc
+                + r * stride_uh
+                + c * stride_uw
+            )
+            u_vals = tl.load(u_ptrs, mask=mask_n, other=0.0)
+            u_vals = u_vals.to(tl.float32)
+            acc_rc += v_rc[:, None] * u_vals[None, :]
+            return acc_rc
+
+        acc00 = mac(v00, 0, 0, acc00)
+        acc01 = mac(v01, 0, 1, acc01)
+        acc02 = mac(v02, 0, 2, acc02)
+        acc03 = mac(v03, 0, 3, acc03)
+
+        acc10 = mac(v10, 1, 0, acc10)
+        acc11 = mac(v11, 1, 1, acc11)
+        acc12 = mac(v12, 1, 2, acc12)
+        acc13 = mac(v13, 1, 3, acc13)
+
+        acc20 = mac(v20, 2, 0, acc20)
+        acc21 = mac(v21, 2, 1, acc21)
+        acc22 = mac(v22, 2, 2, acc22)
+        acc23 = mac(v23, 2, 3, acc23)
+
+        acc30 = mac(v30, 3, 0, acc30)
+        acc31 = mac(v31, 3, 1, acc31)
+        acc32 = mac(v32, 3, 2, acc32)
+        acc33 = mac(v33, 3, 3, acc33)
+
+        ci += 1
+
+    # -------------------------
+    # Inverse Winograd transform:
+    # Y = A^T M A
+    # A^T = [[1, 1, 1, 0],
+    #        [0, 1,-1,-1]]
+    # -------------------------
+
+    m00 = acc00
+    m01 = acc01
+    m02 = acc02
+    m03 = acc03
+
+    m10 = acc10
+    m11 = acc11
+    m12 = acc12
+    m13 = acc13
+
+    m20 = acc20
+    m21 = acc21
+    m22 = acc22
+    m23 = acc23
+
+    m30 = acc30
+    m31 = acc31
+    m32 = acc32
+    m33 = acc33
+
+    # Vertical: T = A^T * M (2x4)
+    t0c0 = m00 + m10 + m20
+    t1c0 = m10 - m20 - m30
+
+    t0c1 = m01 + m11 + m21
+    t1c1 = m11 - m21 - m31
+
+    t0c2 = m02 + m12 + m22
+    t1c2 = m12 - m22 - m32
+
+    t0c3 = m03 + m13 + m23
+    t1c3 = m13 - m23 - m33
+
+    # Horizontal: Y = T * A  (2x2)
+    y00 = t0c0 + t0c1 + t0c2
+    y01 = t0c1 - t0c2 - t0c3
+    y10 = t1c0 + t1c1 + t1c2
+    y11 = t1c1 - t1c2 - t1c3
+
+    # -------------------------
+    # Store back [N, C_out, H, W]
+    # -------------------------
+    n_b = n_idx[:, None]
+    oc_b = offs_n[None, :]
+
+    # (0,0)
+    h_out = h_base
+    w_out = w_base
+    out_mask_00 = (
+        mask_m[:, None]
+        & mask_n[None, :]
+        & (h_out[:, None] < H)
+        & (w_out[:, None] < W)
+    )
+    y_ptrs_00 = (
+        y_ptr
+        + n_b * stride_yn
+        + oc_b * stride_yc
+        + h_out[:, None] * stride_yh
+        + w_out[:, None] * stride_yw
+    )
+    tl.store(y_ptrs_00, y00, mask=out_mask_00)
+
+    # (0,1)
+    h_out = h_base
+    w_out = w_base + 1
+    out_mask_01 = (
+        mask_m[:, None]
+        & mask_n[None, :]
+        & (h_out[:, None] < H)
+        & (w_out[:, None] < W)
+    )
+    y_ptrs_01 = (
+        y_ptr
+        + n_b * stride_yn
+        + oc_b * stride_yc
+        + h_out[:, None] * stride_yh
+        + w_out[:, None] * stride_yw
+    )
+    tl.store(y_ptrs_01, y01, mask=out_mask_01)
+
+    # (1,0)
+    h_out = h_base + 1
+    w_out = w_base
+    out_mask_10 = (
+        mask_m[:, None]
+        & mask_n[None, :]
+        & (h_out[:, None] < H)
+        & (w_out[:, None] < W)
+    )
+    y_ptrs_10 = (
+        y_ptr
+        + n_b * stride_yn
+        + oc_b * stride_yc
+        + h_out[:, None] * stride_yh
+        + w_out[:, None] * stride_yw
+    )
+    tl.store(y_ptrs_10, y10, mask=out_mask_10)
+
+    # (1,1)
+    h_out = h_base + 1
+    w_out = w_base + 1
+    out_mask_11 = (
+        mask_m[:, None]
+        & mask_n[None, :]
+        & (h_out[:, None] < H)
+        & (w_out[:, None] < W)
+    )
+    y_ptrs_11 = (
+        y_ptr
+        + n_b * stride_yn
+        + oc_b * stride_yc
+        + h_out[:, None] * stride_yh
+        + w_out[:, None] * stride_yw
+    )
+    tl.store(y_ptrs_11, y11, mask=out_mask_11)
+
+
+def conv3x3_relu(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """
+    Winograd-accelerated 3x3 Conv2d (padding=1, stride=1, bias=False)
+    with ReLU applied to the BatchNorm output (input of conv).
+
+    Args:
+        x:      (N, C_in, H, W) tensor, typically BN output
+        weight: (C_out, C_in, 3, 3) convolution weights
+
+    Returns:
+        y:      (N, C_out, H, W)
+    """
+    assert x.is_cuda and weight.is_cuda, "Triton kernels require CUDA tensors"
+    assert x.dtype == torch.float32 and weight.dtype == torch.float32, \
+        "This Winograd kernel currently assumes float32 tensors"
+
+    N, C_in, H, W = x.shape
+    C_out = weight.shape[0]
+    assert weight.shape[1] == C_in and weight.shape[2] == 3 and weight.shape[3] == 3
+
+    # Pre-transform weights once per call into Winograd domain
+    u = winograd_weight_transform_3x3(weight).contiguous()  # (C_out, C_in, 4, 4)
+
+    # Output same spatial size as input (padding=1, stride=1)
+    y = torch.empty((N, C_out, H, W), device=x.device, dtype=x.dtype)
+
+    # Number of 2x2 output tiles along each dimension
+    tiles_h = (H + 1) // 2
+    tiles_w = (W + 1) // 2
+    total_tiles = N * tiles_h * tiles_w
+
+    def grid(meta):
+        return (
+            max(1, triton.cdiv(total_tiles, meta["BLOCK_M"])),
+            max(1, triton.cdiv(C_out, meta["BLOCK_N"])),
+        )
+
+    conv3x3_winograd_relu_kernel[grid](
+        x, u, y,
+        N, C_in, H, W, C_out,
+        tiles_h, tiles_w,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        u.stride(0), u.stride(1), u.stride(2), u.stride(3),
+        y.stride(0), y.stride(1), y.stride(2), y.stride(3),
+        BLOCK_M=32,
+        BLOCK_N=32,
+        num_warps=4,
+        num_stages=2,
+    )
+    return y
+
+
+# ----------------------------
+# Dense block using Triton
+# ----------------------------
+
+class DenseLayerNew(nn.Module):
+    """
+    Single dense layer with:
+    BatchNorm2d -> ReLU (inside Triton Winograd conv)
+    -> Conv2d(3x3, padding=1, bias=False) -> Dropout(0.0)
+    """
+    def __init__(self, in_features: int, growth_rate: int):
+        super().__init__()
+        self.bn = nn.BatchNorm2d(in_features)
+        self.weight = nn.Parameter(torch.empty(growth_rate, in_features, 3, 3))
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        self.dropout = nn.Dropout(0.0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # BatchNorm in PyTorch for correctness
+        x = self.bn(x)
+        # Winograd-accelerated Conv2d(3x3) with fused ReLU on BN output
+        out = conv3x3_relu(x, self.weight)
+        # Dropout (p=0.0, kept for structural parity)
+        out = self.dropout(out)
+        return out
+
+
+class ModelNew(nn.Module):
+    def __init__(self, num_layers: int, num_input_features: int, growth_rate: int):
+        """
+        Dense block with Triton-accelerated Winograd 3x3 convolutions.
+
+        :param num_layers: The number of layers in the dense block
+        :param num_input_features: The number of input feature maps
+        :param growth_rate: The growth rate (new features per layer)
+        """
+        super(ModelNew, self).__init__()
+        layers = []
+        for i in range(num_layers):
+            in_features = num_input_features + i * growth_rate
+            layers.append(DenseLayerNew(in_features, growth_rate))
+        self.layers = nn.ModuleList(layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        :param x: Input tensor of shape (batch_size, num_input_features, height, width)
+        :return: Concatenated output tensor with shape
+                 (batch_size, num_output_features, height, width)
+        """
+        features = [x]
+        for layer in self.layers:
+            new_feature = layer(x)
+            features.append(new_feature)
+            x = torch.cat(features, dim=1)
+        return x
+```
