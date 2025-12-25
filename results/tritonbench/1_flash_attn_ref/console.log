@@ -1,0 +1,86 @@
+[Seed] Generating seed kernel...
+[Seed 1/2] Generating...
+[92mFinish reason: stop[0m
+Usage: In=1854, Out=11676, Total=13530
+[seed_0] score=1.1198 (baseline=0.1298ms)
+[seed_0] metrics saved to: /home/hyc/LLMKernel/run/20251224_100543_1_flash_attn_ref_openai_deepseek/1_flash_attn_ref/evaluation/eval_0000.json
+[Seed 1] Final score: 1.1198 ✓
+[Seed] Early stop: seed 1 already beats PyTorch (1.1198 >= 1.0)
+[Seed] Skipping remaining 1 seed(s)
+[Seed] Will proceed to algorithm analysis to attempt further optimization
+
+================================================================================
+[Hybrid Strategy] Analyzing all seeds for algorithmic optimization...
+[Hybrid Strategy] - 1 seed(s) with score >= 1.0 (further optimization)
+================================================================================
+
+[Hybrid] Seed 1: score=1.1198 >= 1.0
+[Hybrid] Attempting algorithm analysis for further optimization...
+[Hybrid] Requesting LLM analysis for seed 1...
+[92mFinish reason: stop[0m
+Usage: In=3658, Out=603, Total=4261
+[Hybrid] Worth optimizing: yes
+[Hybrid] Reason: The current Triton implementation still materializes the full [B, H, S, S] scores tensor and uses three separate kernels, leaving a clear opportunity to apply a true FlashAttention-style algorithm.
+[Hybrid] Analysis complete for seed 1, generating optimized kernel...
+[Hybrid] Bottleneck: The main bottleneck is quadratic global memory traffic to read/write the scores ...
+[Hybrid] Optimization: Replace the three-kernel pipeline (qk_matmul_scaled → softmax_inplace_last_dim →...
+[Hybrid] Expected speedup: 30-40%
+[92mFinish reason: stop[0m
+Usage: In=3948, Out=9521, Total=13469
+[algorithm_optimized_seed0] score=1.2399 (baseline=0.1298ms)
+[algorithm_optimized_seed0] metrics saved to: /home/hyc/LLMKernel/run/20251224_100543_1_flash_attn_ref_openai_deepseek/1_flash_attn_ref/evaluation/eval_0001.json
+[Hybrid] ✓ Rescue successful: 1.1198 → 1.2399
+
+================================================================================
+[Hybrid] Candidate Selection
+================================================================================
+[Hybrid] Total candidates: 2
+  [1] seed 1: 1.1198
+  [2] algo-optimized (from seed 1): 1.2399
+
+[Hybrid] ★ Selected best candidate: score=1.2399
+
+[Optimization] Starting 3-stage optimization...
+
+================================================================================
+[Stage 1/3] grid_and_parallel
+Description: Optimize grid layout and parallel work distribution across SMs.
+Current candidates: 1, best score: 1.2399
+================================================================================
+[Stage 1] Profiling best candidate...
+[Stage 1] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=2346, Out=4954, Total=7300
+[stage1_grid_and_parallel] score=1.7598 (baseline=0.1298ms)
+[stage1_grid_and_parallel] metrics saved to: /home/hyc/LLMKernel/run/20251224_100543_1_flash_attn_ref_openai_deepseek/1_flash_attn_ref/evaluation/eval_0002.json
+  Optimized kernel score: 1.7598 ✓
+[Stage 1] ★ New best score: 1.7598
+
+================================================================================
+[Stage 2/3] block_tiling
+Description: Tune BLOCK_M/N/K sizes for optimal register/memory balance.
+Current candidates: 1, best score: 1.7598
+================================================================================
+[Stage 2] Profiling best candidate...
+[Stage 2] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=2826, Out=5843, Total=8669
+[stage2_block_tiling] score=1.1418 (baseline=0.1298ms)
+[stage2_block_tiling] metrics saved to: /home/hyc/LLMKernel/run/20251224_100543_1_flash_attn_ref_openai_deepseek/1_flash_attn_ref/evaluation/eval_0003.json
+  Optimized kernel score: 1.1418 ✓
+[Stage 2] Current: 1.1418 (global best: 1.7598)
+
+================================================================================
+[Stage 3/3] memory_and_tuning
+Description: Optimize memory access patterns and fine-tune num_stages/num_warps.
+Current candidates: 1, best score: 1.7598
+================================================================================
+[Stage 3] Profiling best candidate...
+[Stage 3] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=2921, Out=3996, Total=6917
+[stage3_memory_and_tuning] score=1.9028 (baseline=0.1298ms)
+[stage3_memory_and_tuning] metrics saved to: /home/hyc/LLMKernel/run/20251224_100543_1_flash_attn_ref_openai_deepseek/1_flash_attn_ref/evaluation/eval_0004.json
+  Optimized kernel score: 1.9028 ✓
+[Stage 3] ★ New best score: 1.9028
+[1_flash_attn_ref.py] Figure saved to: /home/hyc/LLMKernel/run/20251224_100543_1_flash_attn_ref_openai_deepseek/1_flash_attn_ref/figures/1_flash_attn_ref_score.png

@@ -1,0 +1,202 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        # Smaller, safer on register pressure / small head dims
+        triton.Config({"BLOCK_D": 64}, num_warps=2, num_stages=2),
+        # Good default for most head dims on modern GPUs
+        triton.Config({"BLOCK_D": 128}, num_warps=4, num_stages=2),
+        # Aggressive for larger D
+        triton.Config({"BLOCK_D": 256}, num_warps=8, num_stages=2),
+    ],
+    key=["HALF_D"],  # tune primarily on head dim (D/2)
+)
+@triton.jit
+def rope_kernel_inplace(
+    q_ptr, k_ptr, cos_ptr, sin_ptr,
+    BH, S, D, HALF_D,
+    stride_q0, stride_q1, stride_q2,
+    stride_k0, stride_k1, stride_k2,
+    stride_cos0, stride_cos1,
+    stride_sin0, stride_sin1,
+    BLOCK_D: tl.constexpr,
+):
+    """
+    In-place RoPE kernel (even/odd pairing).
+
+    Layouts:
+      q, k:    (BH, S, D)      strides (stride_q0, stride_q1, stride_q2)
+      cos/sin: (S, HALF_D)     strides (stride_cos0, stride_cos1)
+
+    RoPE is applied on pairs along the last dimension:
+      For j in [0, HALF_D):
+        x_even = x[..., 2*j]
+        x_odd  = x[..., 2*j + 1]
+        x_even' = x_even * cos - x_odd * sin
+        x_odd'  = x_odd  * cos + x_even * sin
+
+    Grid:
+      pid_bh      in [0, BH)
+      pid_s       in [0, S)
+      pid_block_d in [0, ceil_div(HALF_D, BLOCK_D))
+
+    Each program:
+      - processes one (bh, s) pair
+      - covers BLOCK_D complex dims (each complex dim = 2 real dims)
+      - rotates both q and k in-place
+    """
+    pid_bh = tl.program_id(0)
+    pid_s = tl.program_id(1)
+    pid_block_d = tl.program_id(2)
+
+    # Indices along the HALF_D (number of pairs) dimension
+    offs_d = pid_block_d * BLOCK_D + tl.arange(0, BLOCK_D)
+    mask = offs_d < HALF_D  # [BLOCK_D]
+
+    # Base offsets for q/k for this (bh, s)
+    q_base = pid_bh * stride_q0 + pid_s * stride_q1
+    k_base = pid_bh * stride_k0 + pid_s * stride_k1
+
+    # Even / odd indices along last dimension
+    offs_even = (2 * offs_d) * stride_q2
+    offs_odd = (2 * offs_d + 1) * stride_q2
+
+    # q pointers: even and odd positions
+    q_even_ptrs = q_ptr + q_base + offs_even
+    q_odd_ptrs = q_ptr + q_base + offs_odd
+
+    # k pointers: even and odd positions
+    k_even_ptrs = k_ptr + k_base + offs_even
+    k_odd_ptrs = k_ptr + k_base + offs_odd
+
+    # cos/sin pointers: shared across BH, vary only with (s, complex-dim)
+    cos_ptrs = cos_ptr + pid_s * stride_cos0 + offs_d * stride_cos1
+    sin_ptrs = sin_ptr + pid_s * stride_sin0 + offs_d * stride_sin1
+
+    # Load cos/sin once per (bh, s, d-block) and reuse for q and k
+    cos_vals = tl.load(cos_ptrs, mask=mask, other=0.0)
+    sin_vals = tl.load(sin_ptrs, mask=mask, other=0.0)
+
+    # --- Rotate q in-place ---
+    q_even = tl.load(q_even_ptrs, mask=mask, other=0.0)
+    q_odd = tl.load(q_odd_ptrs, mask=mask, other=0.0)
+
+    # [q_even, q_odd] -> [q_even*cos - q_odd*sin, q_odd*cos + q_even*sin]
+    q_rot_even = q_even * cos_vals - q_odd * sin_vals
+    q_rot_odd = q_odd * cos_vals + q_even * sin_vals
+
+    tl.store(q_even_ptrs, q_rot_even, mask=mask)
+    tl.store(q_odd_ptrs, q_rot_odd, mask=mask)
+
+    # --- Rotate k in-place ---
+    k_even = tl.load(k_even_ptrs, mask=mask, other=0.0)
+    k_odd = tl.load(k_odd_ptrs, mask=mask, other=0.0)
+
+    # [k_even, k_odd] -> [k_even*cos - k_odd*sin, k_odd*cos + k_even*sin]
+    k_rot_even = k_even * cos_vals - k_odd * sin_vals
+    k_rot_odd = k_odd * cos_vals + k_even * sin_vals
+
+    tl.store(k_even_ptrs, k_rot_even, mask=mask)
+    tl.store(k_odd_ptrs, k_rot_odd, mask=mask)
+
+
+def rope_triton(q: torch.Tensor, k: torch.Tensor,
+                cos: torch.Tensor, sin: torch.Tensor):
+    """
+    High-performance Triton implementation of RoPE.
+
+    Inputs:
+      q, k:  (B, H, S, D)
+      cos, sin: (S, D//2)
+
+    Returns:
+      q_rot, k_rot: (B, H, S, D)
+      cos_trunc, sin_trunc: (S, D//2)
+
+    RoPE is applied on pairs along the last dimension:
+      For j in [0, D//2):
+        x_even = x[..., 2*j]
+        x_odd  = x[..., 2*j + 1]
+        x_even' = x_even * cos - x_odd * sin
+        x_odd'  = x_odd  * cos + x_even * sin
+    """
+    assert q.is_cuda and k.is_cuda and cos.is_cuda and sin.is_cuda
+    assert q.dtype == k.dtype == cos.dtype == sin.dtype
+    assert q.ndim == 4 and k.ndim == 4
+
+    B, H, S, D = q.shape
+    assert D % 2 == 0
+    HALF_D = D // 2
+    assert HALF_D > 0
+
+    # Flatten (B, H, S, D) -> (BH, S, D)
+    BH = B * H
+    assert BH > 0 and S > 0
+
+    # Ensure contiguous so that view is valid and strides are simple
+    q_contig = q.contiguous()
+    k_contig = k.contiguous()
+    q_flat = q_contig.view(BH, S, D)
+    k_flat = k_contig.view(BH, S, D)
+
+    # Match PyTorch reference truncation/broadcast semantics
+    cos_trunc = cos[:S, :HALF_D].contiguous()
+    sin_trunc = sin[:S, :HALF_D].contiguous()
+
+    # Launch configuration:
+    #   axis 0: BH
+    #   axis 1: S
+    #   axis 2: HALF_D / BLOCK_D
+    def grid(meta):
+        block_d = meta["BLOCK_D"]
+        return (
+            BH,
+            S,
+            triton.cdiv(HALF_D, block_d),
+        )
+
+    rope_kernel_inplace[grid](
+        q_flat, k_flat, cos_trunc, sin_trunc,
+        BH, S, D, HALF_D,
+        q_flat.stride(0), q_flat.stride(1), q_flat.stride(2),
+        k_flat.stride(0), k_flat.stride(1), k_flat.stride(2),
+        cos_trunc.stride(0), cos_trunc.stride(1),
+        sin_trunc.stride(0), sin_trunc.stride(1),
+    )
+
+    # q_flat / k_flat have been rotated in-place
+    q_rot = q_flat.view(B, H, S, D)
+    k_rot = k_flat.view(B, H, S, D)
+
+    return q_rot, k_rot, cos_trunc, sin_trunc
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized RoPE module.
+
+    forward(q, k, cos, sin) -> (q_rotated, k_rotated, cos_out, sin_out)
+
+    Shapes:
+      q, k: (B, H, S, D)
+      cos, sin: (S, D//2)
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+
+    def forward(self, q, k, cos, sin):
+        # Ensure q/k are on the same device as cos/sin
+        dev = cos.device
+        if q.device != dev:
+            q = q.to(device=dev, non_blocking=True)
+        if k.device != dev:
+            k = k.to(device=dev, non_blocking=True)
+
+        q_rot, k_rot, cos_out, sin_out = rope_triton(q, k, cos, sin)
+        return q_rot, k_rot, cos_out, sin_out
+```

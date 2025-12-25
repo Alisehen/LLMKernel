@@ -1043,11 +1043,11 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
 
             # Early stop: if this seed already beats PyTorch, no need to generate more seeds
             # But still proceed to algorithm analysis to potentially improve further
-            if this_score >= 1.0 and seed_idx < num_seeds_actual - 1:
-                print(f"[Seed] Early stop: seed {seed_idx + 1} already beats PyTorch ({this_score:.4f} >= 1.0)")
-                print(f"[Seed] Skipping remaining {num_seeds_actual - seed_idx - 1} seed(s)")
-                print(f"[Seed] Will proceed to algorithm analysis to attempt further optimization")
-                break
+            # if this_score >= 1.0 and seed_idx < num_seeds_actual - 1:
+            #     print(f"[Seed] Early stop: seed {seed_idx + 1} already beats PyTorch ({this_score:.4f} >= 1.0)")
+            #     print(f"[Seed] Skipping remaining {num_seeds_actual - seed_idx - 1} seed(s)")
+            #     print(f"[Seed] Will proceed to algorithm analysis to attempt further optimization")
+            #     break
         else:
             # After all repair attempts, still failed
             seed_candidates.append(BeamCandidate(

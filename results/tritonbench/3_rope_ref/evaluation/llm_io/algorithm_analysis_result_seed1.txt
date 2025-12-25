@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "RoPE is a purely elementwise transform applied to Q/K before attention, so doing it in a standalone kernel adds an extra full read/write of Q/K that is completely memory-bound.",
+  "bottleneck": "The current Triton kernel materializes rotated Q/K in global memory, causing an additional pass over all Q/K data (loads of q/k + stores of q_rot/k_rot) and a separate launch, even though the rotation could be done on-the-fly where Q/K are actually consumed.",
+  "optimisation method": "Operator fusion: fuse the RoPE rotation directly into the QK^T attention kernel (or the Q/K projection + attention kernel), computing the rotation in registers as you load Q/K tiles, instead of having a dedicated RoPE kernel that produces q_rot/k_rot tensors.",
+  "modification plan": "Refactor the attention implementation so that the main attention matmul Triton kernel takes raw q, k, cos, sin as inputs. Inside that kernel, when loading a tile of q/k from global memory, immediately split into halves, apply the RoPE rotation using cos/sin for the current sequence positions, and use the rotated values directly in the QK^T dot-products without writing them back to global memory. Remove the standalone rope_triton/rope_kernel and adjust the Python side to no longer materialize intermediate q_rot/k_rot tensors.",
+  "expected_speedup": "50-80% reduction of RoPE-specific overhead (roughly 2-4x vs the current standalone RoPE kernel), translating to around 10-20% speedup for the combined RoPE+attention block depending on model size and sequence length."
+}

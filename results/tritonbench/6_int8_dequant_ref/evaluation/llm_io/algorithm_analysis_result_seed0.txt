@@ -1,0 +1,10 @@
+```json
+{
+  "worth_optimizing": "yes",
+  "reason": "The kernel is performing the core GEMM in fp32 even though both operands are int8, leaving dedicated int8 dot-product/tensor-core hardware unused.",
+  "bottleneck": "Inside the K-loop, the kernel loads int8 tiles `a` and `b`, immediately casts them to fp32 (`a_f32`, `b_f32`), and performs `tl.dot` in fp32, which is much less efficient than native int8×int8→int32 tensor-core/dp4a paths both in throughput and energy; this makes the compute phase the dominant avoidable cost.",
+  "optimisation method": "Replace the fp32 matmul with a true int8×int8→int32 accumulation kernel (dp4a / tensor-core MMA via Triton’s int8 `tl.dot` support), keeping the accumulator in int32 and only converting to fp32 once at the end for dequantization and bias addition.",
+  "modification plan": "Change `acc` to `tl.int32`, drop the `tl.cast` to fp32 inside the K-loop, and use an int8 `tl.dot` variant (or manual dp4a-style unrolling) to accumulate into int32. After the K-loop, cast `acc` to fp32 once, apply `divfactor`, `scale_x`, `scale_w`, and `bias`, and then cast to fp16 for storage. This retains the same numerical semantics (INT8 @ INT8 → INT32 → FP) while routing the GEMM through the hardware’s high-throughput int8 matrix units.",
+  "expected_speedup": "1.5-3x for the matmul+dequant section on modern GPUs with int8 tensor cores (overall layer speedup will depend on surrounding model structure)."
+}
+```

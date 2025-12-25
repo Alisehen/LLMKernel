@@ -1,0 +1,228 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU: 4090
+
+[OPTIMIZATION STAGE]
+
+## Current Optimization Stage
+
+Focus: Grid layout & indexing for FUSED operations.
+
+Key Principle:
+- All fused ops share the SAME grid AND the SAME (offsets, mask) tuple
+- Grid covers OUTPUT tensor dimensions
+
+Hard Rules:
+- Every fused op MUST use identical offset calculation
+- Every fused op MUST use identical boundary mask
+- If broadcast needed: explicit `[None, :]` or `[:, None]`, NOT different offsets
+- Element-wise: 1D grid, single `offs = pid * BLOCK + tl.arange(0, BLOCK)`
+- Matmul fusion: 2D grid, `offs_m/offs_n` shared by bias add & activation
+
+Verification:
+- Check: all tl.load/tl.store use same `offsets` variable
+- Check: all masks derived from same boundary condition
+- If ANY op needs different indexing → do NOT fuse, split kernel
+
+
+
+[CURRENT CODE]
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def int8_matmul_rowwise_dequant_kernel(
+    a_ptr,        # int8  [M, K]
+    b_ptr,        # int8  [K, N]  (weight_int8.T)
+    scale_x_ptr,  # fp32 [M]
+    scale_w_ptr,  # fp32 [N]
+    bias_ptr,     # fp16 [N]
+    c_ptr,        # fp16 [M, N]
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Pointers to first K-slab of A and B
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Main K-loop
+    for k in range(0, K, BLOCK_K):
+        k_remaining = K - k
+
+        a = tl.load(
+            a_ptrs,
+            mask=(offs_m[:, None] < M) & (offs_k[None, :] < k_remaining),
+            other=0,
+        )
+        b = tl.load(
+            b_ptrs,
+            mask=(offs_k[:, None] < k_remaining) & (offs_n[None, :] < N),
+            other=0,
+        )
+
+        a_f32 = tl.cast(a, tl.float32)
+        b_f32 = tl.cast(b, tl.float32)
+
+        acc += tl.dot(a_f32, b_f32, allow_tf32=True)
+
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Dequantization and scaling
+    divfactor = 1.0 / (127.0 * 127.0)
+
+    scale_x = tl.load(
+        scale_x_ptr + offs_m,
+        mask=offs_m < M,
+        other=0.0,
+    )  # [BLOCK_M]
+    scale_w = tl.load(
+        scale_w_ptr + offs_n,
+        mask=offs_n < N,
+        other=0.0,
+    )  # [BLOCK_N]
+
+    acc = acc * divfactor
+    acc = acc * scale_x[:, None]
+    acc = acc * scale_w[None, :]
+
+    # Bias add (bias is fp16 -> upcast to fp32)
+    bias = tl.load(
+        bias_ptr + offs_n,
+        mask=offs_n < N,
+        other=0.0,
+    )  # fp16
+    bias_f32 = tl.cast(bias, tl.float32)
+    acc = acc + bias_f32[None, :]
+
+    # Store to fp16
+    c = tl.cast(acc, tl.float16)
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    mask_out = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, c, mask=mask_out)
+
+
+def fused_int8_rowwise_dequant_matmul(x, weight_int8, scale_x, scale_w, bias):
+    """
+    x:           int8  [M, K]
+    weight_int8: int8  [N, K]  (original storage, we transpose here)
+    scale_x:     fp32 [M]
+    scale_w:     fp32 [N]
+    bias:        fp16 [N]
+    returns:     fp16 [M, N]
+    """
+    assert x.dtype == torch.int8
+    assert weight_int8.dtype == torch.int8
+    assert scale_x.dtype == torch.float32
+    assert scale_w.dtype == torch.float32
+    assert bias.dtype == torch.float16
+
+    M, K = x.shape
+    N = weight_int8.shape[0]
+
+    # Prepare B = weight_int8.T [K, N], contiguous for coalesced loads
+    b = weight_int8.t().contiguous()
+
+    c = torch.empty((M, N), device=x.device, dtype=torch.float16)
+
+    def grid(META):
+        return (
+            max(1, triton.cdiv(M, META["BLOCK_M"])),
+            max(1, triton.cdiv(N, META["BLOCK_N"])),
+        )
+
+    int8_matmul_rowwise_dequant_kernel[grid](
+        x, b, scale_x, scale_w, bias, c,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        b.stride(0), b.stride(1),
+        c.stride(0), c.stride(1),
+        BLOCK_M=64,
+        BLOCK_N=64,
+        BLOCK_K=32,
+        num_warps=4,
+        num_stages=3,
+    )
+
+    return c
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized INT8 MatMul with Row-wise Dequantization.
+
+    Semantics match the reference Model:
+        output = (x.float() @ weight_int8.t().float()) * scale_x * scale_w / (127*127) + bias
+        output is returned as float16.
+    """
+    def __init__(self, in_features=2048, out_features=2048):
+        super(ModelNew, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+
+        # Match original parameter shapes & dtypes for easy state_dict loading
+        self.weight_int8 = nn.Parameter(
+            torch.randint(-128, 127, (out_features, in_features), dtype=torch.int8),
+            requires_grad=False,
+        )
+        self.scale_w = nn.Parameter(
+            torch.randn(out_features, dtype=torch.float32).abs() * 0.01,
+            requires_grad=False,
+        )
+        self.bias = nn.Parameter(
+            torch.randn(out_features, dtype=torch.float16) * 0.01,
+            requires_grad=False,
+        )
+
+    def forward(self, x: torch.Tensor, scale_x: torch.Tensor) -> torch.Tensor:
+        return fused_int8_rowwise_dequant_matmul(
+            x, self.weight_int8, scale_x, self.scale_w, self.bias
+        )
+```
+
+[NCU PROFILING METRICS]
+No NCU metrics available
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+## CRITICAL — Code MUST compile and run:
+1. EVERY kernel function MUST have `@triton.jit` decorator
+2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+3. BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+4. `tl.program_id(axis)` only supports axis = 0, 1, 2
+5. No `continue`, `break`, `return` inside loops — use masking
+6. No tensor indexing with loop vars: `x[:, i]` is INVALID
+7. mask shape MUST match data shape in tl.load/tl.store
+
+## Missing Triton Functions (implement manually):
+- tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+## OUTPUT FORMAT (STRICT):
+1. Imports: torch, torch.nn, triton, triton.language as tl
+2. @triton.jit decorated kernel function(s)
+3. Wrapper function(s) for grid calculation and kernel launch
+4. class ModelNew(nn.Module) that calls your kernels
+
+Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

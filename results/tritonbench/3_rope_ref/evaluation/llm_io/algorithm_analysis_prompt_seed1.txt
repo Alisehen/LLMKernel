@@ -1,0 +1,319 @@
+You are a GPU kernel optimization architect. Analyze the kernel and identify **ONE high-level algorithmic optimization**.
+
+# PyTorch Reference
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    RoPE (Rotary Position Embedding) - PyTorch Reference Implementation
+
+    Rotary Position Embedding applies a rotation to the query and key vectors
+    based on their position in the sequence. This allows the model to naturally
+    encode relative positions.
+
+    Formula:
+        For each position, split the embedding into two halves [x1, x2]
+        Apply rotation: [x1*cos - x2*sin, x2*cos + x1*sin]
+
+    Used in: LLaMA, GPT-J, GPT-NeoX, PaLM, and many modern LLMs
+    """
+    def __init__(self):
+        super(Model, self).__init__()
+
+    def forward(self, q, k, cos, sin):
+        """
+        Apply RoPE to query and key tensors.
+
+        Args:
+            q (torch.Tensor): Query tensor of shape (batch, n_heads, seq_len, head_dim)
+            k (torch.Tensor): Key tensor of shape (batch, n_heads, seq_len, head_dim)
+            cos (torch.Tensor): Cosine values of shape (seq_len, head_dim//2)
+            sin (torch.Tensor): Sine values of shape (seq_len, head_dim//2)
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+                - q_rotated: Rotated query (batch, n_heads, seq_len, head_dim)
+                - k_rotated: Rotated key (batch, n_heads, seq_len, head_dim)
+                - cos: Cosine values (unchanged)
+                - sin: Sine values (unchanged)
+        """
+        # Transpose to (batch, seq_len, n_heads, head_dim) for easier position-wise operation
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+
+        batch_size, seq_len, n_heads, head_dim = q.shape
+        half_dim = head_dim // 2
+
+        # Split into two halves along head_dim
+        q1 = q[..., :half_dim]  # First half
+        q2 = q[..., half_dim:]  # Second half
+        k1 = k[..., :half_dim]
+        k2 = k[..., half_dim:]
+
+        # Reshape cos/sin for broadcasting: (seq_len, head_dim//2) -> (1, seq_len, 1, head_dim//2)
+        cos = cos[:seq_len, :].unsqueeze(0).unsqueeze(2)
+        sin = sin[:seq_len, :].unsqueeze(0).unsqueeze(2)
+
+        # Apply rotation transformation
+        # RoPE formula: rotate_half([x1, x2]) = [x1*cos - x2*sin, x2*cos + x1*sin]
+        q_rotated = torch.cat([
+            q1 * cos - q2 * sin,  # New first half
+            q2 * cos + q1 * sin   # New second half
+        ], dim=-1)
+
+        k_rotated = torch.cat([
+            k1 * cos - k2 * sin,
+            k2 * cos + k1 * sin
+        ], dim=-1)
+
+        # Transpose back to (batch, n_heads, seq_len, head_dim)
+        q_rotated = q_rotated.transpose(1, 2)
+        k_rotated = k_rotated.transpose(1, 2)
+
+        # Return cos/sin as well to match Triton interface
+        return q_rotated, k_rotated, cos.squeeze(0).squeeze(1), sin.squeeze(0).squeeze(1)
+
+
+BATCH_SIZE = 2
+N_HEADS = 8
+SEQ_LEN = 4
+HEAD_DIM = 16
+
+def get_inputs():
+    """
+    Generate test inputs for RoPE.
+
+    Returns:
+        List containing [q, k, cos, sin]:
+            - q: Query tensor (batch, n_heads, seq_len, head_dim)
+            - k: Key tensor (batch, n_heads, seq_len, head_dim)
+            - cos: Cosine values (seq_len, head_dim//2)
+            - sin: Sine values (seq_len, head_dim//2)
+    """
+    q = torch.randn(BATCH_SIZE, N_HEADS, SEQ_LEN, HEAD_DIM, dtype=torch.float32)
+    k = torch.randn(BATCH_SIZE, N_HEADS, SEQ_LEN, HEAD_DIM, dtype=torch.float32)
+    cos = torch.randn(SEQ_LEN, HEAD_DIM // 2, dtype=torch.float32)
+    sin = torch.randn(SEQ_LEN, HEAD_DIM // 2, dtype=torch.float32)
+    return [q, k, cos, sin]
+
+def get_init_inputs():
+    """
+    Get initialization parameters for Model.
+
+    Returns:
+        Empty list (no initialization parameters needed)
+    """
+    return []
+```
+
+# Current Triton Kernel
+```python
+import torch, torch.nn as nn, triton, triton.language as tl
+
+
+@triton.jit
+def rope_kernel(
+    q_ptr, k_ptr, cos_ptr, sin_ptr,
+    q_out_ptr, k_out_ptr,
+    BH, S, D, HALF_D,
+    stride_q0, stride_q1, stride_q2,
+    stride_k0, stride_k1, stride_k2,
+    stride_qo0, stride_qo1, stride_qo2,
+    stride_ko0, stride_ko1, stride_ko2,
+    stride_cos0, stride_cos1,
+    stride_sin0, stride_sin1,
+    BLOCK_D: tl.constexpr,
+):
+    pid_bh = tl.program_id(0)
+    pid_s = tl.program_id(1)
+    pid_block_d = tl.program_id(2)
+
+    offs_d = pid_block_d * BLOCK_D + tl.arange(0, BLOCK_D)
+
+    mask_d = offs_d < HALF_D
+    valid = (pid_bh < BH) & (pid_s < S)
+    mask = mask_d & valid
+
+    # Pointers for q halves
+    q1_ptrs = q_ptr + pid_bh * stride_q0 + pid_s * stride_q1 + offs_d * stride_q2
+    q2_ptrs = q_ptr + pid_bh * stride_q0 + pid_s * stride_q1 + (offs_d + HALF_D) * stride_q2
+
+    # Pointers for k halves
+    k1_ptrs = k_ptr + pid_bh * stride_k0 + pid_s * stride_k1 + offs_d * stride_k2
+    k2_ptrs = k_ptr + pid_bh * stride_k0 + pid_s * stride_k1 + (offs_d + HALF_D) * stride_k2
+
+    # Pointers for cos/sin
+    cos_ptrs = cos_ptr + pid_s * stride_cos0 + offs_d * stride_cos1
+    sin_ptrs = sin_ptr + pid_s * stride_sin0 + offs_d * stride_sin1
+
+    # Load data
+    q1 = tl.load(q1_ptrs, mask=mask, other=0.0)
+    q2 = tl.load(q2_ptrs, mask=mask, other=0.0)
+    k1 = tl.load(k1_ptrs, mask=mask, other=0.0)
+    k2 = tl.load(k2_ptrs, mask=mask, other=0.0)
+
+    cos_vals = tl.load(cos_ptrs, mask=mask, other=0.0)
+    sin_vals = tl.load(sin_ptrs, mask=mask, other=0.0)
+
+    # RoPE rotation
+    q_rot1 = q1 * cos_vals - q2 * sin_vals
+    q_rot2 = q2 * cos_vals + q1 * sin_vals
+
+    k_rot1 = k1 * cos_vals - k2 * sin_vals
+    k_rot2 = k2 * cos_vals + k1 * sin_vals
+
+    # Pointers for output q halves
+    qo1_ptrs = q_out_ptr + pid_bh * stride_qo0 + pid_s * stride_qo1 + offs_d * stride_qo2
+    qo2_ptrs = q_out_ptr + pid_bh * stride_qo0 + pid_s * stride_qo1 + (offs_d + HALF_D) * stride_qo2
+
+    # Pointers for output k halves
+    ko1_ptrs = k_out_ptr + pid_bh * stride_ko0 + pid_s * stride_ko1 + offs_d * stride_ko2
+    ko2_ptrs = k_out_ptr + pid_bh * stride_ko0 + pid_s * stride_ko1 + (offs_d + HALF_D) * stride_ko2
+
+    # Store results
+    tl.store(qo1_ptrs, q_rot1, mask=mask)
+    tl.store(qo2_ptrs, q_rot2, mask=mask)
+    tl.store(ko1_ptrs, k_rot1, mask=mask)
+    tl.store(ko2_ptrs, k_rot2, mask=mask)
+
+
+def rope_triton(q: torch.Tensor, k: torch.Tensor,
+                cos: torch.Tensor, sin: torch.Tensor):
+    """
+    High-performance Triton implementation of RoPE.
+
+    q, k: (B, H, S, D)
+    cos, sin: (S, D//2)
+    """
+    assert q.is_cuda and k.is_cuda and cos.is_cuda and sin.is_cuda
+    assert q.dtype == k.dtype == cos.dtype == sin.dtype
+    assert q.ndim == 4 and k.ndim == 4
+    B, H, S, D = q.shape
+    assert D % 2 == 0
+    HALF_D = D // 2
+
+    # Flatten (B, H, S, D) -> (BH, S, D) for simpler indexing
+    BH = B * H
+    q_flat = q.contiguous().view(BH, S, D)
+    k_flat = k.contiguous().view(BH, S, D)
+
+    # Outputs
+    q_out_flat = torch.empty_like(q_flat)
+    k_out_flat = torch.empty_like(k_flat)
+
+    # Truncate/broadcast cos/sin exactly like reference
+    cos_trunc = cos[:S, :HALF_D].contiguous()
+    sin_trunc = sin[:S, :HALF_D].contiguous()
+
+    grid = lambda META: (
+        BH,
+        S,
+        triton.cdiv(HALF_D, META["BLOCK_D"]),
+    )
+
+    rope_kernel[grid](
+        q_flat, k_flat, cos_trunc, sin_trunc,
+        q_out_flat, k_out_flat,
+        BH, S, D, HALF_D,
+        q_flat.stride(0), q_flat.stride(1), q_flat.stride(2),
+        k_flat.stride(0), k_flat.stride(1), k_flat.stride(2),
+        q_out_flat.stride(0), q_out_flat.stride(1), q_out_flat.stride(2),
+        k_out_flat.stride(0), k_out_flat.stride(1), k_out_flat.stride(2),
+        cos_trunc.stride(0), cos_trunc.stride(1),
+        sin_trunc.stride(0), sin_trunc.stride(1),
+        BLOCK_D=64,
+    )
+
+    # Restore original shape (B, H, S, D)
+    q_rot = q_out_flat.view(B, H, S, D)
+    k_rot = k_out_flat.view(B, H, S, D)
+
+    return q_rot, k_rot, cos_trunc, sin_trunc
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized RoPE module: replaces the PyTorch RoPE in Model.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+
+    def forward(self, q, k, cos, sin):
+        # Inputs are expected in shape (batch, n_heads, seq_len, head_dim)
+        # and cos/sin in (seq_len, head_dim//2), matching the reference.
+        q_rot, k_rot, cos_out, sin_out = rope_triton(
+            q.to(device=cos.device),
+            k.to(device=cos.device),
+            cos,
+            sin,
+        )
+        return q_rot, k_rot, cos_out, sin_out
+```
+
+# Performance
+- **PyTorch baseline**: 0.20 ms
+- **Current Triton**: 0.08 ms
+- **Current speedup**: 2.54x (+60.7% vs baseline)
+
+
+---
+
+## Analysis Steps
+
+1. **Code Analysis**: Count kernels, identify operations, check for inefficiencies
+2. **Performance Diagnosis**: Use metrics/latency to identify bottleneck type
+3. **Root Cause**: Combine code + performance to find the core issue
+
+## Optimization Categories (pick ONE if worth optimizing):
+
+### 1. Operator Fusion
+Fuse consecutive ops into fewer kernels to reduce memory traffic and launch overhead.
+
+### 2. Algorithm Replacement
+Replace naive algorithm with optimized variant.
+- For Attention: Flash Attention, online softmax
+- For Convolution: Winograd, im2col
+- **For RNN/GRU/LSTM**: Persistent kernel with HYBRID computation
+  - **CRITICAL**: Use hybrid approach for best performance:
+    * Precompute input-side gates ONCE (outside kernel): `gates_x = (T*B, In) @ W_ih`
+    * Persistent kernel (inside): only recurrent-side: `for t: gates_h = h @ W_hh`
+  - Time loop `for t in range(T)` must be inside kernel, NOT in Python
+  - Launch kernel once per layer, not once per timestep
+  - Expected speedup: 10-100x (vs per-timestep launches)
+
+### 3. Kernel Launch Reduction
+Combine multiple small kernels to reduce overhead.
+- **For RNN/GRU/LSTM**: See "Algorithm Replacement" above for persistent kernel approach
+
+### 4. Memory Layout Optimization
+Use in-place operations, buffer reuse, or better layouts.
+
+## Should We Optimize?
+
+Before proposing optimization, determine if it's worthwhile:
+- **Not worth optimizing** if:
+  - Code is already near-optimal (expected speedup < 10%)
+  - Bottleneck cannot be addressed (hardware limited, already optimal algorithm)
+  - Optimization would add significant complexity with minimal gain
+
+- **Worth optimizing** if:
+  - Clear algorithmic inefficiency exists (multiple kernels, suboptimal algorithm)
+  - Expected speedup >= 20%
+  - Concrete optimization path available
+
+## Output (JSON)
+
+```json
+{
+  "worth_optimizing": "yes/no",
+  "reason": "<Why worth or not worth optimizing, 1 sentence>",
+  "bottleneck": "<Root cause in 1-2 sentences, empty if not worth optimizing>",
+  "optimisation method": "<Specific optimization in 1-2 sentences, empty if not worth optimizing>",
+  "modification plan": "<Implementation steps in 2-3 sentences, empty if not worth optimizing>",
+  "expected_speedup": "<e.g., '30-40%', empty if not worth optimizing>"
+}
+```
+
+Return JSON only.

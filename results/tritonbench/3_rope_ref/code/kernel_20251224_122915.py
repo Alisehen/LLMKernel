@@ -1,0 +1,187 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def rope_qk_kernel(
+    q_ptr, k_ptr,
+    cos_ptr, sin_ptr,
+    out_q_ptr, out_k_ptr,
+    B, H, S, HALF_DIM,
+    stride_qb, stride_qh, stride_qs, stride_qd,
+    stride_kb, stride_kh, stride_ks, stride_kd,
+    stride_coss, stride_cosd,
+    stride_sins, stride_sind,
+    BLOCK_D: tl.constexpr,
+):
+    """
+    Compute RoPE for Q and K:
+      [x1, x2] -> [x1*cos - x2*sin, x2*cos + x1*sin]
+    Shapes:
+      q, k, out_q, out_k: (B, H, S, D) with D = 2 * HALF_DIM
+      cos, sin: (S, HALF_DIM)
+    Each program instance processes:
+      - one (b, h, s) row (program_id(0))
+      - one tile along HALF_DIM of size BLOCK_D (program_id(1))
+    """
+    pid_row = tl.program_id(0)
+    pid_d = tl.program_id(1)
+
+    bh = B * H
+    seq = S
+    total_rows = bh * seq
+
+    # Map linear pid_row -> (b, h, s)
+    s = pid_row % seq
+    tmp = pid_row // seq
+    h = tmp % H
+    b = tmp // H
+
+    row_mask = pid_row < total_rows
+
+    # Base pointers for this (b, h, s)
+    q_base = q_ptr + b * stride_qb + h * stride_qh + s * stride_qs
+    k_base = k_ptr + b * stride_kb + h * stride_kh + s * stride_ks
+    out_q_base = out_q_ptr + b * stride_qb + h * stride_qh + s * stride_qs
+    out_k_base = out_k_ptr + b * stride_kb + h * stride_kh + s * stride_ks
+
+    cos_base = cos_ptr + s * stride_coss
+    sin_base = sin_ptr + s * stride_sins
+
+    # Offsets within HALF_DIM for this tile
+    offs = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+    mask_d = (offs < HALF_DIM) & row_mask
+
+    # First and second halves for q/k
+    q1_ptrs = q_base + offs * stride_qd
+    q2_ptrs = q_base + (offs + HALF_DIM) * stride_qd
+
+    k1_ptrs = k_base + offs * stride_kd
+    k2_ptrs = k_base + (offs + HALF_DIM) * stride_kd
+
+    cos_ptrs = cos_base + offs * stride_cosd
+    sin_ptrs = sin_base + offs * stride_sind
+
+    # Loads
+    q1 = tl.load(q1_ptrs, mask=mask_d, other=0.0)
+    q2 = tl.load(q2_ptrs, mask=mask_d, other=0.0)
+    k1 = tl.load(k1_ptrs, mask=mask_d, other=0.0)
+    k2 = tl.load(k2_ptrs, mask=mask_d, other=0.0)
+
+    c = tl.load(cos_ptrs, mask=mask_d, other=0.0)
+    s_ = tl.load(sin_ptrs, mask=mask_d, other=0.0)
+
+    # RoPE transform for q
+    q1c = q1 * c
+    q2c = q2 * c
+    q1s = q1 * s_
+    q2s = q2 * s_
+    out_q1 = q1c - q2s
+    out_q2 = q2c + q1s
+
+    # RoPE transform for k
+    k1c = k1 * c
+    k2c = k2 * c
+    k1s = k1 * s_
+    k2s = k2 * s_
+    out_k1 = k1c - k2s
+    out_k2 = k2c + k1s
+
+    # Output pointers
+    out_q1_ptrs = out_q_base + offs * stride_qd
+    out_q2_ptrs = out_q_base + (offs + HALF_DIM) * stride_qd
+
+    out_k1_ptrs = out_k_base + offs * stride_kd
+    out_k2_ptrs = out_k_base + (offs + HALF_DIM) * stride_kd
+
+    # Stores
+    tl.store(out_q1_ptrs, out_q1, mask=mask_d)
+    tl.store(out_q2_ptrs, out_q2, mask=mask_d)
+    tl.store(out_k1_ptrs, out_k1, mask=mask_d)
+    tl.store(out_k2_ptrs, out_k2, mask=mask_d)
+
+
+def fused_rope_qk(q: torch.Tensor,
+                  k: torch.Tensor,
+                  cos: torch.Tensor,
+                  sin: torch.Tensor):
+    """
+    Triton implementation of RoPE on (B, H, S, D) tensors.
+    Matches the semantics of the reference PyTorch implementation.
+
+    Args:
+        q, k: (B, H, S, D), float16/float32, CUDA
+        cos, sin: (S_full, D//2), float16/float32, same device or CPU
+
+    Returns:
+        out_q, out_k: (B, H, S, D)
+        cos_used, sin_used: (S, D//2)
+    """
+    assert q.is_cuda and k.is_cuda, "Inputs must be CUDA tensors"
+    assert q.shape == k.shape, "q and k must have the same shape"
+    B, H, S, D = q.shape
+    assert D % 2 == 0, "head_dim must be even for RoPE"
+    half_dim = D // 2
+
+    # Match reference: truncate cos/sin to sequence length and half-dim
+    cos_used = cos[:S, :half_dim]
+    sin_used = sin[:S, :half_dim]
+
+    # Move to device if needed
+    if cos_used.device != q.device:
+        cos_used = cos_used.to(q.device)
+    if sin_used.device != q.device:
+        sin_used = sin_used.to(q.device)
+
+    # Ensure contiguous layout for faster access
+    q_ = q.contiguous()
+    k_ = k.contiguous()
+    cos_used = cos_used.contiguous()
+    sin_used = sin_used.contiguous()
+
+    out_q = torch.empty_like(q_)
+    out_k = torch.empty_like(k_)
+
+    # Choose BLOCK_D based on half_dim (power-of-2 as required)
+    if half_dim >= 128:
+        block_d = 128
+    elif half_dim >= 64:
+        block_d = 64
+    elif half_dim >= 32:
+        block_d = 32
+    else:
+        block_d = 16
+
+    total_rows = B * H * S
+    num_d_tiles = triton.cdiv(half_dim, block_d)
+    grid = (max(1, total_rows), max(1, num_d_tiles))
+
+    rope_qk_kernel[grid](
+        q_, k_,
+        cos_used, sin_used,
+        out_q, out_k,
+        B, H, S, half_dim,
+        q_.stride(0), q_.stride(1), q_.stride(2), q_.stride(3),
+        k_.stride(0), k_.stride(1), k_.stride(2), k_.stride(3),
+        cos_used.stride(0), cos_used.stride(1),
+        sin_used.stride(0), sin_used.stride(1),
+        BLOCK_D=block_d,
+        num_warps=4,
+        num_stages=2,
+    )
+
+    return out_q, out_k, cos_used, sin_used
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized RoPE module.
+    Operates directly on (batch, n_heads, seq_len, head_dim) tensors.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+
+    def forward(self, q, k, cos, sin):
+        return fused_rope_qk(q, k, cos, sin)

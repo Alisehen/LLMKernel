@@ -1,0 +1,200 @@
+# <complete ModelNew code with optimized Triton kernels>
+
+import math
+import torch, torch.nn as nn, triton, triton.language as tl
+
+
+@triton.jit
+def flash_attn_fwd_kernel(
+    q_ptr, k_ptr, v_ptr, o_ptr,
+    stride_qb, stride_qm, stride_qk,
+    stride_kb, stride_kn, stride_kk,
+    stride_vb, stride_vk, stride_vn,
+    stride_ob, stride_om, stride_ok,
+    sm_scale,
+    N_CTX: tl.constexpr,
+    D_HEAD: tl.constexpr,
+    BLOCK_M: tl.constexpr,  # queries per program
+    BLOCK_N: tl.constexpr,  # keys per tile
+    BLOCK_D: tl.constexpr,  # head dim tile (>= D_HEAD)
+):
+    # program ids
+    pid_m = tl.program_id(0)   # along sequence / queries
+    pid_bh = tl.program_id(1)  # along batch*heads
+
+    # row (query) indices this program will compute
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    # head-dim indices
+    offs_d = tl.arange(0, BLOCK_D)
+
+    # pointers to Q for this (bh, block of queries)
+    q_ptrs = (
+        q_ptr
+        + pid_bh * stride_qb
+        + offs_m[:, None] * stride_qm
+        + offs_d[None, :] * stride_qk
+    )
+    q = tl.load(
+        q_ptrs,
+        mask=(offs_m[:, None] < N_CTX) & (offs_d[None, :] < D_HEAD),
+        other=0.0,
+    )
+    q_dtype = q.dtype
+    q = q.to(tl.float32)
+
+    # initialize online-softmax statistics
+    m_i = tl.full((BLOCK_M,), -float("inf"), dtype=tl.float32)  # running max
+    l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)                # running sum
+    acc = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)        # output accumulator
+
+    # loop over key/value tiles
+    for start_n in range(0, N_CTX, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        kv_mask = offs_n < N_CTX
+
+        # ---- load K tile: shape (D, BLOCK_N) ----
+        k_ptrs = (
+            k_ptr
+            + pid_bh * stride_kb
+            + offs_d[:, None] * stride_kk
+            + offs_n[None, :] * stride_kn
+        )
+        k = tl.load(
+            k_ptrs,
+            mask=(offs_d[:, None] < D_HEAD) & (kv_mask[None, :]),
+            other=0.0,
+        )
+        k = k.to(tl.float32)
+
+        # ---- QK^T for this tile ----
+        # q: (BLOCK_M, BLOCK_D), k: (BLOCK_D, BLOCK_N) -> qk: (BLOCK_M, BLOCK_N)
+        qk = tl.dot(q, k, allow_tf32=True)
+        qk = qk * sm_scale
+
+        # Mask out-of-range keys to -inf so they don't affect softmax
+        qk = tl.where(kv_mask[None, :], qk, -float("inf"))
+
+        # ---- online softmax update ----
+        # tile-wise max
+        m_ij = tl.max(qk, axis=1)
+        m_i_new = tl.maximum(m_i, m_ij)
+
+        # exponentiate scores relative to new max
+        p = tl.exp(qk - m_i_new[:, None])
+        p_sum = tl.sum(p, axis=1)
+
+        # update normalizer
+        alpha = tl.exp(m_i - m_i_new)
+        l_i_new = l_i * alpha + p_sum
+
+        # ---- apply probabilities to V tile ----
+        v_ptrs = (
+            v_ptr
+            + pid_bh * stride_vb
+            + offs_n[:, None] * stride_vk
+            + offs_d[None, :] * stride_vn
+        )
+        v = tl.load(
+            v_ptrs,
+            mask=(kv_mask[:, None]) & (offs_d[None, :] < D_HEAD),
+            other=0.0,
+        )
+        v = v.to(tl.float32)
+
+        # p: (BLOCK_M, BLOCK_N), v: (BLOCK_N, BLOCK_D)
+        pv = tl.dot(p, v, allow_tf32=True)  # (BLOCK_M, BLOCK_D)
+
+        # combine with previous accumulator
+        acc_scale = (l_i * alpha) / l_i_new
+        acc = acc * acc_scale[:, None] + pv / l_i_new[:, None]
+
+        # commit new statistics
+        m_i = m_i_new
+        l_i = l_i_new
+
+    # ---- write output ----
+    o_ptrs = (
+        o_ptr
+        + pid_bh * stride_ob
+        + offs_m[:, None] * stride_om
+        + offs_d[None, :] * stride_ok
+    )
+    out = acc.to(q_dtype)
+    out_mask = (offs_m[:, None] < N_CTX) & (offs_d[None, :] < D_HEAD)
+    tl.store(o_ptrs, out, mask=out_mask)
+
+
+def flash_attn_fwd(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
+    """
+    Fused FlashAttention-style forward:
+    out = softmax(Q @ K^T / sqrt(d)) @ V
+
+    Q, K, V: [B, H, S, D]
+    returns: [B, H, S, D]
+    """
+    assert Q.shape == K.shape == V.shape
+    B, H, S, D = Q.shape
+    BH = B * H
+
+    q = Q.contiguous().view(BH, S, D)
+    k = K.contiguous().view(BH, S, D)
+    v = V.contiguous().view(BH, S, D)
+    out = torch.empty_like(q)
+
+    # strides in elements
+    stride_qb, stride_qm, stride_qk = q.stride()
+    stride_kb, stride_kn, stride_kk = k.stride()
+    stride_vb, stride_vk, stride_vn = v.stride()
+    stride_ob, stride_om, stride_ok = out.stride()
+
+    # block sizes (all powers of two)
+    BLOCK_M = 64
+    BLOCK_N = 64
+    if D <= 32:
+        BLOCK_D = 32
+    elif D <= 64:
+        BLOCK_D = 64
+    elif D <= 128:
+        BLOCK_D = 128
+    else:
+        BLOCK_D = 256  # handle larger heads if needed
+
+    sm_scale = 1.0 / math.sqrt(D)
+
+    grid = (
+        triton.cdiv(S, BLOCK_M),  # number of query blocks
+        BH,                       # batch-head blocks
+    )
+
+    flash_attn_fwd_kernel[grid](
+        q, k, v, out,
+        stride_qb, stride_qm, stride_qk,
+        stride_kb, stride_kn, stride_kk,
+        stride_vb, stride_vk, stride_vn,
+        stride_ob, stride_om, stride_ok,
+        sm_scale,
+        N_CTX=S,
+        D_HEAD=D,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_D=BLOCK_D,
+        num_warps=4,
+        num_stages=2,
+    )
+
+    return out.view(B, H, S, D)
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized scaled dot-product attention:
+    softmax(Q @ K^T / sqrt(d)) @ V
+
+    Matches the behavior of the reference PyTorch Model.forward.
+    """
+
+    def __init__(self):
+        super(ModelNew, self).__init__()
+
+    def forward(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
+        return flash_attn_fwd(Q, K, V)

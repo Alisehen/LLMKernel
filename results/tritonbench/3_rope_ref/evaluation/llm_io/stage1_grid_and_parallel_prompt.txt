@@ -1,0 +1,214 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU: 4090
+
+[OPTIMIZATION STAGE]
+
+## Current Optimization Stage
+
+Focus: Grid layout & indexing for FUSED operations.
+
+Key Principle:
+- All fused ops share the SAME grid AND the SAME (offsets, mask) tuple
+- Grid covers OUTPUT tensor dimensions
+
+Hard Rules:
+- Every fused op MUST use identical offset calculation
+- Every fused op MUST use identical boundary mask
+- If broadcast needed: explicit `[None, :]` or `[:, None]`, NOT different offsets
+- Element-wise: 1D grid, single `offs = pid * BLOCK + tl.arange(0, BLOCK)`
+- Matmul fusion: 2D grid, `offs_m/offs_n` shared by bias add & activation
+
+Verification:
+- Check: all tl.load/tl.store use same `offsets` variable
+- Check: all masks derived from same boundary condition
+- If ANY op needs different indexing → do NOT fuse, split kernel
+
+
+
+[CURRENT CODE]
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def rope_kernel_inplace(
+    q_ptr, k_ptr, cos_ptr, sin_ptr,
+    BH, S, D, HALF_D,
+    stride_q0, stride_q1, stride_q2,
+    stride_k0, stride_k1, stride_k2,
+    stride_cos0, stride_cos1,
+    stride_sin0, stride_sin1,
+    BLOCK_D: tl.constexpr,
+):
+    """
+    In-place RoPE kernel.
+
+    Operates on tensors laid out as (BH, S, D), where BH = B * H.
+    For each (bh, s), rotates the head_dim D using cos/sin of shape (S, D//2).
+
+    Rotation:
+      [x1, x2] -> [x1*cos - x2*sin, x2*cos + x1*sin]
+    where x1/x2 are the first/second halves along D.
+    """
+    pid_bh = tl.program_id(0)
+    pid_s = tl.program_id(1)
+    pid_block_d = tl.program_id(2)
+
+    offs_d = pid_block_d * BLOCK_D + tl.arange(0, BLOCK_D)
+    mask_d = offs_d < HALF_D
+
+    # Only valid if within BH, S ranges
+    valid = (pid_bh < BH) & (pid_s < S)
+    mask = mask_d & valid
+
+    # Base pointers for q/k
+    # q, k: (BH, S, D) with strides (stride_q0, stride_q1, stride_q2)
+    # Split into two halves along D: [0:HALF_D] and [HALF_D:D]
+    q1_ptrs = q_ptr + pid_bh * stride_q0 + pid_s * stride_q1 + offs_d * stride_q2
+    q2_ptrs = q_ptr + pid_bh * stride_q0 + pid_s * stride_q1 + (offs_d + HALF_D) * stride_q2
+
+    k1_ptrs = k_ptr + pid_bh * stride_k0 + pid_s * stride_k1 + offs_d * stride_k2
+    k2_ptrs = k_ptr + pid_bh * stride_k0 + pid_s * stride_k1 + (offs_d + HALF_D) * stride_k2
+
+    # cos/sin: (S, HALF_D) with strides (stride_cos0, stride_cos1)
+    cos_ptrs = cos_ptr + pid_s * stride_cos0 + offs_d * stride_cos1
+    sin_ptrs = sin_ptr + pid_s * stride_sin0 + offs_d * stride_sin1
+
+    # Hint alignment for better codegen on the D dimension
+    tl.multiple_of(offs_d, BLOCK_D)
+
+    # Load q/k halves and cos/sin
+    q1 = tl.load(q1_ptrs, mask=mask, other=0.0)
+    q2 = tl.load(q2_ptrs, mask=mask, other=0.0)
+    k1 = tl.load(k1_ptrs, mask=mask, other=0.0)
+    k2 = tl.load(k2_ptrs, mask=mask, other=0.0)
+
+    cos_vals = tl.load(cos_ptrs, mask=mask, other=0.0)
+    sin_vals = tl.load(sin_ptrs, mask=mask, other=0.0)
+
+    # RoPE rotation in registers
+    q_rot1 = q1 * cos_vals - q2 * sin_vals
+    q_rot2 = q2 * cos_vals + q1 * sin_vals
+
+    k_rot1 = k1 * cos_vals - k2 * sin_vals
+    k_rot2 = k2 * cos_vals + k1 * sin_vals
+
+    # Store results IN-PLACE back to q_ptr / k_ptr
+    tl.store(q1_ptrs, q_rot1, mask=mask)
+    tl.store(q2_ptrs, q_rot2, mask=mask)
+
+    tl.store(k1_ptrs, k_rot1, mask=mask)
+    tl.store(k2_ptrs, k_rot2, mask=mask)
+
+
+def rope_triton(q: torch.Tensor, k: torch.Tensor,
+                cos: torch.Tensor, sin: torch.Tensor):
+    """
+    High-performance Triton implementation of RoPE.
+
+    Inputs:
+      q, k:  (B, H, S, D)
+      cos, sin: (S, D//2)
+
+    Returns:
+      q_rot, k_rot, cos_trunc, sin_trunc
+        q_rot, k_rot: (B, H, S, D), numerically equal to PyTorch reference
+        cos_trunc, sin_trunc: (S, D//2)
+    """
+    assert q.is_cuda and k.is_cuda and cos.is_cuda and sin.is_cuda
+    assert q.dtype == k.dtype == cos.dtype == sin.dtype
+    assert q.ndim == 4 and k.ndim == 4
+
+    B, H, S, D = q.shape
+    assert D % 2 == 0
+    HALF_D = D // 2
+
+    # Flatten (B, H, S, D) -> (BH, S, D) for simpler kernel indexing
+    BH = B * H
+    # Ensure contiguity so that strides match the kernel's expectations
+    q_flat = q.contiguous().view(BH, S, D)
+    k_flat = k.contiguous().view(BH, S, D)
+
+    # Match PyTorch reference truncation/broadcast semantics
+    cos_trunc = cos[:S, :HALF_D].contiguous()
+    sin_trunc = sin[:S, :HALF_D].contiguous()
+
+    # Launch configuration
+    def grid(meta):
+        return (
+            BH,
+            S,
+            triton.cdiv(HALF_D, meta["BLOCK_D"]),
+        )
+
+    rope_kernel_inplace[grid](
+        q_flat, k_flat, cos_trunc, sin_trunc,
+        BH, S, D, HALF_D,
+        q_flat.stride(0), q_flat.stride(1), q_flat.stride(2),
+        k_flat.stride(0), k_flat.stride(1), k_flat.stride(2),
+        cos_trunc.stride(0), cos_trunc.stride(1),
+        sin_trunc.stride(0), sin_trunc.stride(1),
+        BLOCK_D=64,
+    )
+
+    # q_flat / k_flat have been rotated in-place
+    q_rot = q_flat.view(B, H, S, D)
+    k_rot = k_flat.view(B, H, S, D)
+
+    return q_rot, k_rot, cos_trunc, sin_trunc
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized RoPE module: replaces the PyTorch RoPE in Model.
+
+    Behavior:
+      forward(q, k, cos, sin) -> (q_rotated, k_rotated, cos_out, sin_out)
+    Shapes:
+      q, k: (B, H, S, D)
+      cos, sin: (S, D//2)
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+
+    def forward(self, q, k, cos, sin):
+        # Ensure q/k are on the same device as cos/sin
+        dev = cos.device
+        q = q.to(device=dev)
+        k = k.to(device=dev)
+        q_rot, k_rot, cos_out, sin_out = rope_triton(q, k, cos, sin)
+        return q_rot, k_rot, cos_out, sin_out
+```
+
+[NCU PROFILING METRICS]
+No NCU metrics available
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+## CRITICAL — Code MUST compile and run:
+1. EVERY kernel function MUST have `@triton.jit` decorator
+2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+3. BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+4. `tl.program_id(axis)` only supports axis = 0, 1, 2
+5. No `continue`, `break`, `return` inside loops — use masking
+6. No tensor indexing with loop vars: `x[:, i]` is INVALID
+7. mask shape MUST match data shape in tl.load/tl.store
+
+## Missing Triton Functions (implement manually):
+- tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+## OUTPUT FORMAT (STRICT):
+1. Imports: torch, torch.nn, triton, triton.language as tl
+2. @triton.jit decorated kernel function(s)
+3. Wrapper function(s) for grid calculation and kernel launch
+4. class ModelNew(nn.Module) that calls your kernels
+
+Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

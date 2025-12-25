@@ -1,0 +1,289 @@
+```python
+import torch, torch.nn as nn, triton, triton.language as tl
+import math
+
+
+@triton.jit
+def qk_matmul_scaled_kernel(
+    q_ptr, k_ptr, scores_ptr,
+    BH, M, N, D, sm_scale,
+    stride_qb, stride_qm, stride_qk,
+    stride_kb, stride_kn, stride_kk,
+    stride_sb, stride_sm, stride_sn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """
+    Compute scaled Q @ K^T for batched heads:
+    Q: [BH, M, D]
+    K: [BH, N, D]
+    scores: [BH, M, N]
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    pid_b = tl.program_id(2)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Pointers to the first K-tile in K dimension
+    q_ptrs = q_ptr + pid_b * stride_qb \
+             + offs_m[:, None] * stride_qm \
+             + offs_k[None, :] * stride_qk  # (BLOCK_M, BLOCK_K)
+
+    # We load K as shape (BLOCK_K, BLOCK_N) to do Q @ K^T
+    k_ptrs = k_ptr + pid_b * stride_kb \
+             + offs_n[None, :] * stride_kn \
+             + offs_k[:, None] * stride_kk  # (BLOCK_K, BLOCK_N)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k0 in range(0, D, BLOCK_K):
+        k_offsets = k0 + offs_k
+        k_mask = k_offsets < D
+
+        q_mask = (offs_m[:, None] < M) & (k_mask[None, :])
+        k_mask_full = (k_mask[:, None]) & (offs_n[None, :] < N)
+
+        q = tl.load(q_ptrs, mask=q_mask, other=0.0)
+        k_block = tl.load(k_ptrs, mask=k_mask_full, other=0.0)
+
+        acc += tl.dot(q, k_block, allow_tf32=True)
+
+        q_ptrs += BLOCK_K * stride_qk
+        k_ptrs += BLOCK_K * stride_kk
+
+    acc = acc * sm_scale
+
+    scores_ptrs = scores_ptr + pid_b * stride_sb \
+                  + offs_m[:, None] * stride_sm \
+                  + offs_n[None, :] * stride_sn
+
+    out_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(scores_ptrs, acc, mask=out_mask)
+
+
+@triton.jit
+def softmax_kernel(
+    x_ptr,
+    BH, M, N,
+    stride_xb, stride_xm, stride_xn,
+    BLOCK_N: tl.constexpr,
+):
+    """
+    In-place softmax over last dimension N of x: [BH, M, N].
+    One program handles one row (fixed [b, m, :]).
+    """
+    row_id = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_N)
+
+    # Map row_id -> (bh, m)
+    bh = row_id // M
+    m = row_id % M
+
+    row_ptr = x_ptr + bh * stride_xb + m * stride_xm
+
+    # Pass 1: compute max
+    m_i = -float('inf')
+    for n0 in range(0, N, BLOCK_N):
+        offs_n = n0 + offs
+        mask = offs_n < N
+        x = tl.load(row_ptr + offs_n * stride_xn, mask=mask, other=-float('inf'))
+        curr_max = tl.max(x, axis=0)
+        m_i = tl.maximum(m_i, curr_max)
+
+    # Pass 2: compute sum of exp(x - m_i), store exp(x - m_i) to x_ptr
+    l_i = 0.0
+    for n0 in range(0, N, BLOCK_N):
+        offs_n = n0 + offs
+        mask = offs_n < N
+        x = tl.load(row_ptr + offs_n * stride_xn, mask=mask, other=-float('inf'))
+        x = x - m_i
+        p = tl.exp(x)
+        tl.store(row_ptr + offs_n * stride_xn, p, mask=mask)
+        l_i += tl.sum(p, axis=0)
+
+    # Pass 3: normalize
+    inv_l_i = 1.0 / l_i
+    for n0 in range(0, N, BLOCK_N):
+        offs_n = n0 + offs
+        mask = offs_n < N
+        p = tl.load(row_ptr + offs_n * stride_xn, mask=mask, other=0.0)
+        p = p * inv_l_i
+        tl.store(row_ptr + offs_n * stride_xn, p, mask=mask)
+
+
+@triton.jit
+def pv_matmul_kernel(
+    p_ptr, v_ptr, out_ptr,
+    BH, M, N_CTX, D,
+    stride_pb, stride_pm, stride_pk,
+    stride_vb, stride_vk, stride_vn,
+    stride_ob, stride_om, stride_on,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """
+    Compute out = P @ V
+    P: [BH, M, N_CTX]
+    V: [BH, N_CTX, D]
+    out: [BH, M, D]
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    pid_b = tl.program_id(2)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    p_ptrs = p_ptr + pid_b * stride_pb \
+             + offs_m[:, None] * stride_pm \
+             + offs_k[None, :] * stride_pk  # (BLOCK_M, BLOCK_K)
+
+    v_ptrs = v_ptr + pid_b * stride_vb \
+             + offs_k[:, None] * stride_vk \
+             + offs_n[None, :] * stride_vn  # (BLOCK_K, BLOCK_N)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k0 in range(0, N_CTX, BLOCK_K):
+        k_offsets = k0 + offs_k
+        k_mask = k_offsets < N_CTX
+
+        p_mask = (offs_m[:, None] < M) & (k_mask[None, :])
+        v_mask = (k_mask[:, None]) & (offs_n[None, :] < D)
+
+        p_block = tl.load(p_ptrs, mask=p_mask, other=0.0)
+        v_block = tl.load(v_ptrs, mask=v_mask, other=0.0)
+
+        acc += tl.dot(p_block, v_block, allow_tf32=True)
+
+        p_ptrs += BLOCK_K * stride_pk
+        v_ptrs += BLOCK_K * stride_vk
+
+    out_ptrs = out_ptr + pid_b * stride_ob \
+               + offs_m[:, None] * stride_om \
+               + offs_n[None, :] * stride_on
+
+    out_mask = (offs_m[:, None] < M) & (offs_n[None, :] < D)
+    tl.store(out_ptrs, acc, mask=out_mask)
+
+
+def qk_matmul_scaled(Q, K):
+    """
+    Q, K: [B, H, S, D]
+    returns scores: [B, H, S, S]
+    """
+    B, H, S, D = Q.shape
+    BH = B * H
+    device = Q.device
+
+    q = Q.contiguous().view(BH, S, D)
+    k = K.contiguous().view(BH, S, D)
+    scores = torch.empty((BH, S, S), device=device, dtype=Q.dtype)
+
+    stride_qb, stride_qm, stride_qk = q.stride()
+    stride_kb, stride_kn, stride_kk = k.stride()
+    stride_sb, stride_sm, stride_sn = scores.stride()
+
+    sm_scale = 1.0 / math.sqrt(D)
+
+    BLOCK_M = 64
+    BLOCK_N = 64
+    BLOCK_K = 64
+
+    grid = lambda META: (
+        triton.cdiv(S, META['BLOCK_M']),
+        triton.cdiv(S, META['BLOCK_N']),
+        BH,
+    )
+
+    qk_matmul_scaled_kernel[grid](
+        q, k, scores,
+        BH, S, S, D, sm_scale,
+        stride_qb, stride_qm, stride_qk,
+        stride_kb, stride_kn, stride_kk,
+        stride_sb, stride_sm, stride_sn,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+    )
+
+    return scores.view(B, H, S, S)
+
+
+def softmax_inplace_last_dim(x):
+    """
+    In-place softmax over last dim of x: [B, H, S, S]
+    """
+    B, H, M, N = x.shape
+    BH = B * H
+    x_ = x.view(BH, M, N)
+
+    stride_xb, stride_xm, stride_xn = x_.stride()
+    BLOCK_N = 128
+
+    num_rows = BH * M
+    grid = lambda META: (triton.cdiv(num_rows, 1),)
+
+    softmax_kernel[grid](
+        x_,
+        BH, M, N,
+        stride_xb, stride_xm, stride_xn,
+        BLOCK_N=BLOCK_N,
+    )
+
+
+def pv_matmul(P, V):
+    """
+    P: [B, H, S, S] (softmaxed attention)
+    V: [B, H, S, D]
+    returns: [B, H, S, D]
+    """
+    B, H, M, N_CTX = P.shape
+    _, _, _, D = V.shape
+    BH = B * H
+    device = P.device
+
+    p = P.contiguous().view(BH, M, N_CTX)
+    v = V.contiguous().view(BH, N_CTX, D)
+    out = torch.empty((BH, M, D), device=device, dtype=P.dtype)
+
+    stride_pb, stride_pm, stride_pk = p.stride()
+    stride_vb, stride_vk, stride_vn = v.stride()
+    stride_ob, stride_om, stride_on = out.stride()
+
+    BLOCK_M = 64
+    BLOCK_N = 64
+    BLOCK_K = 64
+
+    grid = lambda META: (
+        triton.cdiv(M, META['BLOCK_M']),
+        triton.cdiv(D, META['BLOCK_N']),
+        BH,
+    )
+
+    pv_matmul_kernel[grid](
+        p, v, out,
+        BH, M, N_CTX, D,
+        stride_pb, stride_pm, stride_pk,
+        stride_vb, stride_vk, stride_vn,
+        stride_ob, stride_om, stride_on,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+    )
+
+    return out.view(B, H, M, D)
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized scaled dot-product attention:
+    softmax(Q @ K^T / sqrt(d)) @ V
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+
+    def forward(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
+        scores = qk_matmul_scaled(Q, K)
+        softmax_inplace_last_dim(scores)
+        out = pv_matmul(scores, V)
+        return out
+```

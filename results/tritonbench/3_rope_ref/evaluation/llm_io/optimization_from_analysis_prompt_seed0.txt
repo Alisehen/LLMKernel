@@ -1,0 +1,328 @@
+You are optimizing a Triton kernel based on algorithmic analysis.
+
+# PyTorch Reference (Target Behavior)
+
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    RoPE (Rotary Position Embedding) - PyTorch Reference Implementation
+
+    Rotary Position Embedding applies a rotation to the query and key vectors
+    based on their position in the sequence. This allows the model to naturally
+    encode relative positions.
+
+    Formula:
+        For each position, split the embedding into two halves [x1, x2]
+        Apply rotation: [x1*cos - x2*sin, x2*cos + x1*sin]
+
+    Used in: LLaMA, GPT-J, GPT-NeoX, PaLM, and many modern LLMs
+    """
+    def __init__(self):
+        super(Model, self).__init__()
+
+    def forward(self, q, k, cos, sin):
+        """
+        Apply RoPE to query and key tensors.
+
+        Args:
+            q (torch.Tensor): Query tensor of shape (batch, n_heads, seq_len, head_dim)
+            k (torch.Tensor): Key tensor of shape (batch, n_heads, seq_len, head_dim)
+            cos (torch.Tensor): Cosine values of shape (seq_len, head_dim//2)
+            sin (torch.Tensor): Sine values of shape (seq_len, head_dim//2)
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+                - q_rotated: Rotated query (batch, n_heads, seq_len, head_dim)
+                - k_rotated: Rotated key (batch, n_heads, seq_len, head_dim)
+                - cos: Cosine values (unchanged)
+                - sin: Sine values (unchanged)
+        """
+        # Transpose to (batch, seq_len, n_heads, head_dim) for easier position-wise operation
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+
+        batch_size, seq_len, n_heads, head_dim = q.shape
+        half_dim = head_dim // 2
+
+        # Split into two halves along head_dim
+        q1 = q[..., :half_dim]  # First half
+        q2 = q[..., half_dim:]  # Second half
+        k1 = k[..., :half_dim]
+        k2 = k[..., half_dim:]
+
+        # Reshape cos/sin for broadcasting: (seq_len, head_dim//2) -> (1, seq_len, 1, head_dim//2)
+        cos = cos[:seq_len, :].unsqueeze(0).unsqueeze(2)
+        sin = sin[:seq_len, :].unsqueeze(0).unsqueeze(2)
+
+        # Apply rotation transformation
+        # RoPE formula: rotate_half([x1, x2]) = [x1*cos - x2*sin, x2*cos + x1*sin]
+        q_rotated = torch.cat([
+            q1 * cos - q2 * sin,  # New first half
+            q2 * cos + q1 * sin   # New second half
+        ], dim=-1)
+
+        k_rotated = torch.cat([
+            k1 * cos - k2 * sin,
+            k2 * cos + k1 * sin
+        ], dim=-1)
+
+        # Transpose back to (batch, n_heads, seq_len, head_dim)
+        q_rotated = q_rotated.transpose(1, 2)
+        k_rotated = k_rotated.transpose(1, 2)
+
+        # Return cos/sin as well to match Triton interface
+        return q_rotated, k_rotated, cos.squeeze(0).squeeze(1), sin.squeeze(0).squeeze(1)
+
+
+BATCH_SIZE = 2
+N_HEADS = 8
+SEQ_LEN = 4
+HEAD_DIM = 16
+
+def get_inputs():
+    """
+    Generate test inputs for RoPE.
+
+    Returns:
+        List containing [q, k, cos, sin]:
+            - q: Query tensor (batch, n_heads, seq_len, head_dim)
+            - k: Key tensor (batch, n_heads, seq_len, head_dim)
+            - cos: Cosine values (seq_len, head_dim//2)
+            - sin: Sine values (seq_len, head_dim//2)
+    """
+    q = torch.randn(BATCH_SIZE, N_HEADS, SEQ_LEN, HEAD_DIM, dtype=torch.float32)
+    k = torch.randn(BATCH_SIZE, N_HEADS, SEQ_LEN, HEAD_DIM, dtype=torch.float32)
+    cos = torch.randn(SEQ_LEN, HEAD_DIM // 2, dtype=torch.float32)
+    sin = torch.randn(SEQ_LEN, HEAD_DIM // 2, dtype=torch.float32)
+    return [q, k, cos, sin]
+
+def get_init_inputs():
+    """
+    Get initialization parameters for Model.
+
+    Returns:
+        Empty list (no initialization parameters needed)
+    """
+    return []
+```
+
+**CRITICAL**: Study the PyTorch code carefully to understand:
+- What does `forward()` return? (full output sequence vs final hidden state only)
+- What is the computational pattern?
+- What are the input/output shapes?
+
+Your optimized kernel MUST match this exact behavior.
+
+---
+
+# Analysis Results
+
+**Bottleneck**: The current Triton kernel fully materializes rotated q_rotated and k_rotated in global memory before they are consumed by the attention matmul, doubling Q/K-related memory traffic and adding an extra kernel launch in the attention pipeline; this is characteristic of a memory‑bound stage where extra reads/writes dominate.
+
+**Optimization Strategy**: Fuse RoPE directly into the attention (QKᵀ / FlashAttention) kernel so that Q/K tiles are loaded once from memory, rotated in registers using cos/sin, and immediately used in the dot-product accumulation without writing q_rotated/k_rotated back to global memory.
+
+**Implementation Plan**: Refactor the attention kernel so that, for each tile, it loads raw Q/K vectors and the corresponding cos/sin slice, applies the RoPE rotation in registers (or shared memory) just before the dot-product, and accumulates into the attention scores without ever storing rotated Q/K. Remove or bypass the standalone fused_rope_qk call, passing the original Q/K and cos/sin tensors directly to the fused attention+RoPE kernel. Ensure the new kernel preserves broadcasting semantics over (B, H, S, D), handles partial tiles, and is wired into the model in place of both the RoPE and pre-existing attention kernels.
+
+**Expected Speedup**: 30-40%
+
+---
+
+# Current Kernel (needs optimization)
+
+```python
+import torch, torch.nn as nn, triton, triton.language as tl
+
+
+@triton.jit
+def rope_qk_kernel(
+    q_ptr, k_ptr,
+    cos_ptr, sin_ptr,
+    out_q_ptr, out_k_ptr,
+    B, H, S, HEAD_DIM, HALF_DIM,
+    stride_qb, stride_qh, stride_qs, stride_qd,
+    stride_kb, stride_kh, stride_ks, stride_kd,
+    stride_coss, stride_cosd,
+    stride_sins, stride_sind,
+    BLOCK_D: tl.constexpr,
+):
+    pid_bh = tl.program_id(0)
+    pid_s = tl.program_id(1)
+
+    bh = B * H
+    in_bounds_bh = pid_bh < bh
+    in_bounds_s = pid_s < S
+    row_mask = in_bounds_bh & in_bounds_s
+
+    # Compute batch and head indices from flattened bh index
+    b = pid_bh // H
+    h = pid_bh - b * H
+
+    # Base pointers for this (b, h, s) row
+    q_base = q_ptr + b * stride_qb + h * stride_qh + pid_s * stride_qs
+    k_base = k_ptr + b * stride_kb + h * stride_kh + pid_s * stride_ks
+
+    out_q_base = out_q_ptr + b * stride_qb + h * stride_qh + pid_s * stride_qs
+    out_k_base = out_k_ptr + b * stride_kb + h * stride_kh + pid_s * stride_ks
+
+    cos_base = cos_ptr + pid_s * stride_coss
+    sin_base = sin_ptr + pid_s * stride_sins
+
+    # Loop over half-dimension tiles
+    for d0 in range(0, HALF_DIM, BLOCK_D):
+        offs = d0 + tl.arange(0, BLOCK_D)
+        mask_d = row_mask & (offs < HALF_DIM)
+
+        # Pointers for first and second halves of q and k
+        q1_ptrs = q_base + offs * stride_qd
+        q2_ptrs = q_base + (offs + HALF_DIM) * stride_qd
+
+        k1_ptrs = k_base + offs * stride_kd
+        k2_ptrs = k_base + (offs + HALF_DIM) * stride_kd
+
+        # Cos/Sin pointers
+        cos_ptrs = cos_base + offs * stride_cosd
+        sin_ptrs = sin_base + offs * stride_sind
+
+        # Loads
+        q1 = tl.load(q1_ptrs, mask=mask_d, other=0.0)
+        q2 = tl.load(q2_ptrs, mask=mask_d, other=0.0)
+        k1 = tl.load(k1_ptrs, mask=mask_d, other=0.0)
+        k2 = tl.load(k2_ptrs, mask=mask_d, other=0.0)
+
+        c = tl.load(cos_ptrs, mask=mask_d, other=0.0)
+        s = tl.load(sin_ptrs, mask=mask_d, other=0.0)
+
+        # RoPE transform for q
+        q1c = q1 * c
+        q2c = q2 * c
+        q1s = q1 * s
+        q2s = q2 * s
+        out_q1 = q1c - q2s
+        out_q2 = q2c + q1s
+
+        # RoPE transform for k
+        k1c = k1 * c
+        k2c = k2 * c
+        k1s = k1 * s
+        k2s = k2 * s
+        out_k1 = k1c - k2s
+        out_k2 = k2c + k1s
+
+        # Output pointers
+        out_q1_ptrs = out_q_base + offs * stride_qd
+        out_q2_ptrs = out_q_base + (offs + HALF_DIM) * stride_qd
+
+        out_k1_ptrs = out_k_base + offs * stride_kd
+        out_k2_ptrs = out_k_base + (offs + HALF_DIM) * stride_kd
+
+        # Stores
+        tl.store(out_q1_ptrs, out_q1, mask=mask_d)
+        tl.store(out_q2_ptrs, out_q2, mask=mask_d)
+        tl.store(out_k1_ptrs, out_k1, mask=mask_d)
+        tl.store(out_k2_ptrs, out_k2, mask=mask_d)
+
+
+def fused_rope_qk(q: torch.Tensor,
+                  k: torch.Tensor,
+                  cos: torch.Tensor,
+                  sin: torch.Tensor):
+    """
+    Triton implementation of RoPE on (B, H, S, D) tensors.
+    Matches the semantics of the reference PyTorch implementation.
+    """
+    assert q.is_cuda and k.is_cuda, "Inputs must be CUDA tensors"
+    assert q.shape == k.shape, "q and k must have the same shape"
+    B, H, S, D = q.shape
+    assert D % 2 == 0, "head_dim must be even for RoPE"
+    half_dim = D // 2
+
+    # Match reference: truncate cos/sin to sequence length
+    cos_used = cos[:S, :half_dim]
+    sin_used = sin[:S, :half_dim]
+
+    # Ensure devices match
+    cos_used = cos_used.to(q.device)
+    sin_used = sin_used.to(q.device)
+
+    out_q = torch.empty_like(q)
+    out_k = torch.empty_like(k)
+
+    grid = lambda META: (max(1, B * H), max(1, S))
+
+    rope_qk_kernel[grid](
+        q, k,
+        cos_used, sin_used,
+        out_q, out_k,
+        B, H, S, D, half_dim,
+        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+        cos_used.stride(0), cos_used.stride(1),
+        sin_used.stride(0), sin_used.stride(1),
+        BLOCK_D=64,
+    )
+
+    return out_q, out_k, cos_used, sin_used
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized RoPE module.
+    Operates directly on (batch, n_heads, seq_len, head_dim) tensors.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+
+    def forward(self, q, k, cos, sin):
+        return fused_rope_qk(q, k, cos, sin)
+```
+
+---
+
+# Your Task
+
+Implement the optimization strategy above. Focus on the specific bottleneck identified.
+
+## Key Requirements
+
+1. **Preserve correctness**: Maintain the same input/output behavior
+2. **Apply the optimization**: Follow the implementation plan exactly
+3. **Use valid Triton syntax**:
+   - Every kernel MUST have `@triton.jit` decorator
+   - Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+   - BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+   - No `continue`, `break`, `return` inside kernels (use masking)
+   - Prefer `tl.dot(a, b, allow_tf32=True)` for matmul operations
+
+4. **CRITICAL for RNN/GRU/LSTM Persistent Kernels**:
+   - Time loop MUST be inside @triton.jit kernel, NOT in Python forward()
+   - **HYBRID computation strategy** (CRITICAL for performance):
+     * Precompute input-side gates OUTSIDE kernel: `gates_x = (T*B, In) @ W_ih` (ONE large GEMM)
+     * INSIDE kernel: only recurrent-side: `for t: gates_h = h @ W_hh` (T small GEMMs)
+   - CORRECT (FAST - use this):
+     ```python
+     # Python forward():
+     gates_x_all = x.reshape(T*B, In) @ W_ih + b_ih  # ONE large GEMM
+     gates_x_all = gates_x_all.view(T, B, 3*H)
+     gru_persistent_kernel[grid](gates_x_all, h0, W_hh, ...)  # Launch ONCE
+
+     @triton.jit
+     def gru_persistent_kernel(gates_x_ptr, h_ptr, W_hh_ptr, ...):
+         for t in range(T):  # Inside kernel
+             gates_x_t = tl.load(gates_x_ptr + t*...)  # Precomputed
+             gates_h = h @ W_hh  # Only recurrent GEMM
+             h = (1-z)*n + z*h   # Fuse and update
+     ```
+
+5. **Output format**:
+   - Imports: `import torch, torch.nn as nn, triton, triton.language as tl`
+   - `@triton.jit` kernel(s)
+   - Wrapper function(s)
+   - `class ModelNew(nn.Module)` — REQUIRED
+   - NO testing code, NO `if __name__ == "__main__"`
+
+---
+
+Generate the optimized kernel now. Output ONLY the complete Python code.

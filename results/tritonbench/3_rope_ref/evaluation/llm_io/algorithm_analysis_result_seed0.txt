@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "RoPE is a purely elementwise transform on Q/K and is currently run as a standalone kernel, so it introduces extra global memory traffic and a launch that can be eliminated by fusion.",
+  "bottleneck": "The current Triton kernel fully materializes rotated q_rotated and k_rotated in global memory before they are consumed by the attention matmul, doubling Q/K-related memory traffic and adding an extra kernel launch in the attention pipeline; this is characteristic of a memory‑bound stage where extra reads/writes dominate.",
+  "optimisation method": "Fuse RoPE directly into the attention (QKᵀ / FlashAttention) kernel so that Q/K tiles are loaded once from memory, rotated in registers using cos/sin, and immediately used in the dot-product accumulation without writing q_rotated/k_rotated back to global memory.",
+  "modification plan": "Refactor the attention kernel so that, for each tile, it loads raw Q/K vectors and the corresponding cos/sin slice, applies the RoPE rotation in registers (or shared memory) just before the dot-product, and accumulates into the attention scores without ever storing rotated Q/K. Remove or bypass the standalone fused_rope_qk call, passing the original Q/K and cos/sin tensors directly to the fused attention+RoPE kernel. Ensure the new kernel preserves broadcasting semantics over (B, H, S, D), handles partial tiles, and is wired into the model in place of both the RoPE and pre-existing attention kernels.",
+  "expected_speedup": "30-40%"
+}

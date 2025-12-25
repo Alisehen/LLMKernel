@@ -546,7 +546,8 @@ def compare_and_bench(
             ref_out,  _ = _run_once(ref_model,  inp, dev)
             if TORCH_DEVICE == "cuda":
                 torch.cuda.synchronize(dev)
-            # 将 ref_out 移到 CPU，释放 GPU 内存给 test_model
+            # 先提取 tensor，再将 ref_out 移到 CPU，释放 GPU 内存给 test_model
+            ref_out = _first_tensor(ref_out).contiguous()
             ref_out_cpu = ref_out.cpu()
             del ref_out
             torch.cuda.empty_cache()
@@ -558,7 +559,6 @@ def compare_and_bench(
             ref_out = ref_out_cpu
 
             # 统一取 Tensor、保证连续
-            ref_out  = _first_tensor(ref_out).contiguous()
             test_out = _first_tensor(test_out).contiguous()
             if ref_out.dtype != test_out.dtype:
                 test_out = test_out.to(ref_out.dtype)

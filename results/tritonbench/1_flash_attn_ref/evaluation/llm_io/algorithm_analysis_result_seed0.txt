@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The current Triton implementation still materializes the full [B, H, S, S] scores tensor and uses three separate kernels, leaving a clear opportunity to apply a true FlashAttention-style algorithm.",
+  "bottleneck": "The main bottleneck is quadratic global memory traffic to read/write the scores tensor and the separation of QK^T, softmax, and PV into distinct kernels. This wastes bandwidth and launch overhead compared to an on-chip, streaming attention algorithm.",
+  "optimisation method": "Replace the three-kernel pipeline (qk_matmul_scaled → softmax_inplace_last_dim → pv_matmul) with a single fused FlashAttention-style kernel that performs tiled QK^T, online softmax, and PV in one pass without ever materializing the scores matrix in global memory.",
+  "modification plan": "Implement a Triton kernel that, for each block of queries, iterates over K/V in tiles: (1) compute partial QK^T for the tile, (2) update per-row running max and normalization factor using online softmax formulas, and (3) update the output accumulation P@V in registers/SMEM. At the end of the loop over K/V tiles, write only the final output [B, H, S, D] to global memory, eliminating the scores buffer and the separate softmax and PV matmul kernels.",
+  "expected_speedup": "30-40%"
+}
