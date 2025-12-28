@@ -1,0 +1,210 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def conv2d_div_leakyrelu_kernel(
+    x_ptr, w_ptr, bias_ptr, y_ptr,
+    divisor, negative_slope,
+    N, C_in,
+    H_in, W_in,
+    C_out, H_out, W_out,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_wn, stride_wc, stride_wk, stride_wl,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    K_total,
+    KERNEL_SIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """
+    Implicit-GEMM 2D convolution with fused divide and LeakyReLU.
+
+    x:      (N, C_in, H_in, W_in)
+    w:      (C_out, C_in, KERNEL_SIZE, KERNEL_SIZE)
+    bias:   (C_out,)
+    y:      (N, C_out, H_out, W_out), where H_out = H_in - KERNEL_SIZE + 1, similarly for W_out.
+    """
+
+    pid_m = tl.program_id(0)  # along flattened output positions (N * H_out * W_out)
+    pid_n = tl.program_id(1)  # along output channels
+
+    # Offsets in the flattened M and N dimensions
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    M = N * H_out * W_out
+
+    mask_m = offs_m < M
+    mask_n = offs_n < C_out
+
+    # Decode flattened output index m -> (n_idx, oh_idx, ow_idx)
+    tmp = offs_m
+    hw_out = H_out * W_out
+    n_idx = tmp // hw_out
+    tmp = tmp % hw_out
+    oh_idx = tmp // W_out
+    ow_idx = tmp % W_out
+
+    # Prepare K offsets
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Accumulator in FP32 for better numeric stability
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    KS = KERNEL_SIZE
+    KS2 = KS * KS
+
+    for k_start in range(0, K_total, BLOCK_K):
+        k_offsets = k_start + offs_k  # [BLOCK_K]
+        mask_k = k_offsets < K_total
+
+        # Map flattened k index -> (c_idx, kh_idx, kw_idx)
+        c_idx = k_offsets // KS2
+        rem = k_offsets % KS2
+        kh_idx = rem // KS
+        kw_idx = rem % KS
+
+        # Broadcast indices for input (A matrix: [M, K])
+        n_b = n_idx[:, None]
+        oh_b = oh_idx[:, None]
+        ow_b = ow_idx[:, None]
+
+        c_b = c_idx[None, :]
+        kh_b = kh_idx[None, :]
+        kw_b = kw_idx[None, :]
+
+        # Compute input pointers
+        x_ptrs = (
+            x_ptr
+            + n_b * stride_xn
+            + c_b * stride_xc
+            + (oh_b + kh_b) * stride_xh
+            + (ow_b + kw_b) * stride_xw
+        )
+
+        # Bounds mask for input (for generality; always true for valid conv w/o padding)
+        in_bounds_h = (oh_b + kh_b) < H_in
+        in_bounds_w = (ow_b + kw_b) < W_in
+        mask_hw = in_bounds_h & in_bounds_w
+
+        mask_a = mask_m[:, None] & mask_k[None, :] & mask_hw
+
+        a = tl.load(x_ptrs, mask=mask_a, other=0.0)
+
+        # Weight (B matrix: [K, C_out])
+        w_ptrs = (
+            w_ptr
+            + offs_n[None, :] * stride_wn
+            + c_idx[:, None] * stride_wc
+            + kh_idx[:, None] * stride_wk
+            + kw_idx[:, None] * stride_wl
+        )
+
+        mask_b = mask_k[:, None] & mask_n[None, :]
+        b = tl.load(w_ptrs, mask=mask_b, other=0.0)
+
+        # Accumulate with tensor cores if available
+        a_fp32 = a.to(tl.float32)
+        b_fp32 = b.to(tl.float32)
+        acc += tl.dot(a_fp32, b_fp32, allow_tf32=True)
+
+    # Add bias
+    bias_vals = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0)
+    acc += bias_vals[None, :]
+
+    # Divide by constant
+    inv_div = 1.0 / divisor
+    acc = acc * inv_div
+
+    # LeakyReLU
+    acc = tl.where(acc >= 0, acc, acc * negative_slope)
+
+    # Store to output
+    n_b = n_idx[:, None]
+    oh_b = oh_idx[:, None]
+    ow_b = ow_idx[:, None]
+
+    y_ptrs = (
+        y_ptr
+        + n_b * stride_yn
+        + offs_n[None, :] * stride_yc
+        + oh_b * stride_yh
+        + ow_b * stride_yw
+    )
+    mask_store = mask_m[:, None] & mask_n[None, :]
+    tl.store(y_ptrs, acc, mask=mask_store)
+
+
+def conv2d_div_leakyrelu(x, weight, bias, divisor, negative_slope=0.01):
+    """
+    Wrapper around the Triton kernel implementing:
+      y = LeakyReLU( conv2d(x, weight, bias) / divisor )
+    for stride=1, padding=0, dilation=1, groups=1.
+    """
+    assert x.dim() == 4, "Input must be NCHW"
+    N, C_in, H_in, W_in = x.shape
+    C_out, Cw_in, KH, KW = weight.shape
+    assert C_in == Cw_in, "Incompatible in_channels between input and weight"
+    assert KH == KW, "Only square kernels are supported in this kernel"
+    KS = KH
+
+    # Valid convolution: no padding, stride 1
+    H_out = H_in - KS + 1
+    W_out = W_in - KS + 1
+    assert H_out > 0 and W_out > 0, "Kernel larger than input with no padding"
+
+    y = torch.empty((N, C_out, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    K_total = C_in * KS * KS
+
+    grid = lambda META: (
+        triton.cdiv(N * H_out * W_out, META["BLOCK_M"]),
+        triton.cdiv(C_out, META["BLOCK_N"]),
+    )
+
+    conv2d_div_leakyrelu_kernel[grid](
+        x, weight, bias, y,
+        float(divisor), float(negative_slope),
+        N, C_in,
+        H_in, W_in,
+        C_out, H_out, W_out,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        weight.stride(0), weight.stride(1), weight.stride(2), weight.stride(3),
+        y.stride(0), y.stride(1), y.stride(2), y.stride(3),
+        K_total,
+        KERNEL_SIZE=KS,
+        BLOCK_M=64, BLOCK_N=64, BLOCK_K=32,
+        num_warps=4,
+        num_stages=2,
+    )
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized version of:
+      Conv2d -> divide by constant -> LeakyReLU
+    (stride=1, padding=0, dilation=1, groups=1)
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size, divisor):
+        super(ModelNew, self).__init__()
+        if isinstance(kernel_size, tuple):
+            assert kernel_size[0] == kernel_size[1], "Only square kernels supported"
+            k = kernel_size[0]
+        else:
+            k = kernel_size
+
+        self.weight = nn.Parameter(
+            torch.randn(out_channels, in_channels, k, k)
+        )
+        self.bias = nn.Parameter(torch.randn(out_channels))
+        self.divisor = float(divisor)
+        self.negative_slope = 0.01
+
+    def forward(self, x):
+        return conv2d_div_leakyrelu(
+            x, self.weight, self.bias, self.divisor, self.negative_slope
+        )

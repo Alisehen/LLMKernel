@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The current implementation fully materializes the [M, N] GEMM output and then rereads it for reduction/activation, causing heavy, avoidable memory traffic and extra launches.",
+  "bottleneck": "After GEMM, the kernel writes the entire [M, N] matrix to global memory, then performs separate max-reduction and mean+GELU passes that reread the same data even though the final result only needs a [M, 1] (or [1, N]) tensor. This makes the workload memory-bound and launch-heavy instead of compute-bound.",
+  "optimisation method": "Fuse the GEMM with the max reduction and subsequent mean+GELU into a single Triton kernel that computes the per-row (or per-column) max on the fly during accumulation, immediately applies the mean-subtraction and GELU in registers, and only writes the final reduced tensor, never materializing the full [M, N] output.",
+  "modification_plan": "Replace `linear_gemm_kernel` + `triton_max_reduce` + `triton_mean_sub_gelu` with one fused kernel. In that kernel, tile over M, N, K as in GEMM; for each row (or column) in the tile, track a scalar running max as you accumulate partial dot-products, without storing intermediate outputs. After processing all K and N tiles, for each row/column compute its mean (over the keepdim dimension), subtract it, apply GELU in-place in registers, and write only the final [M, 1] or [1, N] result to global memory. Update `ModelNew.forward` to call just this fused kernel instead of three separate Triton calls.",
+  "expected_speedup": "40-60%"
+}

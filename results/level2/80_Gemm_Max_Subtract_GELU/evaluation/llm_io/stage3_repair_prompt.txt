@@ -1,0 +1,409 @@
+Fix the Triton kernel errors. Generate correct code.
+
+## ERROR LOG
+```
+Traceback (most recent call last):
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 43, in wrapper
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 2865, in multiple_of
+    return _semantic.multiple_of(input, values)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/semantic.py", line 1780, in multiple_of
+    raise ValueError("Shape of input to multiple_of does not match the length of values")
+ValueError: Shape of input to multiple_of does not match the length of values
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 555, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251228_161811_batch_range79to85_openai_deepseek/80_Gemm_Max_Subtract_GELU/code/kernel_20251228_164820.py", line 296, in forward
+    _ = fused_linear(x, weight_t, self.gemm.bias)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251228_161811_batch_range79to85_openai_deepseek/80_Gemm_Max_Subtract_GELU/code/kernel_20251228_164820.py", line 167, in fused_linear
+    linear_gemm_bias_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 419, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 238, in run
+    benchmark()
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 227, in benchmark
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 227, in <dictcomp>
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 162, in _bench
+    return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/testing.py", line 149, in do_bench
+    fn()
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 148, in kernel_call
+    self.fn.run(
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 733, in run
+    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 861, in _do_compile
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 300, in compile
+    module = src.make_ir(target, options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 80, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 50:4:
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Give Triton alignment / divisibility hints for better vectorization
+    tl.multiple_of(offs_m, BLOCK_M)
+    tl.multiple_of(offs_n, BLOCK_N)
+    tl.multiple_of(offs_k, BLOCK_K)
+
+    # Initial pointers for tiles
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    w_ptrs = w_ptr + offs_k[:, None] * stride_wk + offs_n[None, :] * stride_wn
+
+    tl.multiple_of(a_ptrs, 16)
+    ^
+Shape of input to multiple_of does not match the length of values
+```
+
+## Broken Code
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+# -----------------------
+# GEMM + Bias kernel
+# -----------------------
+
+
+@triton.autotune(
+    configs=[
+        # Conservative baseline: good occupancy, low register pressure
+        triton.Config(
+            {
+                "BLOCK_M": 64,
+                "BLOCK_N": 64,
+                "BLOCK_K": 32,
+                "GROUP_M": 8,
+            },
+            num_warps=4,
+            num_stages=2,
+        ),
+        # Wider N tile – better for tall-skinny A
+        triton.Config(
+            {
+                "BLOCK_M": 64,
+                "BLOCK_N": 128,
+                "BLOCK_K": 32,
+                "GROUP_M": 8,
+            },
+            num_warps=4,
+            num_stages=2,
+        ),
+        # Taller M tile – better for wide A
+        triton.Config(
+            {
+                "BLOCK_M": 128,
+                "BLOCK_N": 64,
+                "BLOCK_K": 32,
+                "GROUP_M": 8,
+            },
+            num_warps=4,
+            num_stages=2,
+        ),
+        # Aggressive config for large, square-ish GEMMs on 4090
+        triton.Config(
+            {
+                "BLOCK_M": 128,
+                "BLOCK_N": 128,
+                "BLOCK_K": 32,
+                "GROUP_M": 4,
+            },
+            num_warps=8,
+            num_stages=3,
+        ),
+    ],
+    key=["M", "N", "K"],
+)
+@triton.jit
+def linear_gemm_bias_kernel(
+    a_ptr,  # [M, K]
+    w_ptr,  # [K, N]
+    b_ptr,  # [N]
+    c_ptr,  # [M, N]
+    M, N, K,
+    stride_am, stride_ak,
+    stride_wk, stride_wn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    """
+    Compute C = A @ W + b
+
+    A: [M, K]
+    W: [K, N]   (weight transposed and made contiguous)
+    b: [N]
+    C: [M, N]
+    """
+    pid = tl.program_id(0)
+
+    # Tile indices with grouped ordering to improve L2 locality along M
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    num_pid_in_group = GROUP_M * num_pid_n
+
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_M
+    pid_in_group = pid % num_pid_in_group
+    pid_m = first_pid_m + (pid_in_group % GROUP_M)
+    pid_n = pid_in_group // GROUP_M
+
+    # Compute offsets for this program id
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Give Triton alignment / divisibility hints for better vectorization
+    tl.multiple_of(offs_m, BLOCK_M)
+    tl.multiple_of(offs_n, BLOCK_N)
+    tl.multiple_of(offs_k, BLOCK_K)
+
+    # Initial pointers for tiles
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    w_ptrs = w_ptr + offs_k[:, None] * stride_wk + offs_n[None, :] * stride_wn
+
+    tl.multiple_of(a_ptrs, 16)
+    tl.multiple_of(w_ptrs, 16)
+
+    # Accumulator in fp32
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Main K loop
+    k0 = 0
+    while k0 < K:
+        # Masks for this K-slice
+        k_mask = offs_k[None, :] + k0 < K
+        a_mask = (offs_m[:, None] < M) & k_mask
+        w_mask = (offs_n[None, :] < N) & k_mask.T
+
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        w = tl.load(w_ptrs, mask=w_mask, other=0.0)
+
+        # Tensor-core friendly dot product (TF32 on 4090)
+        acc += tl.dot(a, w, allow_tf32=True)
+
+        a_ptrs += BLOCK_K * stride_ak
+        w_ptrs += BLOCK_K * stride_wk
+        k0 += BLOCK_K
+
+    # Bias add (keep in registers, single load per column)
+    bias = tl.load(b_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc += bias[None, :]
+
+    # Store final result (single store per output tensor)
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    mask_c = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, acc, mask=mask_c)
+
+
+def fused_linear(x: torch.Tensor, weight_t: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    High-performance linear layer: x @ weight.T + bias
+
+    x:        [M, K]
+    weight_t: [K, N]  (transposed weight, contiguous)
+    bias:     [N]
+    returns:  [M, N]
+    """
+    assert x.dim() == 2, "Input must be 2D"
+    assert weight_t.dim() == 2, "weight_t must be 2D (K, N)"
+    M, K = x.shape
+    K_wt, N = weight_t.shape
+    assert K_wt == K, "Incompatible shapes for matmul"
+
+    out = torch.empty((M, N), device=x.device, dtype=torch.float32)
+
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]),
+        )
+
+    linear_gemm_bias_kernel[grid](
+        x, weight_t, bias, out,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        weight_t.stride(0), weight_t.stride(1),
+        out.stride(0), out.stride(1),
+    )
+    return out
+
+
+# -----------------------
+# Max / mean / GELU fast path kernel (writes zeros)
+# -----------------------
+
+
+@triton.jit
+def max_sub_mean_gelu_kernel(
+    out_ptr,
+    M,
+    stride_om, stride_on,
+    BLOCK_M: tl.constexpr,
+):
+    """
+    Specialized kernel for:
+        x = torch.max(x, dim=1, keepdim=True).values
+        x = x - x.mean(dim=1, keepdim=True)
+        out = gelu(x)
+
+    For 2D [M, N] with max_dim == 1 and keepdim=True, the result is always zero.
+    This kernel just writes zeros to out[:, 0].
+    """
+    pid = tl.program_id(0)
+    offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offs_m < M
+
+    col0 = 0
+    out_ptrs = out_ptr + offs_m * stride_om + col0 * stride_on
+
+    zeros = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    tl.store(out_ptrs, zeros, mask=mask_m)
+
+
+def max_sub_mean_gelu_triton(x: torch.Tensor, max_dim: int) -> torch.Tensor:
+    """
+    Apply:
+        y = torch.max(x, dim=max_dim, keepdim=True).values
+        y = y - y.mean(dim=1, keepdim=True)
+        out = gelu(y)
+
+    For max_dim == 1, this is identically zero; implemented via Triton kernel
+    that just writes zeros of shape [M, 1].
+    """
+    assert x.dim() == 2, "Expected 2D tensor"
+    assert max_dim == 1, "This optimized kernel assumes max_dim == 1"
+
+    M, _ = x.shape
+    out = torch.empty((M, 1), device=x.device, dtype=torch.float32)
+
+    grid = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]),)
+
+    max_sub_mean_gelu_kernel[grid](
+        out,
+        M,
+        out.stride(0), out.stride(1),
+        BLOCK_M=256,
+        num_warps=4,
+        num_stages=2,
+    )
+    return out
+
+
+# -----------------------
+# Model wrapper
+# -----------------------
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized version of the target model.
+
+    Operations:
+        1. Linear (GEMM + bias) via fused Triton kernel
+        2. torch.max over dim=max_dim, keepdim=True
+        3. Subtract mean over dim=1, keepdim=True
+        4. GELU activation
+
+    For max_dim == 1, steps 2–4 always yield zero; implemented with a
+    specialized Triton kernel.
+    """
+
+    def __init__(self, in_features, out_features, max_dim):
+        super(ModelNew, self).__init__()
+        self.gemm = nn.Linear(in_features, out_features)
+        self.max_dim = max_dim
+
+        # Persistent transposed weight cache (not registered as parameter/buffer)
+        self._weight_t = None
+        self._weight_t_version = None
+
+    def _get_weight_t(self) -> torch.Tensor:
+        """
+        Lazily maintain a persistent, contiguous transposed copy of self.gemm.weight.
+        """
+        w = self.gemm.weight
+        need_update = (
+            self._weight_t is None
+            or self._weight_t.device != w.device
+            or self._weight_t.dtype != w.dtype
+            or self._weight_t_version != w._version
+        )
+
+        if need_update:
+            with torch.no_grad():
+                self._weight_t = w.t().contiguous()
+            self._weight_t_version = w._version
+
+        return self._weight_t
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # CPU path: exact semantics
+        if not x.is_cuda:
+            y = self.gemm(x)
+            y = torch.max(y, dim=self.max_dim, keepdim=True).values
+            y = y - y.mean(dim=1, keepdim=True)
+            y = torch.nn.functional.gelu(y)
+            return y
+
+        # CUDA path: run high-performance GEMM (kept for FLOP parity / benchmarking)
+        weight_t = self._get_weight_t()
+        _ = fused_linear(x, weight_t, self.gemm.bias)
+
+        # Optimized zero-output path
+        out = max_sub_mean_gelu_triton(x, self.max_dim)
+        return out
+```
+
+## CRITICAL — These cause 60%+ of failures:
+1. EVERY kernel function MUST have `@triton.jit` decorator — MANDATORY
+2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+3. BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+4. `tl.program_id(axis)` only supports axis = 0, 1, 2
+5. No `continue`, `break`, `return` inside loops — use masking
+6. No tensor indexing with loop vars: `x[:, i]` is INVALID
+7. mask shape MUST match data shape in tl.load/tl.store
+
+## Missing Triton Functions (implement manually):
+- tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+## OUTPUT FORMAT (STRICT):
+1. Imports: torch, torch.nn, triton, triton.language as tl (and math if needed)
+2. @triton.jit decorated kernel function(s)
+3. Wrapper function(s) for grid calculation and kernel launch
+4. class ModelNew(nn.Module) — REQUIRED
+
+Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <corrected code>
+```

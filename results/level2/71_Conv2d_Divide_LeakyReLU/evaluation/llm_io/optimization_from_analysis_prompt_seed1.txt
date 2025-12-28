@@ -1,0 +1,320 @@
+You are optimizing a Triton kernel based on algorithmic analysis.
+
+# PyTorch Reference (Target Behavior)
+
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs a convolution, divides by a constant, and applies LeakyReLU.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, divisor):
+        super(Model, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.divisor = divisor
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = x / self.divisor
+        x = torch.nn.functional.leaky_relu(x, negative_slope=0.01)
+        return x
+
+batch_size = 128
+in_channels = 8
+out_channels = 64
+height, width = 128, 128
+kernel_size = 3
+divisor = 2
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, divisor]
+```
+
+**CRITICAL**: Study the PyTorch code carefully to understand:
+- What does `forward()` return? (full output sequence vs final hidden state only)
+- What is the computational pattern?
+- What are the input/output shapes?
+
+Your optimized kernel MUST match this exact behavior.
+
+---
+
+# Analysis Results
+
+**Bottleneck**: The kernel is predominantly compute-bound due to performing a full KH*KW=9 MACs per output element for every (Cin, Cout) pair in a direct convolution formulation, so FLOP count rather than memory bandwidth is the main limiter.
+
+**Optimization Strategy**: Replace the direct 3x3 convolution with a Winograd F(2x2,3x3) algorithm in Triton, which transforms 4x4 input tiles and 3x3 filters into the Winograd domain, does cheaper elementwise multiplications, and then applies an inverse transform, reducing the total number of MACs per output by roughly 2×.
+
+**Implementation Plan**: Specialize the Triton kernel for stride=1, 3x3 kernels and tile the output into 2x2 blocks; for each tile, load the corresponding 4x4 input patch, apply the fixed Winograd input transform (B matrix) in registers/shared memory, and multiply with pre-transformed weights (U matrix) that are computed once on the host or in a small preprocessing kernel. Accumulate in the Winograd domain, apply the inverse transform (A matrix) to recover the 2x2 output block, and fuse the bias, division, and LeakyReLU as the epilogue before writing back to global memory. Keep the current direct-convolution path as a fallback for non-3x3 or non-unit-stride cases.
+
+**Expected Speedup**: 25-35%
+
+---
+
+# Current Kernel (needs optimization)
+
+```python
+import torch, torch.nn as nn, triton, triton.language as tl
+import math
+
+
+@triton.jit
+def conv2d_div_leakyrelu_kernel(
+    x_ptr, w_ptr, b_ptr, y_ptr,
+    B, H_in, W_in,
+    H_out, W_out,
+    Cin, Cout,
+    KH, KW,
+    M, N, K,
+    stride_x_n, stride_x_c, stride_x_h, stride_x_w,
+    stride_w_cout, stride_w_cin, stride_w_kh, stride_w_kw,
+    stride_y_n, stride_y_c, stride_y_h, stride_y_w,
+    divisor, negative_slope,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    # Program IDs for tiling over (M, N) = (B * H_out * W_out, Cout)
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # [BLOCK_M]
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # [BLOCK_N]
+
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+
+    # Map flattened M index -> (b, ho, wo)
+    HW_out = H_out * W_out
+    b_idx = offs_m // HW_out
+    rem_m = offs_m % HW_out
+    ho_idx = rem_m // W_out
+    wo_idx = rem_m % W_out
+
+    # Accumulator in FP32 for better precision
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # K dimension is flattened over (Cin, KH, KW)
+    k_range = tl.arange(0, BLOCK_K)
+    KHW = KH * KW
+
+    for k_start in range(0, K, BLOCK_K):
+        offs_k = k_start + k_range  # [BLOCK_K]
+        k_mask = offs_k < K
+
+        # Map flattened K index -> (ci, kh, kw)
+        ci = offs_k // KHW
+        rem_k = offs_k % KHW
+        kh = rem_k // KW
+        kw = rem_k % KW
+
+        # Build input pointers for A: shape (BLOCK_M, BLOCK_K)
+        # x[b, ci, ho + kh, wo + kw]
+        b_b = b_idx[:, None]
+        ho_b = ho_idx[:, None]
+        wo_b = wo_idx[:, None]
+
+        ci_b = ci[None, :]
+        kh_b = kh[None, :]
+        kw_b = kw[None, :]
+
+        h_in = ho_b + kh_b
+        w_in = wo_b + kw_b
+
+        a_ptrs = (
+            x_ptr
+            + b_b * stride_x_n
+            + ci_b * stride_x_c
+            + h_in * stride_x_h
+            + w_in * stride_x_w
+        )
+
+        a_mask = (mask_m[:, None]) & (k_mask[None, :])
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+
+        # Build weight pointers for B: shape (BLOCK_K, BLOCK_N)
+        # w[co, ci, kh, kw]
+        co_b = offs_n[None, :]
+        ci_k = ci[:, None]
+        kh_k = kh[:, None]
+        kw_k = kw[:, None]
+
+        w_ptrs = (
+            w_ptr
+            + co_b * stride_w_cout
+            + ci_k * stride_w_cin
+            + kh_k * stride_w_kh
+            + kw_k * stride_w_kw
+        )
+
+        b_mask = (k_mask[:, None]) & (mask_n[None, :])
+        w = tl.load(w_ptrs, mask=b_mask, other=0.0)
+
+        # Matrix multiply-accumulate
+        acc += tl.dot(a, w, allow_tf32=True)
+
+    # Add bias per output channel
+    bias_vals = tl.load(b_ptr + offs_n, mask=mask_n, other=0.0)
+    acc += bias_vals[None, :]
+
+    # Divide by constant
+    acc = acc / divisor
+
+    # LeakyReLU: x if x >= 0 else negative_slope * x
+    acc = tl.where(acc >= 0, acc, acc * negative_slope)
+
+    # Store results
+    # Map (offs_m, offs_n) -> (b, co, ho, wo)
+    out_b = b_idx[:, None]
+    out_co = offs_n[None, :]
+    out_ho = ho_idx[:, None]
+    out_wo = wo_idx[:, None]
+
+    y_ptrs = (
+        y_ptr
+        + out_b * stride_y_n
+        + out_co * stride_y_c
+        + out_ho * stride_y_h
+        + out_wo * stride_y_w
+    )
+
+    out_mask = (mask_m[:, None]) & (mask_n[None, :])
+    tl.store(y_ptrs, acc, mask=out_mask)
+
+
+def fused_conv2d_div_leakyrelu(x, weight, bias, divisor, negative_slope=0.01):
+    """
+    Fused implementation of:
+        y = conv2d(x, weight, bias, stride=1, padding=0)
+        y = y / divisor
+        y = leaky_relu(y, negative_slope)
+    Assumes NCHW layout and groups=1, dilation=1, stride=1, padding=0.
+    """
+    assert x.ndim == 4, "Input must be 4D NCHW"
+    B, Cin, H_in, W_in = x.shape
+    Cout, Cin_w, KH, KW = weight.shape
+    assert Cin == Cin_w, "Incompatible input/weight channels"
+    assert bias is not None and bias.numel() == Cout
+
+    # Output dimensions for stride=1, padding=0
+    H_out = H_in - KH + 1
+    W_out = W_in - KW + 1
+    assert H_out > 0 and W_out > 0, "Invalid kernel size for given input"
+
+    # Flattened GEMM dimensions
+    M = B * H_out * W_out
+    N = Cout
+    K = Cin * KH * KW
+
+    y = torch.empty((B, Cout, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    # Strides (in elements)
+    stride_x_n, stride_x_c, stride_x_h, stride_x_w = x.stride()
+    stride_w_cout, stride_w_cin, stride_w_kh, stride_w_kw = weight.stride()
+    stride_y_n, stride_y_c, stride_y_h, stride_y_w = y.stride()
+
+    BLOCK_M = 64
+    BLOCK_N = 64
+    BLOCK_K = 32
+
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_M"]),
+        triton.cdiv(N, META["BLOCK_N"]),
+    )
+
+    conv2d_div_leakyrelu_kernel[grid](
+        x, weight, bias, y,
+        B, H_in, W_in,
+        H_out, W_out,
+        Cin, Cout,
+        KH, KW,
+        M, N, K,
+        stride_x_n, stride_x_c, stride_x_h, stride_x_w,
+        stride_w_cout, stride_w_cin, stride_w_kh, stride_w_kw,
+        stride_y_n, stride_y_c, stride_y_h, stride_y_w,
+        float(divisor), float(negative_slope),
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        num_warps=4,
+        num_stages=2,
+    )
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-accelerated version of:
+        Conv2d -> divide by constant -> LeakyReLU
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, divisor):
+        super(ModelNew, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.divisor = divisor
+
+        k = kernel_size
+        self.weight = nn.Parameter(torch.empty(out_channels, in_channels, k, k))
+        self.bias = nn.Parameter(torch.empty(out_channels))
+
+        # Initialize like nn.Conv2d default (Kaiming uniform)
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        fan_in = in_channels * k * k
+        bound = 1 / math.sqrt(fan_in)
+        nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x):
+        return fused_conv2d_div_leakyrelu(
+            x, self.weight, self.bias, self.divisor, negative_slope=0.01
+        )
+```
+
+---
+
+# Your Task
+
+Implement the optimization strategy above. Focus on the specific bottleneck identified.
+
+## Key Requirements
+
+1. **Preserve correctness**: Maintain the same input/output behavior
+2. **Apply the optimization**: Follow the implementation plan exactly
+3. **Use valid Triton syntax**:
+   - Every kernel MUST have `@triton.jit` decorator
+   - Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+   - BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+   - No `continue`, `break`, `return` inside kernels (use masking)
+   - Prefer `tl.dot(a, b, allow_tf32=True)` for matmul operations
+
+4. **CRITICAL for RNN/GRU/LSTM Persistent Kernels**:
+   - Time loop MUST be inside @triton.jit kernel, NOT in Python forward()
+   - **HYBRID computation strategy** (CRITICAL for performance):
+     * Precompute input-side gates OUTSIDE kernel: `gates_x = (T*B, In) @ W_ih` (ONE large GEMM)
+     * INSIDE kernel: only recurrent-side: `for t: gates_h = h @ W_hh` (T small GEMMs)
+   - CORRECT (FAST - use this):
+     ```python
+     # Python forward():
+     gates_x_all = x.reshape(T*B, In) @ W_ih + b_ih  # ONE large GEMM
+     gates_x_all = gates_x_all.view(T, B, 3*H)
+     gru_persistent_kernel[grid](gates_x_all, h0, W_hh, ...)  # Launch ONCE
+
+     @triton.jit
+     def gru_persistent_kernel(gates_x_ptr, h_ptr, W_hh_ptr, ...):
+         for t in range(T):  # Inside kernel
+             gates_x_t = tl.load(gates_x_ptr + t*...)  # Precomputed
+             gates_h = h @ W_hh  # Only recurrent GEMM
+             h = (1-z)*n + z*h   # Fuse and update
+     ```
+
+5. **Output format**:
+   - Imports: `import torch, torch.nn as nn, triton, triton.language as tl`
+   - `@triton.jit` kernel(s)
+   - Wrapper function(s)
+   - `class ModelNew(nn.Module)` — REQUIRED
+   - NO testing code, NO `if __name__ == "__main__"`
+
+---
+
+Generate the optimized kernel now. Output ONLY the complete Python code.

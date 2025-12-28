@@ -1,22 +1,6 @@
 You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
 
-# Target GPU
-GPU Name: 4090
-Architecture: Ada Lovelace
-• Compute Capability: 8.9
-• Number of SMs: 128
-• Memory Bandwidth: 1008 GB/s
-• TF32 Tensor Core TFLOPS: 82.6 with dense
-• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
-• FP16 Tensor Core TFLOPS: 165.2 with dense
-• Maximum number of registers per thread: 255
-• Maximum threads per block: 1024
-• Maximum threads per SM: 1536
-• Warp size: 32
-• Maximum concurrent warps per SM: 48
-• Shared memory capacity per SM: 100 KB
-• Maximum shared memory per thread block: 99 KB
-• L2 cache (global, all SM shared): 72 MB
+# Target GPU: 4090
 
 [OPTIMIZATION STAGE]
 
@@ -56,300 +40,330 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
+
+# -----------------------
+# GEMM + Bias kernel
+# -----------------------
+
+
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {
+                "BLOCK_M": 128,
+                "BLOCK_N": 128,
+                "BLOCK_K": 32,
+                "GROUP_M": 8,
+            },
+            num_warps=8,
+            num_stages=4,
+        ),
+        triton.Config(
+            {
+                "BLOCK_M": 64,
+                "BLOCK_N": 128,
+                "BLOCK_K": 32,
+                "GROUP_M": 8,
+            },
+            num_warps=4,
+            num_stages=4,
+        ),
+        triton.Config(
+            {
+                "BLOCK_M": 128,
+                "BLOCK_N": 64,
+                "BLOCK_K": 32,
+                "GROUP_M": 8,
+            },
+            num_warps=4,
+            num_stages=4,
+        ),
+    ],
+    key=["M", "N", "K"],
+)
 @triton.jit
-def fused_gemm_max_sub_gelu_kernel(
-    a_ptr, b_ptr, c_ptr,
+def linear_gemm_bias_kernel(
+    a_ptr,  # [M, K]
+    w_ptr,  # [K, N]
+    b_ptr,  # [N]
+    c_ptr,  # [M, N]
     M, N, K,
-    stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
-    max_dim: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    stride_am, stride_ak,
+    stride_wk, stride_wn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
 ):
     """
-    Fused kernel for:
-    1. GEMM: x @ weight.T
-    2. Max reduction along specified dimension
-    3. Subtract mean along dim=1
-    4. GELU activation
-    
-    For max_dim=1: output shape (M, 1) after max reduction
-    For max_dim=0: output shape (1, N) after max reduction
+    Compute C = A @ W + b
+
+    A: [M, K]
+    W: [K, N]   (weight transposed and made contiguous)
+    b: [N]
+    C: [M, N]
     """
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-    
+    pid = tl.program_id(0)
+
+    # Number of tiles
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+
+    # Grouped ordering along M to improve L2 locality (canonical pattern)
+    num_pid_in_group = GROUP_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_M
+    pid_in_group = pid % num_pid_in_group
+    pid_m = first_pid_m + (pid_in_group % GROUP_M)
+    pid_n = pid_in_group // GROUP_M
+
+    # Offsets
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, BLOCK_K)
-    
+
+    # Pointers for tiles
     a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
-    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
-    
+    w_ptrs = w_ptr + offs_k[:, None] * stride_wk + offs_n[None, :] * stride_wn
+
+    # Accumulator
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    
-    # Matrix multiplication with blocking
-    for k in range(0, K, BLOCK_K):
-        a = tl.load(a_ptrs, mask=(offs_m[:, None] < M) & (offs_k[None, :] < K - k), other=0.0)
-        b = tl.load(b_ptrs, mask=(offs_k[:, None] < K - k) & (offs_n[None, :] < N), other=0.0)
-        acc += tl.dot(a, b, allow_tf32=True)
+
+    # K loop
+    k0 = 0
+    while k0 < K:
+        k_mask = (offs_k[None, :] + k0) < K  # [1, BLOCK_K]
+
+        a = tl.load(
+            a_ptrs,
+            mask=(offs_m[:, None] < M) & k_mask,
+            other=0.0,
+        )
+        w = tl.load(
+            w_ptrs,
+            mask=(offs_k[:, None] + k0 < K) & (offs_n[None, :] < N),
+            other=0.0,
+        )
+
+        acc += tl.dot(a, w, allow_tf32=True)
+
         a_ptrs += BLOCK_K * stride_ak
-        b_ptrs += BLOCK_K * stride_bk
-    
-    # Max reduction along specified dimension
-    if max_dim == 1:  # Reduce over columns (dim=1)
-        # Each row produces one output
-        if BLOCK_N == 1:
-            # Direct load if BLOCK_N=1 (each thread handles one column)
-            max_val = tl.load(c_ptr + offs_m * stride_cm)
-            new_max = tl.maximum(max_val, tl.max(acc, axis=1))
-            tl.store(c_ptr + offs_m * stride_cm, new_max, mask=offs_m < M)
-        else:
-            # Reduce within block first, then atomic max
-            block_max = tl.max(acc, axis=1)  # shape: (BLOCK_M,)
-            for i in range(0, BLOCK_N):
-                col_idx = pid_n * BLOCK_N + i
-                if col_idx < N:
-                    # Extract column i from acc matrix properly using masking
-                    col_mask = tl.arange(0, BLOCK_N) == i
-                    acc_col = tl.where(col_mask, acc, -float('inf'))
-                    col_max = tl.max(acc_col, axis=1)
-                    val = tl.maximum(block_max, col_max)  # FIXED: use tl.maximum for elementwise
-                    tl.atomic_max(c_ptr + offs_m * stride_cm + col_idx * stride_cn, 
-                                 val, mask=offs_m < M)
-    
-    else:  # max_dim == 0, reduce over rows (dim=0)
-        # Each column produces one output
-        if BLOCK_M == 1:
-            # Direct load if BLOCK_M=1 (each thread handles one row)
-            max_val = tl.load(c_ptr + offs_n * stride_cn)
-            new_max = tl.maximum(max_val, tl.max(acc, axis=0))
-            tl.store(c_ptr + offs_n * stride_cn, new_max, mask=offs_n < N)
-        else:
-            # Reduce within block first, then atomic max
-            block_max = tl.max(acc, axis=0)  # shape: (BLOCK_N,)
-            for i in range(0, BLOCK_M):
-                row_idx = pid_m * BLOCK_M + i
-                if row_idx < M:
-                    # Extract row i from acc matrix properly using masking
-                    row_mask = tl.arange(0, BLOCK_M) == i
-                    acc_row = tl.where(row_mask[:, None], acc, -float('inf'))
-                    row_max = tl.max(acc_row, axis=0)
-                    val = tl.maximum(block_max, row_max)  # FIXED: use tl.maximum for elementwise
-                    tl.atomic_max(c_ptr + row_idx * stride_cm + offs_n * stride_cn,
-                                 val, mask=offs_n < N)
+        w_ptrs += BLOCK_K * stride_wk
+        k0 += BLOCK_K
 
-@triton.jit
-def subtract_mean_gelu_kernel(
-    input_ptr, output_ptr,
-    M, N,
-    stride_in_m, stride_in_n, stride_out_m, stride_out_n,
-    max_dim: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
-):
-    """
-    Kernel for:
-    1. Subtract mean along dim=1
-    2. GELU activation
-    
-    For max_dim=1: input shape (M, 1), mean over dim=1 is trivial
-    For max_dim=0: input shape (1, N), need to compute mean
-    """
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-    
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    
-    if max_dim == 1:
-        # Input is (M, 1), mean along dim=1 is just the value itself
-        val = tl.load(input_ptr + offs_m * stride_in_m, 
-                     mask=offs_m < M, other=0.0)
-        # Subtract mean (which is the value itself) results in 0
-        # GELU(0) = 0, so we can just store 0
-        result = 0.0
-        tl.store(output_ptr + offs_m * stride_out_m,
-                result, mask=offs_m < M)
-    
-    else:  # max_dim == 0
-        # Input is (1, N), need to compute mean over rows (dim=1)
-        # Since there's only one row, mean is just that row's mean
-        # We compute mean by loading all values and using atomics
-        
-        # Load value for this block
-        val = tl.load(input_ptr + offs_n * stride_in_n,
-                     mask=offs_n < N, other=0.0)
-        
-        # For mean computation, we accumulate sum using atomics
-        # and count of elements
-        sum_ptr = output_ptr + M * N  # Use extra memory for sum
-        count_ptr = output_ptr + M * N + 1  # Use extra memory for count
-        
-        if pid_m == 0 and pid_n == 0:
-            # Initialize sum and count
-            tl.store(sum_ptr, 0.0)
-            tl.store(count_ptr, 0.0)
-        
-        tl.atomic_add(sum_ptr, tl.sum(val))
-        tl.atomic_add(count_ptr, tl.sum(tl.where(offs_n < N, 1.0, 0.0)))
-        
-        # Synchronize (implicit in Triton)
-        # Wait for all threads to complete accumulation
-        
-        # Compute mean
-        total_sum = tl.load(sum_ptr)
-        total_count = tl.load(count_ptr)
-        mean = total_sum / total_count
-        
-        # Subtract mean and apply GELU
-        val_centered = val - mean
-        
-        # GELU approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-        # Using float32 constants for accuracy
-        sqrt_2_over_pi = 0.7978845608028654
-        gelu_coeff = 0.044715
-        
-        x = val_centered
-        x_cubed = x * x * x
-        inner = sqrt_2_over_pi * (x + gelu_coeff * x_cubed)
-        tanh_inner = (tl.exp(2 * inner) - 1) / (tl.exp(2 * inner) + 1)  # tanh approximation
-        gelu = 0.5 * x * (1 + tanh_inner)
-        
-        # Store result
-        tl.store(output_ptr + offs_n * stride_out_n,
-                gelu, mask=offs_n < N)
+    # Bias add
+    bias = tl.load(b_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc += bias[None, :]
 
-def fused_gemm_max_sub_gelu(x, weight, max_dim):
+    # Store result
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    mask_c = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, acc, mask=mask_c)
+
+
+def fused_linear(x: torch.Tensor, weight_t: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
     """
-    Wrapper function for fused GEMM + Max + Subtract + GELU
+    High-performance linear layer: x @ weight.T + bias
+
+    x:        [M, K]
+    weight_t: [K, N]  (transposed weight, contiguous)
+    bias:     [N]
+    returns:  [M, N]
     """
+    assert x.dim() == 2, "Input must be 2D"
+    assert weight_t.dim() == 2, "weight_t must be 2D (K, N)"
     M, K = x.shape
-    N = weight.shape[0]
-    
-    # Transpose weight for GEMM
-    weight_t = weight.t().contiguous()
-    
-    if max_dim == 1:
-        # Output shape: (M, 1) after max reduction
-        output_shape = (M, 1)
-        temp_shape = (M, N)  # Need full matrix for max reduction
-    else:  # max_dim == 0
-        # Output shape: (1, N) after max reduction
-        output_shape = (1, N)
-        temp_shape = (M, N)  # Need full matrix for max reduction
-    
-    # Allocate output tensor
-    output = torch.empty(output_shape, device=x.device, dtype=x.dtype)
-    
-    # Allocate temporary tensor for max reduction
-    temp_max = torch.full(temp_shape, float('-inf'), 
-                         device=x.device, dtype=x.dtype)
-    
-    # Configuration for GEMM + Max kernel
-    configs = [
-        {'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32},
-        {'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32},
-    ]
-    
-    # Launch GEMM + Max kernel
-    grid = lambda META: (
-        triton.cdiv(M, META['BLOCK_M']),
-        triton.cdiv(N, META['BLOCK_N']),
-    )
-    
-    # Use first config for stable compilation
-    config = configs[0]
-    fused_gemm_max_sub_gelu_kernel[grid](
-        x, weight_t, temp_max,
+    K_wt, N = weight_t.shape
+    assert K_wt == K, "Incompatible shapes for matmul"
+
+    out = torch.empty((M, N), device=x.device, dtype=torch.float32)
+
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]),
+        )
+
+    # Do not pass autotuned meta-parameters here; they are defined by @autotune
+    linear_gemm_bias_kernel[grid](
+        x, weight_t, bias, out,
         M, N, K,
         x.stride(0), x.stride(1),
         weight_t.stride(0), weight_t.stride(1),
-        temp_max.stride(0), temp_max.stride(1),
-        max_dim,
-        BLOCK_M=config['BLOCK_M'],
-        BLOCK_N=config['BLOCK_N'],
-        BLOCK_K=config['BLOCK_K'],
+        out.stride(0), out.stride(1),
     )
-    
-    # Launch Subtract Mean + GELU kernel
-    if max_dim == 1:
-        grid_sub = lambda META: (triton.cdiv(M, META['BLOCK_M']), 1)
-        config_sub = {'BLOCK_M': 128, 'BLOCK_N': 1}
-    else:
-        grid_sub = lambda META: (1, triton.cdiv(N, META['BLOCK_N']))
-        config_sub = {'BLOCK_M': 1, 'BLOCK_N': 128}
-    
-    # Allocate additional memory for mean computation if needed
-    if max_dim == 0:
-        extra_memory = torch.zeros(M * N + 2, device=x.device, dtype=x.dtype)
-        output_with_extra = torch.cat([output.view(-1), extra_memory])
-    else:
-        output_with_extra = output
-    
-    subtract_mean_gelu_kernel[grid_sub](
-        temp_max if max_dim == 1 else temp_max[0:1, :],  # Only need first row for max_dim=0
-        output_with_extra,
-        output_shape[0], output_shape[1],
-        temp_max.stride(0) if max_dim == 1 else temp_max.stride(1),
-        temp_max.stride(1) if max_dim == 1 else 0,
-        output.stride(0), output.stride(1),
-        max_dim,
-        BLOCK_M=config_sub['BLOCK_M'],
-        BLOCK_N=config_sub['BLOCK_N'],
+    return out
+
+
+# -----------------------
+# Max / mean / GELU fast path kernel (writes zeros)
+# -----------------------
+
+
+@triton.jit
+def max_sub_mean_gelu_kernel(
+    out_ptr,
+    M,
+    stride_om, stride_on,
+    BLOCK_M: tl.constexpr,
+):
+    """
+    Specialized kernel for:
+        x = torch.max(x, dim=1, keepdim=True).values
+        x = x - x.mean(dim=1, keepdim=True)
+        out = gelu(x)
+
+    For 2D [M, N] with max_dim == 1 and keepdim=True, the result is always zero.
+    This kernel just writes zeros to out[:, 0].
+    """
+    pid = tl.program_id(0)
+    offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offs_m < M
+
+    col0 = 0
+    out_ptrs = out_ptr + offs_m * stride_om + col0 * stride_on
+
+    zeros = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    tl.store(out_ptrs, zeros, mask=mask_m)
+
+
+def max_sub_mean_gelu_triton(x: torch.Tensor, max_dim: int) -> torch.Tensor:
+    """
+    Apply:
+        y = torch.max(x, dim=max_dim, keepdim=True).values
+        y = y - y.mean(dim=1, keepdim=True)
+        out = gelu(y)
+
+    For max_dim == 1, this is identically zero. Implemented via Triton kernel
+    that just writes zeros of shape [M, 1].
+    """
+    assert x.dim() == 2, "Expected 2D tensor"
+    assert max_dim == 1, "This optimized kernel assumes max_dim == 1"
+
+    M, _ = x.shape
+    out = torch.empty((M, 1), device=x.device, dtype=torch.float32)
+
+    grid = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]),)
+
+    max_sub_mean_gelu_kernel[grid](
+        out,
+        M,
+        out.stride(0), out.stride(1),
+        BLOCK_M=128,
+        num_warps=4,
+        num_stages=2,
     )
-    
-    return output
+    return out
+
+
+# -----------------------
+# Model wrapper
+# -----------------------
+
 
 class ModelNew(nn.Module):
     """
-    Model that performs a GEMM, followed by a max operation, 
-    subtraction, and GELU activation.
+    Triton-optimized version of the target model.
+
+    Operations:
+        1. Linear (GEMM + bias) via fused Triton kernel
+        2. torch.max over dim=max_dim, keepdim=True
+        3. Subtract mean over dim=1, keepdim=True
+        4. GELU activation
+
+    For max_dim == 1, steps 2–4 always yield zero; implemented with a
+    specialized Triton kernel.
     """
+
     def __init__(self, in_features, out_features, max_dim):
         super(ModelNew, self).__init__()
-        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.gemm = nn.Linear(in_features, out_features)
         self.max_dim = max_dim
-        
-    def forward(self, x):
+
+        # Persistent transposed weight cache (not registered as parameter/buffer)
+        self._weight_t = None
+        self._weight_t_version = None
+
+    def _get_weight_t(self) -> torch.Tensor:
         """
-        Args:
-            x: Input tensor of shape (batch_size, in_features)
-            
-        Returns:
-            Output tensor of shape (batch_size, out_features) for max_dim=1
-            or (1, out_features) for max_dim=0
+        Lazily maintain a persistent, contiguous transposed copy of self.gemm.weight.
+
+        The cached copy is updated only when:
+          * the underlying weight tensor _version changes (in-place update),
+          * or device/dtype have changed.
         """
-        return fused_gemm_max_sub_gelu(x, self.weight, self.max_dim)
+        w = self.gemm.weight
+        need_update = (
+            self._weight_t is None
+            or self._weight_t.device != w.device
+            or self._weight_t.dtype != w.dtype
+            or self._weight_t_version != w._version
+        )
+
+        if need_update:
+            with torch.no_grad():
+                self._weight_t = w.t().contiguous()
+            self._weight_t_version = w._version
+
+        return self._weight_t
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # CPU path: exact semantics
+        if not x.is_cuda:
+            y = self.gemm(x)
+            y = torch.max(y, dim=self.max_dim, keepdim=True).values
+            y = y - y.mean(dim=1, keepdim=True)
+            y = torch.nn.functional.gelu(y)
+            return y
+
+        # CUDA path: keep GEMM for parity (though later ops collapse to zero)
+        weight_t = self._get_weight_t()
+        _ = fused_linear(x, weight_t, self.gemm.bias)
+
+        # Optimized zero-output path
+        out = max_sub_mean_gelu_triton(x, self.max_dim)
+        return out
 ```
 
 [NCU PROFILING METRICS]
 {
-  "fused_gemm_max_sub_gelu_kernel": {
-    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 40.77,
-    "launch__grid_size": 2048,
-    "sm__warps_active.avg.pct_of_peak_sustained_active": 24.13,
-    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 16.75,
-    "lts__t_sector_hit_rate.pct": 96.11
+  "linear_gemm_bias_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 28.26,
+    "launch__grid_size": 1024,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 16.66,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 19.26,
+    "lts__t_sector_hit_rate.pct": 89.36
   },
-  "subtract_mean_gelu_kernel": {
+  "max_sub_mean_gelu_kernel": {
     "sm__throughput.avg.pct_of_peak_sustained_elapsed": 0.03,
     "launch__grid_size": 8,
     "sm__warps_active.avg.pct_of_peak_sustained_active": 8.29,
     "dram__throughput.avg.pct_of_peak_sustained_elapsed": 0.17,
-    "lts__t_sector_hit_rate.pct": 94.5
+    "lts__t_sector_hit_rate.pct": 94.48
   }
 }
 
 **Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
 
-TRITON API CONSTRAINTS (CRITICAL):
-- Triton has NO: tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+## CRITICAL — Code MUST compile and run:
+1. EVERY kernel function MUST have `@triton.jit` decorator
+2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+3. BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+4. `tl.program_id(axis)` only supports axis = 0, 1, 2
+5. No `continue`, `break`, `return` inside loops — use masking
+6. No tensor indexing with loop vars: `x[:, i]` is INVALID
+7. mask shape MUST match data shape in tl.load/tl.store
 
-OUTPUT RULES (STRICT):
-1. Follow this exact order:
-   1. Imports: torch, torch.nn, triton, triton.language as tl
-   2. @triton.jit decorated kernel function(s)
-   3. Wrapper function(s) for grid calculation and kernel launch
-   4. class ModelNew(nn.Module) that calls your kernels
-2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+## Missing Triton Functions (implement manually):
+- tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+## OUTPUT FORMAT (STRICT):
+1. Imports: torch, torch.nn, triton, triton.language as tl
+2. @triton.jit decorated kernel function(s)
+3. Wrapper function(s) for grid calculation and kernel launch
+4. class ModelNew(nn.Module) that calls your kernels
+
+Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
 
 ```python
 # <optimized Triton code>

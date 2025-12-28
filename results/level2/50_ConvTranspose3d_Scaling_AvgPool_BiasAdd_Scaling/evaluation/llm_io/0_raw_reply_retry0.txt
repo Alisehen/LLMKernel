@@ -1,164 +1,171 @@
 ```python
+# <complete ModelNew code with optimized Triton kernels>
+
 import torch
 import torch.nn as nn
 import triton
 import triton.language as tl
-import math
 
 
 @triton.jit
-def fused_scale_pool_bias_scale_kernel(
-    x_ptr, out_ptr,
-    scale1_ptr, bias_ptr, scale2_ptr,
-    N, C, D, H, W,
+def fused_scale_avgpool3d_bias_scale_kernel(
+    x_ptr,          # *const T, input after ConvTranspose3d: [N, C, D_in, H_in, W_in]
+    bias_ptr,       # *const T, bias per channel: [C]
+    y_ptr,          # *mut T, output after fused ops: [N, C, D_out, H_out, W_out]
+    N, C,
+    D_in, H_in, W_in,
+    D_out, H_out, W_out,
     stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
-    stride_on, stride_oc, stride_od, stride_oh, stride_ow,
-    POOL_K: tl.constexpr,
-    BLOCK_C: tl.constexpr,
-    BLOCK_DHW: tl.constexpr,
+    stride_yn, stride_yc, stride_yd, stride_yh, stride_yw,
+    stride_bias_c,
+    scale1,         # float
+    scale2,         # float
+    BLOCK_SIZE: tl.constexpr,
 ):
-    """
-    Fused kernel: Scale1 + AvgPool3d(2) + BiasAdd + Scale2
-    Input: [N, C, D, H, W] -> Output: [N, C, D//2, H//2, W//2]
-    POOL_K = 2 (pooling kernel size)
-    """
-    # Program indices
-    pid_n = tl.program_id(0)
-    pid_cdhw = tl.program_id(1)
-    
-    if pid_n >= N:
-        return
-    
-    # Decode channel and spatial indices
-    C_BLOCKS = tl.cdiv(C, BLOCK_C)
-    cdhw_per_block = BLOCK_DHW
-    block_c = pid_cdhw // (C_BLOCKS * cdhw_per_block)
-    remainder = pid_cdhw % (C_BLOCKS * cdhw_per_block)
-    pid_c_block = remainder // cdhw_per_block
-    pid_spatial = remainder % cdhw_per_block
-    
-    # Convert to 3D spatial indices
-    D_out = D // POOL_K
-    H_out = H // POOL_K
-    W_out = W // POOL_K
-    DHW_out = D_out * H_out * W_out
-    
-    if pid_spatial >= DHW_out:
-        return
-    
-    d_out = pid_spatial // (H_out * W_out)
-    hw_out = pid_spatial % (H_out * W_out)
-    h_out = hw_out // W_out
-    w_out = hw_out % W_out
-    
-    # Calculate input spatial offsets (2x2x2 pooling)
-    d_in_start = d_out * POOL_K
-    h_in_start = h_out * POOL_K
-    w_in_start = w_out * POOL_K
-    
-    # Channel offsets
-    c_offs = pid_c_block * BLOCK_C + tl.arange(0, BLOCK_C)
-    c_mask = c_offs < C
-    
-    # Load parameters
-    scale1 = tl.load(scale1_ptr)
-    scale2 = tl.load(scale2_ptr)
-    bias_vals = tl.load(bias_ptr + c_offs, mask=c_mask, other=0.0)
-    
-    # Accumulate for pooling (2x2x2 = 8 elements)
-    pool_sum = tl.zeros((BLOCK_C,), dtype=tl.float32)
-    
-    for dd in range(POOL_K):
-        d_in = d_in_start + dd
-        for dh in range(POOL_K):
-            h_in = h_in_start + dh
-            for dw in range(POOL_K):
-                w_in = w_in_start + dw
-                
-                # Calculate pointer offsets
-                x_offset = (pid_n * stride_xn + 
-                           c_offs * stride_xc + 
-                           d_in * stride_xd + 
-                           h_in * stride_xh + 
-                           w_in * stride_xw)
-                
-                x_vals = tl.load(x_ptr + x_offset, mask=c_mask, other=0.0)
-                # Apply scale1 and accumulate
-                pool_sum += x_vals * scale1
-    
-    # Average pooling (divide by 8)
-    pool_avg = pool_sum / (POOL_K * POOL_K * POOL_K)
-    
-    # Add bias and apply scale2
-    result = (pool_avg + bias_vals) * scale2
-    
-    # Store result
-    out_offset = (pid_n * stride_on + 
-                  c_offs * stride_oc + 
-                  d_out * stride_od + 
-                  h_out * stride_oh + 
-                  w_out * stride_ow)
-    
-    tl.store(out_ptr + out_offset, result, mask=c_mask)
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    num_out = N * C * D_out * H_out * W_out
+    mask = offs < num_out
 
+    # Decode linear index into (n, c, d_out, h_out, w_out)
+    tmp = offs
+    w_out = tmp % W_out
+    tmp = tmp // W_out
+    h_out = tmp % H_out
+    tmp = tmp // H_out
+    d_out = tmp % D_out
+    tmp = tmp // D_out
+    c = tmp % C
+    n = tmp // C
 
-def fused_post_convtranspose(x, scale1, bias, scale2):
-    """
-    Fused: Scale1 + AvgPool3d(2) + BiasAdd + Scale2
-    """
-    N, C, D, H, W = x.shape
-    D_out, H_out, W_out = D // 2, H // 2, W // 2
-    out = torch.empty((N, C, D_out, H_out, W_out), 
-                      device=x.device, dtype=x.dtype)
-    
-    # Configuration
-    BLOCK_C = triton.next_power_of_2(C)
-    # Limit BLOCK_C to avoid register pressure
-    if BLOCK_C > 512:
-        BLOCK_C = 512
-    
-    # Spatial block size - process multiple spatial positions per program
-    MAX_SPATIAL_PER_BLOCK = 4
-    BLOCK_DHW = min(D_out * H_out * W_out, MAX_SPATIAL_PER_BLOCK)
-    
-    # Calculate grid
-    C_BLOCKS = (C + BLOCK_C - 1) // BLOCK_C
-    DHW_BLOCKS = (D_out * H_out * W_out + BLOCK_DHW - 1) // BLOCK_DHW
-    grid = (N, C_BLOCKS * DHW_BLOCKS)
-    
-    # Launch kernel
-    fused_scale_pool_bias_scale_kernel[grid](
-        x, out,
-        scale1, bias, scale2,
-        N, C, D, H, W,
-        x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
-        out.stride(0), out.stride(1), out.stride(2), out.stride(3), out.stride(4),
-        POOL_K=2,
-        BLOCK_C=BLOCK_C,
-        BLOCK_DHW=BLOCK_DHW,
+    # Corresponding top-left corner in input for 2x2x2 pool window
+    d0 = d_out * 2
+    h0 = h_out * 2
+    w0 = w_out * 2
+
+    # Base offset in input tensor
+    base_offset = (
+        n * stride_xn +
+        c * stride_xc +
+        d0 * stride_xd +
+        h0 * stride_xh +
+        w0 * stride_xw
     )
-    return out
+
+    # Compute pointers for 8 elements in the 2x2x2 window
+    ptr000 = x_ptr + base_offset
+    ptr001 = ptr000 + stride_xw
+    ptr010 = ptr000 + stride_xh
+    ptr011 = ptr010 + stride_xw
+    ptr100 = ptr000 + stride_xd
+    ptr101 = ptr100 + stride_xw
+    ptr110 = ptr100 + stride_xh
+    ptr111 = ptr110 + stride_xw
+
+    v000 = tl.load(ptr000, mask=mask, other=0.0)
+    v001 = tl.load(ptr001, mask=mask, other=0.0)
+    v010 = tl.load(ptr010, mask=mask, other=0.0)
+    v011 = tl.load(ptr011, mask=mask, other=0.0)
+    v100 = tl.load(ptr100, mask=mask, other=0.0)
+    v101 = tl.load(ptr101, mask=mask, other=0.0)
+    v110 = tl.load(ptr110, mask=mask, other=0.0)
+    v111 = tl.load(ptr111, mask=mask, other=0.0)
+
+    # Sum over window
+    sum_vals = (
+        v000 + v001 + v010 + v011 +
+        v100 + v101 + v110 + v111
+    )
+
+    # avg_pool3d(kernel=2) over x * scale1:
+    # mean(x * scale1) = scale1 * (sum / 8)
+    inv_pool = 1.0 / 8.0
+    pooled = sum_vals * scale1 * inv_pool
+
+    # Load per-channel bias
+    bias_val = tl.load(bias_ptr + c * stride_bias_c, mask=mask, other=0.0)
+
+    # Add bias, then final scaling by scale2
+    out_val = (pooled + bias_val) * scale2
+
+    # Store to output
+    y_offset = (
+        n * stride_yn +
+        c * stride_yc +
+        d_out * stride_yd +
+        h_out * stride_yh +
+        w_out * stride_yw
+    )
+    tl.store(y_ptr + y_offset, out_val, mask=mask)
+
+
+def fused_scale_avgpool3d_bias_scale(x, scale1, bias, scale2):
+    """
+    Fuses:
+      x = x * scale1
+      x = AvgPool3d(kernel_size=2, stride=2)(x)
+      x = x + bias        # bias: (C, 1, 1, 1)
+      x = x * scale2
+    into a single Triton kernel.
+    """
+    assert x.is_cuda, "Input must be on CUDA device"
+    x = x.contiguous()
+    N, C, D_in, H_in, W_in = x.shape
+
+    # PyTorch AvgPool3d(kernel=2, stride=2) -> output dims floor(in/2)
+    D_out = D_in // 2
+    H_out = H_in // 2
+    W_out = W_in // 2
+
+    y = torch.empty((N, C, D_out, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    # Bias is (C, 1, 1, 1) -> flatten to (C,)
+    bias_c = bias.view(-1).contiguous()
+
+    stride_xn, stride_xc, stride_xd, stride_xh, stride_xw = x.stride()
+    stride_yn, stride_yc, stride_yd, stride_yh, stride_yw = y.stride()
+    stride_bias_c = bias_c.stride(0)
+
+    num_out = N * C * D_out * H_out * W_out
+    grid = lambda META: (triton.cdiv(num_out, META["BLOCK_SIZE"]),)
+
+    fused_scale_avgpool3d_bias_scale_kernel[grid](
+        x, bias_c, y,
+        N, C,
+        D_in, H_in, W_in,
+        D_out, H_out, W_out,
+        stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
+        stride_yn, stride_yc, stride_yd, stride_yh, stride_yw,
+        stride_bias_c,
+        float(scale1),
+        float(scale2),
+        BLOCK_SIZE=256,
+    )
+    return y
 
 
 class ModelNew(nn.Module):
     """
-    ConvTranspose3d (PyTorch native) + Fused: Scale1 + AvgPool3d(2) + BiasAdd + Scale2 (Triton)
+    Model that performs a 3D transposed convolution, then a fused sequence:
+      scaling (scale1) + AvgPool3d(kernel=2) + bias add + scaling (scale2)
+    implemented with a high-performance Triton kernel.
     """
-    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, scale1, scale2, bias_shape):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding,
+                 scale1, scale2, bias_shape):
         super(ModelNew, self).__init__()
-        # Keep ConvTranspose as PyTorch native
         self.conv_transpose = nn.ConvTranspose3d(
-            in_channels, out_channels, kernel_size, 
-            stride=stride, padding=padding
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
         )
         self.scale1 = nn.Parameter(torch.tensor(scale1, dtype=torch.float32))
-        self.bias = nn.Parameter(torch.randn(out_channels, 1, 1, 1, dtype=torch.float32))
+        self.bias = nn.Parameter(torch.randn(bias_shape, dtype=torch.float32))
         self.scale2 = nn.Parameter(torch.tensor(scale2, dtype=torch.float32))
-    
+
     def forward(self, x):
-        # Step 1: PyTorch native ConvTranspose3d
         x = self.conv_transpose(x)
-        # Step 2: Fused post-ops in Triton
-        x = fused_post_convtranspose(x, self.scale1, self.bias, self.scale2)
+        x = fused_scale_avgpool3d_bias_scale(x, self.scale1.item(), self.bias, self.scale2.item())
         return x
 ```

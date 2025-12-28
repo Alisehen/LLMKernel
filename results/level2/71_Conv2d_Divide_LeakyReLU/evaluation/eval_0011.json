@@ -1,52 +1,6 @@
 {
-  "timestamp": "2025-12-13T08:44:24",
-  "reference_file": "KernelBench/level2/71_Conv2d_Divide_LeakyReLU.py",
-  "candidate_file": "/home/hyc/LLMKernel/run/20251213_080749_batch_range71to100_deepseek_deepseek/71_Conv2d_Divide_LeakyReLU/code/kernel_20251213_084410.py",
-  "tolerance": 0.001,
-  "max_abs_err": 0.0,
-  "mean_abs_err": 0.0,
-  "ref_latency_ms": {
-    "avg": 4.108031940460205,
-    "min": 4.099071979522705,
-    "max": 4.131775856018066,
-    "all": [
-      4.131775856018066,
-      4.106048107147217,
-      4.10214376449585,
-      4.099071979522705,
-      4.1011199951171875
-    ]
-  },
-  "test_latency_ms": {
-    "avg": 842.50205078125,
-    "min": 838.6519165039062,
-    "max": 847.3320922851562,
-    "all": [
-      843.490234375,
-      838.6519165039062,
-      840.1867065429688,
-      847.3320922851562,
-      842.8493041992188
-    ]
-  },
-  "num_runs": 5,
-  "model_init_args": [
-    8,
-    64,
-    3,
-    2
-  ],
-  "model_init_kwargs": {},
-  "seed": 100,
-  "align_stats": {
-    "pair_aligner": 1,
-    "copied_same_shape": 1,
-    "mapped_shape": 0,
-    "skipped": 0,
-    "pair_key": "Model->ModelNew"
-  },
-  "runnable": true,
-  "phase": "stage4_repair",
-  "pytorch_baseline_ms": 4.1000831604003904,
-  "score": 0.004866555703453059
+  "runnable": false,
+  "phase": "algorithm_optimized_seed0_repair1",
+  "error_type": "RuntimeError",
+  "message": "Traceback (most recent call last):\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py\", line 43, in wrapper\n    return fn(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py\", line 1094, in __getitem__\n    for dim, sl in enumerate(slices):\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py\", line 41, in wrapper\n    raise ValueError(\"Did you forget to add @triton.jit ? \"\nValueError: Did you forget to add @triton.jit ? (`_semantic` argument must be provided outside of JIT functions.)\n\nThe above exception was the direct cause of the following exception:\n\nTraceback (most recent call last):\n  File \"/home/hyc/LLMKernel/utils/compile_and_run.py\", line 555, in compare_and_bench\n    test_out, _ = _run_once(test_model, inp, dev)\n                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/LLMKernel/utils/compile_and_run.py\", line 132, in _run_once\n    out = model(*inp)\n          ^^^^^^^^^^^\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py\", line 1775, in _wrapped_call_impl\n    return self._call_impl(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py\", line 1786, in _call_impl\n    return forward_call(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/LLMKernel/run/20251228_161743_batch_range68to77_openai_deepseek/71_Conv2d_Divide_LeakyReLU/code/kernel_20251228_163059.py\", line 532, in forward\n    return conv2d_winograd_f2k3_div_leakyrelu(\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/LLMKernel/run/20251228_161743_batch_range68to77_openai_deepseek/71_Conv2d_Divide_LeakyReLU/code/kernel_20251228_163059.py\", line 474, in conv2d_winograd_f2k3_div_leakyrelu\n    conv2d_winograd_f2k3_div_leakyrelu_kernel[grid](\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py\", line 419, in <lambda>\n    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)\n                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py\", line 733, in run\n    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py\", line 861, in _do_compile\n    kernel = self.compile(src, target=target, options=options.__dict__)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py\", line 300, in compile\n    module = src.make_ir(target, options, codegen_fns, module_map, context)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py\", line 80, in make_ir\n    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\ntriton.compiler.errors.CompilationError: at 76:13:\n        mask_h = h_idx[:, None] < H_in\n        mask_w = w_idx[None, :] < W_in\n        mask_x = mask_h & mask_w\n\n        d = tl.load(x_ptrs, mask=mask_x, other=0.0).to(tl.float32)  # (4,4)\n\n        # Flatten to 1D to avoid scalar indexing\n        d_flat = tl.reshape(d, (16,))\n        offs4 = tl.arange(0, 4)\n\n        # Rows of d as 4-element vectors\n        r0 = d_flat[offs4 + 0]\n             ^\nDid you forget to add @triton.jit ? (`_semantic` argument must be provided outside of JIT functions.)\n"
 }

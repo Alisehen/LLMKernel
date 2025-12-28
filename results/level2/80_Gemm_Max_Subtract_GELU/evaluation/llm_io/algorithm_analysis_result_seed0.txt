@@ -1,0 +1,10 @@
+```json
+{
+  "worth_optimizing": "yes",
+  "reason": "The current Triton path is slower than the PyTorch baseline largely because it performs a full weight transpose+contiguous every forward pass, adding an extra O(N*K) memory movement on top of the GEMM.",
+  "bottleneck": "In fused_linear, `w_t = weight.t().contiguous()` materializes a full 8192x8192 transposed copy on every call, which is extremely bandwidth-heavy and not overlapped with compute; for these sizes this copy can cost a substantial fraction (or more) of the total 4.02 ms runtime.",
+  "optimisation method": "Apply a memory-layout optimization: keep a transposed (or GEMM-friendly) copy of the weight matrix persistent across forwards, and update it only when the original weight changes, so the kernel can use this layout directly without doing `weight.t().contiguous()` each iteration.",
+  "modification plan": "In ModelNew.__init__, register an additional parameter/buffer (e.g., `self.weight_t`) that stores `self.gemm.weight.t().contiguous()`; update `self.weight_t` lazily or in `no_grad()` whenever `self.gemm.weight` is modified (e.g., via a hook or an explicit `sync_weight_t()` method). Change `fused_linear` (or the forward) to pass `weight_t` directly into the Triton GEMM kernel, removing the per-forward transpose; alternatively, rewrite the GEMM kernel indexing to operate directly on the original [N, K] layout and drop the transpose altogether.",
+  "expected_speedup": "30-50%"
+}
+```

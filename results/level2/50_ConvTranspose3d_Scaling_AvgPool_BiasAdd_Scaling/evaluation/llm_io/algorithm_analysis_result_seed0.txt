@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The current design still materializes the full high-resolution ConvTranspose3d output and then immediately downsamples it, causing large unnecessary memory traffic and extra FLOPs.",
+  "bottleneck": "ConvTranspose3d with stride=2 produces a large intermediate tensor that is then reduced by AvgPool3d(kernel=2, stride=2). This upsample-then-downsample pattern wastes bandwidth (writing/reading a 3D volume that is ~8x larger) and computes many values that are later averaged away.",
+  "optimisation method": "Replace the sequence ConvTranspose3d → scale1 → AvgPool3d → bias → scale2 with a single custom 'pooled transposed convolution' kernel that directly produces the downsampled output, algebraically combining the transposed-conv weights with the 2×2×2 average pooling and including scale1, bias, and scale2 in the same pass.",
+  "modification plan": "Derive how each final output voxel (after pooling) can be expressed as a weighted sum over the original input using an effective kernel that merges the transposed-convolution filter with the 2×2×2 averaging window. Implement a Triton kernel that iterates over the final (N, C_out, D_out, H_out, W_out) grid and accumulates contributions directly from the input, avoiding the explicit high-resolution intermediate. Fold scale1 and scale2 into the effective weights and add the per-channel bias in-register before storing the final result.",
+  "expected_speedup": "30-40%"
+}

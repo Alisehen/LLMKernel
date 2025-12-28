@@ -1,6 +1,51 @@
 {
-  "runnable": false,
-  "phase": "stage2_repair",
-  "error_type": "RuntimeError",
-  "message": "Traceback (most recent call last):\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py\", line 34, in wrapper\n    return fn(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py\", line 1451, in arange\n    return semantic.arange(start, end, _builder)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/semantic.py\", line 614, in arange\n    raise ValueError(\"arange's arguments must be of type tl.constexpr\")\nValueError: arange's arguments must be of type tl.constexpr\n\nThe above exception was the direct cause of the following exception:\n\nTraceback (most recent call last):\n  File \"/home/hyc/LLMKernel/utils/compile_and_run.py\", line 535, in compare_and_bench\n    test_out, _ = _run_once(test_model, inp, dev)\n                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/LLMKernel/utils/compile_and_run.py\", line 132, in _run_once\n    out = model(*inp)\n          ^^^^^^^^^^^\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py\", line 1751, in _wrapped_call_impl\n    return self._call_impl(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py\", line 1762, in _call_impl\n    return forward_call(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/LLMKernel/run/20251213_080749_batch_range71to100_deepseek_deepseek/71_Conv2d_Divide_LeakyReLU/code/kernel_20251213_083503.py\", line 261, in forward\n    return triton_conv_div_leaky_relu(\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/LLMKernel/run/20251213_080749_batch_range71to100_deepseek_deepseek/71_Conv2d_Divide_LeakyReLU/code/kernel_20251213_083503.py\", line 230, in triton_conv_div_leaky_relu\n    conv_div_leaky_relu_kernel[grid](\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py\", line 347, in <lambda>\n    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)\n                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py\", line 192, in run\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py\", line 192, in <dictcomp>\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py\", line 170, in _bench\n    return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/testing.py\", line 145, in do_bench\n    fn()\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py\", line 156, in kernel_call\n    self.fn.run(\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py\", line 569, in run\n    kernel = self.compile(src, target=target, options=options.__dict__)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py\", line 278, in compile\n    module = src.make_ir(options, codegen_fns, module_map, context)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py\", line 81, in make_ir\n    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\ntriton.compiler.errors.CompilationError: at 66:17:\n    input_channels_per_group = in_channels // groups\n    output_channels_per_group = out_channels // groups\n    channel_blocks_per_group = tl.cdiv(output_channels_per_group, BLOCK_CHANNEL)\n    group_id = pid_channel // channel_blocks_per_group\n    group_channel_offset = group_id * output_channels_per_group\n\n    # Compute actual channel indices\n    channel_idx = channel_start + channel_range\n    output_channel_idx = channel_idx + group_channel_offset\n\n    # Precompute kernel positions\n    kh_indices = tl.arange(0, kernel_h)\n                 ^\n"
+  "timestamp": "2025-12-28T16:25:09",
+  "reference_file": "KernelBench/tt/71_Conv2d_Divide_LeakyReLU.py",
+  "candidate_file": "/home/hyc/LLMKernel/run/20251228_161743_batch_range68to77_openai_deepseek/71_Conv2d_Divide_LeakyReLU/code/kernel_20251228_162505.py",
+  "tolerance": 1,
+  "max_abs_err": 0.0003153085708618164,
+  "mean_abs_err": 3.755330908461474e-05,
+  "ref_latency_ms": {
+    "avg": 4.1428672790527346,
+    "min": 4.1308159828186035,
+    "max": 4.157440185546875,
+    "all": [
+      4.157440185546875,
+      4.151264190673828,
+      4.131840229034424,
+      4.1308159828186035,
+      4.142975807189941
+    ]
+  },
+  "test_latency_ms": {
+    "avg": 1.517951989173889,
+    "min": 1.5147199630737305,
+    "max": 1.5206400156021118,
+    "all": [
+      1.5206400156021118,
+      1.5185920000076294,
+      1.5147199630737305,
+      1.5162559747695923,
+      1.5195519924163818
+    ]
+  },
+  "num_runs": 5,
+  "model_init_args": [
+    8,
+    64,
+    3,
+    2
+  ],
+  "model_init_kwargs": {},
+  "seed": 100,
+  "align_stats": {
+    "pair_aligner": 1,
+    "copied_same_shape": 1,
+    "mapped_shape": 0,
+    "skipped": 0,
+    "pair_key": "Model->ModelNew"
+  },
+  "runnable": true,
+  "phase": "seed_0",
+  "score": 2.7292479001970253
 }

@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The convolution is implemented as a straightforward implicit GEMM for a 3x3 kernel, where a Winograd algorithm can significantly reduce arithmetic cost for this very common case.",
+  "bottleneck": "The kernel is predominantly compute-bound due to performing a full KH*KW=9 MACs per output element for every (Cin, Cout) pair in a direct convolution formulation, so FLOP count rather than memory bandwidth is the main limiter.",
+  "optimisation method": "Replace the direct 3x3 convolution with a Winograd F(2x2,3x3) algorithm in Triton, which transforms 4x4 input tiles and 3x3 filters into the Winograd domain, does cheaper elementwise multiplications, and then applies an inverse transform, reducing the total number of MACs per output by roughly 2×.",
+  "modification plan": "Specialize the Triton kernel for stride=1, 3x3 kernels and tile the output into 2x2 blocks; for each tile, load the corresponding 4x4 input patch, apply the fixed Winograd input transform (B matrix) in registers/shared memory, and multiply with pre-transformed weights (U matrix) that are computed once on the host or in a small preprocessing kernel. Accumulate in the Winograd domain, apply the inverse transform (A matrix) to recover the 2x2 output block, and fuse the bias, division, and LeakyReLU as the epilogue before writing back to global memory. Keep the current direct-convolution path as a fallback for non-3x3 or non-unit-stride cases.",
+  "expected_speedup": "25-35%"
+}

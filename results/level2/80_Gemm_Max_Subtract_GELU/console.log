@@ -1,0 +1,324 @@
+[Seed] Generating seed kernel...
+[Seed 1/2] Generating...
+[92mFinish reason: stop[0m
+Usage: In=1671, Out=10911, Total=12582
+[seed_0] score=0.7822 (baseline=3.1423ms)
+[seed_0] metrics saved to: /home/hyc/LLMKernel/run/20251228_161811_batch_range79to85_openai_deepseek/80_Gemm_Max_Subtract_GELU/evaluation/eval_0010.json
+[Seed 1] Final score: 0.7822 ✓
+[Seed 2/2] Generating...
+[92mFinish reason: stop[0m
+Usage: In=1671, Out=12935, Total=14606
+[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 43, in wrapper
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 2192, in store
+    return _semantic.store(pointer, value, mask, boundary_check, cache_modifier, eviction_policy)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/semantic.py", line 1297, in store
+    return self._store_legacy(ptr, val, mask, boundary_check, cache, eviction)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/semantic.py", line 1253, in _store_legacy
+    raise ValueError("Value argument cannot be block type if pointer argument is not a block")
+ValueError: Value argument cannot be block type if pointer argument is not a block
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 555, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251228_161811_batch_range79to85_openai_deepseek/80_Gemm_Max_Subtract_GELU/code/kernel_20251228_164013.py", line 318, in forward
+    x = triton_max_reduce(x, self.max_dim)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251228_161811_batch_range79to85_openai_deepseek/80_Gemm_Max_Subtract_GELU/code/kernel_20251228_164013.py", line 173, in triton_max_reduce
+    rowwise_max_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 419, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 733, in run
+    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 861, in _do_compile
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 300, in compile
+    module = src.make_ir(target, options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 80, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 30:4:
+    for start_n in range(0, N, BLOCK_N):
+        offs_n = start_n + cols
+        ptrs = row_in_ptr + offs_n * stride_in
+        vals = tl.load(
+            ptrs,
+            mask=row_mask & (offs_n < N),
+            other=-float("inf"),
+        )
+        block_max = tl.max(vals, axis=0)
+        max_val = tl.maximum(max_val, block_max)
+
+    tl.store(row_out_ptr + 0 * stride_on, max_val, mask=row_mask)
+    ^
+Value argument cannot be block type if pointer argument is not a block
+
+[seed_1] failed. See metrics.message for details.
+[seed_1] metrics saved to: /home/hyc/LLMKernel/run/20251228_161811_batch_range79to85_openai_deepseek/80_Gemm_Max_Subtract_GELU/evaluation/eval_0011.json
+[Seed 2] Failed, attempting repair...
+[92mFinish reason: stop[0m
+Usage: In=4313, Out=6403, Total=10716
+[seed_1_repair_1] score=0.7184 (baseline=3.1423ms)
+[seed_1_repair_1] metrics saved to: /home/hyc/LLMKernel/run/20251228_161811_batch_range79to85_openai_deepseek/80_Gemm_Max_Subtract_GELU/evaluation/eval_0012.json
+[Seed 2 Repair] Score: 0.7184 ✓
+[Seed 2] Final score: 0.7184 ✓
+
+================================================================================
+[Hybrid Strategy] Analyzing all seeds for algorithmic optimization...
+[Hybrid Strategy] - 2 seed(s) with score < 1.0 (rescue)
+================================================================================
+
+[Hybrid] Seed 1: score=0.7822 < 1.0
+[Hybrid] Attempting algorithm analysis rescue...
+[ncu] Using GPU device 7 (CUDA_VISIBLE_DEVICES=7)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_3267963.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_3267963.py /home/hyc/LLMKernel/KernelBench/tt/80_Gemm_Max_Subtract_GELU.py /home/hyc/LLMKernel/run/20251228_161811_batch_range79to85_openai_deepseek/80_Gemm_Max_Subtract_GELU/code/test_kernel_analysis_seed0.py --repeat 1
+[ncu stdout]: [bench] Completed 1 iterations successfully
+
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_3267963.csv
+[Hybrid] Requesting LLM analysis for seed 1...
+[92mFinish reason: stop[0m
+Usage: In=2660, Out=650, Total=3310
+[Hybrid] Worth optimizing: yes
+[Hybrid] Reason: The current Triton path is slower than the PyTorch baseline largely because it performs a full weight transpose+contiguous every forward pass, adding an extra O(N*K) memory movement on top of the GEMM.
+[Hybrid] Analysis complete for seed 1, generating optimized kernel...
+[Hybrid] Bottleneck: In fused_linear, `w_t = weight.t().contiguous()` materializes a full 8192x8192 t...
+[Hybrid] Optimization: Apply a memory-layout optimization: keep a transposed (or GEMM-friendly) copy of...
+[Hybrid] Expected speedup: 30-50%
+[92mFinish reason: stop[0m
+Usage: In=2983, Out=3750, Total=6733
+[algorithm_optimized_seed0] score=1.4899 (baseline=3.1423ms)
+[algorithm_optimized_seed0] metrics saved to: /home/hyc/LLMKernel/run/20251228_161811_batch_range79to85_openai_deepseek/80_Gemm_Max_Subtract_GELU/evaluation/eval_0013.json
+[Hybrid] ✓ Rescue successful: 0.7822 → 1.4899
+
+[Hybrid] Seed 2: score=0.7184 < 1.0
+[Hybrid] Attempting algorithm analysis rescue...
+[ncu] Using GPU device 7 (CUDA_VISIBLE_DEVICES=7)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_3267963.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_3267963.py /home/hyc/LLMKernel/KernelBench/tt/80_Gemm_Max_Subtract_GELU.py /home/hyc/LLMKernel/run/20251228_161811_batch_range79to85_openai_deepseek/80_Gemm_Max_Subtract_GELU/code/test_kernel_analysis_seed1.py --repeat 1
+[ncu stdout]: [bench] Completed 1 iterations successfully
+
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_3267963.csv
+[Hybrid] Requesting LLM analysis for seed 2...
+[92mFinish reason: stop[0m
+Usage: In=3745, Out=1613, Total=5358
+[Hybrid] Worth optimizing: yes
+[Hybrid] Reason: The current implementation fully materializes the [M, N] GEMM output and then rereads it for reduction/activation, causing heavy, avoidable memory traffic and extra launches.
+[Hybrid] Analysis complete for seed 2, generating optimized kernel...
+[Hybrid] Bottleneck: After GEMM, the kernel writes the entire [M, N] matrix to global memory, then pe...
+[Hybrid] Optimization: Fuse the GEMM with the max reduction and subsequent mean+GELU into a single Trit...
+[Hybrid] Expected speedup: 40-60%
+[92mFinish reason: stop[0m
+Usage: In=3962, Out=16522, Total=20484
+[algorithm_optimized_seed1] score=0.2493 (baseline=3.1423ms)
+[algorithm_optimized_seed1] metrics saved to: /home/hyc/LLMKernel/run/20251228_161811_batch_range79to85_openai_deepseek/80_Gemm_Max_Subtract_GELU/evaluation/eval_0014.json
+[Hybrid] ✓ Rescue successful: 0.7184 → 0.2493
+
+================================================================================
+[Hybrid] Candidate Selection
+================================================================================
+[Hybrid] Total candidates: 4
+  [1] seed 1: 0.7822
+  [2] seed 2: 0.7184
+  [3] algo-optimized (from seed 1): 1.4899
+  [4] algo-optimized (from seed 2): 0.2493
+
+[Hybrid] ★ Selected best candidate: score=1.4899
+
+[Optimization] Starting 3-stage optimization...
+
+================================================================================
+[Stage 1/3] grid_and_parallel
+Description: Optimize grid layout and parallel work distribution across SMs.
+Current candidates: 1, best score: 1.4899
+================================================================================
+[Stage 1] Profiling best candidate...
+[ncu] Using GPU device 7 (CUDA_VISIBLE_DEVICES=7)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_3267963.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_3267963.py /home/hyc/LLMKernel/KernelBench/tt/80_Gemm_Max_Subtract_GELU.py /home/hyc/LLMKernel/run/20251228_161811_batch_range79to85_openai_deepseek/80_Gemm_Max_Subtract_GELU/code/test_kernel_analysis_seed1.py --repeat 1
+[ncu stdout]: [bench] Completed 1 iterations successfully
+
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_3267963.csv
+[Stage 1] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=2786, Out=9031, Total=11817
+[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 555, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251228_161811_batch_range79to85_openai_deepseek/80_Gemm_Max_Subtract_GELU/code/kernel_20251228_164530.py", line 308, in forward
+    _ = fused_linear(x, weight_t, self.gemm.bias)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251228_161811_batch_range79to85_openai_deepseek/80_Gemm_Max_Subtract_GELU/code/kernel_20251228_164530.py", line 157, in fused_linear
+    linear_gemm_bias_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 419, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 238, in run
+    benchmark()
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 227, in benchmark
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 227, in <dictcomp>
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 137, in _bench
+    raise ValueError(f"Conflicting meta-parameters: {', '.join(conflicts)}."
+ValueError: Conflicting meta-parameters: BLOCK_N, BLOCK_K, BLOCK_M, GROUP_M. Make sure that you don't re-define auto-tuned symbols.
+
+[stage1_grid_and_parallel] failed. See metrics.message for details.
+[stage1_grid_and_parallel] metrics saved to: /home/hyc/LLMKernel/run/20251228_161811_batch_range79to85_openai_deepseek/80_Gemm_Max_Subtract_GELU/evaluation/eval_0015.json
+  Optimization failed, attempting repair...
+[92mFinish reason: stop[0m
+Usage: In=3624, Out=6113, Total=9737
+[stage1_grid_and_parallel_repair] score=0.9628 (baseline=3.1423ms)
+[stage1_grid_and_parallel_repair] metrics saved to: /home/hyc/LLMKernel/run/20251228_161811_batch_range79to85_openai_deepseek/80_Gemm_Max_Subtract_GELU/evaluation/eval_0016.json
+  Optimized kernel score: 0.9628 ✓
+[Stage 1] Current: 0.9628 (global best: 1.4899)
+
+================================================================================
+[Stage 2/3] block_tiling
+Description: Tune BLOCK_M/N/K sizes for optimal register/memory balance.
+Current candidates: 1, best score: 1.4899
+================================================================================
+[Stage 2] Profiling best candidate...
+[ncu] Using GPU device 7 (CUDA_VISIBLE_DEVICES=7)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_3267963.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_3267963.py /home/hyc/LLMKernel/KernelBench/tt/80_Gemm_Max_Subtract_GELU.py /home/hyc/LLMKernel/run/20251228_161811_batch_range79to85_openai_deepseek/80_Gemm_Max_Subtract_GELU/code/test_kernel_analysis_seed1.py --repeat 1
+[ncu stdout]: [bench] Completed 1 iterations successfully
+
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_3267963.csv
+[Stage 2] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=3126, Out=5015, Total=8141
+[stage2_block_tiling] score=1.0703 (baseline=3.1423ms)
+[stage2_block_tiling] metrics saved to: /home/hyc/LLMKernel/run/20251228_161811_batch_range79to85_openai_deepseek/80_Gemm_Max_Subtract_GELU/evaluation/eval_0017.json
+  Optimized kernel score: 1.0703 ✓
+[Stage 2] Current: 1.0703 (global best: 1.4899)
+
+================================================================================
+[Stage 3/3] memory_and_tuning
+Description: Optimize memory access patterns and fine-tune num_stages/num_warps.
+Current candidates: 1, best score: 1.4899
+================================================================================
+[Stage 3] Profiling best candidate...
+[ncu] Using GPU device 7 (CUDA_VISIBLE_DEVICES=7)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_3267963.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_3267963.py /home/hyc/LLMKernel/KernelBench/tt/80_Gemm_Max_Subtract_GELU.py /home/hyc/LLMKernel/run/20251228_161811_batch_range79to85_openai_deepseek/80_Gemm_Max_Subtract_GELU/code/test_kernel_analysis_seed1.py --repeat 1
+[ncu stdout]: [bench] Completed 1 iterations successfully
+
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_3267963.csv
+[Stage 3] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=3206, Out=5218, Total=8424
+[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 43, in wrapper
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 2865, in multiple_of
+    return _semantic.multiple_of(input, values)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/semantic.py", line 1780, in multiple_of
+    raise ValueError("Shape of input to multiple_of does not match the length of values")
+ValueError: Shape of input to multiple_of does not match the length of values
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 555, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251228_161811_batch_range79to85_openai_deepseek/80_Gemm_Max_Subtract_GELU/code/kernel_20251228_164820.py", line 296, in forward
+    _ = fused_linear(x, weight_t, self.gemm.bias)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251228_161811_batch_range79to85_openai_deepseek/80_Gemm_Max_Subtract_GELU/code/kernel_20251228_164820.py", line 167, in fused_linear
+    linear_gemm_bias_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 419, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 238, in run
+    benchmark()
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 227, in benchmark
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 227, in <dictcomp>
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 162, in _bench
+    return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/testing.py", line 149, in do_bench
+    fn()
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 148, in kernel_call
+    self.fn.run(
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 733, in run
+    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 861, in _do_compile
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 300, in compile
+    module = src.make_ir(target, options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 80, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 50:4:
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Give Triton alignment / divisibility hints for better vectorization
+    tl.multiple_of(offs_m, BLOCK_M)
+    tl.multiple_of(offs_n, BLOCK_N)
+    tl.multiple_of(offs_k, BLOCK_K)
+
+    # Initial pointers for tiles
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    w_ptrs = w_ptr + offs_k[:, None] * stride_wk + offs_n[None, :] * stride_wn
+
+    tl.multiple_of(a_ptrs, 16)
+    ^
+Shape of input to multiple_of does not match the length of values
+
+[stage3_memory_and_tuning] failed. See metrics.message for details.
+[stage3_memory_and_tuning] metrics saved to: /home/hyc/LLMKernel/run/20251228_161811_batch_range79to85_openai_deepseek/80_Gemm_Max_Subtract_GELU/evaluation/eval_0018.json
+  Optimization failed, attempting repair...
+[92mFinish reason: stop[0m
+Usage: In=4240, Out=5352, Total=9592
+[stage3_memory_and_tuning_repair] score=1.0707 (baseline=3.1423ms)
+[stage3_memory_and_tuning_repair] metrics saved to: /home/hyc/LLMKernel/run/20251228_161811_batch_range79to85_openai_deepseek/80_Gemm_Max_Subtract_GELU/evaluation/eval_0019.json
+  Optimized kernel score: 1.0707 ✓
+[Stage 3] Current: 1.0707 (global best: 1.4899)
+[80_Gemm_Max_Subtract_GELU.py] Figure saved to: /home/hyc/LLMKernel/run/20251228_161811_batch_range79to85_openai_deepseek/80_Gemm_Max_Subtract_GELU/figures/80_Gemm_Max_Subtract_GELU_score.png

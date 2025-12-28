@@ -1,0 +1,309 @@
+You are a GPU kernel optimization architect. Analyze the kernel and identify **ONE high-level algorithmic optimization**.
+
+# PyTorch Reference
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs a GEMM, followed by a max operation, subtraction, and GELU activation.
+    """
+    def __init__(self, in_features, out_features, max_dim):
+        super(Model, self).__init__()
+        self.gemm = nn.Linear(in_features, out_features)
+        self.max_dim = max_dim
+
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor of shape (batch_size, in_features)
+
+        Returns:
+            Output tensor of shape (batch_size, out_features)
+        """
+        x = self.gemm(x)
+        x = torch.max(x, dim=self.max_dim, keepdim=True).values
+        x = x - x.mean(dim=1, keepdim=True)
+        x = torch.nn.functional.gelu(x)
+        return x
+
+batch_size = 1024
+in_features = 8192
+out_features = 8192
+max_dim = 1
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features)]
+
+def get_init_inputs():
+    return [in_features, out_features, max_dim]
+```
+
+# Current Triton Kernel
+```python
+# <complete ModelNew code with optimized Triton kernels>
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def linear_gemm_bias_kernel(
+    a_ptr, w_ptr, b_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_wk, stride_wn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """
+    Compute C = A @ W + b
+    A: [M, K]
+    W: [K, N]   (weight transposed and made contiguous)
+    b: [N]
+    C: [M, N]
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    w_ptrs = w_ptr + offs_k[:, None] * stride_wk + offs_n[None, :] * stride_wn
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k in range(0, K, BLOCK_K):
+        k_remaining = K - k
+
+        a = tl.load(
+            a_ptrs,
+            mask=(offs_m[:, None] < M) & (offs_k[None, :] < k_remaining),
+            other=0.0,
+        )
+        w = tl.load(
+            w_ptrs,
+            mask=(offs_k[:, None] < k_remaining) & (offs_n[None, :] < N),
+            other=0.0,
+        )
+        acc += tl.dot(a, w, allow_tf32=True)
+
+        a_ptrs += BLOCK_K * stride_ak
+        w_ptrs += BLOCK_K * stride_wk
+
+    # Add bias (broadcast over rows)
+    bias = tl.load(b_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc += bias[None, :]
+
+    # Store result
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    tl.store(
+        c_ptrs,
+        acc.to(tl.float32),
+        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+    )
+
+
+@triton.jit
+def max_sub_mean_gelu_kernel(
+    x_ptr, out_ptr,
+    M, N,
+    stride_xm, stride_xn,
+    stride_om, stride_on,
+    BLOCK_M: tl.constexpr,
+):
+    """
+    Compute:
+        x_max = torch.max(x, dim=1, keepdim=True).values
+        x_centered = x_max - x_max.mean(dim=1, keepdim=True)
+        out = gelu(x_centered)
+
+    For the given model configuration (max_dim == 1 and keepdim=True),
+    this simplifies mathematically to out[...] = 0 for all inputs.
+
+    We therefore just write zeros, which is both correct and maximally fast.
+    """
+    pid_m = tl.program_id(0)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offs_m < M
+
+    # We only write column 0 (keepdim=True -> shape [M, 1])
+    col0 = 0
+    out_ptrs = out_ptr + offs_m * stride_om + col0 * stride_on
+
+    zeros = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    tl.store(out_ptrs, zeros, mask=mask_m)
+
+
+def fused_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    High-performance linear layer: x @ weight.T + bias
+    x:      [M, K]
+    weight: [N, K] (PyTorch Linear layout)
+    bias:   [N]
+    returns: [M, N]
+    """
+    assert x.dim() == 2, "Input must be 2D"
+    M, K = x.shape
+    N, K_w = weight.shape
+    assert K_w == K, "Incompatible shapes for matmul"
+
+    # Use weight^T, contiguous, for more coalesced memory access
+    w_t = weight.t().contiguous()  # [K, N]
+
+    out = torch.empty((M, N), device=x.device, dtype=x.dtype)
+
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_M"]),
+        triton.cdiv(N, META["BLOCK_N"]),
+    )
+
+    linear_gemm_bias_kernel[grid](
+        x, w_t, bias, out,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        w_t.stride(0), w_t.stride(1),
+        out.stride(0), out.stride(1),
+        BLOCK_M=128, BLOCK_N=128, BLOCK_K=32,
+        num_warps=4,
+        num_stages=3,
+    )
+    return out
+
+
+def max_sub_mean_gelu_triton(x: torch.Tensor, max_dim: int) -> torch.Tensor:
+    """
+    Apply the sequence:
+        x = torch.max(x, dim=max_dim, keepdim=True).values
+        x = x - x.mean(dim=1, keepdim=True)
+        x = gelu(x)
+
+    For the target model, max_dim == 1 and keepdim=True, which implies
+    the result is identically zero for any x. We implement this fast path
+    via a Triton kernel that simply writes zeros with the correct shape.
+    """
+    assert x.dim() == 2, "Expected 2D tensor"
+    assert max_dim == 1, "This optimized kernel assumes max_dim == 1"
+
+    M, N = x.shape
+    out = torch.empty((M, 1), device=x.device, dtype=x.dtype)
+
+    grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]),)
+
+    max_sub_mean_gelu_kernel[grid](
+        x, out,
+        M, N,
+        x.stride(0), x.stride(1),
+        out.stride(0), out.stride(1),
+        BLOCK_M=128,
+        num_warps=4,
+        num_stages=2,
+    )
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized version of the target model.
+
+    Operations:
+        1. Linear (GEMM + bias) via fused Triton kernel
+        2. torch.max over dim=max_dim, keepdim=True
+        3. Subtract mean over dim=1, keepdim=True
+        4. GELU activation
+
+    For the given configuration (max_dim=1), steps 2–4 simplify to an
+    identically zero output; this is implemented with a specialized
+    Triton kernel for maximal performance.
+    """
+
+    def __init__(self, in_features, out_features, max_dim):
+        super(ModelNew, self).__init__()
+        self.gemm = nn.Linear(in_features, out_features)
+        self.max_dim = max_dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Fallback to pure PyTorch on CPU (Triton is CUDA-only)
+        if not x.is_cuda:
+            x = self.gemm(x)
+            x = torch.max(x, dim=self.max_dim, keepdim=True).values
+            x = x - x.mean(dim=1, keepdim=True)
+            x = torch.nn.functional.gelu(x)
+            return x
+
+        # Triton-accelerated path on CUDA
+        y = fused_linear(x, self.gemm.weight, self.gemm.bias)
+        out = max_sub_mean_gelu_triton(y, self.max_dim)
+        return out
+```
+
+# Performance
+- **PyTorch baseline**: 3.14 ms
+- **Current Triton**: 4.02 ms
+- **Current speedup**: 0.78x (-27.8% vs baseline)
+
+
+---
+
+## Analysis Steps
+
+1. **Code Analysis**: Count kernels, identify operations, check for inefficiencies
+2. **Performance Diagnosis**: Use metrics/latency to identify bottleneck type
+3. **Root Cause**: Combine code + performance to find the core issue
+
+## Optimization Categories (pick ONE if worth optimizing):
+
+### 1. Operator Fusion
+Fuse consecutive ops into fewer kernels to reduce memory traffic and launch overhead.
+
+### 2. Algorithm Replacement
+Replace naive algorithm with optimized variant.
+- For Attention: Flash Attention, online softmax
+- For Convolution: Winograd, im2col
+- **For RNN/GRU/LSTM**: Persistent kernel with HYBRID computation
+  - **CRITICAL**: Use hybrid approach for best performance:
+    * Precompute input-side gates ONCE (outside kernel): `gates_x = (T*B, In) @ W_ih`
+    * Persistent kernel (inside): only recurrent-side: `for t: gates_h = h @ W_hh`
+  - Time loop `for t in range(T)` must be inside kernel, NOT in Python
+  - Launch kernel once per layer, not once per timestep
+  - Expected speedup: 10-100x (vs per-timestep launches)
+
+### 3. Kernel Launch Reduction
+Combine multiple small kernels to reduce overhead.
+- **For RNN/GRU/LSTM**: See "Algorithm Replacement" above for persistent kernel approach
+
+### 4. Memory Layout Optimization
+Use in-place operations, buffer reuse, or better layouts.
+
+## Should We Optimize?
+
+Before proposing optimization, determine if it's worthwhile:
+- **Not worth optimizing** if:
+  - Code is already near-optimal (expected speedup < 10%)
+  - Bottleneck cannot be addressed (hardware limited, already optimal algorithm)
+  - Optimization would add significant complexity with minimal gain
+
+- **Worth optimizing** if:
+  - Clear algorithmic inefficiency exists (multiple kernels, suboptimal algorithm)
+  - Expected speedup >= 20%
+  - Concrete optimization path available
+
+## Output (JSON)
+
+```json
+{
+  "worth_optimizing": "yes/no",
+  "reason": "<Why worth or not worth optimizing, 1 sentence>",
+  "bottleneck": "<Root cause in 1-2 sentences, empty if not worth optimizing>",
+  "optimisation method": "<Specific optimization in 1-2 sentences, empty if not worth optimizing>",
+  "modification plan": "<Implementation steps in 2-3 sentences, empty if not worth optimizing>",
+  "expected_speedup": "<e.g., '30-40%', empty if not worth optimizing>"
+}
+```
+
+Return JSON only.

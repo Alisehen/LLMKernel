@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The kernel uses a direct/implicit-GEMM 3x3 convolution, which can be replaced by a Winograd variant that reduces arithmetic and memory traffic for this specific kernel size.",
+  "bottleneck": "The current implicit-GEMM convolution performs a full 3x3 sliding-window MAC for every output pixel, leading to redundant arithmetic and repeated loading of overlapping input regions, especially for stride=1, 3x3 filters.",
+  "optimisation method": "Replace the direct implicit-GEMM 3x3 convolution with a Winograd F(2x2, 3x3) algorithm, keeping the divide and LeakyReLU fused after the inverse transform.",
+  "modification plan": "Precompute and store Winograd-transformed weights (G * w * G^T) once in the model’s __init__ or in a cached buffer. In the Triton kernel, tile the input into 4x4 patches, apply the Winograd input transform (B^T * d * B) per tile, perform elementwise multiplication and reduction in the Winograd domain across C_in, then apply the inverse transform (A^T * m * A) to get 2x2 output tiles. Finally, fuse the division by the constant and LeakyReLU into the epilogue when writing the 2x2 outputs back to y.",
+  "expected_speedup": "20-40%"
+}

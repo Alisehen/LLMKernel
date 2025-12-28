@@ -1,0 +1,464 @@
+```python
+# complete ModelNew code with optimized Triton kernels
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+# ------------------------------------------------------------
+# 1) Baseline GEMM (Linear) kernel: y = x @ W^T + b
+#    Used as fallback for max_dim == 0
+# ------------------------------------------------------------
+@triton.jit
+def linear_gemm_kernel(
+    a_ptr, w_ptr, b_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_wn, stride_wk,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    w_ptrs = w_ptr + offs_k[:, None] * stride_wk + offs_n[None, :] * stride_wn
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k in range(0, K, BLOCK_K):
+        k_mask = offs_k < (K - k)
+        a = tl.load(
+            a_ptrs,
+            mask=(offs_m[:, None] < M) & k_mask[None, :],
+            other=0.0,
+        )
+        w = tl.load(
+            w_ptrs,
+            mask=k_mask[:, None] & (offs_n[None, :] < N),
+            other=0.0,
+        )
+        a = a.to(tl.float32)
+        w = w.to(tl.float32)
+        acc += tl.dot(a, w, allow_tf32=True)
+        a_ptrs += BLOCK_K * stride_ak
+        w_ptrs += BLOCK_K * stride_wk
+
+    # add bias: shape [N], broadcast over rows
+    bias = tl.load(b_ptr + offs_n, mask=offs_n < N, other=0.0)
+    bias = bias.to(tl.float32)
+    acc += bias[None, :]
+
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    mask_out = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, acc.to(c_ptr.dtype.element_ty), mask=mask_out)
+
+
+def triton_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    x:      [M, K]
+    weight: [N, K]  (nn.Linear weight)
+    bias:   [N]
+    returns y = x @ weight.T + bias  with shape [M, N]
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+    M, K = x.shape
+    N = weight.shape[0]
+
+    # W^T is [K, N], contiguous for better memory coalescing
+    w_t = weight.t().contiguous()
+
+    y = torch.empty((M, N), device=x.device, dtype=x.dtype)
+
+    def grid(meta):
+        return (
+            max(1, triton.cdiv(M, meta["BLOCK_M"])),
+            max(1, triton.cdiv(N, meta["BLOCK_N"])),
+        )
+
+    linear_gemm_kernel[grid](
+        x, w_t, bias, y,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        w_t.stride(1), w_t.stride(0),
+        y.stride(0), y.stride(1),
+        BLOCK_M=128, BLOCK_N=128, BLOCK_K=32,
+        num_warps=8, num_stages=2,
+    )
+    return y
+
+
+# ------------------------------------------------------------
+# 2) Max-reduction kernels (fallback path for max_dim == 0)
+# ------------------------------------------------------------
+@triton.jit
+def rowwise_max_kernel(
+    in_ptr, out_ptr,
+    M, N,
+    stride_im, stride_in,
+    stride_om, stride_on,
+    BLOCK_N: tl.constexpr,
+):
+    # Each program processes one row (reduce over columns)
+    pid = tl.program_id(0)
+    row = pid
+    row_mask = row < M
+
+    row_in_ptr = in_ptr + row * stride_im
+    row_out_ptr = out_ptr + row * stride_om
+
+    max_val = tl.full((), -float("inf"), dtype=tl.float32)
+
+    cols = tl.arange(0, BLOCK_N)
+    for start_n in range(0, N, BLOCK_N):
+        offs_n = start_n + cols
+        ptrs = row_in_ptr + offs_n * stride_in
+        vals = tl.load(
+            ptrs,
+            mask=row_mask & (offs_n < N),
+            other=-float("inf"),
+        )
+        vals_f32 = vals.to(tl.float32)
+        block_max = tl.max(vals_f32, axis=0)  # scalar
+        max_val = tl.maximum(max_val, block_max)
+
+    tl.store(row_out_ptr, max_val.to(out_ptr.dtype.element_ty), mask=row_mask)
+
+
+@triton.jit
+def colwise_max_kernel(
+    in_ptr, out_ptr,
+    M, N,
+    stride_im, stride_in,
+    stride_om, stride_on,
+    BLOCK_M: tl.constexpr,
+):
+    # Each program processes one column (reduce over rows)
+    pid = tl.program_id(0)
+    col = pid
+    col_mask = col < N
+
+    col_out_ptr = out_ptr + col * stride_on
+
+    max_val = tl.full((), -float("inf"), dtype=tl.float32)
+
+    rows = tl.arange(0, BLOCK_M)
+    for start_m in range(0, M, BLOCK_M):
+        offs_m = start_m + rows
+        ptrs = in_ptr + offs_m * stride_im + col * stride_in
+        vals = tl.load(
+            ptrs,
+            mask=col_mask & (offs_m < M),
+            other=-float("inf"),
+        )
+        vals_f32 = vals.to(tl.float32)
+        block_max = tl.max(vals_f32, axis=0)  # scalar
+        max_val = tl.maximum(max_val, block_max)
+
+    tl.store(col_out_ptr, max_val.to(out_ptr.dtype.element_ty), mask=col_mask)
+
+
+def triton_max_reduce(x: torch.Tensor, dim: int) -> torch.Tensor:
+    """
+    x: [M, N]
+    dim: 0 or 1
+    returns torch.max(x, dim=dim, keepdim=True).values
+    """
+    assert x.is_cuda
+    M, N = x.shape
+    if dim == 1:
+        # Reduce over columns: output [M, 1]
+        out = torch.empty((M, 1), device=x.device, dtype=x.dtype)
+
+        def grid(meta):
+            return (max(1, triton.cdiv(M, 1)),)
+
+        rowwise_max_kernel[grid](
+            x, out,
+            M, N,
+            x.stride(0), x.stride(1),
+            out.stride(0), out.stride(1),
+            BLOCK_N=128,
+            num_warps=4, num_stages=2,
+        )
+        return out
+    elif dim == 0:
+        # Reduce over rows: output [1, N]
+        out = torch.empty((1, N), device=x.device, dtype=x.dtype)
+
+        def grid(meta):
+            return (max(1, triton.cdiv(N, 1)),)
+
+        colwise_max_kernel[grid](
+            x, out,
+            M, N,
+            x.stride(0), x.stride(1),
+            out.stride(0), out.stride(1),
+            BLOCK_M=128,
+            num_warps=4, num_stages=2,
+        )
+        return out
+    else:
+        raise NotImplementedError("Only dim=0 or dim=1 are supported for max reduction.")
+
+
+# ------------------------------------------------------------
+# 3) Mean-subtract + GELU kernel (fallback for max_dim == 0)
+#    out = GELU(z - z.mean(dim=1, keepdim=True))
+# ------------------------------------------------------------
+@triton.jit
+def mean_sub_gelu_kernel(
+    in_ptr, out_ptr,
+    M, N,
+    stride_im, stride_in,
+    stride_om, stride_on,
+    BLOCK_N: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    row = pid
+    row_mask = row < M
+
+    row_in_ptr = in_ptr + row * stride_im
+    row_out_ptr = out_ptr + row * stride_om
+
+    # ---- First pass: compute row-wise mean over dim=1 ----
+    sum_val = tl.zeros((), dtype=tl.float32)
+
+    cols = tl.arange(0, BLOCK_N)
+    for start_n in range(0, N, BLOCK_N):
+        offs_n = start_n + cols
+        ptrs = row_in_ptr + offs_n * stride_in
+        vals = tl.load(
+            ptrs,
+            mask=row_mask & (offs_n < N),
+            other=0.0,
+        )
+        vals_f32 = vals.to(tl.float32)
+        block_sum = tl.sum(vals_f32, axis=0)  # scalar
+        sum_val += block_sum
+
+    n_f32 = tl.full((), N, dtype=tl.float32)
+    mean = sum_val / n_f32  # scalar
+
+    # ---- Second pass: subtract mean and apply GELU ----
+    for start_n in range(0, N, BLOCK_N):
+        offs_n = start_n + cols
+        ptrs = row_in_ptr + offs_n * stride_in
+        vals = tl.load(
+            ptrs,
+            mask=row_mask & (offs_n < N),
+            other=0.0,
+        )
+        x = vals.to(tl.float32) - mean  # center
+
+        # GELU approximation:
+        x3 = x * x * x
+        u = 0.7978845608028654 * (x + 0.044715 * x3)  # sqrt(2/pi)
+        e = tl.exp(2.0 * u)
+        tanh_u = (e - 1.0) / (e + 1.0)
+        gelu = 0.5 * x * (1.0 + tanh_u)
+
+        out_vals = gelu.to(vals.dtype)
+        out_ptrs = row_out_ptr + offs_n * stride_on
+        tl.store(out_ptrs, out_vals, mask=row_mask & (offs_n < N))
+
+
+def triton_mean_sub_gelu(z: torch.Tensor) -> torch.Tensor:
+    """
+    z: 2D tensor
+       In this model, z is either [B, 1] (if max_dim=1) or [1, F] (if max_dim=0).
+    returns GELU(z - z.mean(dim=1, keepdim=True))
+    """
+    assert z.is_cuda
+    M, N = z.shape
+    out = torch.empty_like(z)
+
+    def grid(meta):
+        return (max(1, triton.cdiv(M, 1)),)
+
+    mean_sub_gelu_kernel[grid](
+        z, out,
+        M, N,
+        z.stride(0), z.stride(1),
+        out.stride(0), out.stride(1),
+        BLOCK_N=128,
+        num_warps=4, num_stages=2,
+    )
+    return out
+
+
+# ------------------------------------------------------------
+# 4) FUSED kernel for max_dim == 1
+#    Fuses: GEMM + row-wise max + mean-sub (dim=1) + GELU
+#    and only writes [M, 1] output. Never materializes [M, N].
+# ------------------------------------------------------------
+@triton.jit
+def fused_linear_rowmax_mean_gelu_kernel(
+    a_ptr, w_ptr, b_ptr, out_ptr,
+    M, N, K,
+    stride_am, stride_ak,   # x: [M, K]
+    stride_wk, stride_wn,   # w_t: [K, N]
+    stride_b,
+    stride_om,              # out: [M, 1]
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+
+    # Rows this program will process
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    m_mask = offs_m < M
+
+    # Per-row accumulator for the max over columns
+    row_max = tl.full((BLOCK_M,), -float("inf"), dtype=tl.float32)
+
+    # Loop over column blocks
+    for start_n in range(0, N, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        n_mask = offs_n < N
+
+        # Accumulator for this [BLOCK_M, BLOCK_N] tile
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+        # Loop over K dimension in BLOCK_K chunks
+        for start_k in range(0, K, BLOCK_K):
+            offs_k = start_k + tl.arange(0, BLOCK_K)
+            k_mask = offs_k < K
+
+            # Load A tile: [BLOCK_M, BLOCK_K]
+            a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+            a = tl.load(
+                a_ptrs,
+                mask=m_mask[:, None] & k_mask[None, :],
+                other=0.0,
+            )
+            a = a.to(tl.float32)
+
+            # Load W^T tile: [BLOCK_K, BLOCK_N]
+            w_ptrs = w_ptr + offs_k[:, None] * stride_wk + offs_n[None, :] * stride_wn
+            w = tl.load(
+                w_ptrs,
+                mask=k_mask[:, None] & n_mask[None, :],
+                other=0.0,
+            )
+            w = w.to(tl.float32)
+
+            # GEMM: [BLOCK_M, BLOCK_K] x [BLOCK_K, BLOCK_N] -> [BLOCK_M, BLOCK_N]
+            acc += tl.dot(a, w, allow_tf32=True)
+
+        # Add bias across columns
+        bias = tl.load(b_ptr + offs_n * stride_b, mask=n_mask, other=0.0)
+        bias = bias.to(tl.float32)
+        acc += bias[None, :]
+
+        # Update row-wise max with this tile's contribution
+        block_max = tl.max(acc, axis=1)  # [BLOCK_M]
+        row_max = tl.maximum(row_max, block_max)
+
+    # At this point, row_max[m] = max over all columns for row offs_m[m].
+    # The PyTorch reference then does:
+    #   z = max(x, dim=1, keepdim=True)           # [M, 1]
+    #   z = z - z.mean(dim=1, keepdim=True)       # mean over size-1 dim => z - z == 0
+    #   z = gelu(z)                               # gelu(0) == 0
+    #
+    # We replicate that exactly (it is identically zero, but we keep the math).
+
+    x = row_max - row_max  # centered -> all zeros
+
+    # GELU approximation in fp32
+    x3 = x * x * x
+    u = 0.7978845608028654 * (x + 0.044715 * x3)  # sqrt(2/pi)
+    e = tl.exp(2.0 * u)
+    tanh_u = (e - 1.0) / (e + 1.0)
+    gelu = 0.5 * x * (1.0 + tanh_u)
+
+    # Store scalar result per row to [M, 1]
+    out_ptrs = out_ptr + offs_m * stride_om
+    tl.store(out_ptrs, gelu.to(out_ptr.dtype.element_ty), mask=m_mask)
+
+
+def triton_fused_linear_rowmax_mean_gelu(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor
+) -> torch.Tensor:
+    """
+    Fused path for max_dim == 1:
+      y = x @ W^T + b        # [M, N]
+      z = max(y, dim=1, keepdim=True).values   # [M, 1]
+      z = z - z.mean(dim=1, keepdim=True)
+      z = gelu(z)
+
+    Returns tensor of shape [M, 1].
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+    M, K = x.shape
+    N = weight.shape[0]
+
+    # W^T is [K, N], contiguous
+    w_t = weight.t().contiguous()
+
+    out = torch.empty((M, 1), device=x.device, dtype=x.dtype)
+
+    def grid(meta):
+        # 1D grid over row blocks
+        return (max(1, triton.cdiv(M, meta["BLOCK_M"])),)
+
+    fused_linear_rowmax_mean_gelu_kernel[grid](
+        x, w_t, bias, out,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        w_t.stride(0), w_t.stride(1),
+        bias.stride(0),
+        out.stride(0),
+        BLOCK_M=32, BLOCK_N=128, BLOCK_K=32,
+        num_warps=8, num_stages=3,
+    )
+    return out
+
+
+# ------------------------------------------------------------
+# 5) High-performance replacement model
+# ------------------------------------------------------------
+class ModelNew(nn.Module):
+    """
+    Model that performs:
+      1) GEMM (Linear): x @ W^T + b
+      2) torch.max(x, dim=max_dim, keepdim=True).values
+      3) subtraction of mean along dim=1 (keepdim=True)
+      4) GELU activation
+
+    For max_dim == 1, a single fused Triton kernel is used that
+    never materializes the full [M, N] GEMM output.
+    For max_dim == 0, the original 3-kernel pipeline is used.
+    """
+
+    def __init__(self, in_features, out_features, max_dim):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.bias = nn.Parameter(torch.randn(out_features))
+        self.max_dim = max_dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Ensure parameters are on same device as input
+        if self.weight.device != x.device:
+            self.weight.data = self.weight.data.to(x.device)
+            self.bias.data = self.bias.data.to(x.device)
+
+        if self.max_dim == 1:
+            # Fully fused fast path: GEMM + row-wise max + mean-sub + GELU
+            return triton_fused_linear_rowmax_mean_gelu(x, self.weight, self.bias)
+        elif self.max_dim == 0:
+            # Fallback path using existing Triton kernels
+            x = triton_linear(x, self.weight, self.bias)
+            x = triton_max_reduce(x, self.max_dim)
+            x = triton_mean_sub_gelu(x)
+            return x
+        else:
+            raise NotImplementedError("Only max_dim=0 or max_dim=1 are supported.")
+```
