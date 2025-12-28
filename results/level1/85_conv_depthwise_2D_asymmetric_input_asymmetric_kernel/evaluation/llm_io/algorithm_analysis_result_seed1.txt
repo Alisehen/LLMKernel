@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The current kernel repeatedly reloads the same input pixels from global memory for overlapping convolution windows, leaving clear headroom in DRAM efficiency.",
+  "bottleneck": "Each program instance computes a single output row (fixed n, c, oh) over W, so overlapping receptive fields across neighboring oh and ow positions are not reused; the same x[n,c,ih,iw] is fetched from DRAM many times by different program_ids, inflating memory traffic and making the kernel partially memory-bandwidth bound (dram__throughput ~63% of peak).",
+  "optimisation method": "Replace the per-row convolution with a 2D-tiled, shared-memory (or register-tiled) convolution over H_out×W_out for each (n, c), where each program processes an H_tile×W_tile output block and first stages the corresponding (H_tile+Kh-1)×(W_tile+Kw-1) input patch into on-chip memory, so that each input pixel is loaded once and reused for all Kh×Kw overlapping outputs in the tile.",
+  "modification plan": "Redefine the Triton grid so that program_id(0) indexes (n, c) and program_id(1/2) index tiles in H_out and W_out (e.g., (pid_h, pid_w)), with meta-parameters BLOCK_H and BLOCK_W. Inside the kernel, cooperatively load the required input region for that (n, c, tile_h, tile_w) into a shared-memory (or scratchpad) tensor, including halo for Kh, Kw and padding/stride/dilation, then perform the Kh×Kw accumulation entirely from this tile to produce the BLOCK_H×BLOCK_W outputs before writing them back. Tune BLOCK_H/BLOCK_W to balance shared memory usage, occupancy, and reuse, and keep the bias add fused as it is.",
+  "expected_speedup": "25-35%"
+}

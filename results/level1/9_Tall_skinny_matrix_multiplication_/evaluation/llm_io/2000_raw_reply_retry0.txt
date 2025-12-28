@@ -1,0 +1,200 @@
+```python
+import torch, torch.nn as nn, triton, triton.language as tl
+
+
+@triton.jit
+def matmul_kernel_standard(
+    A_ptr, B_ptr, C_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # 2D program id: (pid_m, pid_n)
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Pointer to the first block of A and B this program will process
+    a_ptrs = A_ptr + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    # B is interpreted as [K, N], reduction dim = 0 (stride_bk)
+    b_ptrs = B_ptr + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    k_start = 0
+    while k_start < K:
+        k_mask = (offs_k[None, :] + k_start) < K
+
+        a_mask = (offs_m[:, None] < M) & k_mask
+        b_mask = k_mask.T & (offs_n[None, :] < N)
+
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+        acc += tl.dot(a, b, allow_tf32=True)
+
+        k_start += BLOCK_K
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Write back
+    c_ptrs = C_ptr + (offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn)
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, acc.to(tl.float32), mask=c_mask)
+
+
+@triton.jit
+def matmul_kernel_BtK_contig(
+    A_ptr, Btc_ptr, C_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_btn, stride_btk,  # Btc is [N, K]: strides for n (rows) and k (cols)
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """
+    Optimized kernel for the case where original B[K,N] has its reduction
+    dimension (K) with a very large stride. We materialize B^T (shape [N,K])
+    so that K is contiguous (stride 1), and compute:
+
+        C[m, n] = sum_k A[m, k] * Btc[n, k]
+
+    A:   [M, K]
+    Btc: [N, K]  (contiguous, so stride_btk == 1)
+    C:   [M, N]
+    """
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # A is [M, K], reduction dim = 1 (stride_ak)
+    a_ptrs = A_ptr + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
+
+    # Btc is [N, K]; we want a tile shaped [K, N] = Btc^T
+    # Btc[n, k] with pointer: n*stride_btn + k*stride_btk
+    # For tile: rows = k, cols = n
+    b_ptrs = Btc_ptr + (offs_n[None, :] * stride_btn + offs_k[:, None] * stride_btk)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    k_start = 0
+    while k_start < K:
+        k_mask_row = (offs_k[:, None] + k_start) < K
+        k_mask_col = (offs_k[None, :] + k_start) < K  # reused for A
+
+        a_mask = (offs_m[:, None] < M) & k_mask_col
+        b_mask = k_mask_row & (offs_n[None, :] < N)
+
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+        acc += tl.dot(a, b, allow_tf32=True)
+
+        k_start += BLOCK_K
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_btk
+
+    c_ptrs = C_ptr + (offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn)
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, acc.to(tl.float32), mask=c_mask)
+
+
+def triton_matmul(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    # Fallback for non-CUDA tensors
+    if A.device.type != "cuda" or B.device.type != "cuda":
+        return torch.matmul(A, B)
+
+    assert A.dim() == 2 and B.dim() == 2, "Only 2D matmul is supported"
+    assert A.size(1) == B.size(0), "Incompatible shapes for matmul"
+
+    M, K = A.shape
+    K2, N = B.shape
+    assert K == K2
+
+    # Output tensor (match PyTorch matmul behavior: M x N)
+    C = torch.empty((M, N), device=A.device, dtype=torch.float32)
+
+    # Strides in elements
+    stride_am, stride_ak = A.stride()
+    stride_bk, stride_bn = B.stride()
+    stride_cm, stride_cn = C.stride()
+
+    # Tuned for tall-skinny K << M,N
+    BLOCK_M = 128
+    BLOCK_N = 128
+    BLOCK_K = 32
+
+    # Detect if B's reduction dimension (K) is poorly laid out: large stride
+    # e.g., contiguous B[K, N] has strides (N, 1) -> stride_bk >> stride_bn
+    use_BtK_contig = stride_bk > stride_bn
+
+    if use_BtK_contig:
+        # Materialize B^T with K as the contiguous dimension.
+        # B:   [K, N]  (row-major)
+        # B^T: [N, K]  (contiguous, stride_btk == 1)
+        Btc = B.t().contiguous()
+        stride_btn, stride_btk = Btc.stride()
+
+        grid = (
+            triton.cdiv(M, BLOCK_M),
+            triton.cdiv(N, BLOCK_N),
+        )
+
+        matmul_kernel_BtK_contig[grid](
+            A, Btc, C,
+            M, N, K,
+            stride_am, stride_ak,
+            stride_btn, stride_btk,
+            stride_cm, stride_cn,
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            BLOCK_K=BLOCK_K,
+            num_warps=4,
+            num_stages=2,
+        )
+    else:
+        # Default path: B is already friendly for reduction along K (stride_bk small)
+        grid = (
+            triton.cdiv(M, BLOCK_M),
+            triton.cdiv(N, BLOCK_N),
+        )
+
+        matmul_kernel_standard[grid](
+            A, B, C,
+            M, N, K,
+            stride_am, stride_ak,
+            stride_bk, stride_bn,
+            stride_cm, stride_cn,
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            BLOCK_K=BLOCK_K,
+            num_warps=4,
+            num_stages=2,
+        )
+
+    return C
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-accelerated model performing a single matrix multiplication (C = A * B).
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, A, B):
+        return triton_matmul(A, B)
+```

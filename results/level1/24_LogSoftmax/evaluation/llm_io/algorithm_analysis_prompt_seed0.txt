@@ -1,0 +1,256 @@
+You are a GPU kernel optimization architect. Analyze the kernel and identify **ONE high-level algorithmic optimization**.
+
+# PyTorch Reference
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs a LogSoftmax activation.
+    """
+    def __init__(self, dim: int = 1):
+        super(Model, self).__init__()
+        self.dim = dim
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies LogSoftmax activation to the input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, dim).
+
+        Returns:
+            torch.Tensor: Output tensor with LogSoftmax applied, same shape as input.
+        """
+        return torch.log_softmax(x, dim=self.dim)
+
+batch_size = 4096
+dim = 393216
+
+def get_inputs():
+    x = torch.rand(batch_size, dim)
+    return [x]
+
+def get_init_inputs():
+    return []  # No special initialization inputs needed
+```
+
+# Current Triton Kernel
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def log_softmax_kernel(
+    x_ptr,
+    y_ptr,
+    stride_xm,
+    stride_xn,
+    stride_ym,
+    stride_yn,
+    M,
+    N,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid_m = tl.program_id(axis=0)
+    # Guard against extra blocks when grid > M
+    if pid_m >= M:
+        return
+
+    # Row pointers
+    row_x_ptr = x_ptr + pid_m * stride_xm
+    row_y_ptr = y_ptr + pid_m * stride_ym
+
+    offsets = tl.arange(0, BLOCK_SIZE)
+    n_cols = N
+
+    # -----------------------
+    # Pass 1: compute row max
+    # -----------------------
+    col = 0
+    row_max = -float("inf")
+    while col < n_cols:
+        idx = col + offsets
+        mask = idx < n_cols
+        x = tl.load(
+            row_x_ptr + idx * stride_xn,
+            mask=mask,
+            other=-float("inf"),
+        )
+        local_max = tl.max(x, axis=0)
+        row_max = tl.maximum(row_max, local_max)
+        col += BLOCK_SIZE
+
+    # ------------------------------------------
+    # Pass 2: compute sum(exp(x - row_max)) per row
+    # ------------------------------------------
+    col = 0
+    row_sum = 0.0
+    while col < n_cols:
+        idx = col + offsets
+        mask = idx < n_cols
+        x = tl.load(
+            row_x_ptr + idx * stride_xn,
+            mask=mask,
+            other=-float("inf"),
+        )
+        x = x - row_max
+        exp_x = tl.exp(x)
+        row_sum = row_sum + tl.sum(exp_x, axis=0)
+        col += BLOCK_SIZE
+
+    log_row_sum = tl.log(row_sum)
+
+    # ---------------------------------
+    # Pass 3: write log_softmax outputs
+    # ---------------------------------
+    col = 0
+    while col < n_cols:
+        idx = col + offsets
+        mask = idx < n_cols
+        x = tl.load(
+            row_x_ptr + idx * stride_xn,
+            mask=mask,
+            other=-float("inf"),
+        )
+        y = x - row_max - log_row_sum
+        tl.store(
+            row_y_ptr + idx * stride_yn,
+            y,
+            mask=mask,
+        )
+        col += BLOCK_SIZE
+
+
+def triton_log_softmax(x: torch.Tensor, dim: int = 1) -> torch.Tensor:
+    """
+    High-performance row-wise log_softmax using Triton.
+    Optimized for large last-dimension (e.g., [batch, dim] with dim >> 1).
+    Currently supports dim being the last dimension.
+    """
+    if not x.is_cuda:
+        raise ValueError("Input tensor must be on CUDA device for Triton kernel.")
+
+    # Normalize dim to positive and ensure it's the last dimension
+    if dim < 0:
+        dim = x.ndim + dim
+    if dim != x.ndim - 1:
+        raise NotImplementedError("triton_log_softmax only supports softmax over the last dimension.")
+
+    # Collapse all leading dimensions into a single batch dimension
+    orig_shape = x.shape
+    batch = int(torch.prod(torch.tensor(orig_shape[:-1])).item())
+    n_cols = orig_shape[-1]
+
+    x_2d = x.contiguous().view(batch, n_cols)
+    y_2d = torch.empty_like(x_2d)
+
+    M, N = x_2d.shape
+    BLOCK_SIZE = 256  # power-of-2 as required
+
+    x_ptr = x_2d
+    y_ptr = y_2d
+
+    stride_xm, stride_xn = x_2d.stride()
+    stride_ym, stride_yn = y_2d.stride()
+
+    grid = lambda meta: (max(M, 1),)
+
+    log_softmax_kernel[grid](
+        x_ptr,
+        y_ptr,
+        stride_xm,
+        stride_xn,
+        stride_ym,
+        stride_yn,
+        M,
+        N,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=8,
+        num_stages=2,
+    )
+
+    return y_2d.view(orig_shape)
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized model that performs a LogSoftmax activation along a given dimension.
+    """
+    def __init__(self, dim: int = 1):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_log_softmax(x, dim=self.dim)
+```
+
+# Performance
+- **PyTorch baseline**: 27.81 ms
+- **Current Triton**: 36.81 ms
+- **Current speedup**: 0.76x (-32.4% vs baseline)
+
+
+---
+
+## Analysis Steps
+
+1. **Code Analysis**: Count kernels, identify operations, check for inefficiencies
+2. **Performance Diagnosis**: Use metrics/latency to identify bottleneck type
+3. **Root Cause**: Combine code + performance to find the core issue
+
+## Optimization Categories (pick ONE if worth optimizing):
+
+### 1. Operator Fusion
+Fuse consecutive ops into fewer kernels to reduce memory traffic and launch overhead.
+
+### 2. Algorithm Replacement
+Replace naive algorithm with optimized variant.
+- For Attention: Flash Attention, online softmax
+- For Convolution: Winograd, im2col
+- **For RNN/GRU/LSTM**: Persistent kernel with HYBRID computation
+  - **CRITICAL**: Use hybrid approach for best performance:
+    * Precompute input-side gates ONCE (outside kernel): `gates_x = (T*B, In) @ W_ih`
+    * Persistent kernel (inside): only recurrent-side: `for t: gates_h = h @ W_hh`
+  - Time loop `for t in range(T)` must be inside kernel, NOT in Python
+  - Launch kernel once per layer, not once per timestep
+  - Expected speedup: 10-100x (vs per-timestep launches)
+
+### 3. Kernel Launch Reduction
+Combine multiple small kernels to reduce overhead.
+- **For RNN/GRU/LSTM**: See "Algorithm Replacement" above for persistent kernel approach
+
+### 4. Memory Layout Optimization
+Use in-place operations, buffer reuse, or better layouts.
+
+## Should We Optimize?
+
+Before proposing optimization, determine if it's worthwhile:
+- **Not worth optimizing** if:
+  - Code is already near-optimal (expected speedup < 10%)
+  - Bottleneck cannot be addressed (hardware limited, already optimal algorithm)
+  - Optimization would add significant complexity with minimal gain
+
+- **Worth optimizing** if:
+  - Clear algorithmic inefficiency exists (multiple kernels, suboptimal algorithm)
+  - Expected speedup >= 20%
+  - Concrete optimization path available
+
+## Output (JSON)
+
+```json
+{
+  "worth_optimizing": "yes/no",
+  "reason": "<Why worth or not worth optimizing, 1 sentence>",
+  "bottleneck": "<Root cause in 1-2 sentences, empty if not worth optimizing>",
+  "optimisation method": "<Specific optimization in 1-2 sentences, empty if not worth optimizing>",
+  "modification plan": "<Implementation steps in 2-3 sentences, empty if not worth optimizing>",
+  "expected_speedup": "<e.g., '30-40%', empty if not worth optimizing>"
+}
+```
+
+Return JSON only.

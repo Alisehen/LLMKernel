@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The standalone HardSigmoid kernel is purely memory-bound and currently slower than PyTorch, so reducing global memory traffic can give a substantial speedup.",
+  "bottleneck": "The kernel performs a single elementwise map with one load and one store per element, so performance is dominated by global memory bandwidth and kernel launch overhead rather than arithmetic throughput.",
+  "optimisation method": "Operator fusion: fuse HardSigmoid into adjacent compute (e.g., GEMM/conv epilogue or neighboring elementwise ops) so the activation is applied while data is already in registers or shared memory instead of as a separate pass over global memory.",
+  "modification plan": "Redesign the model so that HardSigmoid is not launched as an isolated Triton kernel but is integrated into the producer kernel (for example, extend the matmul/conv/bias-add kernel to apply `y = clamp(x/6 + 0.5, 0, 1)` in its epilogue). In Triton, this means writing a fused kernel that computes the upstream operation and immediately applies the HardSigmoid before storing, or using `torch.compile`/graph fusers to generate such a fused kernel automatically instead of this standalone activation kernel.",
+  "expected_speedup": "30-40%"
+}

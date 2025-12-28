@@ -5,104 +5,235 @@ import triton
 import triton.language as tl
 
 
+# ---------------------------------------------------------------------------
+# Manually implement missing Triton math helpers (only used if called)
+# ---------------------------------------------------------------------------
+
+def _tl_sigmoid(x):
+    return 1.0 / (1.0 + tl.exp(-x))
+
+
+def _tl_tanh(x):
+    # tanh(x) = 2*sigmoid(2x) - 1
+    return 2.0 * _tl_sigmoid(2.0 * x) - 1.0
+
+
+def _tl_gelu(x):
+    # Approximate GELU (Hendrycks)
+    sqrt_2_over_pi = 0.7978845608028654
+    return 0.5 * x * (1.0 + _tl_tanh(sqrt_2_over_pi * (x + 0.044715 * x * x * x)))
+
+
+def _tl_silu(x):
+    return x * _tl_sigmoid(x)
+
+
+def _tl_softmax(x, axis=-1):
+    # Simple softmax along last axis; only valid if used in that context.
+    x_max = tl.max(x, axis=axis)
+    x_exp = tl.exp(x - x_max)
+    return x_exp / tl.sum(x_exp, axis=axis)
+
+
+def _tl_mish(x):
+    return x * _tl_tanh(tl.log(1.0 + tl.exp(x)))
+
+
+# Attach to tl namespace (only used if referenced)
+tl.sigmoid = _tl_sigmoid
+tl.tanh = _tl_tanh
+tl.gelu = _tl_gelu
+tl.silu = _tl_silu
+tl.softmax = _tl_softmax
+tl.mish = _tl_mish
+
+
+# ---------------------------------------------------------------------------
+# Optimized Triton kernel
+# ---------------------------------------------------------------------------
+
 @triton.autotune(
     configs=[
-        triton.Config({"BLOCK_IN": 32, "BLOCK_OC": 2}, num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_IN": 64, "BLOCK_OC": 2}, num_warps=4, num_stages=4),
-        triton.Config({"BLOCK_IN": 64, "BLOCK_OC": 4}, num_warps=8, num_stages=3),
-        triton.Config({"BLOCK_IN": 128, "BLOCK_OC": 4}, num_warps=8, num_stages=4),
+        # Same BLOCK sizes; autotune only num_warps / num_stages for 4090
+        triton.Config({"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_K": 32}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_K": 32}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_K": 32}, num_warps=8, num_stages=3),
     ],
-    key=["total_in_elems", "cout_per_group"],
+    key=["CIN", "COUT", "Dout", "Hout", "Wout", "GROUPS"],
 )
 @triton.jit
-def conv_transpose3d_kernel(
-    x_ptr,
-    w_ptr,
-    out_ptr,
-    total_in_elems,
-    N,
-    Cin,
-    Cout,
-    D,
-    H,
-    W,
-    KD,
-    KH,
-    KW,
-    stride_d,
-    stride_h,
-    stride_w,
-    pad_d,
-    pad_h,
-    pad_w,
-    out_pad_d,
-    out_pad_h,
-    out_pad_w,
-    out_D,
-    out_H,
-    out_W,
-    cin_per_group,
-    cout_per_group,
-    BLOCK_IN: tl.constexpr,
-    BLOCK_OC: tl.constexpr,
+def conv_transpose3d_gemm_kernel(
+    x_ptr,        # (N, Cin, Din, Hin, Win)
+    w_ptr,        # (Cin, Cout_per_group, KD, KH, KW)
+    b_ptr,        # (Cout,) or dummy
+    y_ptr,        # (N, Cout, Dout, Hout, Wout)
+    N, Din, Hin, Win,
+    Dout, Hout, Wout,
+    stride_d, stride_h, stride_w,
+    pad_d, pad_h, pad_w,
+    BLOCK_M: tl.constexpr,   # tile over output pixels (M dimension)
+    BLOCK_N: tl.constexpr,   # tile over output channels per group (N dimension)
+    BLOCK_K: tl.constexpr,   # tile over reduction dimension (K)
+    CIN: tl.constexpr,
+    COUT: tl.constexpr,
+    KD: tl.constexpr,
+    KH: tl.constexpr,
+    KW: tl.constexpr,
+    GROUPS: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
 ):
-    pid_in = tl.program_id(axis=0)
-    pid_oc = tl.program_id(axis=1)
+    # Derived compile-time constants
+    Cin_per_g = CIN // GROUPS
+    Cout_per_g = COUT // GROUPS
+    K_TOTAL = Cin_per_g * KD * KH * KW
 
-    in_offsets = pid_in * BLOCK_IN + tl.arange(0, BLOCK_IN)
-    in_mask = in_offsets < total_in_elems
-    in_offsets64 = in_offsets.to(tl.int64)
+    # Strides (in elements)
+    x_N_stride = CIN * Din * Hin * Win
+    x_C_stride = Din * Hin * Win
+    x_D_stride = Hin * Win
+    x_H_stride = Win
 
-    oc_sub_block = pid_oc * BLOCK_OC + tl.arange(0, BLOCK_OC)
-    oc_mask = oc_sub_block < cout_per_group
-    oc_sub_block64 = oc_sub_block.to(tl.int64)
+    y_N_stride = COUT * Dout * Hout * Wout
+    y_C_stride = Dout * Hout * Wout
+    y_D_stride = Hout * Wout
+    y_H_stride = Wout
 
-    w_idx = in_offsets64 % W
-    tmp = in_offsets64 // W
-    h_idx = tmp % H
-    tmp = tmp // H
-    d_idx = tmp % D
-    tmp = tmp // D
-    c_idx = tmp % Cin
-    n_idx = tmp // Cin
+    # Total number of output pixels (M dimension)
+    M_TOTAL = N * Dout * Hout * Wout
 
-    x_vals = tl.load(x_ptr + in_offsets64, mask=in_mask, other=0.0)
+    # Program IDs
+    pid_m = tl.program_id(axis=0)  # tiles over M (flattened pixels)
+    pid_n = tl.program_id(axis=1)  # tiles over Cout_per_g
+    pid_g = tl.program_id(axis=2)  # group id
 
-    group_idx = c_idx // cin_per_group
-    oc_base = group_idx * cout_per_group
+    # Row (pixel) indices in [0, M_TOTAL)
+    m_offsets = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = m_offsets < M_TOTAL
 
-    for kd in range(0, KD):
-        out_d = d_idx * stride_d - pad_d + kd
-        valid_d = (out_d >= 0) & (out_d < out_D)
+    # Decode flattened pixel index -> (n, d_out, h_out, w_out)
+    tmp = m_offsets
+    w_out = tmp % Wout
+    tmp = tmp // Wout
+    h_out = tmp % Hout
+    tmp = tmp // Hout
+    d_out = tmp % Dout
+    n_idx = tmp // Dout
 
-        for kh in range(0, KH):
-            out_h = h_idx * stride_h - pad_h + kh
-            valid_h = (out_h >= 0) & (out_h < out_H)
+    # Column (output channel within group) indices
+    ocg_offsets = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_ng = ocg_offsets < Cout_per_g
 
-            for kw in range(0, KW):
-                out_w = w_idx * stride_w - pad_w + kw
-                valid_w = (out_w >= 0) & (out_w < out_W)
+    # Accumulator
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-                base_mask = in_mask & valid_d & valid_h & valid_w
-                if not tl.any(base_mask):
-                    continue
+    # Pre-broadcasted row terms (used across K loop)
+    n_mat = n_idx[:, None]
+    d_out_mat = d_out[:, None]
+    h_out_mat = h_out[:, None]
+    w_out_mat = w_out[:, None]
 
-                for oc_lane in range(0, BLOCK_OC):
-                    oc_valid = oc_mask[oc_lane]
-                    lane_mask = base_mask & oc_valid
-                    if not tl.any(lane_mask):
-                        continue
+    # Reduction over K = Cin_per_g * KD * KH * KW
+    for k_start in range(0, K_TOTAL, BLOCK_K):
+        k_offsets = k_start + tl.arange(0, BLOCK_K)
+        mask_k = k_offsets < K_TOTAL
 
-                    oc_sub = oc_sub_block64[oc_lane]
-                    oc_full = oc_base + oc_sub
+        # Decode k_offsets -> (ic_g, kd, kh, kw)
+        t = k_offsets
+        kw = t % KW
+        t = t // KW
+        kh = t % KH
+        t = t // KH
+        kd = t % KD
+        t = t // KD
+        ic_g = t  # 0..Cin_per_g-1
 
-                    w_offsets = (((((c_idx * cout_per_group) + oc_sub) * KD + kd) * KH + kh) * KW + kw)
-                    w_vals = tl.load(w_ptr + w_offsets, mask=lane_mask, other=0.0)
+        ic_global = ic_g + pid_g * Cin_per_g  # [BLOCK_K]
 
-                    out_offsets = (((((n_idx * Cout) + oc_full) * out_D + out_d) * out_H + out_h) * out_W + out_w)
-                    contrib = x_vals * w_vals
-                    tl.atomic_add(out_ptr + out_offsets, contrib, mask=lane_mask)
+        # Broadcast K-side terms
+        kd_mat = kd[None, :]            # [1, BK]
+        kh_mat = kh[None, :]            # [1, BK]
+        kw_mat = kw[None, :]            # [1, BK]
+        ic_mat = ic_global[None, :]     # [1, BK]
 
+        # Compute input coordinates for each (m, k)
+        # Depth
+        in_d_nom = d_out_mat + pad_d - kd_mat
+        id_in = in_d_nom // stride_d
+        recomputed_d = id_in * stride_d - pad_d + kd_mat
+        valid_d = (recomputed_d == d_out_mat) & (id_in >= 0) & (id_in < Din)
+
+        # Height
+        in_h_nom = h_out_mat + pad_h - kh_mat
+        ih_in = in_h_nom // stride_h
+        recomputed_h = ih_in * stride_h - pad_h + kh_mat
+        valid_h = (recomputed_h == h_out_mat) & (ih_in >= 0) & (ih_in < Hin)
+
+        # Width
+        in_w_nom = w_out_mat + pad_w - kw_mat
+        iw_in = in_w_nom // stride_w
+        recomputed_w = iw_in * stride_w - pad_w + kw_mat
+        valid_w = (recomputed_w == w_out_mat) & (iw_in >= 0) & (iw_in < Win)
+
+        valid_spatial = valid_d & valid_h & valid_w
+
+        # Full mask for A tile
+        a_mask = mask_m[:, None] & mask_k[None, :] & valid_spatial
+
+        # Input offsets: (n, ic_global, id_in, ih_in, iw_in)
+        x_offsets = (
+            n_mat * x_N_stride
+            + ic_mat * x_C_stride
+            + id_in * x_D_stride
+            + ih_in * x_H_stride
+            + iw_in
+        )
+
+        a_tile = tl.load(x_ptr + x_offsets, mask=a_mask, other=0.0).to(tl.float32)
+
+        # Weight tile B: shape [BLOCK_K, BLOCK_N]
+        ocg_mat = ocg_offsets[None, :]      # [1, BN]
+        ic_global_mat = ic_global[:, None]  # [BK, 1]
+        kd_col = kd[:, None]
+        kh_col = kh[:, None]
+        kw_col = kw[:, None]
+
+        base_ic = ic_global_mat * Cout_per_g              # [BK,1]
+        tmp1 = base_ic + ocg_mat                          # [BK,BN]
+        tmp2 = tmp1 * KD + kd_col                         # [BK,BN]
+        tmp3 = tmp2 * KH + kh_col                         # [BK,BN]
+        tmp4 = tmp3 * KW + kw_col                         # [BK,BN]
+        b_mask = mask_k[:, None] & mask_ng[None, :]
+
+        b_tile = tl.load(w_ptr + tmp4, mask=b_mask, other=0.0).to(tl.float32)
+
+        # Matmul accumulation
+        acc += tl.dot(a_tile, b_tile, allow_tf32=True)
+
+    # Add bias if present: bias is indexed by global output channel
+    if HAS_BIAS:
+        oc_global_bias = pid_g * Cout_per_g + ocg_offsets
+        bias_vals = tl.load(b_ptr + oc_global_bias, mask=mask_ng, other=0.0).to(tl.float32)
+        acc += bias_vals[None, :]
+
+    # Write back to y
+    oc_global = pid_g * Cout_per_g + ocg_offsets
+    oc_global_mat = oc_global[None, :]
+
+    y_offsets = (
+        n_mat * y_N_stride
+        + oc_global_mat * y_C_stride
+        + d_out_mat * y_D_stride
+        + h_out_mat * y_H_stride
+        + w_out_mat
+    )
+
+    out_mask = mask_m[:, None] & mask_ng[None, :]
+    tl.store(y_ptr + y_offsets, acc, mask=out_mask)
+
+
+# ---------------------------------------------------------------------------
+# Python wrapper: grid computation & kernel launch
+# ---------------------------------------------------------------------------
 
 def triton_conv_transpose3d(
     x: torch.Tensor,
@@ -113,65 +244,79 @@ def triton_conv_transpose3d(
     output_padding: tuple,
     groups: int,
 ) -> torch.Tensor:
-    N, Cin, D, H, W = x.shape
-    KD, KH, KW = weight.shape[2:]
+    # Ensure contiguity
+    x = x.contiguous()
+    weight = weight.contiguous()
+    has_bias = bias is not None
+    if has_bias:
+        b_t = bias.contiguous()
+    else:
+        # Dummy tensor to satisfy pointer requirement
+        b_t = x.new_empty(1)
+
+    N, Cin, Din, Hin, Win = x.shape
+    Cin_w, Cout_per_g, KD, KH, KW = weight.shape
+    assert Cin_w == Cin, "Input channels mismatch with weight"
+    assert Cin % groups == 0, "Cin must be divisible by groups"
+    Cout = Cout_per_g * groups
+    assert Cout % groups == 0, "Cout must be divisible by groups"
+
     stride_d, stride_h, stride_w = stride
     pad_d, pad_h, pad_w = padding
     out_pad_d, out_pad_h, out_pad_w = output_padding
-    Cout = weight.shape[1] * groups
 
-    out_D = (D - 1) * stride_d - 2 * pad_d + KD + out_pad_d
-    out_H = (H - 1) * stride_h - 2 * pad_h + KH + out_pad_h
-    out_W = (W - 1) * stride_w - 2 * pad_w + KW + out_pad_w
+    Dout = (Din - 1) * stride_d - 2 * pad_d + KD + out_pad_d
+    Hout = (Hin - 1) * stride_h - 2 * pad_h + KH + out_pad_h
+    Wout = (Win - 1) * stride_w - 2 * pad_w + KW + out_pad_w
 
-    output = torch.zeros((N, Cout, out_D, out_H, out_W), device=x.device, dtype=x.dtype)
-
-    total_in_elems = x.numel()
-    cin_per_group = Cin // groups
-    cout_per_group = Cout // groups
-
-    grid = lambda meta: (
-        triton.cdiv(total_in_elems, meta["BLOCK_IN"]),
-        triton.cdiv(cout_per_group, meta["BLOCK_OC"]),
+    y = torch.empty(
+        (N, Cout, Dout, Hout, Wout),
+        device=x.device,
+        dtype=x.dtype,
     )
 
-    conv_transpose3d_kernel[grid](
-        x,
-        weight,
-        output,
-        total_in_elems,
-        N,
-        Cin,
-        Cout,
-        D,
-        H,
-        W,
-        KD,
-        KH,
-        KW,
-        stride_d,
-        stride_h,
-        stride_w,
-        pad_d,
-        pad_h,
-        pad_w,
-        out_pad_d,
-        out_pad_h,
-        out_pad_w,
-        out_D,
-        out_H,
-        out_W,
-        cin_per_group,
-        cout_per_group,
+    Cin_per_g = Cin // groups
+    M = N * Dout * Hout * Wout
+    Cout_per_g = Cout // groups
+
+    # Grid: keep layout that already gives high SM utilization.
+    # Tiles M (flattened pixels) in axis=0, Cout_per_g in axis=1, groups in axis=2.
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta["BLOCK_M"]),
+            triton.cdiv(Cout_per_g, meta["BLOCK_N"]),
+            groups,
+        )
+
+    conv_transpose3d_gemm_kernel[grid](
+        x, weight, b_t, y,
+        N, Din, Hin, Win,
+        Dout, Hout, Wout,
+        stride_d, stride_h, stride_w,
+        pad_d, pad_h, pad_w,
+        CIN=Cin,
+        COUT=Cout,
+        KD=KD,
+        KH=KH,
+        KW=KW,
+        GROUPS=groups,
+        HAS_BIAS=has_bias,
     )
 
-    if bias is not None:
-        output += bias.view(1, Cout, 1, 1, 1)
+    return y
 
-    return output
 
+# ---------------------------------------------------------------------------
+# nn.Module wrapper
+# ---------------------------------------------------------------------------
 
 class ModelNew(nn.Module):
+    """
+    Triton-accelerated 3D transposed convolution using an implicit GEMM kernel.
+    Matches nn.ConvTranspose3d forward semantics, including stride, padding,
+    output_padding, groups, and optional bias.
+    """
+
     def __init__(
         self,
         in_channels: int,
@@ -184,6 +329,7 @@ class ModelNew(nn.Module):
         bias: bool = False,
     ):
         super().__init__()
+        # Use nn.ConvTranspose3d for parameter management & state_dict compatibility
         self.conv_transpose3d = nn.ConvTranspose3d(
             in_channels,
             out_channels,
@@ -194,15 +340,21 @@ class ModelNew(nn.Module):
             groups=groups,
             bias=bias,
         )
+        self.stride = tuple(stride)
+        self.padding = tuple(padding)
+        self.output_padding = tuple(output_padding)
+        self.groups = groups
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        w = self.conv_transpose3d.weight
+        b = self.conv_transpose3d.bias
         return triton_conv_transpose3d(
             x,
-            self.conv_transpose3d.weight,
-            self.conv_transpose3d.bias,
-            self.conv_transpose3d.stride,
-            self.conv_transpose3d.padding,
-            self.conv_transpose3d.output_padding,
-            self.conv_transpose3d.groups,
+            w,
+            b,
+            self.stride,
+            self.padding,
+            self.output_padding,
+            self.groups,
         )
 ```

@@ -1,0 +1,236 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def conv_transpose3d_kernel(
+    x_ptr,           # *float32,  [N, C_in, D_in, H_in, W_in]
+    w_ptr,           # *float32,  [C_in, C_out, Kd, Kh, Kw]
+    b_ptr,           # *float32,  [C_out]
+    out_ptr,         # *float32,  [N, C_out, D_out, H_out, W_out]
+    n_elements_out,  # total elements in output = N*C_out*D_out*H_out*W_out
+    N,
+    C_in,
+    C_out,
+    D_in,
+    H_in,
+    W_in,
+    D_out,
+    H_out,
+    W_out,
+    Kd,
+    Kh,
+    Kw,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offs = block_start + tl.arange(0, BLOCK_SIZE)
+    mask_out = offs < n_elements_out
+
+    # Decode linear index -> (n, oc, od, oh, ow)
+    tmp = offs
+    ow = tmp % W_out
+    tmp = tmp // W_out
+    oh = tmp % H_out
+    tmp = tmp // H_out
+    od = tmp % D_out
+    tmp = tmp // D_out
+    oc = tmp % C_out
+    n = tmp // C_out
+
+    # Accumulator
+    acc = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+
+    # Loop over input channels and kernel volume
+    # Transposed-conv (stride=1, padding=0, dilation=1, output_padding=0) gather formulation:
+    # out[n, oc, od, oh, ow] = sum_{ic,kd,kh,kw}
+    #     x[n, ic, id=od-kd, ih=oh-kh, iw=ow-kw] * w[ic, oc, kd, kh, kw]
+    # with 0 <= id < D_in, 0 <= ih < H_in, 0 <= iw < W_in
+    for ic in range(0, C_in):
+        for kd in range(0, Kd):
+            id_ = od - kd
+            valid_d = (id_ >= 0) & (id_ < D_in)
+            for kh in range(0, Kh):
+                ih_ = oh - kh
+                valid_h = (ih_ >= 0) & (ih_ < H_in)
+                for kw in range(0, Kw):
+                    iw_ = ow - kw
+                    valid_w = (iw_ >= 0) & (iw_ < W_in)
+                    valid = mask_out & valid_d & valid_h & valid_w
+
+                    # Compute input index
+                    in_idx = (
+                        ((n * C_in + ic) * D_in + id_) * H_in + ih_
+                    ) * W_in + iw_
+
+                    x_val = tl.load(x_ptr + in_idx, mask=valid, other=0.0)
+
+                    # Compute weight index
+                    w_idx = (
+                        ((ic * C_out + oc) * Kd + kd) * Kh + kh
+                    ) * Kw + kw
+
+                    w_val = tl.load(w_ptr + w_idx, mask=valid, other=0.0)
+
+                    acc += x_val * w_val
+
+    # Add bias
+    b_val = tl.load(b_ptr + oc, mask=mask_out, other=0.0)
+    acc += b_val
+
+    # Store result
+    tl.store(out_ptr + offs, acc, mask=mask_out)
+
+
+def conv_transpose3d_triton(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    stride,
+    padding,
+    output_padding,
+    dilation,
+    groups: int,
+) -> torch.Tensor:
+    """
+    High-performance ConvTranspose3d using Triton.
+
+    NOTE: This implementation currently supports only:
+      - groups == 1
+      - stride == (1, 1, 1)
+      - padding == (0, 0, 0)
+      - dilation == (1, 1, 1)
+      - output_padding == (0, 0, 0)
+    which matches the defaults used in the provided model.
+    """
+    assert x.is_cuda, "Input tensor must be on CUDA device"
+    assert x.dtype == torch.float32, "This Triton kernel currently supports float32 only"
+
+    # Normalize hyperparameters to 3-tuples
+    if isinstance(stride, int):
+        stride = (stride, stride, stride)
+    if isinstance(padding, int):
+        padding = (padding, padding, padding)
+    if isinstance(output_padding, int):
+        output_padding = (output_padding, output_padding, output_padding)
+    if isinstance(dilation, int):
+        dilation = (dilation, dilation, dilation)
+
+    # Enforce the supported configuration
+    assert groups == 1, "This Triton ConvTranspose3d currently supports groups == 1 only"
+    assert stride == (1, 1, 1), "Only stride == 1 is supported in this Triton kernel"
+    assert padding == (0, 0, 0), "Only padding == 0 is supported in this Triton kernel"
+    assert dilation == (1, 1, 1), "Only dilation == 1 is supported in this Triton kernel"
+    assert output_padding == (0, 0, 0), "Only output_padding == 0 is supported in this Triton kernel"
+
+    x = x.contiguous()
+    weight = weight.contiguous()
+    if bias is None:
+        # Always pass a valid pointer; bias will be all zeros in this case
+        bias = torch.zeros(weight.shape[1], device=x.device, dtype=x.dtype)
+    else:
+        bias = bias.contiguous()
+
+    N, C_in, D_in, H_in, W_in = x.shape
+    C_in_w, C_out, Kd, Kh, Kw = weight.shape
+    assert C_in_w == C_in, "weight shape mismatch with input channels"
+
+    # Transposed conv output size (matches PyTorch for our supported configuration)
+    stride_d, stride_h, stride_w = stride
+    pad_d, pad_h, pad_w = padding
+    dil_d, dil_h, dil_w = dilation
+    out_pad_d, out_pad_h, out_pad_w = output_padding
+
+    D_out = (D_in - 1) * stride_d - 2 * pad_d + dil_d * (Kd - 1) + out_pad_d + 1
+    H_out = (H_in - 1) * stride_h - 2 * pad_h + dil_h * (Kh - 1) + out_pad_h + 1
+    W_out = (W_in - 1) * stride_w - 2 * pad_w + dil_w * (Kw - 1) + out_pad_w + 1
+
+    out = torch.empty((N, C_out, D_out, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    n_elements_out = out.numel()
+    BLOCK_SIZE = 128
+
+    grid = lambda meta: (triton.cdiv(n_elements_out, meta["BLOCK_SIZE"]),)
+
+    conv_transpose3d_kernel[grid](
+        x,
+        weight,
+        bias,
+        out,
+        n_elements_out,
+        N,
+        C_in,
+        C_out,
+        D_in,
+        H_in,
+        W_in,
+        D_out,
+        H_out,
+        W_out,
+        Kd,
+        Kh,
+        Kw,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized replacement for the provided ConvTranspose3d-based model.
+    Uses a custom ConvTranspose3d implementation in Triton for the forward pass.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        stride: int = 1,
+        padding: int = 0,
+        output_padding: int = 0,
+        dilation: int = 1,
+        groups: int = 1,
+        bias: bool = False,
+    ):
+        super().__init__()
+
+        # Keep a PyTorch ConvTranspose3d module to hold weights / initialization,
+        # but we will NOT use its forward; only its parameters.
+        self.conv_transpose3d = nn.ConvTranspose3d(
+            in_channels,
+            out_channels,
+            (kernel_size, kernel_size, kernel_size),
+            stride=stride,
+            padding=padding,
+            output_padding=output_padding,
+            dilation=dilation,
+            groups=groups,
+            bias=bias,
+        )
+
+        # Cache hyperparameters for the Triton implementation
+        self.stride = self.conv_transpose3d.stride
+        self.padding = self.conv_transpose3d.padding
+        self.output_padding = self.conv_transpose3d.output_padding
+        self.dilation = self.conv_transpose3d.dilation
+        self.groups = self.conv_transpose3d.groups
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        w = self.conv_transpose3d.weight
+        b = self.conv_transpose3d.bias
+
+        return conv_transpose3d_triton(
+            x,
+            w,
+            b,
+            stride=self.stride,
+            padding=self.padding,
+            output_padding=self.output_padding,
+            dilation=self.dilation,
+            groups=self.groups,
+        )

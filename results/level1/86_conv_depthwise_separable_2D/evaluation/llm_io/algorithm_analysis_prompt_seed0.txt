@@ -1,0 +1,428 @@
+You are a GPU kernel optimization architect. Analyze the kernel and identify **ONE high-level algorithmic optimization**.
+
+# PyTorch Reference
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Performs a depthwise-separable 2D convolution operation.
+
+    Args:
+        in_channels (int): Number of channels in the input tensor.
+        out_channels (int): Number of channels produced by the convolution.
+        kernel_size (int): Size of the convolution kernel.
+        stride (int, optional): Stride of the convolution. Defaults to 1.
+        padding (int, optional): Padding applied to the input. Defaults to 0.
+        dilation (int, optional): Spacing between kernel elements. Defaults to 1.
+        bias (bool, optional): If `True`, adds a learnable bias to the output. Defaults to `False`.
+    """
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, stride: int = 1, padding: int = 0, dilation: int = 1, bias: bool = False):
+        super(Model, self).__init__()
+        self.depthwise = nn.Conv2d(in_channels, in_channels, kernel_size, stride=stride, padding=padding, dilation=dilation, groups=in_channels, bias=bias)
+        self.pointwise = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=bias)
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Performs the depthwise-separable 2D convolution.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_channels, height, width).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_channels, height_out, width_out).
+        """
+        x = self.depthwise(x)
+        x = self.pointwise(x)
+        return x
+
+# Test code
+batch_size = 16
+in_channels = 64
+out_channels = 128
+kernel_size = 3
+width = 512
+height = 512
+stride = 1
+padding = 1
+dilation = 1
+
+def get_inputs():
+    x = torch.rand(batch_size, in_channels, height, width)
+    return [x]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, stride, padding, dilation]
+```
+
+# Current Triton Kernel
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def depthwise_conv2d_kernel(
+    x_ptr,        # float32[N, C, H, W]
+    w_ptr,        # float32[C, 1, K, K] (treated as [C, K, K])
+    b_ptr,        # float32[C] or dummy
+    y_ptr,        # float32[N, C, H_out, W_out]
+    N, C, H, W,
+    H_out, W_out,
+    stride,
+    padding,
+    dilation,
+    KERNEL_SIZE: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+):
+    pid_nc = tl.program_id(axis=0)
+    pid_h = tl.program_id(axis=1)
+    pid_w = tl.program_id(axis=2)
+
+    # Decompose pid_nc into (n, c)
+    n = pid_nc // C
+    c = pid_nc % C
+
+    # If pid_nc exceeds N*C (can happen if grid over-provisioned), just mask everything
+    valid_nc = n < N
+
+    h_start = pid_h * BLOCK_H
+    w_start = pid_w * BLOCK_W
+
+    offs_h = h_start + tl.arange(0, BLOCK_H)
+    offs_w = w_start + tl.arange(0, BLOCK_W)
+
+    hh = offs_h[:, None]
+    ww = offs_w[None, :]
+
+    # Output indices
+    h_out_idx = hh
+    w_out_idx = ww
+
+    mask_o = (h_out_idx < H_out) & (w_out_idx < W_out) & valid_nc
+
+    # Compute top-left input index for each output location
+    h_in0 = h_out_idx * stride - padding
+    w_in0 = w_out_idx * stride - padding
+
+    # Base pointer offset for (n, c, 0, 0)
+    base_nc = (n * C + c) * H * W
+
+    acc = tl.zeros((BLOCK_H, BLOCK_W), dtype=tl.float32)
+
+    # Convolution over kernel window
+    for kh in range(0, KERNEL_SIZE):
+        for kw in range(0, KERNEL_SIZE):
+            h_in = h_in0 + kh * dilation
+            w_in = w_in0 + kw * dilation
+
+            in_bounds = (h_in >= 0) & (h_in < H) & (w_in >= 0) & (w_in < W) & mask_o
+
+            idx_in = base_nc + h_in * W + w_in
+            x = tl.load(x_ptr + idx_in, mask=in_bounds, other=0.0)
+
+            w_idx = c * (KERNEL_SIZE * KERNEL_SIZE) + kh * KERNEL_SIZE + kw
+            w_val = tl.load(w_ptr + w_idx)
+
+            acc += x * w_val
+
+    if HAS_BIAS:
+        b_val = tl.load(b_ptr + c)
+        acc += b_val
+
+    out_idx = ((n * C + c) * H_out + h_out_idx) * W_out + w_out_idx
+    tl.store(y_ptr + out_idx, acc, mask=mask_o)
+
+
+def depthwise_conv2d_triton(x, weight, bias, stride: int, padding: int, dilation: int):
+    """
+    x:       [N, C, H, W]
+    weight:  [C, 1, K, K] (depthwise)
+    bias:    [C] or None
+    """
+    assert x.is_cuda and weight.is_cuda
+    N, C, H, W = x.shape
+    K = weight.shape[2]
+
+    # Compute output spatial size (PyTorch Conv2d formula)
+    H_out = (H + 2 * padding - dilation * (K - 1) - 1) // stride + 1
+    W_out = (W + 2 * padding - dilation * (K - 1) - 1) // stride + 1
+
+    y = torch.empty((N, C, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    BLOCK_H = 16
+    BLOCK_W = 16
+    HAS_BIAS = bias is not None
+
+    grid = (
+        N * C,
+        triton.cdiv(H_out, BLOCK_H),
+        triton.cdiv(W_out, BLOCK_W),
+    )
+
+    depthwise_conv2d_kernel[grid](
+        x,
+        weight,
+        bias if HAS_BIAS else x,  # dummy pointer when no bias
+        y,
+        N,
+        C,
+        H,
+        W,
+        H_out,
+        W_out,
+        stride,
+        padding,
+        dilation,
+        KERNEL_SIZE=K,
+        HAS_BIAS=HAS_BIAS,
+        BLOCK_H=BLOCK_H,
+        BLOCK_W=BLOCK_W,
+    )
+    return y
+
+
+@triton.jit
+def pointwise_conv1x1_kernel(
+    x_ptr,   # float32[N, C_IN, H, W]
+    w_ptr,   # float32[C_OUT, C_IN, 1, 1] treated as [C_OUT, C_IN]
+    b_ptr,   # float32[C_OUT] or dummy
+    y_ptr,   # float32[N, C_OUT, H, W]
+    N, H, W,
+    C_OUT,
+    C_IN: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # Treat as matmul: [M, K] @ [K, C_OUT] -> [M, C_OUT]
+    # where M = N * H * W, K = C_IN
+    M = N * H * W
+
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    m_mask = offs_m < M
+    n_mask = offs_n < C_OUT
+
+    # Decode m -> (n_idx, h_idx, w_idx)
+    HW = H * W
+    n_idx = offs_m // HW
+    rem = offs_m % HW
+    h_idx = rem // W
+    w_idx = rem % W
+
+    n_idx_mat = n_idx[:, None]
+    h_idx_mat = h_idx[:, None]
+    w_idx_mat = w_idx[:, None]
+    n_out_mat = offs_n[None, :]
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # K-loop
+    for k0 in range(0, C_IN, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+        k_mask = offs_k < C_IN
+
+        # Load A tile: [BLOCK_M, BLOCK_K] from x
+        k_mat = offs_k[None, :]
+        idx_a = ((n_idx_mat * C_IN + k_mat) * H + h_idx_mat) * W + w_idx_mat
+        mask_a = m_mask[:, None] & k_mask[None, :]
+        a = tl.load(x_ptr + idx_a, mask=mask_a, other=0.0)
+
+        # Load B tile: [BLOCK_K, BLOCK_N] from w (treated as [K, C_OUT] with stride_K=1, stride_N=C_IN)
+        k_col = offs_k[:, None]
+        n_col = offs_n[None, :]
+        idx_b = k_col + n_col * C_IN
+        mask_b = k_mask[:, None] & n_mask[None, :]
+        b = tl.load(w_ptr + idx_b, mask=mask_b, other=0.0)
+
+        acc += tl.dot(a, b, allow_tf32=True)
+
+    if HAS_BIAS:
+        bias = tl.load(b_ptr + offs_n, mask=n_mask, other=0.0)
+        acc += bias[None, :]
+
+    # Store result to y: [N, C_OUT, H, W]
+    idx_out = ((n_idx_mat * C_OUT + n_out_mat) * H + h_idx_mat) * W + w_idx_mat
+    mask_out = m_mask[:, None] & n_mask[None, :]
+    tl.store(y_ptr + idx_out, acc, mask=mask_out)
+
+
+def pointwise_conv1x1_triton(x, weight, bias):
+    """
+    x:       [N, C_IN, H, W]
+    weight:  [C_OUT, C_IN, 1, 1]
+    bias:    [C_OUT] or None
+    """
+    assert x.is_cuda and weight.is_cuda
+    N, C_IN, H, W = x.shape
+    C_OUT = weight.shape[0]
+
+    y = torch.empty((N, C_OUT, H, W), device=x.device, dtype=x.dtype)
+
+    BLOCK_M = 64
+    BLOCK_N = 64
+    BLOCK_K = 32
+    HAS_BIAS = bias is not None
+
+    M = N * H * W
+    grid = (
+        triton.cdiv(M, BLOCK_M),
+        triton.cdiv(C_OUT, BLOCK_N),
+    )
+
+    pointwise_conv1x1_kernel[grid](
+        x,
+        weight,
+        bias if HAS_BIAS else x,  # dummy pointer when no bias
+        y,
+        N,
+        H,
+        W,
+        C_OUT,
+        C_IN=C_IN,
+        HAS_BIAS=HAS_BIAS,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+    )
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Depthwise-separable 2D convolution implemented with Triton kernels.
+    Matches the behavior of the reference PyTorch Model.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        stride: int = 1,
+        padding: int = 0,
+        dilation: int = 1,
+        bias: bool = False,
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+
+        # Keep Conv2d modules so state_dict is compatible with the original model.
+        self.depthwise = nn.Conv2d(
+            in_channels,
+            in_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            groups=in_channels,
+            bias=bias,
+        )
+        self.pointwise = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=1,
+            bias=bias,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Ensure tensors are on the same device as weights
+        x = x.to(self.depthwise.weight.device)
+
+        x = depthwise_conv2d_triton(
+            x,
+            self.depthwise.weight,
+            self.depthwise.bias,
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation,
+        )
+        x = pointwise_conv1x1_triton(
+            x,
+            self.pointwise.weight,
+            self.pointwise.bias,
+        )
+        return x
+```
+
+# Performance
+- **PyTorch baseline**: 7.81 ms
+- **Current Triton**: 15.72 ms
+- **Current speedup**: 0.50x (-101.3% vs baseline)
+
+
+---
+
+## Analysis Steps
+
+1. **Code Analysis**: Count kernels, identify operations, check for inefficiencies
+2. **Performance Diagnosis**: Use metrics/latency to identify bottleneck type
+3. **Root Cause**: Combine code + performance to find the core issue
+
+## Optimization Categories (pick ONE if worth optimizing):
+
+### 1. Operator Fusion
+Fuse consecutive ops into fewer kernels to reduce memory traffic and launch overhead.
+
+### 2. Algorithm Replacement
+Replace naive algorithm with optimized variant.
+- For Attention: Flash Attention, online softmax
+- For Convolution: Winograd, im2col
+- **For RNN/GRU/LSTM**: Persistent kernel with HYBRID computation
+  - **CRITICAL**: Use hybrid approach for best performance:
+    * Precompute input-side gates ONCE (outside kernel): `gates_x = (T*B, In) @ W_ih`
+    * Persistent kernel (inside): only recurrent-side: `for t: gates_h = h @ W_hh`
+  - Time loop `for t in range(T)` must be inside kernel, NOT in Python
+  - Launch kernel once per layer, not once per timestep
+  - Expected speedup: 10-100x (vs per-timestep launches)
+
+### 3. Kernel Launch Reduction
+Combine multiple small kernels to reduce overhead.
+- **For RNN/GRU/LSTM**: See "Algorithm Replacement" above for persistent kernel approach
+
+### 4. Memory Layout Optimization
+Use in-place operations, buffer reuse, or better layouts.
+
+## Should We Optimize?
+
+Before proposing optimization, determine if it's worthwhile:
+- **Not worth optimizing** if:
+  - Code is already near-optimal (expected speedup < 10%)
+  - Bottleneck cannot be addressed (hardware limited, already optimal algorithm)
+  - Optimization would add significant complexity with minimal gain
+
+- **Worth optimizing** if:
+  - Clear algorithmic inefficiency exists (multiple kernels, suboptimal algorithm)
+  - Expected speedup >= 20%
+  - Concrete optimization path available
+
+## Output (JSON)
+
+```json
+{
+  "worth_optimizing": "yes/no",
+  "reason": "<Why worth or not worth optimizing, 1 sentence>",
+  "bottleneck": "<Root cause in 1-2 sentences, empty if not worth optimizing>",
+  "optimisation method": "<Specific optimization in 1-2 sentences, empty if not worth optimizing>",
+  "modification plan": "<Implementation steps in 2-3 sentences, empty if not worth optimizing>",
+  "expected_speedup": "<e.g., '30-40%', empty if not worth optimizing>"
+}
+```
+
+Return JSON only.

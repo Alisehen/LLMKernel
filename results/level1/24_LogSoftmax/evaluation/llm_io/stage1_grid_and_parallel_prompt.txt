@@ -1,269 +1,193 @@
 You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
 
-# Target GPU
-GPU Name: 4090
-Architecture: Ada Lovelace
-• Compute Capability: 8.9
-• Number of SMs: 128
-• Memory Bandwidth: 1008 GB/s
-• TF32 Tensor Core TFLOPS: 82.6 with dense
-• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
-• FP16 Tensor Core TFLOPS: 165.2 with dense
-• Maximum number of registers per thread: 255
-• Maximum threads per block: 1024
-• Maximum threads per SM: 1536
-• Warp size: 32
-• Maximum concurrent warps per SM: 48
-• Shared memory capacity per SM: 100 KB
-• Maximum shared memory per thread block: 99 KB
-• L2 cache (global, all SM shared): 72 MB
+# Target GPU: 4090
 
 [OPTIMIZATION STAGE]
 
 ## Current Optimization Stage
 
-**Focus**: Optimize grid layout and parallel work distribution.
+Focus: Grid layout & parallelism.
 
-**NCU Metrics**:
-• `sm__throughput.avg.pct_of_peak_sustained_elapsed` (target >60%)
-• `launch__grid_size` (primarily determined by grid mapping)
+Metrics:
+- sm__throughput.avg.pct_of_peak_sustained_elapsed (>60%)
+- launch__grid_size
 
-**Guidelines**:
-- 1D → `(cdiv(N, BLOCK))`
-- 2D → `(cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))`
-- 3D (batch×M×N) → `(batch, cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))`
-- 4D+ → flatten **independent parallel dims** to 3D
-- Prefer batch / head / expert parallelism when available, before shrinking BLOCK sizes
+Rules:
+- 1D: (cdiv(N, BLOCK))
+- 2D: (cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))
+- 3D: (batch, cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))
+- >3D: flatten ONLY independent dims
+- Prefer batch / head / expert / group parallelism before shrinking BLOCK
+- For grouped operations: ensure group dimension is in grid (e.g., program_id(2) for groups)
 - Change grid only if SM utilization is clearly low
-- Ensure `grid = (...)` matches `tl.program_id(axis)` logic
 
-**Safety Rules**:
-- Max 3 grid dimensions; grid rank must be static
-- If unsure about correctness, do not modify grid
+Safety:
+- Max 3 grid dims, static rank
+- grid=(G0,G1,G2) must match tl.program_id(0/1/2)
+- For grouped ops: verify group indexing is correct
+- If unsure about correctness, do NOT change grid
 
-**Autotune (safe)**:
-- Autotune **either** BLOCK_* **or** (`num_warps`, `num_stages`)
-- If BLOCK_* are autotuned, use `grid = lambda META: (...)` with `META["BLOCK_*"]`
-- Never redefine BLOCK_* in both configs and launch
+Autotune:
+- Autotune either BLOCK_* OR (num_warps, num_stages)
+- If autotuning BLOCK_*, use grid=lambda META: (...)
+- Never redefine BLOCK_* in both kernel and launch
+- Max 2-3 configs to reduce compilation time
 
 
 
 [CURRENT CODE]
 ```python
-import torch
-import torch.nn as nn
-import triton
-import triton.language as tl
+import torch, torch.nn as nn, triton, triton.language as tl
+
 
 @triton.jit
-def log_softmax_kernel(
-    x_ptr,
-    output_ptr,
-    n_cols,
-    stride_x,
-    stride_output,
+def logsoftmax_online_kernel(
+    x_ptr,             # *f32 / *f16
+    y_ptr,             # *f32 / *f16
+    N_COLS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    """LogSoftmax kernel optimized for row-wise reduction."""
-    # Row index
-    row_idx = tl.program_id(axis=0)
-    
-    # Compute base pointers for this row
-    x_row_ptr = x_ptr + row_idx * stride_x
-    output_row_ptr = output_ptr + row_idx * stride_output
-    
-    # Step 1: Find row maximum for numerical stability
-    col_start = 0
-    max_val = tl.full((1,), -float('inf'), dtype=tl.float32)
-    
-    # Process in blocks to handle large columns
-    while col_start < n_cols:
-        col_offsets = col_start + tl.arange(0, BLOCK_SIZE)
-        mask = col_offsets < n_cols
-        
-        x_chunk = tl.load(x_row_ptr + col_offsets, mask=mask, other=-float('inf'))
-        chunk_max = tl.max(x_chunk, axis=0)
-        max_val = tl.maximum(max_val, chunk_max)
-        
-        col_start += BLOCK_SIZE
-    
-    # Step 2: Compute sum of exp(x - max)
-    col_start = 0
-    sum_exp = tl.zeros((1,), dtype=tl.float32)
-    
-    while col_start < n_cols:
-        col_offsets = col_start + tl.arange(0, BLOCK_SIZE)
-        mask = col_offsets < n_cols
-        
-        x_chunk = tl.load(x_row_ptr + col_offsets, mask=mask)
-        exp_val = tl.exp(x_chunk - max_val)
-        sum_exp += tl.sum(exp_val, axis=0)
-        
-        col_start += BLOCK_SIZE
-    
-    # Step 3: Compute log(sum(exp(x - max))) = logsumexp
-    log_sum_exp = tl.log(sum_exp) + max_val
-    
-    # Step 4: Compute log_softmax = x - logsumexp
-    col_start = 0
-    while col_start < n_cols:
-        col_offsets = col_start + tl.arange(0, BLOCK_SIZE)
-        mask = col_offsets < n_cols
-        
-        x_chunk = tl.load(x_row_ptr + col_offsets, mask=mask)
-        output = x_chunk - log_sum_exp
-        tl.store(output_row_ptr + col_offsets, output, mask=mask)
-        
-        col_start += BLOCK_SIZE
+    pid = tl.program_id(axis=0)  # row index
+    row_start = pid * N_COLS
 
-@triton.jit
-def log_softmax_kernel_small(
-    x_ptr,
-    output_ptr,
-    n_rows,
-    n_cols,
-    stride_x0,
-    stride_x1,
-    stride_output0,
-    stride_output1,
-    BLOCK_SIZE: tl.constexpr,
-):
-    """LogSoftmax kernel for when all columns fit in one block."""
-    # Row index
-    row_idx = tl.program_id(axis=0)
-    
-    # Check if row is valid
-    if row_idx >= n_rows:
-        return
-    
-    # Load entire row at once
-    col_offsets = tl.arange(0, BLOCK_SIZE)
-    mask = col_offsets < n_cols
-    
-    # Compute base pointers for this row
-    x_row_ptr = x_ptr + row_idx * stride_x0
-    output_row_ptr = output_ptr + row_idx * stride_output0
-    
-    # Load entire row
-    x_row = tl.load(x_row_ptr + col_offsets * stride_x1, mask=mask, other=-float('inf'))
-    
-    # Step 1: Find row maximum for numerical stability
-    row_max = tl.max(x_row, axis=0)
-    
-    # Step 2: Compute sum of exp(x - max)
-    exp_vals = tl.exp(x_row - row_max)
-    row_sum_exp = tl.sum(exp_vals, axis=0)
-    
-    # Step 3: Compute log_softmax
-    log_sum_exp = tl.log(row_sum_exp) + row_max
-    output = x_row - log_sum_exp
-    
-    # Store results
-    tl.store(output_row_ptr + col_offsets * stride_output1, output, mask=mask)
+    offs = tl.arange(0, BLOCK_SIZE)
 
-def triton_log_softmax(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
-    """Triton-accelerated LogSoftmax function."""
-    assert x.is_contiguous(), "Input tensor must be contiguous"
-    assert dim == 1 or dim == -1, "Only dim=1 or dim=-1 is supported"
-    
-    # Save original shape
-    original_shape = x.shape
-    output = torch.empty_like(x)
-    
-    # Get tensor dimensions
-    if x.dim() == 2:
-        n_rows, n_cols = x.shape
-    else:
-        # Handle higher dimensions by flattening
-        if dim < 0:
-            dim = x.dim() + dim
-        
-        # Flatten all dimensions before dim into n_rows
-        n_rows = 1
-        for i in range(dim):
-            n_rows *= x.shape[i]
-        
-        # Flatten all dimensions from dim onward into n_cols
-        n_cols = 1
-        for i in range(dim, x.dim()):
-            n_cols *= x.shape[i]
-        
-        x = x.view(n_rows, n_cols)
-        output = output.view(n_rows, n_cols)
-    
-    # Choose optimal block size based on column size
-    MAX_BLOCK_SIZE = 4096
-    BLOCK_SIZE = min(MAX_BLOCK_SIZE, triton.next_power_of_2(n_cols))
-    
-    # Choose kernel based on column size
-    if n_cols <= MAX_BLOCK_SIZE:
-        # Use kernel that processes entire row in one block
-        grid = (n_rows,)
-        log_softmax_kernel_small[grid](
-            x, output,
-            n_rows, n_cols,
-            x.stride(0), x.stride(1),
-            output.stride(0), output.stride(1),
-            BLOCK_SIZE=BLOCK_SIZE
-        )
-    else:
-        # Use kernel that processes row in blocks
-        grid = (n_rows,)
-        log_softmax_kernel[grid](
-            x, output,
-            n_cols,
-            x.stride(0),
-            output.stride(0),
-            BLOCK_SIZE=BLOCK_SIZE
-        )
-    
-    # Restore original shape if needed
-    if output.shape != original_shape:
-        output = output.view(original_shape)
-    
-    return output
+    # Online log-sum-exp state: running max (m) and scaled sum (s)
+    m = -float("inf")
+    s = 0.0
+
+    # Pass 1: single streaming pass to compute logsumexp per row
+    for col_start in range(0, N_COLS, BLOCK_SIZE):
+        idx = col_start + offs
+        mask = idx < N_COLS
+
+        x = tl.load(x_ptr + row_start + idx, mask=mask, other=-float("inf"))
+
+        # Block-wise log-sum-exp
+        block_max = tl.max(x, axis=0)
+        x_centered = x - block_max
+        exp_x = tl.exp(x_centered)
+        block_sum = tl.sum(exp_x, axis=0)
+
+        # Merge block (block_max, block_sum) into running (m, s)
+        new_m = tl.maximum(m, block_max)
+        # rescale old and new sums into the new_max domain
+        s_scaled_old = s * tl.exp(m - new_m)
+        s_scaled_block = block_sum * tl.exp(block_max - new_m)
+        s = s_scaled_old + s_scaled_block
+        m = new_m
+
+    # Final logsumexp for the row
+    logsumexp = tl.log(s) + m
+
+    # Pass 2: compute log_softmax = x - logsumexp and write output
+    for col_start in range(0, N_COLS, BLOCK_SIZE):
+        idx = col_start + offs
+        mask = idx < N_COLS
+
+        x = tl.load(x_ptr + row_start + idx, mask=mask, other=-float("inf"))
+        out = x - logsumexp
+        tl.store(y_ptr + row_start + idx, out, mask=mask)
+
+
+def triton_logsoftmax_2d(x: torch.Tensor) -> torch.Tensor:
+    """
+    High-performance Triton implementation of log_softmax over dimension 1
+    for a 2D tensor of shape (batch, dim).
+    """
+    assert x.ndim == 2, "triton_logsoftmax_2d only supports 2D tensors (batch, dim)"
+    assert x.is_cuda, "Input must be on CUDA device for Triton kernels"
+
+    x = x.contiguous()
+    batch, dim = x.shape
+    y = torch.empty_like(x)
+
+    BLOCK_SIZE = 256
+
+    # One program instance per row
+    grid = lambda meta: (triton.cdiv(batch, 1),)
+
+    logsoftmax_online_kernel[grid](
+        x,
+        y,
+        N_COLS=dim,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=4,
+        num_stages=2,
+    )
+
+    return y
+
 
 class ModelNew(nn.Module):
     """
-    Optimized model that performs LogSoftmax activation using Triton kernels.
+    Triton-accelerated model that performs LogSoftmax activation along an arbitrary dim.
+    Falls back to reshaping so that the reduction is along the last dimension,
+    then applies a fast 2D Triton log_softmax kernel.
     """
     def __init__(self, dim: int = 1):
-        super(ModelNew, self).__init__()
+        super().__init__()
         self.dim = dim
-    
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Applies LogSoftmax activation using Triton kernels.
+        # Match torch.nn.LogSoftmax semantics: apply along self.dim
+        if not x.is_cuda:
+            x = x.cuda(non_blocking=True)
 
-        Args:
-            x (torch.Tensor): Input tensor.
+        dim = self.dim
+        if dim < 0:
+            dim += x.ndim
+        assert 0 <= dim < x.ndim, "Invalid dim for input tensor"
 
-        Returns:
-            torch.Tensor: Output tensor with LogSoftmax applied.
-        """
-        return triton_log_softmax(x, dim=self.dim)
+        # Fast path: 2D tensor, reduction along dim=1
+        if x.ndim == 2 and dim == 1:
+            return triton_logsoftmax_2d(x)
+
+        # General path: move target dim to last, flatten leading dims -> (batch, dim)
+        x_moved = x.movedim(dim, -1)
+        orig_shape = x_moved.shape
+        batch = x_moved.numel() // orig_shape[-1]
+        feat_dim = orig_shape[-1]
+
+        x_2d = x_moved.contiguous().view(batch, feat_dim)
+        y_2d = triton_logsoftmax_2d(x_2d)
+        y_moved = y_2d.view(orig_shape).movedim(-1, dim)
+
+        return y_moved
 ```
 
 [NCU PROFILING METRICS]
 {
-  "log_softmax_kernel": {
-    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 2.52,
+  "logsoftmax_online_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 20.37,
     "launch__grid_size": 4096,
-    "sm__warps_active.avg.pct_of_peak_sustained_active": 77.77,
-    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 91.77,
-    "lts__t_sector_hit_rate.pct": 25.0
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 93.05,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 90.67,
+    "lts__t_sector_hit_rate.pct": 33.33
   }
 }
 
 **Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
 
-OUTPUT RULES (STRICT):
-1. Follow this exact order:
-   1. Imports: torch, torch.nn, triton, triton.language as tl
-   2. @triton.jit decorated kernel function(s)
-   3. Wrapper function(s) for grid calculation and kernel launch
-   4. class ModelNew(nn.Module) that calls your kernels
-2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+## CRITICAL — Code MUST compile and run:
+1. EVERY kernel function MUST have `@triton.jit` decorator
+2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+3. BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+4. `tl.program_id(axis)` only supports axis = 0, 1, 2
+5. No `continue`, `break`, `return` inside loops — use masking
+6. No tensor indexing with loop vars: `x[:, i]` is INVALID
+7. mask shape MUST match data shape in tl.load/tl.store
+
+## Missing Triton Functions (implement manually):
+- tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+## OUTPUT FORMAT (STRICT):
+1. Imports: torch, torch.nn, triton, triton.language as tl
+2. @triton.jit decorated kernel function(s)
+3. Wrapper function(s) for grid calculation and kernel launch
+4. class ModelNew(nn.Module) that calls your kernels
+
+Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
 
 ```python
 # <optimized Triton code>

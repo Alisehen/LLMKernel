@@ -1,0 +1,203 @@
+# <complete ModelNew code with optimized Triton kernels>
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def matmul_triu_kernel(
+    A_ptr,
+    B_ptr,
+    C_ptr,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    num_block_rows,  # number of BLOCK_M tiles along M (and N; assumes square tiling)
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """
+    Compute C = triu(A @ B) for square matrices using an upper-triangular tile
+    scheduling. Only tiles with tile_col >= tile_row are launched, mapped from
+    a 1D program_id via inverse triangular-number mapping.
+    """
+
+    pid = tl.program_id(axis=0)
+
+    # ---------------------------------------------
+    # Map 1D pid -> (pid_m, pid_n) in upper triangle
+    # Tiles are ordered row-wise over (i, j) with 0 <= i <= j < num_block_rows.
+    # Row i has length (num_block_rows - i).
+    # ---------------------------------------------
+    nb = num_block_rows  # number of tiles along each dimension
+
+    # Convert to float for quadratic inversion
+    nb_f = tl.cast(nb, tl.float32)
+    pid_f = tl.cast(pid, tl.float32)
+
+    two_nb_plus_1 = 2.0 * nb_f + 1.0
+    disc = two_nb_plus_1 * two_nb_plus_1 - 8.0 * pid_f
+    sqrt_disc = tl.sqrt(disc)
+    r_f = (two_nb_plus_1 - sqrt_disc) * 0.5
+
+    # Initial integer estimate for row index
+    r = tl.cast(r_f, tl.int32)
+    r = tl.maximum(r, 0)
+    r = tl.minimum(r, nb - 1)
+
+    # P(r): number of tiles before row r
+    # P(r) = r*nb - r*(r-1)/2
+    P_r = r * nb - ((r * (r - 1)) >> 1)
+
+    # Correct downward if we overshot: enforce P(r) <= pid
+    mask_hi = P_r > pid
+    r_hi = r - 1
+    r = tl.where(mask_hi, r_hi, r)
+    P_r = r * nb - ((r * (r - 1)) >> 1)
+
+    # Correct upward if we're still too low: enforce pid < P(r+1)
+    rp1 = r + 1
+    P_rp1 = rp1 * nb - ((rp1 * r) >> 1)
+    mask_lo = (r < nb - 1) & (pid >= P_rp1)
+    r = tl.where(mask_lo, rp1, r)
+    P_r = r * nb - ((r * (r - 1)) >> 1)
+
+    offset_in_row = pid - P_r
+    pid_m = r
+    pid_n = r + offset_in_row  # j = i + offset
+
+    # ---------------------------------------------
+    # Compute offsets for this program's tile
+    # ---------------------------------------------
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Accumulator in FP32
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Loop over K dimension
+    k = 0
+    while k < K:
+        k_offsets = k + offs_k  # [BLOCK_K]
+
+        # Pointers for current tiles of A and B
+        a_ptrs = A_ptr + (offs_m[:, None] * stride_am + k_offsets[None, :] * stride_ak)
+        b_ptrs = B_ptr + (k_offsets[:, None] * stride_bk + offs_n[None, :] * stride_bn)
+
+        # Masks to guard memory accesses
+        a_mask = (offs_m[:, None] < M) & (k_offsets[None, :] < K)
+        b_mask = (k_offsets[:, None] < K) & (offs_n[None, :] < N)
+
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+        # Accumulate matrix product for this K-slice
+        acc += tl.dot(a, b, allow_tf32=True)
+
+        k += BLOCK_K
+
+    # ---------------------------------------------
+    # Write back, keeping only upper-triangular part
+    # ---------------------------------------------
+    row_idx = offs_m[:, None]  # (BLOCK_M, 1)
+    col_idx = offs_n[None, :]  # (1, BLOCK_N)
+
+    in_bounds = (row_idx < M) & (col_idx < N)
+    is_triu = col_idx >= row_idx
+    out_mask = in_bounds & is_triu
+
+    c_ptrs = C_ptr + row_idx * stride_cm + col_idx * stride_cn
+    tl.store(c_ptrs, acc, mask=out_mask)
+
+
+def triton_matmul_triu(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    """
+    Compute torch.triu(A @ B) using a Triton kernel with triangular tile scheduling.
+
+    A: (M, K)
+    B: (K, N)
+    Returns: (M, N) upper-triangular result.
+
+    NOTE: This optimized implementation assumes M == N and uses square tiling.
+    """
+    assert A.dim() == 2 and B.dim() == 2, "Only 2D matrices are supported"
+    assert A.size(1) == B.size(0), "Incompatible matrix dimensions"
+    assert A.device == B.device, "A and B must be on the same device"
+    assert A.is_cuda, "Triton matmul requires CUDA tensors"
+
+    A_mat = A.contiguous()
+    B_mat = B.contiguous()
+
+    M, K = A_mat.shape
+    Kb, N = B_mat.shape
+    assert K == Kb
+    assert M == N, "Upper-triangular optimized kernel currently supports square matrices"
+
+    # Initialize C with zeros so lower-triangular part (tiles we never touch) is correct
+    C = torch.zeros((M, N), device=A_mat.device, dtype=A_mat.dtype)
+
+    # Strides for row-major layout
+    stride_am, stride_ak = A_mat.stride()
+    stride_bk, stride_bn = B_mat.stride()
+    stride_cm, stride_cn = C.stride()
+
+    # Power-of-2 block sizes
+    BLOCK_M = 128
+    BLOCK_N = 128
+    BLOCK_K = 32
+
+    # Number of block rows (and columns, since M == N and BLOCK_M == BLOCK_N)
+    num_block_rows = max(1, triton.cdiv(M, BLOCK_M))
+    num_tiles = num_block_rows * (num_block_rows + 1) // 2
+
+    # 1D grid over upper-triangular tiles
+    def grid(meta):
+        block_m = meta["BLOCK_M"]
+        n_rows = max(1, triton.cdiv(M, block_m))
+        n_tiles = n_rows * (n_rows + 1) // 2
+        return (n_tiles,)
+
+    matmul_triu_kernel[grid](
+        A_mat,
+        B_mat,
+        C,
+        M,
+        N,
+        K,
+        stride_am,
+        stride_ak,
+        stride_bk,
+        stride_bn,
+        stride_cm,
+        stride_cn,
+        num_block_rows,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        num_warps=8,
+        num_stages=4,
+    )
+
+    return C
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-accelerated model computing C = triu(A @ B) using triangular tile scheduling.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, A, B):
+        return triton_matmul_triu(A, B)

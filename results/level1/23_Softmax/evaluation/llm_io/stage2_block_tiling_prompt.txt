@@ -1,0 +1,209 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU: 4090
+
+[OPTIMIZATION STAGE]
+
+## Current Optimization Stage
+
+Focus: BLOCK_M/N/K selection.
+
+Metrics:
+- sm__warps_active.avg.pct_of_peak_sustained_active (>50%)
+
+Rules:
+- BLOCK_* must be powers of 2
+- Tensor Core: BLOCK_M/N multiple of 16, BLOCK_K multiple of 8 (preference)
+- FP32: M/N ∈ {32,64,128,256}, K ∈ {16,32,64}
+- Avoid oversized tiles (mask waste)
+- Keep baseline tile if unsure
+
+Autotune:
+- Max 2-3 configs to reduce compilation time
+- Autotune ONLY on @triton.jit kernel
+
+
+
+[CURRENT CODE]
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=4, num_stages=2),
+        triton.Config({}, num_warps=8, num_stages=2),
+        triton.Config({}, num_warps=4, num_stages=1),
+    ],
+    key=["n_cols"],
+)
+@triton.jit
+def softmax_row_kernel_streaming(
+    x_ptr,           # *f32/f16/bf16, input [M, N]
+    y_ptr,           # same type as x, output [M, N]
+    stride_row,      # row stride for x/y
+    stride_col,      # col stride for x/y (usually 1)
+    n_rows,          # M
+    n_cols,          # N
+    BLOCK_SIZE: tl.constexpr,
+):
+    # One program per row
+    pid = tl.program_id(axis=0)
+
+    # Guard against excess programs (no return in loops, so this is OK)
+    if pid >= n_rows:
+        return
+
+    row_start_x = x_ptr + pid * stride_row
+    row_start_y = y_ptr + pid * stride_row
+
+    offsets = tl.arange(0, BLOCK_SIZE)
+    # Help compiler: offsets are contiguous
+    tl.max_contiguous(offsets, BLOCK_SIZE)
+
+    # -------------------------------------------------------------------------
+    # Pass 1: online (streaming) numerically-stable softmax statistics
+    #         Compute row_max and row_sum in a single sweep over the row.
+    # -------------------------------------------------------------------------
+    row_max = -float("inf")
+    row_sum = 0.0
+
+    col_start = 0
+    while col_start < n_cols:
+        cols = col_start + offsets
+        mask = cols < n_cols
+
+        x = tl.load(
+            row_start_x + cols * stride_col,
+            mask=mask,
+            other=-float("inf"),
+        )
+        x = x.to(tl.float32)
+
+        # Max over this block
+        block_max = tl.max(x, axis=0)
+
+        # New global max for the row
+        new_row_max = tl.maximum(row_max, block_max)
+
+        # Rescale old sum to the new max and add contributions from this block
+        scale = tl.exp(row_max - new_row_max)
+        shifted = x - new_row_max
+        exp_shifted = tl.exp(shifted)
+        block_exp_sum = tl.sum(exp_shifted, axis=0)
+
+        row_sum = row_sum * scale + block_exp_sum
+        row_max = new_row_max
+
+        col_start += BLOCK_SIZE
+
+    # -------------------------------------------------------------------------
+    # Pass 2: compute final softmax values using the finalized row_max/row_sum
+    # -------------------------------------------------------------------------
+    inv_row_sum = 1.0 / row_sum
+
+    col_start = 0
+    while col_start < n_cols:
+        cols = col_start + offsets
+        mask = cols < n_cols
+
+        x = tl.load(
+            row_start_x + cols * stride_col,
+            mask=mask,
+            other=-float("inf"),
+        )
+        x_f32 = x.to(tl.float32)
+
+        out = tl.exp(x_f32 - row_max) * inv_row_sum
+
+        # Cast back to original dtype
+        out = out.to(x.dtype)
+        tl.store(row_start_y + cols * stride_col, out, mask=mask)
+
+        col_start += BLOCK_SIZE
+
+
+def triton_softmax_dim1(x: torch.Tensor) -> torch.Tensor:
+    """
+    Softmax over dim=1 for a 2D tensor using a Triton kernel.
+    Behavior matches torch.softmax(x, dim=1).
+    """
+    assert x.dim() == 2, "Input must be 2D (batch_size, num_features)"
+    x = x.contiguous()
+    M, N = x.shape
+
+    if M == 0:
+        return torch.empty_like(x)
+
+    y = torch.empty_like(x)
+
+    stride_row, stride_col = x.stride()
+    # BLOCK_SIZE must be a power-of-two
+    BLOCK_SIZE = 256
+
+    # One program per row (streaming over columns inside each program)
+    grid = lambda meta: (triton.cdiv(M, 1),)
+
+    softmax_row_kernel_streaming[grid](
+        x,
+        y,
+        stride_row,
+        stride_col,
+        M,
+        N,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-accelerated model performing softmax over dim=1.
+    Behavior matches torch.softmax(x, dim=1).
+    """
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_softmax_dim1(x)
+```
+
+[NCU PROFILING METRICS]
+{
+  "softmax_row_kernel_streaming": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 20.31,
+    "launch__grid_size": 4096,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 94.66,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 90.43,
+    "lts__t_sector_hit_rate.pct": 33.33
+  }
+}
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+## CRITICAL — Code MUST compile and run:
+1. EVERY kernel function MUST have `@triton.jit` decorator
+2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+3. BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+4. `tl.program_id(axis)` only supports axis = 0, 1, 2
+5. No `continue`, `break`, `return` inside loops — use masking
+6. No tensor indexing with loop vars: `x[:, i]` is INVALID
+7. mask shape MUST match data shape in tl.load/tl.store
+
+## Missing Triton Functions (implement manually):
+- tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+## OUTPUT FORMAT (STRICT):
+1. Imports: torch, torch.nn, triton, triton.language as tl
+2. @triton.jit decorated kernel function(s)
+3. Wrapper function(s) for grid calculation and kernel launch
+4. class ModelNew(nn.Module) that calls your kernels
+
+Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

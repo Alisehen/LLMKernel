@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "Most output pixels are strictly interior (no boundary overlap), yet every pixel pays for bounds checks, clamping, and masking inside the innermost loops, which is non-trivial overhead in a compute-heavy kernel.",
+  "bottleneck": "The kernel performs expensive per-element index decoding, clamping, and in-bounds masking for every (kh, kw) tap, even for interior output positions where all accesses are guaranteed valid. This adds extra integer arithmetic and divergent predicates that reduce effective FLOP throughput despite high SM utilization.",
+  "optimisation method": "Split the computation into a fast interior-depthwise-conv kernel with no padding checks (pure affine indexing, no masks) and a small boundary kernel that handles only the halo region where the receptive field crosses image edges.",
+  "modification plan": "On the host, analytically compute the interior output ranges where all (kh, kw) accesses are in-bounds (e.g., h_out in [pad_h, H_out-pad_h_tail), w_out in [...]) for the given stride/dilation/padding. Launch a specialized interior Triton kernel over this region that uses direct affine indexing without clamping or in-bounds predicates inside the K_H×K_W loops; in this kernel, remove all masking logic and compute input offsets as simple n,c,h,w linear indices. For the remaining border pixels (top/bottom rows, left/right columns, and corners), either reuse the existing generic kernel or a smaller masked version, so the heavy fraction of work runs through the simpler, branch-free interior path.",
+  "expected_speedup": "10-20%"
+}

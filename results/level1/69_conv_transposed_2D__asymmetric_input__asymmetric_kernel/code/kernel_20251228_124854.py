@@ -1,0 +1,304 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def conv_transpose2d_igemm_kernel(
+    x_ptr,          # float32[N, C_in, H_in, W_in]
+    w_ptr,          # float32[C_in, C_out_per_g, kH, kW]
+    b_ptr,          # float32[C_out]  (ignored if HAS_BIAS=False)
+    y_ptr,          # float32[N, C_out, H_out, W_out]
+    N, C_in,
+    H_in, W_in,
+    C_out,
+    H_out, W_out,
+    kH, kW,
+    stride_h, stride_w,
+    pad_h, pad_w,
+    dil_h, dil_w,
+    groups,
+    C_in_per_g,
+    C_out_per_g,
+    M,                  # total output positions per all batches: N*H_out*W_out
+    N_BLOCKS_PER_GROUP, # grid_n per group along output-channel axis
+    HAS_BIAS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # -------------------------------------------------------------------------
+    # Program ids for tiling over (M, C_out)
+    # -------------------------------------------------------------------------
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+
+    # Tile of output rows (flattened over N, H_out, W_out)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offs_m < M
+
+    # Decode group and channel tile within group from pid_n
+    g = pid_n // N_BLOCKS_PER_GROUP
+    j = pid_n - g * N_BLOCKS_PER_GROUP  # tile index within group
+
+    co_start = g * C_out_per_g + j * BLOCK_N
+    offs_n = co_start + tl.arange(0, BLOCK_N)
+    # valid output-channel mask: inside total C_out and this group slice
+    mask_n = (offs_n < C_out) & (offs_n >= g * C_out_per_g) & (offs_n < (g + 1) * C_out_per_g)
+
+    # Early exit if this tile is completely out of range (but must not return early in kernel)
+    # We rely on masks to turn all work into no-ops when masks are false.
+
+    # -------------------------------------------------------------------------
+    # Decode (n, ho, wo) from flattened offs_m
+    # -------------------------------------------------------------------------
+    HW_out = H_out * W_out
+    n_m = offs_m // HW_out
+    rem = offs_m - n_m * HW_out
+    ho_m = rem // W_out
+    wo_m = rem - ho_m * W_out
+
+    # Reshape for broadcasting: [M,1] and [1,N]
+    n_m_b = tl.reshape(n_m, (BLOCK_M, 1))
+    ho_m_b = tl.reshape(ho_m, (BLOCK_M, 1))
+    wo_m_b = tl.reshape(wo_m, (BLOCK_M, 1))
+
+    co_b = tl.reshape(offs_n, (1, BLOCK_N))
+
+    # -------------------------------------------------------------------------
+    # Main GEMM loop over K = C_in_per_g * kH * kW
+    # -------------------------------------------------------------------------
+    K_total = C_in_per_g * kH * kW
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Reduction over K in BLOCK_K chunks
+    for k0 in range(0, K_total, BLOCK_K):
+        k_ids = k0 + tl.arange(0, BLOCK_K)  # [K]
+        k_mask = k_ids < K_total
+
+        # Map k_ids -> (ic_in_group, kh, kw)
+        kernel_area = kH * kW
+        ic_g = k_ids // kernel_area
+        kk = k_ids - ic_g * kernel_area
+        kh = kk // kW
+        kw = kk - kh * kW
+
+        # Global input channel index (respecting groups)
+        ic = g * C_in_per_g + ic_g  # [K]
+
+        # Broadcast to [M,K] for geometry
+        ho_b = tl.reshape(ho_m, (BLOCK_M, 1))        # [M,1]
+        wo_b = tl.reshape(wo_m, (BLOCK_M, 1))        # [M,1]
+        kh_b = tl.reshape(kh, (1, BLOCK_K))          # [1,K]
+        kw_b = tl.reshape(kw, (1, BLOCK_K))          # [1,K]
+
+        # Compute corresponding input spatial positions for transposed conv
+        # t_h = ho + pad_h - kh*dil_h
+        t_h = ho_b + pad_h - kh_b * dil_h
+        t_w = wo_b + pad_w - kw_b * dil_w
+
+        # Validity in H dimension
+        within_h = (t_h >= 0) & (t_h <= (H_in - 1) * stride_h)
+        hi = t_h // stride_h
+        mod_h = t_h - hi * stride_h
+        valid_h = within_h & (mod_h == 0)
+
+        # Validity in W dimension
+        within_w = (t_w >= 0) & (t_w <= (W_in - 1) * stride_w)
+        wi = t_w // stride_w
+        mod_w = t_w - wi * stride_w
+        valid_w = within_w & (mod_w == 0)
+
+        valid_hw = valid_h & valid_w  # [M,K]
+
+        # Broadcast ic and n over [M,K] for input indexing
+        ic_b = tl.reshape(ic, (1, BLOCK_K))          # [1,K]
+        n_b = tl.reshape(n_m, (BLOCK_M, 1))          # [M,1]
+
+        # Input index: ((n*C_in + ic)*H_in + hi)*W_in + wi
+        idx_x = ((n_b * C_in + ic_b) * H_in + hi) * W_in + wi  # [M,K]
+
+        load_x_mask = (
+            tl.reshape(mask_m, (BLOCK_M, 1))
+            & tl.reshape(k_mask, (1, BLOCK_K))
+            & valid_hw
+        )
+
+        a = tl.load(x_ptr + idx_x, mask=load_x_mask, other=0.0)  # [M,K], float32
+
+        # ---------------------------------------------------------------------
+        # Load weight tile B[K,N]
+        # weight: [C_in, C_out_per_g, kH, kW]
+        # index = (((ic * C_out_per_g) + co_in_group) * kH + kh) * kW + kw
+        # ---------------------------------------------------------------------
+        co_group = offs_n - g * C_out_per_g  # [N], within-group channel index
+        co_group_b = tl.reshape(co_group, (1, BLOCK_N))      # [1,N]
+
+        ic_bk = tl.reshape(ic, (BLOCK_K, 1))                 # [K,1]
+        kh_bk = tl.reshape(kh, (BLOCK_K, 1))                 # [K,1]
+        kw_bk = tl.reshape(kw, (BLOCK_K, 1))                 # [K,1]
+
+        idx_w = (((ic_bk * C_out_per_g) + co_group_b) * kH + kh_bk) * kW + kw_bk  # [K,N]
+
+        load_w_mask = (
+            tl.reshape(k_mask, (BLOCK_K, 1))
+            & tl.reshape(mask_n, (1, BLOCK_N))
+        )
+
+        b = tl.load(w_ptr + idx_w, mask=load_w_mask, other=0.0)  # [K,N], float32
+
+        # FMA into accumulator
+        acc += tl.dot(a, b, allow_tf32=True)
+
+    # -------------------------------------------------------------------------
+    # Bias add (epilogue)
+    # -------------------------------------------------------------------------
+    if HAS_BIAS:
+        bias = tl.load(b_ptr + offs_n, mask=mask_n, other=0.0)
+        bias_b = tl.reshape(bias, (1, BLOCK_N))
+        acc += bias_b
+
+    # -------------------------------------------------------------------------
+    # Store result: y[n, co, ho, wo]
+    # -------------------------------------------------------------------------
+    idx_y = (((n_m_b * C_out + co_b) * H_out + ho_m_b) * W_out + wo_m_b)
+    store_mask = (
+        tl.reshape(mask_m, (BLOCK_M, 1))
+        & tl.reshape(mask_n, (1, BLOCK_N))
+    )
+    tl.store(y_ptr + idx_y, acc, mask=store_mask)
+
+
+def triton_conv_transpose2d(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    stride,
+    padding,
+    output_padding,
+    dilation,
+    groups: int,
+) -> torch.Tensor:
+    """
+    x:       (N, C_in, H_in, W_in)
+    weight:  (C_in, C_out/groups, kH, kW)  -- nn.ConvTranspose2d layout
+    bias:    (C_out,) or None
+    """
+    assert x.is_cuda and weight.is_cuda, "Triton kernel requires CUDA tensors"
+
+    x = x.contiguous()
+    weight = weight.contiguous()
+    if bias is not None:
+        bias = bias.contiguous()
+
+    N, C_in, H_in, W_in = x.shape
+    C_in_w, C_out_per_g, kH, kW = weight.shape
+    assert C_in_w == C_in, "weight C_in mismatch with input"
+
+    C_out = C_out_per_g * groups
+
+    stride_h, stride_w = stride
+    pad_h, pad_w = padding
+    opad_h, opad_w = output_padding
+    dil_h, dil_w = dilation
+
+    # Output shape as in PyTorch's ConvTranspose2d
+    H_out = (H_in - 1) * stride_h - 2 * pad_h + dil_h * (kH - 1) + opad_h + 1
+    W_out = (W_in - 1) * stride_w - 2 * pad_w + dil_w * (kW - 1) + opad_w + 1
+
+    y = torch.empty((N, C_out, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    M = N * H_out * W_out
+    if M == 0 or C_out == 0:
+        return y
+
+    C_in_per_g = C_in // groups
+    C_out_per_g = C_out // groups
+
+    # Tiling parameters (power-of-two)
+    BLOCK_M = 64
+    BLOCK_N = 64
+    BLOCK_K = 32
+
+    # Number of channel tiles per group
+    N_BLOCKS_PER_GROUP = triton.cdiv(C_out_per_g, BLOCK_N)
+
+    grid = (
+        triton.cdiv(M, BLOCK_M),
+        groups * N_BLOCKS_PER_GROUP,
+    )
+
+    has_bias = bias is not None
+    b_tensor = bias if has_bias else x  # dummy pointer if no bias
+
+    conv_transpose2d_igemm_kernel[grid](
+        x, weight, b_tensor, y,
+        N, C_in,
+        H_in, W_in,
+        C_out,
+        H_out, W_out,
+        kH, kW,
+        stride_h, stride_w,
+        pad_h, pad_w,
+        dil_h, dil_w,
+        groups,
+        C_in_per_g,
+        C_out_per_g,
+        M,
+        N_BLOCKS_PER_GROUP,
+        HAS_BIAS=has_bias,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        num_warps=4,
+        num_stages=3,
+    )
+
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Transposed 2D convolution implemented with a high-performance Triton kernel.
+    API-compatible with the given PyTorch Model.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: tuple,
+        stride: tuple = (1, 1),
+        padding: tuple = (0, 0),
+        output_padding: tuple = (0, 0),
+        dilation: tuple = (1, 1),
+        groups: int = 1,
+        bias: bool = False,
+    ):
+        super().__init__()
+        self.conv_transpose2d = nn.ConvTranspose2d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            output_padding=output_padding,
+            dilation=dilation,
+            groups=groups,
+            bias=bias,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        w = self.conv_transpose2d.weight
+        b = self.conv_transpose2d.bias
+        stride = self.conv_transpose2d.stride
+        padding = self.conv_transpose2d.padding
+        output_padding = self.conv_transpose2d.output_padding
+        dilation = self.conv_transpose2d.dilation
+        groups = self.conv_transpose2d.groups
+
+        return triton_conv_transpose2d(
+            x, w, b, stride, padding, output_padding, dilation, groups
+        )

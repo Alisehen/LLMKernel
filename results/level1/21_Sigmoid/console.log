@@ -1,0 +1,113 @@
+[Seed] Generating seed kernel...
+[Seed 1/2] Generating...
+[92mFinish reason: stop[0m
+Usage: In=1112, Out=1344, Total=2456
+[seed_0] score=0.6801 (baseline=14.1411ms)
+[seed_0] metrics saved to: /home/hyc/LLMKernel/run/20251228_103215_batch_range14to22_openai_deepseek/21_Sigmoid/evaluation/eval_0022.json
+[Seed 1] Final score: 0.6801 ✓
+[Seed 2/2] Generating...
+[92mFinish reason: stop[0m
+Usage: In=1112, Out=1667, Total=2779
+[seed_1] score=0.6792 (baseline=14.1411ms)
+[seed_1] metrics saved to: /home/hyc/LLMKernel/run/20251228_103215_batch_range14to22_openai_deepseek/21_Sigmoid/evaluation/eval_0023.json
+[Seed 2] Final score: 0.6792 ✓
+
+================================================================================
+[Hybrid Strategy] Analyzing all seeds for algorithmic optimization...
+[Hybrid Strategy] - 2 seed(s) with score < 1.0 (rescue)
+================================================================================
+
+[Hybrid] Seed 1: score=0.6801 < 1.0
+[Hybrid] Attempting algorithm analysis rescue...
+[ncu] Using GPU device 1 (CUDA_VISIBLE_DEVICES=1)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_2912504.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_2912504.py /home/hyc/LLMKernel/KernelBench/select2/21_Sigmoid.py /home/hyc/LLMKernel/run/20251228_103215_batch_range14to22_openai_deepseek/21_Sigmoid/code/test_kernel_analysis_seed0.py --repeat 1
+[ncu stdout]: [bench] Completed 1 iterations successfully
+
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_2912504.csv
+[Hybrid] Requesting LLM analysis for seed 1...
+[92mFinish reason: stop[0m
+Usage: In=1260, Out=796, Total=2056
+[Hybrid] Worth optimizing: yes
+[Hybrid] Reason: The Triton kernel is significantly slower than the PyTorch baseline and spends most of its cost in a per-element exp-based sigmoid that can be replaced by a cheaper approximation.
+[Hybrid] Analysis complete for seed 1, generating optimized kernel...
+[Hybrid] Bottleneck: Each element computes an exact sigmoid via tl.exp, which is relatively expensive...
+[Hybrid] Optimization: Algorithm Replacement: replace the exact sigmoid formulation (1 / (1 + exp(-x)))...
+[Hybrid] Expected speedup: 20-40%
+[92mFinish reason: stop[0m
+Usage: In=1545, Out=2249, Total=3794
+[algorithm_optimized_seed0] score=0.6799 (baseline=14.1411ms)
+[algorithm_optimized_seed0] metrics saved to: /home/hyc/LLMKernel/run/20251228_103215_batch_range14to22_openai_deepseek/21_Sigmoid/evaluation/eval_0024.json
+[Hybrid] ✓ Rescue successful: 0.6801 → 0.6799
+
+[Hybrid] Seed 2: score=0.6792 < 1.0
+[Hybrid] Attempting algorithm analysis rescue...
+[ncu] Using GPU device 1 (CUDA_VISIBLE_DEVICES=1)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_2912504.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_2912504.py /home/hyc/LLMKernel/KernelBench/select2/21_Sigmoid.py /home/hyc/LLMKernel/run/20251228_103215_batch_range14to22_openai_deepseek/21_Sigmoid/code/test_kernel_analysis_seed1.py --repeat 1
+[ncu stdout]: [bench] Completed 1 iterations successfully
+
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_2912504.csv
+[Hybrid] Requesting LLM analysis for seed 2...
+[92mFinish reason: stop[0m
+Usage: In=1290, Out=846, Total=2136
+[Hybrid] Worth optimizing: yes
+[Hybrid] Reason: Sigmoid is a purely elementwise op applied to a massive tensor, so its standalone Triton kernel mainly adds extra memory traffic and launch overhead compared to fusing it with surrounding computation.
+[Hybrid] Analysis complete for seed 2, generating optimized kernel...
+[Hybrid] Bottleneck: The kernel is memory-bandwidth bound: it reads and writes ~1.6B elements solely ...
+[Hybrid] Optimization: Use operator fusion to merge the sigmoid into the producer (e.g., linear/matmul)...
+[Hybrid] Expected speedup: 30-50%
+[92mFinish reason: stop[0m
+Usage: In=1606, Out=3630, Total=5236
+[algorithm_optimized_seed1] score=0.6796 (baseline=14.1411ms)
+[algorithm_optimized_seed1] metrics saved to: /home/hyc/LLMKernel/run/20251228_103215_batch_range14to22_openai_deepseek/21_Sigmoid/evaluation/eval_0025.json
+[Hybrid] ✓ Rescue successful: 0.6792 → 0.6796
+
+================================================================================
+[Hybrid] Candidate Selection
+================================================================================
+[Hybrid] Total candidates: 4
+  [1] seed 1: 0.6801
+  [2] seed 2: 0.6792
+  [3] algo-optimized (from seed 1): 0.6799
+  [4] algo-optimized (from seed 2): 0.6796
+
+[Hybrid] ★ Selected best candidate: score=0.6801
+
+[Optimization] Starting 3-stage optimization...
+
+================================================================================
+[Stage 1/2] grid_and_parallel
+Description: Optimize grid layout and parallel work distribution across SMs.
+Current candidates: 1, best score: 0.6801
+================================================================================
+[Stage 1] Profiling best candidate...
+[ncu] Using GPU device 1 (CUDA_VISIBLE_DEVICES=1)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_2912504.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_2912504.py /home/hyc/LLMKernel/KernelBench/select2/21_Sigmoid.py /home/hyc/LLMKernel/run/20251228_103215_batch_range14to22_openai_deepseek/21_Sigmoid/code/test_kernel_analysis_seed1.py --repeat 1
+[ncu stdout]: [bench] Completed 1 iterations successfully
+
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_2912504.csv
+[Stage 1] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=1197, Out=4611, Total=5808
+[stage1_grid_and_parallel] score=0.6802 (baseline=14.1411ms)
+[stage1_grid_and_parallel] metrics saved to: /home/hyc/LLMKernel/run/20251228_103215_batch_range14to22_openai_deepseek/21_Sigmoid/evaluation/eval_0026.json
+  Optimized kernel score: 0.6802 ✓
+[Stage 1] ★ New best score: 0.6802
+
+================================================================================
+[Stage 2/2] block_tiling
+Description: Tune BLOCK_M/N/K sizes for optimal register/memory balance.
+Current candidates: 1, best score: 0.6802
+================================================================================
+[Stage 2] Profiling best candidate...
+[ncu] Using GPU device 1 (CUDA_VISIBLE_DEVICES=1)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_2912504.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_2912504.py /home/hyc/LLMKernel/KernelBench/select2/21_Sigmoid.py /home/hyc/LLMKernel/run/20251228_103215_batch_range14to22_openai_deepseek/21_Sigmoid/code/test_kernel_analysis_seed1.py --repeat 1
+[ncu] ⚠️ Command timed out after 300 seconds
+[93mWarning: NCU profiling failed: NCU CSV file is empty (benchmark script likely failed): /home/hyc/LLMKernel/ncu_temp_2912504.csv[0m
+[Stage 2] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=1022, Out=1830, Total=2852
+[stage2_block_tiling] score=0.6814 (baseline=14.1411ms)
+[stage2_block_tiling] metrics saved to: /home/hyc/LLMKernel/run/20251228_103215_batch_range14to22_openai_deepseek/21_Sigmoid/evaluation/eval_0027.json
+  Optimized kernel score: 0.6814 ✓
+[Stage 2] ★ New best score: 0.6814
+[21_Sigmoid.py] Figure saved to: /home/hyc/LLMKernel/run/20251228_103215_batch_range14to22_openai_deepseek/21_Sigmoid/figures/21_Sigmoid_score.png

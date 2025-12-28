@@ -1,0 +1,10 @@
+```json
+{
+  "worth_optimizing": "yes",
+  "reason": "The custom Triton kernel is ~11x slower than PyTorch, indicating a major algorithmic inefficiency rather than a tuning issue.",
+  "bottleneck": "The kernel computes transposed convolution directly in the output domain with nested loops over input channels and K³, performing expensive per-element index math (div/mod/stride checks) and scalar weight loads, which destroys memory coalescing and reuse compared to GEMM-style implementations.",
+  "optimisation method": "Algorithm replacement: re-express conv_transpose3d as an equivalent forward conv3d (via weight flipping and appropriate padding/dilation transformation) and implement it using a GEMM/implicit-GEMM-style Triton kernel that tiles over (N * spatial, C_in) × (C_in, C_out) with shared input tiles and vectorized weight loads.",
+  "modification plan": "Mathematically transform ConvTranspose3d(N, C_in, D_in, H_in, W_in, stride, padding) into an equivalent Conv3d on the input tensor, with weights flipped in (kd, kh, kw) and adjusted padding/dilation so that PyTorch’s reference output is preserved. Then, replace the current nested-loop Triton kernel with a standard conv3d kernel that uses implicit GEMM tiling: map each program to a tile of (N * D_out * H_out * W_out, C_out), load an input patch tile into shared/registers, multiply it with a weight tile via a matmul-like inner loop, and accumulate, reusing the same kernel for both normal and transposed conv via the parameter transformation. Validate numerically then tune tile sizes (BLOCK_M, BLOCK_N, BLOCK_K) and layouts for coalesced loads.",
+  "expected_speedup": "5-8x (bringing the Triton implementation to parity or better than the PyTorch/cuDNN baseline)"
+}
+```

@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The custom Triton kernel is ~2x slower than PyTorch, and the main inefficiency comes from using a layout that forces heavily strided, poorly coalesced loads for one operand.",
+  "bottleneck": "For the given shapes (A: [M,K] with M>>K, B: [K,N] with K small and N large), B is stored row-major so advancing along the reduction dimension K uses a very large stride (stride_bk = N ≈ 32K), leading to non-coalesced global memory access for B and underutilized memory bandwidth.",
+  "optimisation method": "Reformulate the matmul to operate on transposed operands so that the reduction dimension K is contiguous in memory for both inputs (e.g., compute C^T = B^T @ A^T or explicitly pass B_t = B.t().contiguous() to the kernel), turning the strided access on B into contiguous loads.",
+  "modification plan": "In the Python wrapper, detect that B has stride_bk ≫ stride_bn (i.e., reduction dimension is not contiguous) and either: (1) materialize B_t = B.t().contiguous() once and adjust the kernel to treat it as [N, K] with bk stride = 1, or (2) launch a variant kernel that computes C^T = B^T @ A^T and then returns C^T.t(), ensuring both A^T and B^T are accessed with the reduction dimension contiguous. This layout-aware reformulation keeps K as the fastest-varying index in both operands, enabling fully coalesced loads and much closer-to-cuBLAS performance.",
+  "expected_speedup": "40-60%"
+}

@@ -1,0 +1,226 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=4, num_stages=2),
+        triton.Config({}, num_warps=8, num_stages=2),
+        triton.Config({}, num_warps=4, num_stages=3),
+    ],
+    key=["C_OUT", "H_OUT", "W_OUT"],
+)
+@triton.jit
+def conv_transpose2d_gemm_kernel(
+    x_ptr,        # (N, C_IN, H_IN, W_IN)
+    w_col_ptr,    # (K = C_IN*K_H*K_W, C_OUT) flattened
+    b_ptr,        # (C_OUT,) or dummy
+    y_ptr,        # (N, C_OUT, H_OUT, W_OUT)
+    N,            # batch size
+    H_IN, W_IN,   # input spatial dims
+    C_OUT,        # out channels
+    H_OUT, W_OUT, # output spatial dims
+    PAD_H, PAD_W, # padding
+    HAS_BIAS: tl.constexpr,
+    C_IN: tl.constexpr,
+    K_H: tl.constexpr,
+    K_W: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """
+    Compute ConvTranspose2d (stride=1, dilation=1, output_padding=0) via
+    implicit-im2col + GEMM:
+
+        y[M, C_OUT] = X_im2col[M, K] @ W_col[K, C_OUT]
+
+    where:
+        M = N * H_OUT * W_OUT
+        K = C_IN * K_H * K_W
+    """
+    pid_m = tl.program_id(axis=0)  # tile index along M = N*H_OUT*W_OUT
+    pid_n = tl.program_id(axis=1)  # tile index along C_OUT
+
+    # Offsets for rows (M dimension) and columns (C_OUT dimension)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    M_total = N * H_OUT * W_OUT
+    K_total = C_IN * K_H * K_W
+
+    mask_m = offs_m < M_total
+    mask_n = offs_n < C_OUT
+
+    # De-linearize M-index: m -> (n, ho, wo)
+    hw_out = H_OUT * W_OUT
+    n_batch = offs_m // hw_out
+    rem = offs_m % hw_out
+    ho = rem // W_OUT
+    wo = rem % W_OUT
+
+    # Prepare for broadcasting over K dimension later
+    n_b = n_batch[:, None]
+    ho_b = ho[:, None]
+    wo_b = wo[:, None]
+    mask_m_b = mask_m[:, None]
+
+    # Accumulator for output tile
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Loop over K dimension in BLOCK_K chunks
+    for k_start in range(0, K_total, BLOCK_K):
+        offs_k = k_start + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < K_total
+
+        # Map K-index -> (ci, kh, kw)
+        ci = offs_k // (K_H * K_W)
+        rem_k = offs_k % (K_H * K_W)
+        kh = rem_k // K_W
+        kw = rem_k % K_W
+
+        ci_b = ci[None, :]
+        kh_b = kh[None, :]
+        kw_b = kw[None, :]
+        mask_k_b = mask_k[None, :]
+
+        # Compute input coords (hi, wi) for each (m, k)
+        hi = ho_b - kh_b + PAD_H
+        wi = wo_b - kw_b + PAD_W
+
+        # Valid positions inside input bounds
+        valid_hi = (hi >= 0) & (hi < H_IN)
+        valid_wi = (wi >= 0) & (wi < W_IN)
+        mask_x = mask_m_b & mask_k_b & valid_hi & valid_wi
+
+        # Input linear index: (((n * C_IN + ci) * H_IN + hi) * W_IN + wi)
+        # (hi, wi) may be out-of-bounds but those lanes are masked off in mask_x.
+        in_index = (((n_b * C_IN + ci_b) * H_IN + hi) * W_IN + wi)
+
+        x_tile = tl.load(x_ptr + in_index, mask=mask_x, other=0.0)
+
+        # Weight tile: W_col[K, C_OUT] with row-major layout
+        # Indices: [offs_k, offs_n] -> k*C_OUT + co
+        offs_k_b = offs_k[:, None]
+        offs_n_b = offs_n[None, :]
+        mask_w = mask_k[:, None] & mask_n[None, :]
+        w_index = offs_k_b * C_OUT + offs_n_b
+        w_tile = tl.load(w_col_ptr + w_index, mask=mask_w, other=0.0)
+
+        # Accumulate block GEMM: (BLOCK_M x BLOCK_K) @ (BLOCK_K x BLOCK_N)
+        acc += tl.dot(x_tile, w_tile, allow_tf32=True)
+
+    # Optional bias: add per-channel bias to all rows in the tile
+    if HAS_BIAS:
+        b = tl.load(b_ptr + offs_n, mask=mask_n, other=0.0)
+        b_b = b[None, :]
+        acc += b_b
+
+    # Store result: y[n, co, ho, wo]
+    # Linear index: (((n * C_OUT + co) * H_OUT + ho) * W_OUT + wo)
+    co_b = offs_n[None, :]
+    out_index = (((n_b * C_OUT + co_b) * H_OUT + ho_b) * W_OUT + wo_b)
+
+    mask_y = mask_m_b & mask_n[None, :]
+    tl.store(y_ptr + out_index, acc, mask=mask_y)
+
+
+def triton_conv_transpose2d(x: torch.Tensor,
+                            weight: torch.Tensor,
+                            bias: torch.Tensor,
+                            stride: tuple,
+                            padding: tuple) -> torch.Tensor:
+    """
+    High-performance ConvTranspose2d (stride=1, dilation=1, output_padding=0) using Triton.
+    Falls back to PyTorch for unsupported configurations.
+    """
+    assert x.is_cuda and weight.is_cuda, "Inputs must be CUDA tensors"
+    assert x.dtype == torch.float32 and weight.dtype == torch.float32, "Only float32 is supported"
+
+    stride_h, stride_w = stride
+    pad_h, pad_w = padding
+
+    # Only stride = (1, 1) supported by this kernel
+    if stride_h != 1 or stride_w != 1:
+        return torch.nn.functional.conv_transpose2d(
+            x, weight, bias, stride=stride, padding=padding
+        )
+
+    N, C_in, H_in, W_in = x.shape
+    C_in_w, C_out, K_h, K_w = weight.shape
+    assert C_in_w == C_in, "Weight in_channels must match input channels"
+
+    # ConvTranspose2d output size for stride=1, dilation=1, output_padding=0
+    H_out = (H_in - 1) * stride_h - 2 * pad_h + K_h
+    W_out = (W_in - 1) * stride_w - 2 * pad_w + K_w
+
+    y = torch.empty((N, C_out, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    # Pre-transform weights to (K, C_OUT) for GEMM layout
+    # K = C_in * K_h * K_w
+    w_col = (
+        weight.reshape(C_in, C_out, K_h * K_w)  # (C_in, C_out, K_h*K_w)
+        .permute(0, 2, 1)                       # (C_in, K_h*K_w, C_out)
+        .reshape(C_in * K_h * K_w, C_out)       # (K, C_out)
+        .contiguous()
+    )
+
+    M_total = N * H_out * W_out
+
+    # Tile sizes (power of 2)
+    BLOCK_M = 64
+    BLOCK_N = 64
+    BLOCK_K = 32
+
+    grid = (
+        triton.cdiv(M_total, BLOCK_M),
+        triton.cdiv(C_out, BLOCK_N),
+    )
+
+    has_bias = bias is not None
+    # Dummy pointer when bias is not used; HAS_BIAS guards all accesses
+    b_ptr = bias if has_bias else x
+
+    conv_transpose2d_gemm_kernel[grid](
+        x, w_col, b_ptr, y,
+        N, H_in, W_in, C_out, H_out, W_out,
+        pad_h, pad_w,
+        HAS_BIAS=has_bias,
+        C_IN=C_in,
+        K_H=K_h,
+        K_W=K_w,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+    )
+
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized version of ConvTranspose2d for stride = (1, 1).
+    Falls back to PyTorch for other strides.
+    """
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: tuple,
+                 stride: tuple = (1, 1), padding: tuple = (0, 0), bias: bool = False):
+        super().__init__()
+        self.conv_transpose2d = nn.ConvTranspose2d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            bias=bias,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        w = self.conv_transpose2d.weight
+        b = self.conv_transpose2d.bias
+        stride = self.conv_transpose2d.stride
+        padding = self.conv_transpose2d.padding
+        return triton_conv_transpose2d(x, w, b, stride=stride, padding=padding)
+```

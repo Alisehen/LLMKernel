@@ -1,0 +1,137 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 128}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 256}, num_warps=8, num_stages=2),
+    ],
+    key=['n_elements'],
+)
+@triton.jit
+def fused_elementwise_kernel(
+    a_ptr,           # *const float32
+    bias_ptr,        # *const float32 (only used when HAS_BIAS=True)
+    out_ptr,         # *float32
+    s,               # float32: first scale
+    bias_scalar,     # float32: scalar bias (if used)
+    scale2,          # float32: second scale (if used)
+    n_elements,      # int32: number of elements
+    HAS_BIAS: tl.constexpr,          # bool: elementwise bias tensor
+    HAS_BIAS_SCALAR: tl.constexpr,   # bool: scalar bias
+    HAS_SCALE2: tl.constexpr,        # bool: second scale
+    ACTIVATION: tl.constexpr,        # str: 'identity', 'relu', 'gelu'
+    BLOCK_SIZE: tl.constexpr,        # int: 16, 32, 64, 128, 256
+):
+    """
+    Generic fused elementwise kernel computing:
+
+        x = a * s
+        if HAS_BIAS:        x = x + bias[offset]
+        elif HAS_BIAS_SCALAR: x = x + bias_scalar
+        if HAS_SCALE2:      x = x * scale2
+        x = activation(x)
+
+    For the current model, we use the degenerate case:
+        C = A * s
+    which corresponds to:
+        HAS_BIAS=False, HAS_BIAS_SCALAR=False, HAS_SCALE2=False, ACTIVATION='identity'
+    """
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+
+    a = tl.load(a_ptr + offsets, mask=mask, other=0.0)
+    x = a * s
+
+    if HAS_BIAS:
+        b = tl.load(bias_ptr + offsets, mask=mask, other=0.0)
+        x = x + b
+    elif HAS_BIAS_SCALAR:
+        x = x + bias_scalar
+
+    if HAS_SCALE2:
+        x = x * scale2
+
+    if ACTIVATION == "relu":
+        x = tl.maximum(x, 0.0)
+    elif ACTIVATION == "gelu":
+        # Approximate GELU: 0.5 * x * (1 + erf(x / sqrt(2)))
+        inv_sqrt2 = 0.7071067811865476
+        x_norm = x * inv_sqrt2
+        x = 0.5 * x * (1.0 + tl.math.erf(x_norm))
+    else:
+        # 'identity' or unknown: no-op
+        pass
+
+    tl.store(out_ptr + offsets, x, mask=mask)
+
+
+def triton_fused_scalar_mul(
+    A: torch.Tensor,
+    s: float,
+) -> torch.Tensor:
+    """
+    High-performance Triton implementation of:
+        C = A * s
+
+    Implemented using a generic fused elementwise kernel so this scalar
+    multiply can be easily fused with adjacent ops in a larger model
+    (bias add, second scale, activation, etc.) without extra passes over memory.
+    """
+    assert A.is_cuda, "Input tensor A must be on CUDA device"
+    # Ensure contiguous layout for fully coalesced memory access
+    A_contig = A.contiguous()
+    out = torch.empty_like(A_contig)
+
+    n_elements = A_contig.numel()
+
+    # Degenerate fused configuration: just A * s
+    HAS_BIAS = False
+    HAS_BIAS_SCALAR = False
+    HAS_SCALE2 = False
+    ACTIVATION = "identity"
+
+    # Dummy bias pointer; unused because HAS_BIAS=False
+    bias_ptr = A_contig
+
+    def grid(meta):
+        return (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+
+    fused_elementwise_kernel[grid](
+        A_contig,
+        bias_ptr,
+        out,
+        float(s),
+        0.0,       # bias_scalar (unused)
+        1.0,       # scale2 (unused)
+        n_elements,
+        HAS_BIAS=HAS_BIAS,
+        HAS_BIAS_SCALAR=HAS_BIAS_SCALAR,
+        HAS_SCALE2=HAS_SCALE2,
+        ACTIVATION=ACTIVATION,
+    )
+
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    Simple model that performs a matrix-scalar multiplication (C = A * s)
+    using a high-performance, fusion-ready Triton kernel.
+
+    Behavior matches the reference PyTorch implementation exactly:
+        forward(A, s) -> A * s
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+
+    def forward(self, A: torch.Tensor, s: float) -> torch.Tensor:
+        # Exact same semantics as: return A * s
+        return triton_fused_scalar_mul(A, s)
+```

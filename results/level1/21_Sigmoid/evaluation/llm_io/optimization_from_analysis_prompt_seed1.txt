@@ -1,0 +1,175 @@
+You are optimizing a Triton kernel based on algorithmic analysis.
+
+# PyTorch Reference (Target Behavior)
+
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs a Sigmoid activation.
+    """
+    def __init__(self):
+        super(Model, self).__init__()
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies Sigmoid activation to the input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor of any shape.
+
+        Returns:
+            torch.Tensor: Output tensor with Sigmoid applied, same shape as input.
+        """
+        return torch.sigmoid(x)
+
+batch_size = 4096
+dim = 393216
+
+def get_inputs():
+    x = torch.rand(batch_size, dim)
+    return [x]
+
+def get_init_inputs():
+    return []  # No special initialization inputs needed
+```
+
+**CRITICAL**: Study the PyTorch code carefully to understand:
+- What does `forward()` return? (full output sequence vs final hidden state only)
+- What is the computational pattern?
+- What are the input/output shapes?
+
+Your optimized kernel MUST match this exact behavior.
+
+---
+
+# Analysis Results
+
+**Bottleneck**: The kernel is memory-bandwidth bound: it reads and writes ~1.6B elements solely to apply an elementwise sigmoid, and pays an additional launch overhead, while PyTorch already uses highly optimized pointwise kernels. The separate kernel therefore adds an extra full read+write of the activation tensor compared to a fused implementation.
+
+**Optimization Strategy**: Use operator fusion to merge the sigmoid into the producer (e.g., linear/matmul) or consumer kernel so that sigmoid is computed directly on values while they are still in registers or shared memory, avoiding an extra global memory round-trip and kernel launch.
+
+**Implementation Plan**: Refactor the model so that the operation that produces `x` (e.g., a GEMM or other pointwise chain) and the sigmoid are expressed in a single Triton kernel: load inputs, perform the main computation, immediately apply the sigmoid on the intermediate result, and store only the final activated output. Remove the standalone `triton_sigmoid` wrapper and instead pass the relevant inputs (weights, biases, etc.) into the fused kernel, ensuring that intermediate values never hit global memory unactivated. Verify correctness against `torch.sigmoid(torch.<producer>(...))` and tune block sizes/num_warps once fusion is in place.
+
+**Expected Speedup**: 30-50%
+
+---
+
+# Current Kernel (needs optimization)
+
+```python
+# <complete ModelNew code with optimized Triton kernels>
+import torch, torch.nn as nn, triton, triton.language as tl
+
+
+@triton.jit
+def sigmoid_kernel(
+    x_ptr,
+    out_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+
+    # Sigmoid: 1 / (1 + exp(-x))
+    neg_x = -x
+    exp_neg_x = tl.exp(neg_x)
+    denom = 1.0 + exp_neg_x
+    y = 1.0 / denom
+
+    tl.store(out_ptr + offsets, y, mask=mask)
+
+
+def triton_sigmoid(x: torch.Tensor) -> torch.Tensor:
+    """
+    High-performance Triton implementation of torch.sigmoid(x).
+    Works on any contiguous CUDA tensor (any shape, dtype float32/float16/bfloat16).
+    """
+    if not x.is_cuda:
+        raise ValueError("Input tensor must be on CUDA device for Triton kernels.")
+    x_contig = x.contiguous()
+    out = torch.empty_like(x_contig)
+
+    n_elements = out.numel()
+    if n_elements == 0:
+        return out
+
+    BLOCK_SIZE = 256  # power-of-two, as required
+    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+
+    sigmoid_kernel[grid](
+        x_contig,
+        out,
+        n_elements,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=4,
+        num_stages=2,
+    )
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized model that performs a Sigmoid activation.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_sigmoid(x)
+```
+
+---
+
+# Your Task
+
+Implement the optimization strategy above. Focus on the specific bottleneck identified.
+
+## Key Requirements
+
+1. **Preserve correctness**: Maintain the same input/output behavior
+2. **Apply the optimization**: Follow the implementation plan exactly
+3. **Use valid Triton syntax**:
+   - Every kernel MUST have `@triton.jit` decorator
+   - Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+   - BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+   - No `continue`, `break`, `return` inside kernels (use masking)
+   - Prefer `tl.dot(a, b, allow_tf32=True)` for matmul operations
+
+4. **CRITICAL for RNN/GRU/LSTM Persistent Kernels**:
+   - Time loop MUST be inside @triton.jit kernel, NOT in Python forward()
+   - **HYBRID computation strategy** (CRITICAL for performance):
+     * Precompute input-side gates OUTSIDE kernel: `gates_x = (T*B, In) @ W_ih` (ONE large GEMM)
+     * INSIDE kernel: only recurrent-side: `for t: gates_h = h @ W_hh` (T small GEMMs)
+   - CORRECT (FAST - use this):
+     ```python
+     # Python forward():
+     gates_x_all = x.reshape(T*B, In) @ W_ih + b_ih  # ONE large GEMM
+     gates_x_all = gates_x_all.view(T, B, 3*H)
+     gru_persistent_kernel[grid](gates_x_all, h0, W_hh, ...)  # Launch ONCE
+
+     @triton.jit
+     def gru_persistent_kernel(gates_x_ptr, h_ptr, W_hh_ptr, ...):
+         for t in range(T):  # Inside kernel
+             gates_x_t = tl.load(gates_x_ptr + t*...)  # Precomputed
+             gates_h = h @ W_hh  # Only recurrent GEMM
+             h = (1-z)*n + z*h   # Fuse and update
+     ```
+
+5. **Output format**:
+   - Imports: `import torch, torch.nn as nn, triton, triton.language as tl`
+   - `@triton.jit` kernel(s)
+   - Wrapper function(s)
+   - `class ModelNew(nn.Module)` — REQUIRED
+   - NO testing code, NO `if __name__ == "__main__"`
+
+---
+
+Generate the optimized kernel now. Output ONLY the complete Python code.

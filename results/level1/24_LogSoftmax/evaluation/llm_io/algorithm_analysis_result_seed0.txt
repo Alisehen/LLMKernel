@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The Triton kernel is ~32% slower than the PyTorch baseline and performs three full passes over a very large dimension, causing excessive global memory traffic.",
+  "bottleneck": "Each element of a 4096×393216 tensor is loaded from global memory three times (for max, sum-exp, and writeback), making the kernel strongly memory-bandwidth bound and wasting bandwidth on redundant reads.",
+  "optimisation method": "Algorithm Replacement: use an online, numerically stable log-sum-exp algorithm to compute the normalization term (log_row_sum) and row_max in a single streaming pass, reducing the kernel from three passes over the data to two.",
+  "modification plan": "Replace the separate 'Pass 1: compute row max' and 'Pass 2: compute sum(exp(x - row_max))' with a single streaming pass that maintains running (m, s) such that log_sum_exp = m + log(s) using the recurrence: if x <= m then s += exp(x - m) else s = s * exp(m - x) + 1; m = x. Implement this in the while-loop over columns so that after one pass you have both row_max and log_row_sum without rereading the row. Keep a second pass that rereads x once to compute y = x - log_row_sum (or x - m - log(s)), thereby reducing global reads per element from 3 to 2 while preserving numerical stability.",
+  "expected_speedup": "30-40%"
+}

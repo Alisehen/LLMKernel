@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The custom Triton implementation is ~6x slower than PyTorch largely due to an unnecessary full-tensor copy and an extra reduction pass.",
+  "bottleneck": "The call to `x.permute(...).contiguous()` materializes a full transposed copy of the input before reduction, and the reduction itself is done in two passes with an intermediate `partial` tensor, causing excessive global memory traffic and kernel launches compared to PyTorch’s single-pass, strided reduction.",
+  "optimisation method": "Eliminate the explicit `contiguous()` transpose and two-stage reduction by implementing a single-pass max-reduction kernel that operates directly on the original tensor with arbitrary strides (i.e., reduce along `dim` using its stride, without reordering or copying data).",
+  "modification plan": "Redesign the Triton kernel to take the full shape and per-dimension strides of `x` plus the reduction dimension `dim`, compute the logical index for each program instance, and iterate over that dimension using its stride to accumulate a max directly into the output tensor. Remove `permute(...).contiguous()` and the intermediate `partial` tensor; instead, launch one kernel where each program reduces one (or a small tile of) output elements across the reduction dimension in-register, then writes the final max to the correctly strided output. This keeps the data in-place, avoids the large copy, and collapses the reduction to a single global-memory pass similar to PyTorch’s optimized kernel.",
+  "expected_speedup": "400-600% (bringing performance to at least on par with, and likely modestly faster than, the PyTorch baseline for large tensors)"
+}

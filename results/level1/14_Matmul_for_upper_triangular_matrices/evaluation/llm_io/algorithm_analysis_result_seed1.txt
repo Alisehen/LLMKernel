@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The kernel does a full dense matmul over all (i,j,k) and only enforces upper-triangular structure with a mask at the end, wasting a large amount of compute given that both inputs and the output are upper triangular.",
+  "bottleneck": "The current implementation treats the problem as a generic GEMM and computes every tile of C and the full K loop for each tile, even for tiles entirely below the diagonal and for K ranges where contributions are provably zero due to the triangular structure of A and B.",
+  "optimisation method": "Exploit the upper-triangular structure algorithmically: replace the full GEMM+post-mask with a structure-aware matmul that only processes upper-triangular (i,j) tiles and restricts the K-loop per tile to the range where A[i,k] and B[k,j] can both be non-zero (roughly k ∈ [i, j]).",
+  "modification plan": "Change the launch grid so that program_ids only cover tiles with pid_m * BLOCK_M <= pid_n * BLOCK_N (upper-triangular tiles) and skip launching or early-exit for strictly lower-triangular tiles. For each surviving tile, compute tile-specific k_start and k_end based on the row/column index ranges (e.g., k_start ≈ tile_row_start, k_end ≈ tile_col_end) and loop k only over that interval, adjusting pointer arithmetic accordingly so that tl.dot is never invoked over regions where either A or B are structurally zero. Retain the final triu mask only as a safety guard for partial tiles on the diagonal boundaries.",
+  "expected_speedup": "200-300% vs current Triton kernel (and likely 50-100% vs the PyTorch baseline) due to reducing both the number of (i,j) tiles by ~2x and the average K work per (i,j) by ~3x."
+}

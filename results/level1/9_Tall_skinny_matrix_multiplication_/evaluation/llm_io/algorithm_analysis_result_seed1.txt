@@ -1,0 +1,10 @@
+```json
+{
+  "worth_optimizing": "yes",
+  "reason": "The current Triton matmul is significantly slower than the PyTorch/cuBLAS baseline and uses a generic 2D tiling strategy that does not exploit the extreme tall-skinny aspect ratio.",
+  "bottleneck": "The kernel treats the operation as a generic MxK @ KxN GEMM, using a 2D grid over (M,N); when N is very small (e.g., N=32) many program instances redundantly load the same columns of B and do relatively little work, leading to poor cache reuse and launch/memory overhead dominating.",
+  "optimisation method": "Replace the generic 2D-tiled GEMM with a GEMV-style specialized algorithm for tall-skinny cases, where each program computes the entire N-dimensional output vector for one (or a few) rows of C, turning the problem into many independent dot products and maximizing reuse of the skinny B matrix in registers/L1.",
+  "modification plan": "Introduce a shape-aware dispatch in `triton_matmul`: when min(M,N) is small (e.g., <= 32), launch a 1D grid over the large dimension only (M in your example). In the Triton kernel, have each program: (1) load one row of A (size K), (2) iteratively load tiles of B along K while keeping the full N columns in registers, and (3) accumulate the full length-N output vector for that row; use BLOCK_N = N (or a small multiple) and tile only over K. This reduces redundant loads of B, increases arithmetic intensity per program, and better matches the tall-skinny GEMV-like structure.",
+  "expected_speedup": "30-50%"
+}
+```

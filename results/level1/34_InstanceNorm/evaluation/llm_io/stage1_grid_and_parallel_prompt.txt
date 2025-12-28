@@ -1,240 +1,187 @@
 You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
 
-# Target GPU
-GPU Name: 4090
-Architecture: Ada Lovelace
-• Compute Capability: 8.9
-• Number of SMs: 128
-• Memory Bandwidth: 1008 GB/s
-• TF32 Tensor Core TFLOPS: 82.6 with dense
-• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
-• FP16 Tensor Core TFLOPS: 165.2 with dense
-• Maximum number of registers per thread: 255
-• Maximum threads per block: 1024
-• Maximum threads per SM: 1536
-• Warp size: 32
-• Maximum concurrent warps per SM: 48
-• Shared memory capacity per SM: 100 KB
-• Maximum shared memory per thread block: 99 KB
-• L2 cache (global, all SM shared): 72 MB
+# Target GPU: 4090
 
 [OPTIMIZATION STAGE]
 
 ## Current Optimization Stage
 
-**Focus**: Optimize grid layout and parallel work distribution.
+Focus: Grid layout & parallelism.
 
-**NCU Metrics to Check**:
-• `sm__throughput.avg.pct_of_peak_sustained_elapsed`: Overall SM utilization (target: >60%)
-• `launch__grid_size`: Total number of blocks (controlled by BLOCK_M/N)
+Metrics:
+- sm__throughput.avg.pct_of_peak_sustained_elapsed (>60%)
+- launch__grid_size
 
-**Guidelines**:
-- 2D outputs → 2D grid `(cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))`; 1D ops → 1D grid
-- 3D outputs (e.g., batch×M×N) → 3D grid `(batch, cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))`
-- 4D+ outputs → **flatten** to 3D: `(batch*dim1, dim2, dim3)` or `(cdiv(batch*dim1, BLOCK), dim2, dim3)`
-- Prefer adding parallelism via batch/head/expert dims before reducing BLOCK sizes
-- Only change grid if SM utilization is clearly low; otherwise keep original
-- Always verify `grid = (...)` matches kernel indexing logic
+Rules:
+- 1D: (cdiv(N, BLOCK))
+- 2D: (cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))
+- 3D: (batch, cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))
+- >3D: flatten ONLY independent dims
+- Prefer batch / head / expert / group parallelism before shrinking BLOCK
+- For grouped operations: ensure group dimension is in grid (e.g., program_id(2) for groups)
+- Change grid only if SM utilization is clearly low
 
-**Important Safety Rule**:
-If unsure about grid mapping, do **not** modify it. Never use more than 3 dimensions!
+Safety:
+- Max 3 grid dims, static rank
+- grid=(G0,G1,G2) must match tl.program_id(0/1/2)
+- For grouped ops: verify group indexing is correct
+- If unsure about correctness, do NOT change grid
 
-**Autotune Tip (safe)**:
-Try 2–3 small grid variants using minimal `@autotune` on **kernel function only**.
+Autotune:
+- Autotune either BLOCK_* OR (num_warps, num_stages)
+- If autotuning BLOCK_*, use grid=lambda META: (...)
+- Never redefine BLOCK_* in both kernel and launch
+- Max 2-3 configs to reduce compilation time
 
 
 
 [CURRENT CODE]
 ```python
-import torch
-import torch.nn as nn
-import triton
-import triton.language as tl
+# <complete ModelNew code with optimized Triton kernels>
+import torch, torch.nn as nn, triton, triton.language as tl
 
 
 @triton.jit
-def compute_moments_kernel(
-    x_ptr,
-    mean_ptr,
-    var_ptr,
-    n_elements,
-    spatial_size,
-    eps: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
+def instance_norm_single_pass_kernel(
+    x_ptr,          # *f32 / *f16 / *bf16, [M, S] flattened
+    y_ptr,          # same dtype as x, [M, S]
+    M,              # int: number of (N, C) rows
+    S,              # int: spatial size H*W
+    eps,            # float32
+    NUM_CHUNKS,     # int: number of chunks along S
+    BLOCK_SIZE: tl.constexpr,  # power-of-2, e.g., 256
 ):
     pid = tl.program_id(axis=0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-    
-    # Load input
-    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
-    
-    # Compute sum and sum of squares for this block
-    sum_x = tl.sum(x, axis=0)
-    sum_x2 = tl.sum(x * x, axis=0)
-    
-    # Store block results
-    tl.store(mean_ptr + pid, sum_x)
-    tl.store(var_ptr + pid, sum_x2)
+    # grid is (M,), so 0 <= pid < M
+
+    row = pid
+    row_start = row * S
+
+    offs = tl.arange(0, BLOCK_SIZE)
+
+    # ------------------------------------------------------------------
+    # Pass 1: compute per-row sum and sum of squares (no atomics)
+    # ------------------------------------------------------------------
+    sum_vec = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+    sum_sq_vec = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+
+    # Iterate over S in chunks of BLOCK_SIZE
+    for chunk in range(0, NUM_CHUNKS):
+        idx = chunk * BLOCK_SIZE + offs
+        mask = idx < S
+        x = tl.load(x_ptr + row_start + idx, mask=mask, other=0.0)
+        x_f32 = x.to(tl.float32)
+
+        sum_vec += x_f32
+        sum_sq_vec += x_f32 * x_f32
+
+    # Reduce across the BLOCK_SIZE lanes to scalars
+    sum_val = tl.sum(sum_vec, axis=0)
+    sum_sq_val = tl.sum(sum_sq_vec, axis=0)
+
+    S_f32 = tl.full((), S, dtype=tl.float32)
+    mean = sum_val / S_f32
+    mean_sq = mean * mean
+    var = sum_sq_val / S_f32 - mean_sq
+    inv_std = 1.0 / tl.sqrt(var + eps)
+
+    # ------------------------------------------------------------------
+    # Pass 2: normalize and write output
+    # ------------------------------------------------------------------
+    for chunk in range(0, NUM_CHUNKS):
+        idx = chunk * BLOCK_SIZE + offs
+        mask = idx < S
+        x = tl.load(x_ptr + row_start + idx, mask=mask, other=0.0)
+        x_f32 = x.to(tl.float32)
+
+        y_f32 = (x_f32 - mean) * inv_std
+        y = y_f32.to(x.dtype)
+
+        tl.store(y_ptr + row_start + idx, y, mask=mask)
 
 
-@triton.jit
-def reduce_moments_kernel(
-    mean_ptr,
-    var_ptr,
-    final_mean_ptr,
-    final_var_ptr,
-    spatial_size,
-    eps: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    pid = tl.program_id(axis=0)
-    block_start = pid * BLOCK_SIZE
-    
-    # Load partial sums
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < tl.cdiv(spatial_size, BLOCK_SIZE)
-    
-    mean_partial = tl.load(mean_ptr + offsets, mask=mask, other=0.0)
-    var_partial = tl.load(var_ptr + offsets, mask=mask, other=0.0)
-    
-    # Final reduction
-    sum_x = tl.sum(mean_partial)
-    sum_x2 = tl.sum(var_partial)
-    
-    mean_val = sum_x / spatial_size
-    var_val = sum_x2 / spatial_size - mean_val * mean_val
-    
-    # Store final results
-    tl.store(final_mean_ptr + pid, mean_val)
-    tl.store(final_var_ptr + pid, var_val)
+def triton_instance_norm_2d(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+    """
+    InstanceNorm2d via a single Triton kernel.
+    Normalizes over (H, W) per (N, C) instance, no affine transform.
+    Matches nn.InstanceNorm2d(num_features, affine=False, track_running_stats=False).
+    """
+    assert x.is_cuda, "Input tensor must be on CUDA for Triton kernels."
+    assert x.dim() == 4, "Expected NCHW input."
 
-
-@triton.jit
-def normalize_kernel(
-    x_ptr,
-    output_ptr,
-    mean_ptr,
-    var_ptr,
-    spatial_size,
-    eps: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    pid_nc = tl.program_id(axis=0)
-    pid_spatial = tl.program_id(axis=1)
-    
-    # Load mean and variance for this (n,c) slice
-    mean = tl.load(mean_ptr + pid_nc)
-    var = tl.load(var_ptr + pid_nc)
-    
-    # Compute normalized values
-    inv_std = tl.math.rsqrt(var + eps)
-    
-    # Process spatial elements
-    spatial_start = pid_spatial * BLOCK_SIZE
-    offsets = spatial_start + tl.arange(0, BLOCK_SIZE)
-    spatial_mask = offsets < spatial_size
-    
-    # Load input for this spatial block
-    x_offset = pid_nc * spatial_size + offsets
-    x = tl.load(x_ptr + x_offset, mask=spatial_mask)
-    
-    # Normalize
-    normalized = (x - mean) * inv_std
-    
-    # Store output
-    tl.store(output_ptr + x_offset, normalized, mask=spatial_mask)
-
-
-def triton_instance_norm(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
     N, C, H, W = x.shape
-    spatial_size = H * W
-    total_slices = N * C
-    
-    # Ensure contiguous memory layout
-    x_contig = x.contiguous()
-    output = torch.empty_like(x_contig)
-    
-    # Allocate buffers for moments
-    BLOCK_SIZE = 1024
-    num_spatial_blocks = triton.cdiv(spatial_size, BLOCK_SIZE)
-    
-    # Phase 1: Compute block-wise moments
-    mean_partial = torch.zeros(total_slices * num_spatial_blocks, device=x.device, dtype=x.dtype)
-    var_partial = torch.zeros(total_slices * num_spatial_blocks, device=x.device, dtype=x.dtype)
-    
-    grid1 = lambda meta: (total_slices * num_spatial_blocks,)
-    compute_moments_kernel[grid1](
-        x_contig, mean_partial, var_partial,
-        total_slices * spatial_size, spatial_size,
-        eps, BLOCK_SIZE=BLOCK_SIZE
+    M = N * C
+    S = H * W
+
+    x_flat = x.contiguous().view(M, S)
+    y_flat = torch.empty_like(x_flat)
+
+    BLOCK_SIZE = 256  # power-of-2 as required
+    NUM_CHUNKS = triton.cdiv(S, BLOCK_SIZE)
+
+    grid = lambda meta: (M,)
+
+    instance_norm_single_pass_kernel[grid](
+        x_flat,
+        y_flat,
+        M,
+        S,
+        eps,
+        NUM_CHUNKS,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=4,
+        num_stages=2,
     )
-    
-    # Phase 2: Reduce moments for each (n,c) slice
-    final_mean = torch.zeros(total_slices, device=x.device, dtype=x.dtype)
-    final_var = torch.zeros(total_slices, device=x.device, dtype=x.dtype)
-    
-    grid2 = lambda meta: (total_slices,)
-    reduce_moments_kernel[grid2](
-        mean_partial, var_partial, final_mean, final_var,
-        spatial_size, eps, BLOCK_SIZE=num_spatial_blocks
-    )
-    
-    # Phase 3: Apply normalization
-    num_blocks_spatial = triton.cdiv(spatial_size, BLOCK_SIZE)
-    grid3 = lambda meta: (total_slices, num_blocks_spatial)
-    normalize_kernel[grid3](
-        x_contig, output, final_mean, final_var,
-        spatial_size, eps, BLOCK_SIZE=BLOCK_SIZE
-    )
-    
-    return output
+
+    return y_flat.view(N, C, H, W)
 
 
 class ModelNew(nn.Module):
-    def __init__(self, num_features: int):
+    """
+    Triton-accelerated Instance Normalization (2D, NCHW) without affine.
+    Matches nn.InstanceNorm2d(num_features, affine=False, track_running_stats=False).
+    """
+    def __init__(self, num_features: int, eps: float = 1e-5):
         super().__init__()
         self.num_features = num_features
+        self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return triton_instance_norm(x)
+        return triton_instance_norm_2d(x, eps=self.eps)
 ```
 
 [NCU PROFILING METRICS]
 {
-  "compute_moments_kernel": {
-    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 16.85,
-    "launch__grid_size": 1835008,
-    "sm__warps_active.avg.pct_of_peak_sustained_active": 97.86,
-    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 96.3,
-    "lts__t_sector_hit_rate.pct": 1.54
-  },
-  "reduce_moments_kernel": {
-    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 69.01,
+  "instance_norm_single_pass_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 2.47,
     "launch__grid_size": 7168,
-    "sm__warps_active.avg.pct_of_peak_sustained_active": 76.5,
-    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 0.15,
-    "lts__t_sector_hit_rate.pct": 97.91
-  },
-  "normalize_kernel": {
-    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 2.11,
-    "launch__grid_size": 1835008,
-    "sm__warps_active.avg.pct_of_peak_sustained_active": 84.07,
-    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 87.47,
-    "lts__t_sector_hit_rate.pct": 50.31
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 96.09,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 91.17,
+    "lts__t_sector_hit_rate.pct": 33.33
   }
 }
 
 **Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
 
-OUTPUT RULES (STRICT):
-1. Follow this exact order:
-   1. Imports: torch, torch.nn, triton, triton.language as tl
-   2. @triton.jit decorated kernel function(s)
-   3. Wrapper function(s) for grid calculation and kernel launch
-   4. class ModelNew(nn.Module) that calls your kernels
-2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+## CRITICAL — Code MUST compile and run:
+1. EVERY kernel function MUST have `@triton.jit` decorator
+2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+3. BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+4. `tl.program_id(axis)` only supports axis = 0, 1, 2
+5. No `continue`, `break`, `return` inside loops — use masking
+6. No tensor indexing with loop vars: `x[:, i]` is INVALID
+7. mask shape MUST match data shape in tl.load/tl.store
+
+## Missing Triton Functions (implement manually):
+- tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+## OUTPUT FORMAT (STRICT):
+1. Imports: torch, torch.nn, triton, triton.language as tl
+2. @triton.jit decorated kernel function(s)
+3. Wrapper function(s) for grid calculation and kernel launch
+4. class ModelNew(nn.Module) that calls your kernels
+
+Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
 
 ```python
 # <optimized Triton code>

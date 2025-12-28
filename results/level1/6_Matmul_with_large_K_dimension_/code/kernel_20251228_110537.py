@@ -1,0 +1,159 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        # Baseline large tile for big matrices: high arithmetic intensity
+        triton.Config(
+            {'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32},
+            num_warps=8,
+            num_stages=4,
+        ),
+        # Medium / skinny shapes: more tiles, better SM coverage
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=4,
+        ),
+        # Small / moderate matrices: many tiles, maximize grid size
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=3,
+        ),
+    ],
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def matmul_kernel(
+    A_ptr, B_ptr, C_ptr,
+    M, N, K: tl.constexpr,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """
+    2D-tiled matmul: C = A @ B
+    - BLOCK_* are powers of two and tensor-core friendly.
+    - Autotuned tile shapes to increase active warps and grid size.
+    """
+
+    # Program id for 2D launch grid
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+
+    # Offsets for this tile
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    # Alignment hints for codegen
+    tl.multiple_of(offs_m, BLOCK_M)
+    tl.multiple_of(offs_n, BLOCK_N)
+    tl.max_contiguous(offs_m, BLOCK_M)
+    tl.max_contiguous(offs_n, BLOCK_N)
+
+    # Masks for valid rows / cols
+    m_mask = offs_m < M
+    n_mask = offs_n < N
+
+    # Accumulator (fp32)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # K offsets for a tile
+    offs_k = tl.arange(0, BLOCK_K)
+    tl.multiple_of(offs_k, BLOCK_K)
+    tl.max_contiguous(offs_k, BLOCK_K)
+
+    # Base pointers for first K-tile
+    a_ptrs = A_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak  # (BM, BK)
+    b_ptrs = B_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn  # (BK, BN)
+
+    # Loop over K dimension
+    for k_start in range(0, K, BLOCK_K):
+        k_mask = (k_start + offs_k) < K  # (BK,)
+
+        a_mask = m_mask[:, None] & k_mask[None, :]
+        b_mask = k_mask[:, None] & n_mask[None, :]
+
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+        # Tensor-core friendly dot (TF32 on Ada if allow_tf32=True)
+        acc += tl.dot(a, b, allow_tf32=True)
+
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Write back C
+    c_ptrs = C_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    c_mask = m_mask[:, None] & n_mask[None, :]
+    tl.store(c_ptrs, acc, mask=c_mask)
+
+
+def triton_matmul(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    """
+    Triton-optimized matmul: C = A @ B
+    - Expects A: (M, K), B: (K, N), dtype=float32 on CUDA.
+    """
+    assert A.is_cuda and B.is_cuda, "Inputs must be CUDA tensors"
+    assert A.dtype == torch.float32 and B.dtype == torch.float32, "Expected float32 tensors"
+    assert A.shape[1] == B.shape[0], "Incompatible matmul shapes"
+
+    A = A.contiguous()
+    B = B.contiguous()
+
+    M, K = A.shape
+    K2, N = B.shape
+    assert K2 == K
+
+    if M == 0 or N == 0:
+        return torch.empty((M, N), device=A.device, dtype=A.dtype)
+
+    C = torch.empty((M, N), device=A.device, dtype=A.dtype)
+
+    stride_am = A.stride(0)
+    stride_ak = A.stride(1)
+    stride_bk = B.stride(0)
+    stride_bn = B.stride(1)
+    stride_cm = C.stride(0)
+    stride_cn = C.stride(1)
+
+    def grid(meta):
+        # Ensure grid dimensions are > 0
+        return (
+            triton.cdiv(M, meta['BLOCK_M']),
+            triton.cdiv(N, meta['BLOCK_N']),
+        )
+
+    matmul_kernel[grid](
+        A, B, C,
+        M, N, K,
+        stride_am, stride_ak,
+        stride_bk, stride_bn,
+        stride_cm, stride_cn,
+    )
+
+    return C
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized replacement for torch.matmul(A, B): C = A @ B
+    Tuned for NVIDIA RTX 4090 with aggressive tile selection.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        if not A.is_cuda:
+            A = A.cuda()
+        if not B.is_cuda:
+            B = B.cuda()
+        return triton_matmul(A, B)

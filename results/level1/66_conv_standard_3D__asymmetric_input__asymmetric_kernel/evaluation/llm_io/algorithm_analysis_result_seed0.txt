@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The current Triton kernel is ~20x slower than PyTorch, indicating a fundamentally inefficient convolution algorithm and mapping.",
+  "bottleneck": "Each program instance performs a naive direct convolution over all kernel positions and input channels with per-output-channel loops, causing massive redundant loads of the same input elements and very poor data reuse; effectively, the convolution is implemented as many tiny scalar FMA loops instead of a dense GEMM-like computation.",
+  "optimisation method": "Replace the direct nested-loop convolution with an implicit-GEMM formulation: map the 3D convolution to a matrix multiplication between a 'patch' matrix (im2col of input) and a reshaped weight matrix, and implement this as a high-performance Triton matmul (or call cuBLAS), optionally fusing bias addition.",
+  "modification plan": "Conceptually flatten each output position (n, od, oh, ow) into a row index P and each (ci, kd, kh, kw) into a column index K, forming X_col of shape [P, K] and W_col of shape [K, Co]; then compute Y_flat = X_col @ W_col and reshape back to (N, Co, Do, Ho, Wo). Implement this in Triton using a tiled matmul kernel that computes tiles of [P_block x Co_block] while loading corresponding K-blocks of X and W into shared memory/SMEM, avoiding explicit materialization of X_col by computing patches on the fly inside the matmul tiles. Fuse bias addition in the epilogue of the matmul kernel to avoid an extra pass over the output.",
+  "expected_speedup": "20-30x vs the current Triton kernel (bringing it to at least parity, and likely modestly faster than the PyTorch/cuDNN baseline)."
+}

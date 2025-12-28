@@ -1,0 +1,10 @@
+```json
+{
+  "worth_optimizing": "yes",
+  "reason": "The Triton implementation is ~45% slower than PyTorch and performs multiple passes and kernel launches for a simple L2 norm.",
+  "bottleneck": "The current algorithm makes two full global-memory passes over `x` (one for sum-of-squares, one for normalization), uses atomics for the reduction, and launches three separate kernels, all of which are expensive for large B×D.",
+  "optimisation method": "Fuse the sum-of-squares, sqrt, and normalization into a single kernel that performs a per-row reduction without atomics and then normalizes in a second loop over the row, eliminating intermediate global buffers and extra launches.",
+  "modification plan": "Design a single Triton kernel with one program per row (or a small group of rows): in the first loop over D (in CHUNK_SIZE tiles), load `x`, accumulate `sum(x^2)` in registers using `tl.sum`, then compute `norm = sqrt(sum)` in-register. In a second loop over D, reload `x` tiles, divide by `norm`, and write directly to `y`, removing `norms_sqr`/`norms` buffers, atomics, and the two auxiliary kernels. Tune CHUNK_SIZE/num_warps so each program fully reduces its row without needing atomic_add across programs.",
+  "expected_speedup": "30-50%"
+}
+```

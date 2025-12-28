@@ -4,207 +4,149 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
+
 @triton.jit
 def conv_transpose2d_kernel(
-    x_ptr,
-    w_ptr,
-    bias_ptr,
-    y_ptr,
-    N,
-    IC,
-    IH,
-    IW,
-    OC,
-    KH,
-    KW,
-    OH,
-    OW,
-    STRIDE_H,
-    STRIDE_W,
-    PAD_H,
-    PAD_W,
-    DIL_H,
-    DIL_W,
-    M,
-    K,
-    ADD_BIAS: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
+    x_ptr,      # float32 [N, Cin, H_in, W_in]
+    w_ptr,      # float32 [Cin, Cout, K, K]
+    b_ptr,      # float32 [Cout] (unused if HAS_BIAS=False)
+    y_ptr,      # float32 [N, Cout, H_out, W_out]
+    N, Cin, Cout,
+    H_in, W_in,
+    H_out, W_out,
+    num_w_blocks,
+    BLOCK_P: tl.constexpr,
+    KERNEL_SIZE: tl.constexpr,
+    STRIDE: tl.constexpr,
+    PADDING: tl.constexpr,
+    DILATION: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
 ):
-    pid_m = tl.program_id(axis=0)
-    pid_n = tl.program_id(axis=1)
+    pid = tl.program_id(axis=0)
 
-    m_offsets = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    n_offsets = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    # Decompose program id into (n, co, ho, w_block_id)
+    row_id = pid // num_w_blocks  # over N * Cout * H_out
+    w_block_id = pid % num_w_blocks
 
-    m_mask = m_offsets < M
-    n_mask = n_offsets < OC
+    NC_out_H = Cout * H_out
+    n = row_id // NC_out_H
+    rem = row_id % NC_out_H
+    co = rem // H_out
+    ho = rem % H_out
 
-    ohow = OH * OW
-    m_offsets_int = m_offsets.to(tl.int32)
-    n_idx = m_offsets_int // ohow
-    rem = m_offsets_int - n_idx * ohow
-    oh_idx = rem // OW
-    ow_idx = rem - oh_idx * OW
+    # Output width indices handled by this program
+    w_start = w_block_id * BLOCK_P
+    w_offsets = w_start + tl.arange(0, BLOCK_P)
+    mask_w = w_offsets < W_out
 
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    # Accumulator for this (n, co, ho, w_offsets) slice
+    acc = tl.zeros([BLOCK_P], dtype=tl.float32)
+    if HAS_BIAS:
+        bias_val = tl.load(b_ptr + co)
+        acc = acc + bias_val
 
-    for k_start in range(0, K, BLOCK_K):
-        k_offsets = k_start + tl.arange(0, BLOCK_K)
-        k_mask = k_offsets < K
+    # Loop over input channels and kernel positions
+    for ic in range(0, Cin):
+        for kh in range(0, KERNEL_SIZE):
+            # Compute input height index (scalar)
+            h_in_numer = ho + PADDING - kh * DILATION
+            h_in = h_in_numer // STRIDE
+            h_in_times_stride = h_in * STRIDE
+            valid_h = (h_in_numer == h_in_times_stride) & (h_in >= 0) & (h_in < H_in)
+            safe_h_in = tl.where(valid_h, h_in, 0)
 
-        k_offsets_int = k_offsets.to(tl.int32)
-        ic_span = KH * KW
-        ic_idx = k_offsets_int // ic_span
-        kt = k_offsets_int - ic_idx * ic_span
-        kh_idx = kt // KW
-        kw_idx = kt - kh_idx * KW
+            for kw in range(0, KERNEL_SIZE):
+                # Compute input width indices (vector)
+                w_in_numer = w_offsets + PADDING - kw * DILATION
+                w_in = w_in_numer // STRIDE
+                w_in_times_stride = w_in * STRIDE
+                valid_w = (w_in_numer == w_in_times_stride) & (w_in >= 0) & (w_in < W_in)
 
-        oh_pad = oh_idx[:, None] + PAD_H
-        ow_pad = ow_idx[:, None] + PAD_W
+                mask = mask_w & valid_w & valid_h
+                safe_w_in = tl.where(valid_w & valid_h, w_in, 0)
 
-        ih_nom = oh_pad - kh_idx[None, :] * DIL_H
-        iw_nom = ow_pad - kw_idx[None, :] * DIL_W
+                # Compute input offsets: ((n * Cin + ic) * H_in + h_in) * W_in + w_in
+                base_nc = n * Cin + ic
+                base_nch = base_nc * H_in + safe_h_in
+                in_offsets = base_nch * W_in + safe_w_in
 
-        ih_div = ih_nom // STRIDE_H
-        iw_div = iw_nom // STRIDE_W
+                x_vals = tl.load(x_ptr + in_offsets, mask=mask, other=0.0)
 
-        valid_h = (ih_nom >= 0) & (ih_div * STRIDE_H == ih_nom) & (ih_div < IH)
-        valid_w = (iw_nom >= 0) & (iw_div * STRIDE_W == iw_nom) & (iw_div < IW)
+                # Weight offset: ((ic * Cout + co) * K + kh) * K + kw
+                w_offset = ((ic * Cout + co) * KERNEL_SIZE + kh) * KERNEL_SIZE + kw
+                w_val = tl.load(w_ptr + w_offset)
 
-        valid = (
-            m_mask[:, None]
-            & k_mask[None, :]
-            & valid_h
-            & valid_w
-        )
+                acc += x_vals * w_val
 
-        safe_ih = tl.where(valid, ih_div, 0)
-        safe_iw = tl.where(valid, iw_div, 0)
-
-        n_idx_i64 = n_idx.to(tl.int64)[:, None]
-        ic_idx_i64 = ic_idx.to(tl.int64)[None, :]
-        safe_ih_i64 = safe_ih.to(tl.int64)
-        safe_iw_i64 = safe_iw.to(tl.int64)
-
-        x_ptrs = (
-            (((n_idx_i64 * IC) + ic_idx_i64) * IH + safe_ih_i64) * IW + safe_iw_i64
-        )
-        x_vals = tl.load(x_ptr + x_ptrs, mask=valid, other=0.0)
-        x_vals = x_vals.to(tl.float32)
-
-        w_mask = k_mask[:, None] & n_mask[None, :]
-        n_offsets_i64 = n_offsets.to(tl.int64)[None, :]
-        kh_idx_i64 = kh_idx.to(tl.int64)[:, None]
-        kw_idx_i64 = kw_idx.to(tl.int64)[:, None]
-
-        w_ptrs = (
-            (((ic_idx.to(tl.int64)[:, None] * OC) + n_offsets_i64) * KH + kh_idx_i64) * KW + kw_idx_i64
-        )
-        w_vals = tl.load(w_ptr + w_ptrs, mask=w_mask, other=0.0)
-        w_vals = w_vals.to(tl.float32)
-
-        acc += tl.dot(x_vals, w_vals)
-
-    if ADD_BIAS:
-        bias_vals = tl.load(bias_ptr + n_offsets, mask=n_mask, other=0.0)
-        acc += bias_vals[None, :]
-
-    out_mask = m_mask[:, None] & n_mask[None, :]
-    n_idx_i64 = n_idx.to(tl.int64)[:, None]
-    oh_idx_i64 = oh_idx.to(tl.int64)[:, None]
-    ow_idx_i64 = ow_idx.to(tl.int64)[:, None]
-    n_offsets_i64 = n_offsets.to(tl.int64)[None, :]
-
-    y_ptrs = (
-        (((n_idx_i64 * OC) + n_offsets_i64) * OH + oh_idx_i64) * OW + ow_idx_i64
-    )
-    tl.store(y_ptr + y_ptrs, acc.to(tl.float32), mask=out_mask)
+    # Store result to output: ((n * Cout + co) * H_out + ho) * W_out + w_offsets
+    out_base_nc = n * Cout + co
+    out_base_nch = out_base_nc * H_out + ho
+    out_offsets = out_base_nch * W_out + w_offsets
+    tl.store(y_ptr + out_offsets, acc, mask=mask_w)
 
 
-def triton_conv_transpose2d(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor,
-    stride,
-    padding,
-    dilation,
-) -> torch.Tensor:
-    if isinstance(stride, tuple):
-        stride_h, stride_w = stride
+def triton_conv_transpose2d(x: torch.Tensor,
+                            weight: torch.Tensor,
+                            bias: torch.Tensor,
+                            stride: int,
+                            padding: int,
+                            dilation: int) -> torch.Tensor:
+    # Ensure CUDA tensors and contiguous layout
+    assert x.is_cuda and weight.is_cuda, "Inputs must be CUDA tensors"
+    x_f32 = x.contiguous().to(torch.float32)
+    w_f32 = weight.contiguous().to(torch.float32)
+
+    if bias is not None:
+        b_f32 = bias.contiguous().to(torch.float32)
+        has_bias = True
     else:
-        stride_h = stride_w = stride
-    if isinstance(padding, tuple):
-        pad_h, pad_w = padding
-    else:
-        pad_h = pad_w = padding
-    if isinstance(dilation, tuple):
-        dil_h, dil_w = dilation
-    else:
-        dil_h = dil_w = dilation
+        # Dummy tensor (never read when HAS_BIAS=False)
+        b_f32 = torch.empty(1, device=x.device, dtype=torch.float32)
+        has_bias = False
 
-    x = x.contiguous()
-    weight = weight.contiguous()
-    bias_tensor = bias.contiguous() if bias is not None else None
+    N, Cin, H_in, W_in = x_f32.shape
+    Cin_w, Cout, K_h, K_w = w_f32.shape
+    assert Cin_w == Cin, "Weight Cin must match input Cin"
+    assert K_h == K_w, "Kernel must be square"
+    K = K_h
 
-    N, IC, IH, IW = x.shape
-    IC_w, OC, KH, KW = weight.shape
-    assert IC_w == IC, "Weight/input channel mismatch."
+    stride_int = int(stride)
+    padding_int = int(padding)
+    dilation_int = int(dilation)
 
-    OH = (IH - 1) * stride_h - 2 * pad_h + dil_h * (KH - 1) + 1
-    OW = (IW - 1) * stride_w - 2 * pad_w + dil_w * (KW - 1) + 1
+    # Output size formula (no output_padding)
+    H_out = (H_in - 1) * stride_int - 2 * padding_int + dilation_int * (K - 1) + 1
+    W_out = (W_in - 1) * stride_int - 2 * padding_int + dilation_int * (K - 1) + 1
 
-    out = torch.empty((N, OC, OH, OW), device=x.device, dtype=x.dtype)
+    y = torch.empty((N, Cout, H_out, W_out), device=x.device, dtype=torch.float32)
 
-    M = N * OH * OW
-    K = IC * KH * KW
-
-    BLOCK_M = 64
-    BLOCK_N = 64
-    BLOCK_K = 32
-
-    bias_ptr = bias_tensor if bias_tensor is not None else out.new_empty(1)
-
-    grid = (
-        triton.cdiv(M, BLOCK_M),
-        triton.cdiv(OC, BLOCK_N),
-    )
+    BLOCK_P = 128  # power-of-2 block size for W dimension
+    num_w_blocks = triton.cdiv(W_out, BLOCK_P)
+    total_rows = N * Cout * H_out
+    grid = (total_rows * num_w_blocks,)
 
     conv_transpose2d_kernel[grid](
-        x,
-        weight,
-        bias_ptr,
-        out,
-        N,
-        IC,
-        IH,
-        IW,
-        OC,
-        KH,
-        KW,
-        OH,
-        OW,
-        stride_h,
-        stride_w,
-        pad_h,
-        pad_w,
-        dil_h,
-        dil_w,
-        M,
-        K,
-        ADD_BIAS=1 if bias_tensor is not None else 0,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_K=BLOCK_K,
-        num_warps=4,
-        num_stages=2,
+        x_f32, w_f32, b_f32, y,
+        N, Cin, Cout,
+        H_in, W_in,
+        H_out, W_out,
+        num_w_blocks,
+        BLOCK_P=BLOCK_P,
+        KERNEL_SIZE=K,
+        STRIDE=stride_int,
+        PADDING=padding_int,
+        DILATION=dilation_int,
+        HAS_BIAS=has_bias,
     )
 
-    return out
+    return y.to(dtype=x.dtype)
 
 
 class ModelNew(nn.Module):
+    """
+    Triton-optimized version of ConvTranspose2d forward.
+    """
+
     def __init__(
         self,
         in_channels: int,
@@ -214,9 +156,10 @@ class ModelNew(nn.Module):
         padding: int = 0,
         dilation: int = 1,
         bias: bool = False,
-    ) -> None:
+    ):
         super().__init__()
-        self.conv = nn.ConvTranspose2d(
+        # Keep an nn.ConvTranspose2d for parameter storage / state_dict compatibility
+        self.conv_transpose2d = nn.ConvTranspose2d(
             in_channels,
             out_channels,
             kernel_size,
@@ -227,12 +170,10 @@ class ModelNew(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return triton_conv_transpose2d(
-            x,
-            self.conv.weight,
-            self.conv.bias,
-            self.conv.stride,
-            self.conv.padding,
-            self.conv.dilation,
-        )
+        w = self.conv_transpose2d.weight
+        b = self.conv_transpose2d.bias
+        stride = self.conv_transpose2d.stride[0]
+        padding = self.conv_transpose2d.padding[0]
+        dilation = self.conv_transpose2d.dilation[0]
+        return triton_conv_transpose2d(x, w, b, stride, padding, dilation)
 ```

@@ -1,0 +1,404 @@
+You are optimizing a Triton kernel based on algorithmic analysis.
+
+# PyTorch Reference (Target Behavior)
+
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Performs a standard 3D convolution operation with asymmetric input and kernel sizes.
+
+    Args:
+        in_channels (int): Number of channels in the input tensor.
+        out_channels (int): Number of channels produced by the convolution.
+        kernel_size (tuple): Size of the convolution kernel in the form (kernel_size_d, kernel_size_h, kernel_size_w).
+        stride (tuple, optional): Stride of the convolution in the form (stride_d, stride_h, stride_w). Defaults to (1, 1, 1).
+        padding (tuple, optional): Padding applied to the input in the form (padding_d, padding_h, padding_w). Defaults to (0, 0, 0).
+        dilation (tuple, optional): Spacing between kernel elements in the form (dilation_d, dilation_h, dilation_w). Defaults to (1, 1, 1).
+        groups (int, optional): Number of blocked connections from input channels to output channels. Defaults to 1.
+        bias (bool, optional): If `True`, adds a learnable bias to the output. Defaults to `False`.
+    """
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: tuple, stride: tuple = (1, 1, 1), padding: tuple = (0, 0, 0), dilation: tuple = (1, 1, 1), groups: int = 1, bias: bool = False):
+        super(Model, self).__init__()
+        self.conv3d = nn.Conv3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, dilation=dilation, groups=groups, bias=bias)
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Performs the 3D convolution.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_channels, depth, height, width).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_channels, depth_out, height_out, width_out).
+        """
+        return self.conv3d(x)
+
+# Test code
+batch_size = 8
+in_channels = 3
+out_channels = 64
+kernel_size = (3, 5, 7)  # Asymmetric kernel size
+depth = 16
+height = 128
+width = 128
+
+def get_inputs():
+    x = torch.rand(batch_size, in_channels, depth, height, width)
+    return [x]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size]  # Provide in_channels, out_channels, kernel_size for initialization
+```
+
+**CRITICAL**: Study the PyTorch code carefully to understand:
+- What does `forward()` return? (full output sequence vs final hidden state only)
+- What is the computational pattern?
+- What are the input/output shapes?
+
+Your optimized kernel MUST match this exact behavior.
+
+---
+
+# Analysis Results
+
+**Bottleneck**: Each program instance performs a naive direct convolution over all kernel positions and input channels with per-output-channel loops, causing massive redundant loads of the same input elements and very poor data reuse; effectively, the convolution is implemented as many tiny scalar FMA loops instead of a dense GEMM-like computation.
+
+**Optimization Strategy**: Replace the direct nested-loop convolution with an implicit-GEMM formulation: map the 3D convolution to a matrix multiplication between a 'patch' matrix (im2col of input) and a reshaped weight matrix, and implement this as a high-performance Triton matmul (or call cuBLAS), optionally fusing bias addition.
+
+**Implementation Plan**: Conceptually flatten each output position (n, od, oh, ow) into a row index P and each (ci, kd, kh, kw) into a column index K, forming X_col of shape [P, K] and W_col of shape [K, Co]; then compute Y_flat = X_col @ W_col and reshape back to (N, Co, Do, Ho, Wo). Implement this in Triton using a tiled matmul kernel that computes tiles of [P_block x Co_block] while loading corresponding K-blocks of X and W into shared memory/SMEM, avoiding explicit materialization of X_col by computing patches on the fly inside the matmul tiles. Fuse bias addition in the epilogue of the matmul kernel to avoid an extra pass over the output.
+
+**Expected Speedup**: 20-30x vs the current Triton kernel (bringing it to at least parity, and likely modestly faster than the PyTorch/cuDNN baseline).
+
+---
+
+# Current Kernel (needs optimization)
+
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def conv3d_fwd_kernel(
+    x_ptr,                    # *f32
+    w_ptr,                    # *f32
+    b_ptr,                    # *f32 or null
+    y_ptr,                    # *f32
+    N, Ci, Di, Hi, Wi,        # int32
+    Co, Do, Ho, Wo,           # int32
+    stride_d, stride_h, stride_w,
+    pad_d, pad_h, pad_w,
+    dil_d, dil_h, dil_w,
+    groups,
+    Co_per_group,
+    sX_N, sX_C, sX_D, sX_H, sX_W,
+    sW_Co, sW_Ci, sW_Kd, sW_Kh, sW_Kw,
+    sY_N, sY_C, sY_D, sY_H, sY_W,
+    P,                        # total output positions = N * Do * Ho * Wo
+    BLOCK_CO: tl.constexpr,
+    Ci_per_group: tl.constexpr,
+    Kd: tl.constexpr,
+    Kh: tl.constexpr,
+    Kw: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+):
+    pid_p = tl.program_id(axis=0)
+    pid_co_block = tl.program_id(axis=1)
+
+    # Position / channel masks
+    mask_p = pid_p < P
+    co_block_start = pid_co_block * BLOCK_CO
+    co_offsets = co_block_start + tl.arange(0, BLOCK_CO)
+    co_mask = co_offsets < Co
+
+    # Decode flat position pid_p -> (n, od, oh, ow)
+    # Even if pid_p >= P, these values won't be used because mask_p will be false
+    tmp = pid_p
+    ow = tmp % Wo
+    tmp = tmp // Wo
+    oh = tmp % Ho
+    tmp = tmp // Ho
+    od = tmp % Do
+    n = tmp // Do
+
+    # Compute output base offset for this spatial location
+    y_base = n * sY_N + od * sY_D + oh * sY_H + ow * sY_W
+
+    # Group indexing
+    # Each output channel belongs to a group; groups partition input channels.
+    # co_group: which group each output channel belongs to
+    co_group = co_offsets // Co_per_group
+    ci_group_base = co_group * Ci_per_group  # starting input-channel index per output channel
+
+    acc = tl.zeros([BLOCK_CO], dtype=tl.float32)
+
+    # Main convolution loops: over kernel depth/height/width and input channels per group
+    for kd in range(Kd):
+        id_ = od * stride_d - pad_d + kd * dil_d
+        in_d_ok = (id_ >= 0) & (id_ < Di)
+
+        for kh in range(Kh):
+            ih = oh * stride_h - pad_h + kh * dil_h
+            in_h_ok = (ih >= 0) & (ih < Hi)
+
+            for kw in range(Kw):
+                iw = ow * stride_w - pad_w + kw * dil_w
+                in_w_ok = (iw >= 0) & (iw < Wi)
+
+                # Scalar in-bounds mask for this spatial location
+                in_bounds = in_d_ok & in_h_ok & in_w_ok
+                mask_spatial = mask_p & in_bounds
+
+                # Common base offset for this (n, id, ih, iw)
+                x_pos_base = n * sX_N + id_ * sX_D + ih * sX_H + iw * sX_W
+
+                for ci_inner in range(Ci_per_group):
+                    # Input channel indices per output channel in the block
+                    ci_vec = ci_group_base + ci_inner  # [BLOCK_CO]
+
+                    # Input offsets for each output channel
+                    x_offsets = x_pos_base + ci_vec * sX_C
+                    # Mask for valid loads: valid position, valid output channel, and in-bounds spatially
+                    x_mask = mask_spatial & co_mask
+
+                    x_vals = tl.load(x_ptr + x_offsets, mask=x_mask, other=0.0)
+
+                    # Weight offsets: w[co, ci_inner, kd, kh, kw]
+                    w_offsets = (
+                        co_offsets * sW_Co
+                        + ci_inner * sW_Ci
+                        + kd * sW_Kd
+                        + kh * sW_Kh
+                        + kw * sW_Kw
+                    )
+                    w_vals = tl.load(w_ptr + w_offsets, mask=co_mask, other=0.0)
+
+                    acc += w_vals * x_vals
+
+    if HAS_BIAS:
+        bias_vals = tl.load(b_ptr + co_offsets, mask=co_mask, other=0.0)
+        acc += bias_vals
+
+    # Store output
+    y_offsets = y_base + co_offsets * sY_C
+    y_mask = mask_p & co_mask
+    tl.store(y_ptr + y_offsets, acc, mask=y_mask)
+
+
+def triton_conv3d(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    stride: tuple,
+    padding: tuple,
+    dilation: tuple,
+    groups: int,
+) -> torch.Tensor:
+    """
+    High-performance Triton implementation of 3D convolution
+    matching torch.nn.Conv3d semantics (NCDHW layout).
+    """
+    assert x.is_cuda and weight.is_cuda, "Inputs must be CUDA tensors"
+    x = x.contiguous()
+    weight = weight.contiguous()
+    if bias is not None:
+        bias = bias.contiguous()
+
+    N, Ci, Di, Hi, Wi = x.shape
+    Co, Ci_per_group, Kd, Kh, Kw = weight.shape
+
+    stride_d, stride_h, stride_w = stride
+    pad_d, pad_h, pad_w = padding
+    dil_d, dil_h, dil_w = dilation
+
+    assert Ci % groups == 0
+    assert Ci_per_group == Ci // groups
+    Co_per_group = Co // groups
+
+    # Compute output dimensions (same as PyTorch)
+    Do = (Di + 2 * pad_d - dil_d * (Kd - 1) - 1) // stride_d + 1
+    Ho = (Hi + 2 * pad_h - dil_h * (Kh - 1) - 1) // stride_h + 1
+    Wo = (Wi + 2 * pad_w - dil_w * (Kw - 1) - 1) // stride_w + 1
+
+    y = torch.empty((N, Co, Do, Ho, Wo), device=x.device, dtype=x.dtype)
+
+    # Strides in elements (NCDHW / NCDHW layouts, but support any contiguous)
+    sX_N, sX_C, sX_D, sX_H, sX_W = x.stride()
+    sW_Co, sW_Ci, sW_Kd, sW_Kh, sW_Kw = weight.stride()
+    sY_N, sY_C, sY_D, sY_H, sY_W = y.stride()
+
+    P = N * Do * Ho * Wo
+    P_grid = max(P, 1)  # ensure grid dimension > 0
+
+    BLOCK_CO = 64  # power-of-2 as required
+
+    grid = lambda meta: (
+        P_grid,
+        triton.cdiv(Co, meta["BLOCK_CO"]),
+    )
+
+    conv3d_fwd_kernel[grid](
+        x,
+        weight,
+        bias if bias is not None else x,  # dummy ptr if HAS_BIAS == 0; won't be used
+        y,
+        N,
+        Ci,
+        Di,
+        Hi,
+        Wi,
+        Co,
+        Do,
+        Ho,
+        Wo,
+        stride_d,
+        stride_h,
+        stride_w,
+        pad_d,
+        pad_h,
+        pad_w,
+        dil_d,
+        dil_h,
+        dil_w,
+        groups,
+        Co_per_group,
+        sX_N,
+        sX_C,
+        sX_D,
+        sX_H,
+        sX_W,
+        sW_Co,
+        sW_Ci,
+        sW_Kd,
+        sW_Kh,
+        sW_Kw,
+        sY_N,
+        sY_C,
+        sY_D,
+        sY_H,
+        sY_W,
+        P,
+        BLOCK_CO=BLOCK_CO,
+        Ci_per_group=Ci_per_group,
+        Kd=Kd,
+        Kh=Kh,
+        Kw=Kw,
+        HAS_BIAS=(bias is not None),
+    )
+
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-accelerated replacement for a 3D convolution (NCDHW),
+    matching torch.nn.Conv3d behavior.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: tuple,
+        stride: tuple = (1, 1, 1),
+        padding: tuple = (0, 0, 0),
+        dilation: tuple = (1, 1, 1),
+        groups: int = 1,
+        bias: bool = False,
+    ):
+        super().__init__()
+        if isinstance(kernel_size, int):
+            kernel_size = (kernel_size, kernel_size, kernel_size)
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+        self.groups = groups
+
+        assert in_channels % groups == 0, "in_channels must be divisible by groups"
+        assert out_channels % groups == 0, "out_channels must be divisible by groups"
+
+        Ci_per_group = in_channels // groups
+        Kd, Kh, Kw = kernel_size
+
+        self.weight = nn.Parameter(
+            torch.empty(out_channels, Ci_per_group, Kd, Kh, Kw)
+        )
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_channels))
+        else:
+            self.bias = None
+
+        # Initialize similar to nn.Conv3d
+        nn.init.kaiming_uniform_(self.weight, a=5 ** 0.5)
+        if self.bias is not None:
+            fan_in = in_channels * Kd * Kh * Kw // groups
+            bound = 1 / fan_in**0.5
+            nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_conv3d(
+            x,
+            self.weight,
+            self.bias,
+            self.stride,
+            self.padding,
+            self.dilation,
+            self.groups,
+        )
+```
+
+---
+
+# Your Task
+
+Implement the optimization strategy above. Focus on the specific bottleneck identified.
+
+## Key Requirements
+
+1. **Preserve correctness**: Maintain the same input/output behavior
+2. **Apply the optimization**: Follow the implementation plan exactly
+3. **Use valid Triton syntax**:
+   - Every kernel MUST have `@triton.jit` decorator
+   - Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+   - BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+   - No `continue`, `break`, `return` inside kernels (use masking)
+   - Prefer `tl.dot(a, b, allow_tf32=True)` for matmul operations
+
+4. **CRITICAL for RNN/GRU/LSTM Persistent Kernels**:
+   - Time loop MUST be inside @triton.jit kernel, NOT in Python forward()
+   - **HYBRID computation strategy** (CRITICAL for performance):
+     * Precompute input-side gates OUTSIDE kernel: `gates_x = (T*B, In) @ W_ih` (ONE large GEMM)
+     * INSIDE kernel: only recurrent-side: `for t: gates_h = h @ W_hh` (T small GEMMs)
+   - CORRECT (FAST - use this):
+     ```python
+     # Python forward():
+     gates_x_all = x.reshape(T*B, In) @ W_ih + b_ih  # ONE large GEMM
+     gates_x_all = gates_x_all.view(T, B, 3*H)
+     gru_persistent_kernel[grid](gates_x_all, h0, W_hh, ...)  # Launch ONCE
+
+     @triton.jit
+     def gru_persistent_kernel(gates_x_ptr, h_ptr, W_hh_ptr, ...):
+         for t in range(T):  # Inside kernel
+             gates_x_t = tl.load(gates_x_ptr + t*...)  # Precomputed
+             gates_h = h @ W_hh  # Only recurrent GEMM
+             h = (1-z)*n + z*h   # Fuse and update
+     ```
+
+5. **Output format**:
+   - Imports: `import torch, torch.nn as nn, triton, triton.language as tl`
+   - `@triton.jit` kernel(s)
+   - Wrapper function(s)
+   - `class ModelNew(nn.Module)` — REQUIRED
+   - NO testing code, NO `if __name__ == "__main__"`
+
+---
+
+Generate the optimized kernel now. Output ONLY the complete Python code.

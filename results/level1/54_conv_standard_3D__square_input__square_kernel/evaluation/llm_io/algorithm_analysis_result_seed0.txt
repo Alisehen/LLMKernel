@@ -1,0 +1,10 @@
+```json
+{
+  "worth_optimizing": "yes",
+  "reason": "The Triton kernel is ~11x slower than PyTorch, indicating a major algorithmic inefficiency rather than a tuning issue.",
+  "bottleneck": "The kernel implements convolution as a per-output-position GEMV: each program handles a single (n, d, h, w) and a small OC tile, looping over K with almost no reuse of input/weight data across positions. This yields a huge grid (millions of tiny programs), low arithmetic intensity, poor cache/SRAM reuse, and large launch/scheduling overhead.",
+  "optimisation method": "Replace the per-position GEMV-style convolution with a blocked implicit-GEMM formulation: treat convolution as a matrix multiplication over M = (N * D_out * H_out * W_out), N = Cout, K = Cin_per_group * KD * KH * KW, and use a GEMM-like Triton kernel that tiles over both output positions and output channels.",
+  "modification plan": "Redefine the kernel so that each Triton program computes a BLOCK_M x BLOCK_OC tile of the output (M = flattened output positions, N = Cout), with a loop over K that loads and reuses tiles of input patches and weights from SRAM (similar to standard Triton matmul templates). Compute input indices on-the-fly (implicit im2col) for a BLOCK_M tile, load the corresponding input patch block once per K-tile, and reuse it for all BLOCK_OC outputs in the tile, while similarly reusing a BLOCK_OC x BLOCK_K weight tile. Adjust grid mapping, strides, and masking accordingly so the convolution is effectively a batched GEMM rather than millions of independent GEMVs.",
+  "expected_speedup": "5-10x vs the current Triton kernel (bringing it close to or better than the PyTorch/cuDNN baseline)"
+}
+```

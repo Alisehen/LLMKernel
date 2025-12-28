@@ -1,0 +1,293 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def conv_transpose1d_gemm_kernel(
+    x_ptr,          # *f32, [N, C_IN, L_IN]
+    w_ptr,          # *f32, [C_IN, C_OUT, K]
+    b_ptr,          # *f32, [C_OUT] or dummy
+    y_ptr,          # *f32, [N, C_OUT, L_OUT]
+    N,              # int32
+    L_IN,           # int32
+    L_OUT,          # int32
+    C_IN: tl.constexpr,
+    C_OUT: tl.constexpr,
+    K: tl.constexpr,
+    STRIDE: tl.constexpr,
+    PADDING: tl.constexpr,
+    DILATION: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    BLOCK_M: tl.constexpr,   # tile size along (N * L_OUT)
+    BLOCK_N: tl.constexpr,   # tile size along C_OUT
+    BLOCK_K: tl.constexpr,   # tile size along C_IN * K
+):
+    """
+    GEMM-style ConvTranspose1d:
+      - Treat A as implicit-im2col matrix of shape [M, Ktot]
+      - Treat B as weight matrix of shape [Ktot, C_OUT]
+      - Compute C = A @ B, where M = N * L_OUT, Ktot = C_IN * K
+    """
+    # Problem sizes
+    M = N * L_OUT                      # rows = N * L_OUT
+    K_TOT = C_IN * K                   # reduction dimension
+
+    # Program IDs
+    pid_m = tl.program_id(axis=0)      # along M dimension (N * L_OUT)
+    pid_n = tl.program_id(axis=1)      # along C_OUT
+
+    # Row / column indices this program will handle
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # [BLOCK_M]
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # [BLOCK_N]
+
+    # Masks for valid rows/cols
+    mask_m = offs_m < M
+    mask_n = offs_n < C_OUT
+
+    # Decode (n, l_out) from row index m: m = n * L_OUT + l_out
+    n_idx = offs_m // L_OUT           # [BLOCK_M]
+    l_out = offs_m % L_OUT            # [BLOCK_M]
+
+    # Precompute strides for x and y
+    stride_x_n = C_IN * L_IN
+    stride_x_c = L_IN
+
+    stride_y_n = C_OUT * L_OUT
+    stride_y_c = L_OUT
+
+    # Accumulator for C tile: [BLOCK_M, BLOCK_N]
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Loop over K dimension (C_IN * K) in BLOCK_K chunks
+    for k0 in range(0, K_TOT, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)  # [BLOCK_K]
+        mask_k = offs_k < K_TOT
+
+        # Decode (ci, k) from reduction index: kk = ci * K + k
+        ci = offs_k // K            # [BLOCK_K]
+        k_idx = offs_k % K          # [BLOCK_K]
+
+        # ----- Build A tile: x-im2col -----
+        # Broadcast shapes:
+        #   l_out_b: [BLOCK_M, 1]
+        #   k_b:     [1, BLOCK_K]
+        l_out_b = l_out[:, None]
+        k_b = k_idx[None, :]
+
+        # v = l_out + PADDING - k * DILATION
+        v = l_out_b + PADDING - k_b * DILATION
+
+        # Check divisibility by STRIDE: (l_out + PADDING - k*DILATION) % STRIDE == 0
+        rem = v % STRIDE
+        mask_div = rem == 0
+
+        # Integer input index l_in = v / STRIDE
+        l_in = v // STRIDE
+
+        # Input index must be in-range
+        mask_in_range = (l_in >= 0) & (l_in < L_IN)
+
+        # Combined mask for x load
+        #   - valid row (m)
+        #   - valid k index in K_TOT
+        #   - stride-aligned and in-range input position
+        mask_a = (
+            mask_m[:, None]
+            & mask_k[None, :]
+            & mask_div
+            & mask_in_range
+        )
+
+        # Safe l_in for pointer arithmetic
+        l_in_safe = tl.where(mask_a, l_in, 0)
+
+        # Broadcast n_idx (rows) and ci (cols)
+        n_b = n_idx[:, None]        # [BLOCK_M, 1]
+        ci_b = ci[None, :]          # [1, BLOCK_K]
+
+        # x offsets: x[n, ci, l_in]
+        x_offsets = (
+            n_b * stride_x_n
+            + ci_b * stride_x_c
+            + l_in_safe
+        )
+        a_tile = tl.load(
+            x_ptr + x_offsets,
+            mask=mask_a,
+            other=0.0,
+        )  # [BLOCK_M, BLOCK_K]
+
+        # ----- Build B tile: weight -----
+        # B[ci*K + k, co] = w[ci, co, k]
+        ci_w = ci[:, None]          # [BLOCK_K, 1]
+        k_w = k_idx[:, None]        # [BLOCK_K, 1]
+        co_w = offs_n[None, :]      # [1, BLOCK_N]
+
+        w_offsets = (
+            ci_w * (C_OUT * K)
+            + co_w * K
+            + k_w
+        )
+
+        mask_b = mask_k[:, None] & mask_n[None, :]
+        b_tile = tl.load(
+            w_ptr + w_offsets,
+            mask=mask_b,
+            other=0.0,
+        )  # [BLOCK_K, BLOCK_N]
+
+        # Multiply-accumulate: [BLOCK_M, BLOCK_K] @ [BLOCK_K, BLOCK_N]
+        acc += tl.dot(a_tile, b_tile, allow_tf32=True)
+
+    # Optional bias add: broadcast along rows
+    if HAS_BIAS:
+        b_vals = tl.load(b_ptr + offs_n, mask=mask_n, other=0.0)  # [BLOCK_N]
+        acc += b_vals[None, :]
+
+    # ----- Write back to y: [N, C_OUT, L_OUT] -----
+    n_b_out = n_idx[:, None]        # [BLOCK_M, 1]
+    l_out_b = l_out[:, None]        # [BLOCK_M, 1]
+    co_b_out = offs_n[None, :]      # [1, BLOCK_N]
+
+    y_offsets = (
+        n_b_out * stride_y_n
+        + co_b_out * stride_y_c
+        + l_out_b
+    )
+
+    mask_y = mask_m[:, None] & mask_n[None, :]
+    tl.store(y_ptr + y_offsets, acc, mask=mask_y)
+
+
+def triton_conv_transpose1d(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    stride: int,
+    padding: int,
+    dilation: int,
+) -> torch.Tensor:
+    """
+    x:       [N, C_in, L_in]
+    weight:  [C_in, C_out, K]
+    bias:    [C_out] or None
+    """
+    # Fallback to PyTorch if not CUDA
+    if not x.is_cuda:
+        return torch.nn.functional.conv_transpose1d(
+            x, weight, bias, stride=stride, padding=padding, dilation=dilation
+        )
+
+    x = x.contiguous()
+    weight = weight.contiguous()
+    if bias is not None:
+        bias = bias.contiguous()
+
+    N, C_in, L_in = x.shape
+    C_in_w, C_out, K = weight.shape
+    assert C_in_w == C_in, "Weight C_in must match input C_in"
+
+    # Output length for ConvTranspose1d (output_padding = 0)
+    L_out = (L_in - 1) * stride - 2 * padding + dilation * (K - 1) + 1
+
+    y = torch.empty((N, C_out, L_out), device=x.device, dtype=x.dtype)
+
+    # GEMM dimensions
+    M = N * L_out          # rows
+    K_tot = C_in * K       # reduction
+
+    # Tile sizes (power-of-2 as required)
+    BLOCK_M = 64
+    BLOCK_N = 64
+    # Choose BLOCK_K <= K_tot, power of 2
+    if K_tot >= 64:
+        BLOCK_K = 64
+    elif K_tot >= 32:
+        BLOCK_K = 32
+    else:
+        # smallest allowed power-of-2, but not exceeding K_tot
+        BLOCK_K = 16
+
+    grid = (
+        triton.cdiv(M, BLOCK_M),
+        triton.cdiv(C_out, BLOCK_N),
+    )
+
+    HAS_BIAS = bias is not None
+    b_ptr = bias if HAS_BIAS else y  # dummy pointer if no bias
+
+    conv_transpose1d_gemm_kernel[grid](
+        x,
+        weight,
+        b_ptr,
+        y,
+        N,
+        L_in,
+        L_out,
+        C_IN=C_in,
+        C_OUT=C_out,
+        K=K,
+        STRIDE=stride,
+        PADDING=padding,
+        DILATION=dilation,
+        HAS_BIAS=HAS_BIAS,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        num_warps=4,
+    )
+
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    ConvTranspose1d implemented with a high-performance Triton kernel.
+    API matches the given PyTorch Model.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        stride: int = 1,
+        padding: int = 0,
+        dilation: int = 1,
+        bias: bool = False,
+    ):
+        super().__init__()
+        # Use PyTorch ConvTranspose1d only for parameter initialization
+        ref = nn.ConvTranspose1d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            bias=bias,
+        )
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+
+        self.weight = nn.Parameter(ref.weight.detach().clone())
+        if bias:
+            self.bias = nn.Parameter(ref.bias.detach().clone())
+        else:
+            self.bias = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_conv_transpose1d(
+            x,
+            self.weight,
+            self.bias,
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation,
+        )

@@ -1,0 +1,261 @@
+You are optimizing a Triton kernel based on algorithmic analysis.
+
+# PyTorch Reference (Target Behavior)
+
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs Instance Normalization.
+    """
+    def __init__(self, num_features: int):
+        """
+        Initializes the InstanceNorm layer.
+
+        Args:
+            num_features (int): Number of features in the input tensor.
+        """
+        super(Model, self).__init__()
+        self.inorm = nn.InstanceNorm2d(num_features=num_features)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies Instance Normalization to the input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, num_features, height, width).
+
+        Returns:
+            torch.Tensor: Output tensor with Instance Normalization applied, same shape as input.
+        """
+        return self.inorm(x)
+
+batch_size = 112  # heavier workload
+features = 64
+dim1 = 512
+dim2 = 512
+
+def get_inputs():
+    x = torch.rand(batch_size, features, dim1, dim2)
+    return [x]
+
+def get_init_inputs():
+    return [features]
+```
+
+**CRITICAL**: Study the PyTorch code carefully to understand:
+- What does `forward()` return? (full output sequence vs final hidden state only)
+- What is the computational pattern?
+- What are the input/output shapes?
+
+Your optimized kernel MUST match this exact behavior.
+
+---
+
+# Analysis Results
+
+**Bottleneck**: Per-(N,C) statistics are computed via many atomic_add operations across NUM_CHUNKS and a separate normalization kernel, causing high contention on atomics, extra global memory traffic for intermediate sums, and two kernel launches over the full tensor.
+
+**Optimization Strategy**: Replace the two-kernel, atomic-based partial-sum scheme with a single-kernel, block-per-instance reduction using a numerically stable algorithm (e.g., Welford) that first reduces over S in-kernel and then immediately normalizes, eliminating atomics and the intermediate sum buffers.
+
+**Implementation Plan**: Launch one Triton program per (N*C) row with sufficient BLOCK_SIZE, and iterate over S in a loop inside the kernel to compute mean and variance using Welford or a standard parallel reduction in registers/SMEM, without atomics. After the reduction, broadcast mean and inv_std to the same block and perform a second in-kernel sweep over S to normalize x and write y, so the entire instance norm is done in a single kernel (two passes over x, but no global atomics or separate stats kernel). Adjust BLOCK_SIZE and loop stride to maintain coalesced loads over the flattened S dimension and ensure good occupancy.
+
+**Expected Speedup**: 20-30%
+
+---
+
+# Current Kernel (needs optimization)
+
+```python
+# <complete ModelNew code with optimized Triton kernels>
+import torch, torch.nn as nn, triton, triton.language as tl
+
+
+@triton.jit
+def instance_norm_partial_sums_kernel(
+    x_ptr,          # *f32 / *f16 / *bf16, [M, S] flattened
+    sum_ptr,        # *f32, [M]
+    sum_sq_ptr,     # *f32, [M]
+    M,              # int: number of (N, C) rows
+    S,              # int: spatial size H*W
+    NUM_CHUNKS,     # int: number of chunks along S
+    BLOCK_SIZE: tl.constexpr,  # power-of-2, e.g., 256
+):
+    pid = tl.program_id(axis=0)
+
+    row = pid // NUM_CHUNKS
+    chunk = pid % NUM_CHUNKS
+
+    # Each row has S contiguous elements
+    row_start = row * S
+
+    offsets = chunk * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < S
+
+    idx = row_start + offsets
+    x = tl.load(x_ptr + idx, mask=mask, other=0.0)
+    x_f32 = x.to(tl.float32)
+
+    sum_val = tl.sum(x_f32, axis=0)
+    sum_sq_val = tl.sum(x_f32 * x_f32, axis=0)
+
+    tl.atomic_add(sum_ptr + row, sum_val)
+    tl.atomic_add(sum_sq_ptr + row, sum_sq_val)
+
+
+@triton.jit
+def instance_norm_forward_kernel(
+    x_ptr,          # *f32 / *f16 / *bf16, [M, S] flattened
+    y_ptr,          # same dtype as x, [M, S]
+    sum_ptr,        # *f32, [M]
+    sum_sq_ptr,     # *f32, [M]
+    M,              # int
+    S,              # int
+    eps,            # float32
+    NUM_CHUNKS,     # int
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+
+    row = pid // NUM_CHUNKS
+    chunk = pid % NUM_CHUNKS
+
+    row_start = row * S
+
+    offsets = chunk * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < S
+    idx = row_start + offsets
+
+    # Load row statistics
+    sum_val = tl.load(sum_ptr + row)
+    sum_sq_val = tl.load(sum_sq_ptr + row)
+
+    S_f32 = tl.full((), S, dtype=tl.float32)
+    mean = sum_val / S_f32
+    mean_sq = mean * mean
+    var = sum_sq_val / S_f32 - mean_sq
+    inv_std = 1.0 / tl.sqrt(var + eps)
+
+    x = tl.load(x_ptr + idx, mask=mask, other=0.0)
+    x_f32 = x.to(tl.float32)
+
+    y_f32 = (x_f32 - mean) * inv_std
+    y = y_f32.to(x.dtype)
+
+    tl.store(y_ptr + idx, y, mask=mask)
+
+
+def triton_instance_norm_2d(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+    """
+    InstanceNorm2d via Triton.
+    Normalizes over (H, W) per (N, C) instance, no affine transform.
+    """
+    assert x.is_cuda, "Input tensor must be on CUDA for Triton kernels."
+    assert x.dim() == 4, "Expected NCHW input."
+
+    N, C, H, W = x.shape
+    M = N * C
+    S = H * W
+
+    x_flat = x.contiguous().view(M, S)
+    y_flat = torch.empty_like(x_flat)
+
+    # Accumulators for per-(N,C) statistics
+    sum_buf = torch.zeros(M, device=x.device, dtype=torch.float32)
+    sum_sq_buf = torch.zeros(M, device=x.device, dtype=torch.float32)
+
+    BLOCK_SIZE = 256  # power-of-2 as required
+    NUM_CHUNKS = triton.cdiv(S, BLOCK_SIZE)
+
+    grid = lambda meta: (M * NUM_CHUNKS,)
+
+    # Pass 1: compute partial sums and sum of squares
+    instance_norm_partial_sums_kernel[grid](
+        x_flat,
+        sum_buf,
+        sum_sq_buf,
+        M,
+        S,
+        NUM_CHUNKS,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+
+    # Pass 2: normalize
+    instance_norm_forward_kernel[grid](
+        x_flat,
+        y_flat,
+        sum_buf,
+        sum_sq_buf,
+        M,
+        S,
+        eps,
+        NUM_CHUNKS,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+
+    return y_flat.view(N, C, H, W)
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-accelerated Instance Normalization (2D, NCHW) without affine.
+    Matches nn.InstanceNorm2d(num_features, affine=False, track_running_stats=False).
+    """
+    def __init__(self, num_features: int, eps: float = 1e-5):
+        super().__init__()
+        self.num_features = num_features
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_instance_norm_2d(x, eps=self.eps)
+```
+
+---
+
+# Your Task
+
+Implement the optimization strategy above. Focus on the specific bottleneck identified.
+
+## Key Requirements
+
+1. **Preserve correctness**: Maintain the same input/output behavior
+2. **Apply the optimization**: Follow the implementation plan exactly
+3. **Use valid Triton syntax**:
+   - Every kernel MUST have `@triton.jit` decorator
+   - Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+   - BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+   - No `continue`, `break`, `return` inside kernels (use masking)
+   - Prefer `tl.dot(a, b, allow_tf32=True)` for matmul operations
+
+4. **CRITICAL for RNN/GRU/LSTM Persistent Kernels**:
+   - Time loop MUST be inside @triton.jit kernel, NOT in Python forward()
+   - **HYBRID computation strategy** (CRITICAL for performance):
+     * Precompute input-side gates OUTSIDE kernel: `gates_x = (T*B, In) @ W_ih` (ONE large GEMM)
+     * INSIDE kernel: only recurrent-side: `for t: gates_h = h @ W_hh` (T small GEMMs)
+   - CORRECT (FAST - use this):
+     ```python
+     # Python forward():
+     gates_x_all = x.reshape(T*B, In) @ W_ih + b_ih  # ONE large GEMM
+     gates_x_all = gates_x_all.view(T, B, 3*H)
+     gru_persistent_kernel[grid](gates_x_all, h0, W_hh, ...)  # Launch ONCE
+
+     @triton.jit
+     def gru_persistent_kernel(gates_x_ptr, h_ptr, W_hh_ptr, ...):
+         for t in range(T):  # Inside kernel
+             gates_x_t = tl.load(gates_x_ptr + t*...)  # Precomputed
+             gates_h = h @ W_hh  # Only recurrent GEMM
+             h = (1-z)*n + z*h   # Fuse and update
+     ```
+
+5. **Output format**:
+   - Imports: `import torch, torch.nn as nn, triton, triton.language as tl`
+   - `@triton.jit` kernel(s)
+   - Wrapper function(s)
+   - `class ModelNew(nn.Module)` — REQUIRED
+   - NO testing code, NO `if __name__ == "__main__"`
+
+---
+
+Generate the optimized kernel now. Output ONLY the complete Python code.

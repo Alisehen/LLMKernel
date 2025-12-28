@@ -1,191 +1,124 @@
-Looking at the NCU metrics, I can identify key optimization opportunities:
-
-1. **SM utilization is low for compute_moments_kernel (16.85%) and normalize_kernel (2.11%)**
-2. **Grid sizes are too large** (1.8M blocks) causing overhead
-3. **Poor L2 cache hit rates** (1.54% in compute_moments_kernel)
-
-The main issue is that we're launching too many small blocks. For spatial dimensions in instance norm, we should process multiple (n,c) slices per block to increase work per block and improve SM utilization.
-
-Here's the optimized version:
-
 ```python
+# <optimized Triton code>
 import torch
 import torch.nn as nn
 import triton
 import triton.language as tl
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 128}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 256}, num_warps=4, num_stages=2),
+    ],
+    key=['S'],
+)
 @triton.jit
-def compute_moments_kernel(
-    x_ptr,
-    mean_ptr,
-    var_ptr,
-    spatial_size,
-    stride_nc,
-    eps: tl.constexpr,
-    BLOCK_SPATIAL: tl.constexpr,
-    BLOCK_NC: tl.constexpr,
+def instance_norm_single_pass_kernel(
+    x_ptr,          # *f32 / *f16 / *bf16, [M, S] flattened
+    y_ptr,          # same dtype as x, [M, S]
+    M,              # int: number of (N, C) rows
+    S,              # int: spatial size H*W
+    eps,            # float32
+    NUM_CHUNKS,     # int: number of chunks along S
+    BLOCK_SIZE: tl.constexpr,  # power-of-2: 128 or 256
 ):
-    """Compute mean and variance for multiple (n,c) slices in parallel"""
-    pid_spatial = tl.program_id(axis=0)
-    pid_nc = tl.program_id(axis=1) * BLOCK_NC
-    
-    # Create ranges
-    nc_offsets = pid_nc + tl.arange(0, BLOCK_NC)
-    spatial_offsets = pid_spatial * BLOCK_SPATIAL + tl.arange(0, BLOCK_SPATIAL)
-    
-    # Masks
-    nc_mask = nc_offsets < stride_nc
-    spatial_mask = spatial_offsets < spatial_size
-    
-    # Initialize accumulators
-    sum_x = tl.zeros((BLOCK_NC,), dtype=tl.float32)
-    sum_x2 = tl.zeros((BLOCK_NC,), dtype=tl.float32)
-    
-    # Process spatial elements for multiple (n,c) slices
-    for s in range(0, BLOCK_SPATIAL, 128):  # Process in chunks for better cache
-        spatial_idx = spatial_offsets + s
-        spatial_chunk_mask = spatial_mask & (spatial_idx < spatial_size)
-        
-        if tl.any(spatial_chunk_mask):
-            # Vectorized loading for better memory throughput
-            for nc_idx in range(0, BLOCK_NC, 4):  # Process 4 (n,c) slices at once
-                if nc_idx < BLOCK_NC and (pid_nc + nc_idx) < stride_nc:
-                    x_ptrs = x_ptr + (pid_nc + nc_idx) * spatial_size + spatial_idx
-                    x_chunk = tl.load(x_ptrs, mask=spatial_chunk_mask, other=0.0)
-                    
-                    # Update sums
-                    sum_x = tl.sum(x_chunk, axis=0) + tl.view(sum_x, tl.float32)
-                    sum_x2 = tl.sum(x_chunk * x_chunk, axis=0) + tl.view(sum_x2, tl.float32)
-    
-    # Store partial results
-    nc_write_mask = nc_mask & (pid_spatial == 0)  # Only first spatial block stores
-    if tl.any(nc_write_mask):
-        tl.store(mean_ptr + nc_offsets, sum_x, mask=nc_write_mask)
-        tl.store(var_ptr + nc_offsets, sum_x2, mask=nc_write_mask)
+    pid = tl.program_id(axis=0)
+    # grid is (M,), so 0 <= pid < M
+    row = pid
+    row_start = row * S
+
+    offs = tl.arange(0, BLOCK_SIZE)
+
+    # Pointers to the start of this row
+    x_row_ptr = x_ptr + row_start
+    y_row_ptr = y_ptr + row_start
+
+    # ------------------------------------------------------------------
+    # Pass 1: compute per-row sum and sum of squares (no atomics)
+    # ------------------------------------------------------------------
+    sum_vec = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+    sum_sq_vec = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+
+    for chunk in range(0, NUM_CHUNKS):
+        idx = chunk * BLOCK_SIZE + offs
+        mask = idx < S
+        x = tl.load(x_row_ptr + idx, mask=mask, other=0.0)
+        x_f32 = x.to(tl.float32)
+
+        sum_vec += x_f32
+        sum_sq_vec += x_f32 * x_f32
+
+    # Reduce across the BLOCK_SIZE lanes to scalars
+    sum_val = tl.sum(sum_vec, axis=0)
+    sum_sq_val = tl.sum(sum_sq_vec, axis=0)
+
+    S_f32 = tl.full((), S, dtype=tl.float32)
+    mean = sum_val / S_f32
+    mean_sq = mean * mean
+    var = sum_sq_val / S_f32 - mean_sq
+    inv_std = 1.0 / tl.sqrt(var + eps)
+
+    # ------------------------------------------------------------------
+    # Pass 2: normalize and write output
+    # ------------------------------------------------------------------
+    for chunk in range(0, NUM_CHUNKS):
+        idx = chunk * BLOCK_SIZE + offs
+        mask = idx < S
+        x = tl.load(x_row_ptr + idx, mask=mask, other=0.0)
+        x_f32 = x.to(tl.float32)
+
+        y_f32 = (x_f32 - mean) * inv_std
+        y = y_f32.to(x.dtype)
+
+        tl.store(y_row_ptr + idx, y, mask=mask)
 
 
-@triton.jit
-def normalize_kernel(
-    x_ptr,
-    output_ptr,
-    mean_ptr,
-    var_ptr,
-    spatial_size,
-    stride_nc,
-    eps: tl.constexpr,
-    BLOCK_SPATIAL: tl.constexpr,
-    BLOCK_NC: tl.constexpr,
-):
-    """Normalize multiple (n,c) slices in parallel"""
-    pid_spatial = tl.program_id(axis=0)
-    pid_nc = tl.program_id(axis=1) * BLOCK_NC
-    
-    # Load mean and variance for this block of (n,c) slices
-    nc_offsets = pid_nc + tl.arange(0, BLOCK_NC)
-    nc_mask = nc_offsets < stride_nc
-    
-    mean = tl.load(mean_ptr + nc_offsets, mask=nc_mask, other=0.0)
-    var = tl.load(var_ptr + nc_offsets, mask=nc_mask, other=0.0)
-    inv_std = tl.math.rsqrt(var + eps)
-    
-    # Process spatial elements
-    spatial_offsets = pid_spatial * BLOCK_SPATIAL + tl.arange(0, BLOCK_SPATIAL)
-    spatial_mask = spatial_offsets < spatial_size
-    
-    # Process in vectorized chunks
-    for s in range(0, BLOCK_SPATIAL, 128):
-        spatial_idx = spatial_offsets + s
-        spatial_chunk_mask = spatial_mask & (spatial_idx < spatial_size)
-        
-        if tl.any(spatial_chunk_mask):
-            # Process 4 (n,c) slices at once for better memory coalescing
-            for nc_idx in range(0, BLOCK_NC, 4):
-                if nc_idx < BLOCK_NC and (pid_nc + nc_idx) < stride_nc:
-                    # Load input
-                    x_ptrs = x_ptr + (pid_nc + nc_idx) * spatial_size + spatial_idx
-                    x = tl.load(x_ptrs, mask=spatial_chunk_mask)
-                    
-                    # Normalize
-                    normalized = (x - tl.view(mean[nc_idx], tl.float32)) * tl.view(inv_std[nc_idx], tl.float32)
-                    
-                    # Store output
-                    out_ptrs = output_ptr + (pid_nc + nc_idx) * spatial_size + spatial_idx
-                    tl.store(out_ptrs, normalized, mask=spatial_chunk_mask)
+def triton_instance_norm_2d(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+    """
+    InstanceNorm2d via a single Triton kernel.
+    Normalizes over (H, W) per (N, C) instance, no affine transform.
+    Matches nn.InstanceNorm2d(num_features, affine=False, track_running_stats=False).
+    """
+    assert x.is_cuda, "Input tensor must be on CUDA for Triton kernels."
+    assert x.dim() == 4, "Expected NCHW input."
 
-
-def triton_instance_norm(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
     N, C, H, W = x.shape
-    spatial_size = H * W
-    total_slices = N * C
-    
-    # Ensure contiguous memory layout
-    x_contig = x.contiguous()
-    output = torch.empty_like(x_contig)
-    
-    # Optimized block sizes for Ada Lovelace
-    BLOCK_SPATIAL = 256  # Reduced from 1024 to increase blocks per SM
-    BLOCK_NC = 8  # Process 8 (n,c) slices per block
-    
-    # Allocate buffers for moments
-    mean = torch.zeros(total_slices, device=x.device, dtype=torch.float32)
-    var = torch.zeros(total_slices, device=x.device, dtype=torch.float32)
-    
-    # Grid configuration for better SM utilization
-    num_spatial_blocks = triton.cdiv(spatial_size, BLOCK_SPATIAL)
-    num_nc_blocks = triton.cdiv(total_slices, BLOCK_NC)
-    
-    # Phase 1: Compute moments with optimized grid
-    grid1 = lambda meta: (num_spatial_blocks, num_nc_blocks)
-    compute_moments_kernel[grid1](
-        x_contig, mean, var,
-        spatial_size, total_slices,
-        eps, 
-        BLOCK_SPATIAL=BLOCK_SPATIAL,
-        BLOCK_NC=BLOCK_NC
-    )
-    
-    # Phase 2: Normalize with same optimized grid
-    grid2 = lambda meta: (num_spatial_blocks, num_nc_blocks)
-    normalize_kernel[grid2](
-        x_contig, output, mean, var,
-        spatial_size, total_slices,
+    M = N * C
+    S = H * W
+
+    x_flat = x.contiguous().view(M, S)
+    y_flat = torch.empty_like(x_flat)
+
+    # Use the largest BLOCK_SIZE in autotune configs for NUM_CHUNKS;
+    # smaller BLOCK_SIZE configs will simply loop over more chunks.
+    max_block_size = 256
+    NUM_CHUNKS = triton.cdiv(S, max_block_size)
+
+    grid = lambda meta: (M,)
+
+    instance_norm_single_pass_kernel[grid](
+        x_flat,
+        y_flat,
+        M,
+        S,
         eps,
-        BLOCK_SPATIAL=BLOCK_SPATIAL,
-        BLOCK_NC=BLOCK_NC
+        NUM_CHUNKS,
     )
-    
-    return output
+
+    return y_flat.view(N, C, H, W)
 
 
 class ModelNew(nn.Module):
-    def __init__(self, num_features: int):
+    """
+    Triton-accelerated Instance Normalization (2D, NCHW) without affine.
+    Matches nn.InstanceNorm2d(num_features, affine=False, track_running_stats=False).
+    """
+    def __init__(self, num_features: int, eps: float = 1e-5):
         super().__init__()
         self.num_features = num_features
+        self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return triton_instance_norm(x)
+        return triton_instance_norm_2d(x, eps=self.eps)
 ```
-
-**Key optimizations made:**
-
-1. **2D grid layout**: Changed from 1D/2D to consistent 2D grid `(num_spatial_blocks, num_nc_blocks)` for better parallelism
-
-2. **Increased work per block**: Added `BLOCK_NC=8` to process 8 (n,c) slices per block, reducing grid size from ~1.8M to ~230k blocks
-
-3. **Vectorized memory access**: Process 4 (n,c) slices at once and use chunks of 128 spatial elements for better cache utilization
-
-4. **Optimized block sizes**: `BLOCK_SPATIAL=256` and `BLOCK_NC=8` chosen to:
-   - Keep threads per block = 256 * 8 / 4 = 512 (good for occupancy)
-   - Maximize SM utilization by processing multiple (n,c) slices
-   - Improve L2 cache hit rate through better data reuse
-
-5. **Removed intermediate reduction kernel**: Fused reduction into compute_moments_kernel by accumulating across spatial dimension
-
-6. **Better memory coalescing**: Process spatial elements in chunks with vectorized loads/stores
-
-This should significantly improve SM utilization by:
-- Reducing grid size from ~1.8M to ~230k blocks
-- Increasing work per block by 8x
-- Improving cache utilization through better data locality
-- Better balancing compute and memory operations

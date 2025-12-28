@@ -1,46 +1,37 @@
 You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
 
-# Target GPU
-GPU Name: 4090
-Architecture: Ada Lovelace
-• Compute Capability: 8.9
-• Number of SMs: 128
-• Memory Bandwidth: 1008 GB/s
-• TF32 Tensor Core TFLOPS: 82.6 with dense
-• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
-• FP16 Tensor Core TFLOPS: 165.2 with dense
-• Maximum number of registers per thread: 255
-• Maximum threads per block: 1024
-• Maximum threads per SM: 1536
-• Warp size: 32
-• Maximum concurrent warps per SM: 48
-• Shared memory capacity per SM: 100 KB
-• Maximum shared memory per thread block: 99 KB
-• L2 cache (global, all SM shared): 72 MB
+# Target GPU: 4090
 
 [OPTIMIZATION STAGE]
 
 ## Current Optimization Stage
 
-**Focus**: Optimize grid layout and parallel work distribution.
+Focus: Grid layout & parallelism.
 
-**NCU Metrics to Check**:
-• `sm__throughput.avg.pct_of_peak_sustained_elapsed`: Overall SM utilization (target: >60%)
-• `launch__grid_size`: Total number of blocks (controlled by BLOCK_M/N)
+Metrics:
+- sm__throughput.avg.pct_of_peak_sustained_elapsed (>60%)
+- launch__grid_size
 
-**Guidelines**:
-- 2D outputs → 2D grid `(cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))`; 1D ops → 1D grid
-- 3D outputs (e.g., batch×M×N) → 3D grid `(batch, cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))`
-- 4D+ outputs → **flatten** to 3D: `(batch*dim1, dim2, dim3)` or `(cdiv(batch*dim1, BLOCK), dim2, dim3)`
-- Prefer adding parallelism via batch/head/expert dims before reducing BLOCK sizes
-- Only change grid if SM utilization is clearly low; otherwise keep original
-- Always verify `grid = (...)` matches kernel indexing logic
+Rules:
+- 1D: (cdiv(N, BLOCK))
+- 2D: (cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))
+- 3D: (batch, cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))
+- >3D: flatten ONLY independent dims
+- Prefer batch / head / expert / group parallelism before shrinking BLOCK
+- For grouped operations: ensure group dimension is in grid (e.g., program_id(2) for groups)
+- Change grid only if SM utilization is clearly low
 
-**Important Safety Rule**:
-If unsure about grid mapping, do **not** modify it. Never use more than 3 dimensions!
+Safety:
+- Max 3 grid dims, static rank
+- grid=(G0,G1,G2) must match tl.program_id(0/1/2)
+- For grouped ops: verify group indexing is correct
+- If unsure about correctness, do NOT change grid
 
-**Autotune Tip (safe)**:
-Try 2–3 small grid variants using minimal `@autotune` on **kernel function only**.
+Autotune:
+- Autotune either BLOCK_* OR (num_warps, num_stages)
+- If autotuning BLOCK_*, use grid=lambda META: (...)
+- Never redefine BLOCK_* in both kernel and launch
+- Max 2-3 configs to reduce compilation time
 
 
 
@@ -51,221 +42,142 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
-@triton.jit
-def l2_norm_kernel(
-    x_ptr,
-    output_ptr,
-    batch_size,
-    dim,
-    stride_x_batch,
-    stride_x_dim,
-    stride_out_batch,
-    stride_out_dim,
-    BLOCK_SIZE_BATCH: tl.constexpr,
-    BLOCK_SIZE_DIM: tl.constexpr,
-):
-    # 2D block structure for better cache utilization
-    pid_batch = tl.program_id(0)
-    pid_dim = tl.program_id(1)
-    
-    # Calculate offsets for this block
-    batch_offsets = pid_batch * BLOCK_SIZE_BATCH + tl.arange(0, BLOCK_SIZE_BATCH)
-    dim_offsets = pid_dim * BLOCK_SIZE_DIM + tl.arange(0, BLOCK_SIZE_DIM)
-    
-    # Create masks for boundary checks
-    batch_mask = batch_offsets < batch_size
-    dim_mask = dim_offsets < dim
-    
-    # Load block of data with proper striding
-    x_ptrs = x_ptr + (
-        batch_offsets[:, None] * stride_x_batch +
-        dim_offsets[None, :] * stride_x_dim
-    )
-    x_block = tl.load(x_ptrs, mask=batch_mask[:, None] & dim_mask[None, :])
-    
-    # Compute local sum of squares with higher precision
-    local_squares = x_block * x_block
-    local_sum = tl.sum(local_squares, axis=1)
-    
-    # Use atomic add to accumulate sums across dimension blocks
-    sum_ptr = output_ptr + batch_offsets * stride_out_batch
-    tl.atomic_add(sum_ptr, local_sum, mask=batch_mask)
 
 @triton.jit
-def normalize_kernel(
-    x_ptr,
-    norm_ptr,
-    output_ptr,
-    batch_size,
-    dim,
-    epsilon,
-    stride_x_batch,
-    stride_x_dim,
-    stride_norm_batch,
-    stride_out_batch,
-    stride_out_dim,
-    BLOCK_SIZE_BATCH: tl.constexpr,
-    BLOCK_SIZE_DIM: tl.constexpr,
+def l2norm_fused_kernel(
+    x_ptr,              # *f32 / *f16, [B, D]
+    y_ptr,              # *f32 / *f16, [B, D]
+    stride_x_batch,     # int32
+    stride_x_dim,       # int32
+    stride_y_batch,     # int32
+    stride_y_dim,       # int32
+    D: tl.constexpr,    # number of columns (dim=1), compile-time for this specialization
+    BLOCK_SIZE: tl.constexpr,  # columns per tile, power-of-2
 ):
-    # 2D block structure
-    pid_batch = tl.program_id(0)
-    pid_dim = tl.program_id(1)
-    
-    # Calculate offsets
-    batch_offsets = pid_batch * BLOCK_SIZE_BATCH + tl.arange(0, BLOCK_SIZE_BATCH)
-    dim_offsets = pid_dim * BLOCK_SIZE_DIM + tl.arange(0, BLOCK_SIZE_DIM)
-    
-    # Create masks
-    batch_mask = batch_offsets < batch_size
-    dim_mask = dim_offsets < dim
-    
-    # Load norm values for this batch
-    norm_ptrs = norm_ptr + batch_offsets * stride_norm_batch
-    norm_values = tl.load(norm_ptrs, mask=batch_mask)
-    
-    # Add epsilon and compute inverse norm
-    norm_values = tl.sqrt(norm_values) + epsilon
-    inv_norm = 1.0 / norm_values
-    
-    # Load input data
-    x_ptrs = x_ptr + (
-        batch_offsets[:, None] * stride_x_batch +
-        dim_offsets[None, :] * stride_x_dim
-    )
-    x_block = tl.load(x_ptrs, mask=batch_mask[:, None] & dim_mask[None, :])
-    
-    # Normalize and store
-    normalized = x_block * inv_norm[:, None]
-    
-    # Store results
-    out_ptrs = output_ptr + (
-        batch_offsets[:, None] * stride_out_batch +
-        dim_offsets[None, :] * stride_out_dim
-    )
-    tl.store(out_ptrs, normalized, mask=batch_mask[:, None] & dim_mask[None, :])
+    pid_batch = tl.program_id(axis=0)
 
-def triton_l2_norm(x: torch.Tensor, epsilon: float = 1e-8) -> torch.Tensor:
-    assert x.is_cuda, "Input must be on CUDA device"
-    assert x.dim() >= 2, "Input must have at least 2 dimensions"
-    
-    # Get input shape and strides
-    batch_size, dim = x.shape[0], x.shape[1]
-    output = torch.empty_like(x)
-    
-    # Ensure input is contiguous for optimal memory access
-    x = x.contiguous()
-    output = output.contiguous()
-    
-    # Get strides
-    stride_x_batch = x.stride(0) if x.dim() > 1 else 0
-    stride_x_dim = x.stride(1) if x.dim() > 1 else x.stride(0)
-    
-    # Allocate tensor for norm sums
-    norm_sums = torch.zeros(batch_size, device=x.device, dtype=torch.float32)
-    
-    # Configure block sizes (tuned for A100)
-    BLOCK_SIZE_BATCH = 64  # Warp-aligned for better memory coalescing
-    BLOCK_SIZE_DIM = 256   # Good for cache line utilization
-    
-    # Calculate grid dimensions
-    grid_batch = triton.cdiv(batch_size, BLOCK_SIZE_BATCH)
-    grid_dim = triton.cdiv(dim, BLOCK_SIZE_DIM)
-    
-    # Launch first kernel to compute sums
-    l2_norm_kernel[(
-        grid_batch,
-        grid_dim,
-        1  # 3D grid for better occupancy
-    )](
+    # Pointers to the start of this row in x and y
+    row_x_ptr = x_ptr + pid_batch * stride_x_batch
+    row_y_ptr = y_ptr + pid_batch * stride_y_batch
+
+    # ----------------------------------------
+    # 1) Compute sum of squares for this row
+    # ----------------------------------------
+    acc = tl.zeros((), dtype=tl.float32)
+
+    NUM_TILES = (D + BLOCK_SIZE - 1) // BLOCK_SIZE
+
+    for tile in range(0, NUM_TILES):
+        col_start = tile * BLOCK_SIZE
+        offs = col_start + tl.arange(0, BLOCK_SIZE)
+        mask = offs < D
+
+        x = tl.load(row_x_ptr + offs * stride_x_dim, mask=mask, other=0.0)
+        x_f32 = x.to(tl.float32)
+        acc += tl.sum(x_f32 * x_f32, axis=0)
+
+    # L2 norm (no epsilon to match torch.norm behavior)
+    norm = tl.sqrt(acc)
+
+    # ----------------------------------------
+    # 2) Normalize the row by its L2 norm
+    # ----------------------------------------
+    for tile in range(0, NUM_TILES):
+        col_start = tile * BLOCK_SIZE
+        offs = col_start + tl.arange(0, BLOCK_SIZE)
+        mask = offs < D
+
+        x = tl.load(row_x_ptr + offs * stride_x_dim, mask=mask, other=0.0)
+        x_f32 = x.to(tl.float32)
+        y = (x_f32 / norm).to(x.dtype)
+
+        tl.store(row_y_ptr + offs * stride_y_dim, y, mask=mask)
+
+
+def triton_l2norm(x: torch.Tensor) -> torch.Tensor:
+    """
+    L2-normalize each row of a 2D tensor [B, D] using a single fused Triton kernel.
+    The output has the same dtype and device as the input.
+    """
+    assert x.ndim == 2, "Input must be 2D tensor [batch, dim]"
+    if not x.is_cuda:
+        raise ValueError("Input tensor must be on CUDA device for Triton kernels.")
+
+    B, D = x.shape
+    if B == 0 or D == 0:
+        # Degenerate case: nothing to normalize
+        return x.clone()
+
+    y = torch.empty_like(x)
+
+    stride_x_batch, stride_x_dim = x.stride()
+    stride_y_batch, stride_y_dim = y.stride()
+
+    BLOCK_SIZE = 256  # power-of-2, good trade-off for large D
+
+    grid = lambda meta: (B,)
+
+    l2norm_fused_kernel[grid](
         x,
-        norm_sums,
-        batch_size,
-        dim,
+        y,
         stride_x_batch,
         stride_x_dim,
-        1,  # norm_sums is 1D
-        0,
-        BLOCK_SIZE_BATCH=BLOCK_SIZE_BATCH,
-        BLOCK_SIZE_DIM=BLOCK_SIZE_DIM,
+        stride_y_batch,
+        stride_y_dim,
+        D=D,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=8,
+        num_stages=2,
     )
-    
-    # Launch second kernel for normalization
-    normalize_kernel[(
-        grid_batch,
-        grid_dim,
-        1
-    )](
-        x,
-        norm_sums,
-        output,
-        batch_size,
-        dim,
-        epsilon,
-        stride_x_batch,
-        stride_x_dim,
-        1,  # norm_sums stride
-        output.stride(0) if output.dim() > 1 else 0,
-        output.stride(1) if output.dim() > 1 else output.stride(0),
-        BLOCK_SIZE_BATCH=BLOCK_SIZE_BATCH,
-        BLOCK_SIZE_DIM=BLOCK_SIZE_DIM,
-    )
-    
-    return output
+
+    return y
+
 
 class ModelNew(nn.Module):
     """
-    L2 normalization layer with optimized Triton kernels.
+    Triton-optimized model that performs L2 normalization along dim=1,
+    matching `x / torch.norm(x, p=2, dim=1, keepdim=True)`.
     """
-    def __init__(self, epsilon: float = 1e-8):
-        """
-        Initializes the L2Norm layer.
 
-        Args:
-            epsilon (float): Small value to avoid division by zero.
-        """
-        super(ModelNew, self).__init__()
-        self.epsilon = epsilon
+    def __init__(self) -> None:
+        super().__init__()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Applies L2 normalization to the input tensor.
-
-        Args:
-            x (torch.Tensor): Input tensor of shape (*, dim, *).
-
-        Returns:
-            torch.Tensor: Output tensor with L2 normalization applied, same shape as input.
-        """
-        return triton_l2_norm(x, self.epsilon)
+        return triton_l2norm(x)
 ```
 
 [NCU PROFILING METRICS]
 {
-  "l2_norm_kernel": {
-    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 25.23,
-    "launch__grid_size": 131072,
-    "sm__warps_active.avg.pct_of_peak_sustained_active": 21.21,
-    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 97.13,
-    "lts__t_sector_hit_rate.pct": 5.16
-  },
-  "normalize_kernel": {
-    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 4.33,
-    "launch__grid_size": 131072,
-    "sm__warps_active.avg.pct_of_peak_sustained_active": 16.02,
-    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 74.88,
-    "lts__t_sector_hit_rate.pct": 54.28
+  "l2norm_fused_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 24.15,
+    "launch__grid_size": 32768,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 95.17,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 90.11,
+    "lts__t_sector_hit_rate.pct": 40.58
   }
 }
 
 **Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
 
-OUTPUT RULES (STRICT):
-1. Follow this exact order:
-   1. Imports: torch, torch.nn, triton, triton.language as tl
-   2. @triton.jit decorated kernel function(s)
-   3. Wrapper function(s) for grid calculation and kernel launch
-   4. class ModelNew(nn.Module) that calls your kernels
-2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+## CRITICAL — Code MUST compile and run:
+1. EVERY kernel function MUST have `@triton.jit` decorator
+2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+3. BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+4. `tl.program_id(axis)` only supports axis = 0, 1, 2
+5. No `continue`, `break`, `return` inside loops — use masking
+6. No tensor indexing with loop vars: `x[:, i]` is INVALID
+7. mask shape MUST match data shape in tl.load/tl.store
+
+## Missing Triton Functions (implement manually):
+- tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+## OUTPUT FORMAT (STRICT):
+1. Imports: torch, torch.nn, triton, triton.language as tl
+2. @triton.jit decorated kernel function(s)
+3. Wrapper function(s) for grid calculation and kernel launch
+4. class ModelNew(nn.Module) that calls your kernels
+
+Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
 
 ```python
 # <optimized Triton code>

@@ -1,6 +1,48 @@
 {
-  "runnable": false,
-  "phase": "seed",
-  "error_type": "RuntimeError",
-  "message": "Traceback (most recent call last):\n  File \"/home/hyc/LLMKernel/utils/compile_and_run.py\", line 535, in compare_and_bench\n    test_out, _ = _run_once(test_model, inp, dev)\n                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/LLMKernel/utils/compile_and_run.py\", line 132, in _run_once\n    out = model(*inp)\n          ^^^^^^^^^^^\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py\", line 1751, in _wrapped_call_impl\n    return self._call_impl(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py\", line 1762, in _call_impl\n    return forward_call(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/LLMKernel/run/20251212_170043_batch_range5to40_deepseek_deepseek/9_Tall_skinny_matrix_multiplication_/code/kernel_20251212_182012.py\", line 108, in forward\n    return triton_matmul(A, B)\n           ^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/LLMKernel/run/20251212_170043_batch_range5to40_deepseek_deepseek/9_Tall_skinny_matrix_multiplication_/code/kernel_20251212_182012.py\", line 72, in triton_matmul\n    matmul_kernel_tall_skinny[grid](\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py\", line 347, in <lambda>\n    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)\n                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py\", line 569, in run\n    kernel = self.compile(src, target=target, options=options.__dict__)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py\", line 278, in compile\n    module = src.make_ir(options, codegen_fns, module_map, context)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py\", line 81, in make_ir\n    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\ntriton.compiler.errors.CompilationError: at 29:4:\n    pid_n = tl.program_id(axis=1)\n\n    # Offsets for the output tile\n    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)\n    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)\n\n    # Initialize accumulator\n    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)\n\n    # Compute dot products for this tile\n    # Since N is small (32), we can process all columns in one go\n    for k in range(0, N):\n    ^\nAssertionError(\"Loop-carried variable acc has initial type <['128', '64'], fp32> but is re-assigned to <['128', '128', '64'], fp32> in loop! Please make sure that the type stays consistent.\")\n"
+  "timestamp": "2025-12-28T11:20:10",
+  "reference_file": "KernelBench/select2/9_Tall_skinny_matrix_multiplication_.py",
+  "candidate_file": "/home/hyc/LLMKernel/run/20251228_103146_batch_range4to9_openai_deepseek/9_Tall_skinny_matrix_multiplication_/code/kernel_20251228_112006.py",
+  "tolerance": 1,
+  "max_abs_err": 0.009279251098632812,
+  "mean_abs_err": 0.005440888926386833,
+  "ref_latency_ms": {
+    "avg": 5.498233604431152,
+    "min": 5.493599891662598,
+    "max": 5.5070719718933105,
+    "all": [
+      5.493599891662598,
+      5.493760108947754,
+      5.500927925109863,
+      5.5070719718933105,
+      5.495808124542236
+    ]
+  },
+  "test_latency_ms": {
+    "avg": 10.92817268371582,
+    "min": 10.918911933898926,
+    "max": 10.93734359741211,
+    "all": [
+      10.930399894714355,
+      10.920960426330566,
+      10.918911933898926,
+      10.93734359741211,
+      10.933247566223145
+    ]
+  },
+  "num_runs": 5,
+  "model_init_args": [],
+  "model_init_kwargs": {},
+  "seed": 100,
+  "align_stats": {
+    "copied_same_shape": 0,
+    "unique_shape_copied": 0,
+    "mapped_shape": 0,
+    "skipped": 0,
+    "pair_aligner": 0,
+    "pair_key": "Model->ModelNew"
+  },
+  "runnable": true,
+  "phase": "algorithm_optimized_seed0",
+  "pytorch_baseline_ms": 5.500889587402344,
+  "score": 0.5033677401162662
 }

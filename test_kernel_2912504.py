@@ -1,0 +1,59 @@
+import torch, torch.nn as nn, triton, triton.language as tl
+
+
+@triton.jit
+def tanh_kernel(
+    x_ptr,
+    y_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+
+    # tanh(x) = (exp(2x) - 1) / (exp(2x) + 1)
+    two_x = x + x
+    exp_2x = tl.exp(two_x)
+    num = exp_2x - 1.0
+    den = exp_2x + 1.0
+    y = num / den
+
+    tl.store(y_ptr + offsets, y, mask=mask)
+
+
+def triton_tanh(x: torch.Tensor) -> torch.Tensor:
+    # Fallback for non-CUDA tensors (Triton requires GPU)
+    if not x.is_cuda:
+        return torch.tanh(x)
+
+    x_contig = x.contiguous()
+    y = torch.empty_like(x_contig)
+    n_elements = x_contig.numel()
+
+    BLOCK_SIZE = 256  # power-of-2, as required
+    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+
+    tanh_kernel[grid](
+        x_contig,
+        y,
+        n_elements,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=8,  # tuned for BLOCK_SIZE=256
+    )
+
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Model that applies a high-performance Triton-based Tanh activation.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_tanh(x)

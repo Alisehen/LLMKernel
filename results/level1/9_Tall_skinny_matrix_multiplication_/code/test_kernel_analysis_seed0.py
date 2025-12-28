@@ -1,0 +1,109 @@
+# Optimized Triton-based replacement for torch.matmul in the given model
+
+import torch, torch.nn as nn, triton, triton.language as tl
+
+
+@triton.jit
+def matmul_kernel(
+    A_ptr, B_ptr, C_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # 2D program id: (pid_m, pid_n)
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Pointer to the first block of A and B this program will process
+    a_ptrs = A_ptr + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = B_ptr + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    k_remaining = K
+    k_start = 0
+    while k_remaining > 0:
+        k_mask = offs_k[None, :] + k_start < K
+
+        a_mask = (offs_m[:, None] < M) & k_mask
+        b_mask = k_mask.T & (offs_n[None, :] < N)
+
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+        acc += tl.dot(a, b, allow_tf32=True)
+
+        k_start += BLOCK_K
+        k_remaining -= BLOCK_K
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Write back
+    c_ptrs = C_ptr + (offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn)
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    c = acc.to(tl.float32)
+    tl.store(c_ptrs, c, mask=c_mask)
+
+
+def triton_matmul(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    # Fallback for non-CUDA tensors
+    if A.device.type != "cuda" or B.device.type != "cuda":
+        return torch.matmul(A, B)
+
+    assert A.dim() == 2 and B.dim() == 2, "Only 2D matmul is supported"
+    assert A.size(1) == B.size(0), "Incompatible shapes for matmul"
+
+    M, K = A.shape
+    K2, N = B.shape
+    assert K == K2
+
+    C = torch.empty((M, N), device=A.device, dtype=torch.float32)
+
+    # Strides in elements
+    stride_am, stride_ak = A.stride()
+    stride_bk, stride_bn = B.stride()
+    stride_cm, stride_cn = C.stride()
+
+    BLOCK_M = 128
+    BLOCK_N = 128
+    BLOCK_K = 32
+
+    grid = (
+        triton.cdiv(M, BLOCK_M),
+        triton.cdiv(N, BLOCK_N),
+    )
+
+    matmul_kernel[grid](
+        A, B, C,
+        M, N, K,
+        stride_am, stride_ak,
+        stride_bk, stride_bn,
+        stride_cm, stride_cn,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        num_warps=4,
+        num_stages=2,
+    )
+
+    return C
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-accelerated model performing a single matrix multiplication (C = A * B).
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, A, B):
+        return triton_matmul(A, B)

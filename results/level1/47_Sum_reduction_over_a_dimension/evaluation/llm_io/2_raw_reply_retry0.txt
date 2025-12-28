@@ -1,141 +1,171 @@
 ```python
-# <complete ModelNew code with optimized Triton kernels>
-import torch
-import torch.nn as nn
-import triton
-import triton.language as tl
+# <optimized Triton code>
+import torch, torch.nn as nn, triton, triton.language as tl
 
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 128, 'BLOCK_R': 64}, num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 128, 'BLOCK_R': 128}, num_warps=8, num_stages=2),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_R': 64}, num_warps=8, num_stages=3),
-        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 256, 'BLOCK_R': 64}, num_warps=8, num_stages=2),
-        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 64, 'BLOCK_R': 256}, num_warps=4, num_stages=3),
+        triton.Config(
+            {'BLOCK_N': 128, 'BLOCK_R': 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+        triton.Config(
+            {'BLOCK_N': 256, 'BLOCK_R': 16},
+            num_warps=8,
+            num_stages=2,
+        ),
+        triton.Config(
+            {'BLOCK_N': 64, 'BLOCK_R': 64},
+            num_warps=4,
+            num_stages=3,
+        ),
     ],
-    key=['M', 'N', 'R'],
+    key=['N', 'R'],
 )
 @triton.jit
 def sum_reduce_dim_kernel(
-    x_ptr,
-    out_ptr,
-    M,
-    R,
-    N,
-    stride_m,
-    stride_r,
-    stride_n,
-    out_stride_m,
-    out_stride_n,
-    OUTPUT_DTYPE: tl.constexpr,
-    BLOCK_M: tl.constexpr,
+    x_ptr,       # *f32 / *f16 / *bf16
+    out_ptr,     # *f32
+    M,           # number of outer batches
+    R,           # reduction length
+    N,           # number of inner elements
     BLOCK_N: tl.constexpr,
     BLOCK_R: tl.constexpr,
 ):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    # 3D grid:
+    # axis 0 -> tiles along N
+    # axis 1 -> batches M
+    # axis 2 -> chunks along R (for parallel reduction)
+    pid_n = tl.program_id(axis=0)
+    pid_m = tl.program_id(axis=1)
+    pid_r = tl.program_id(axis=2)
 
-    m_offsets = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    n_offsets = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    mask_m = m_offsets < M
+    # Offsets along N
+    n_start = pid_n * BLOCK_N
+    n_offsets = n_start + tl.arange(0, BLOCK_N)  # [BLOCK_N]
     mask_n = n_offsets < N
 
-    m_offsets_i64 = m_offsets.to(tl.int64)
-    n_offsets_i64 = n_offsets.to(tl.int64)
-    stride_m = tl.full((), stride_m, tl.int64)
-    stride_r = tl.full((), stride_r, tl.int64)
-    stride_n = tl.full((), stride_n, tl.int64)
-    out_stride_m = tl.full((), out_stride_m, tl.int64)
-    out_stride_n = tl.full((), out_stride_n, tl.int64)
+    # Single m index
+    m = pid_m
+    mask_m = m < M
 
-    base_ptrs = x_ptr + (
-        m_offsets_i64[:, None, None] * stride_m
-        + n_offsets_i64[None, :, None] * stride_n
-    )
+    # Offsets along R for this chunk
+    r_start = pid_r * BLOCK_R
+    r_offsets = r_start + tl.arange(0, BLOCK_R)  # [BLOCK_R]
+    mask_r = r_offsets < R
 
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    # Base offset for this m in [M, R, N] layout
+    base_m = m * R * N
 
-    for r_start in range(0, R, BLOCK_R):
-        r_offsets = r_start + tl.arange(0, BLOCK_R)
-        r_mask = r_offsets < R
-        r_offsets_i64 = r_offsets.to(tl.int64)
+    # 2D tile indices: [BLOCK_R, BLOCK_N]
+    r_broadcast = r_offsets[:, None]
+    n_broadcast = n_offsets[None, :]
 
-        ptrs = base_ptrs + r_offsets_i64[None, None, :] * stride_r
-        mask = (
-            mask_m[:, None, None]
-            & mask_n[None, :, None]
-            & r_mask[None, None, :]
-        )
-        vals = tl.load(ptrs, mask=mask, other=0.0).to(tl.float32)
-        acc += tl.sum(vals, axis=2)
+    idx = base_m + r_broadcast * N + n_broadcast
 
-    out_ptrs = out_ptr + (
-        m_offsets_i64[:, None] * out_stride_m
-        + n_offsets_i64[None, :] * out_stride_n
-    )
-    out_mask = mask_m[:, None] & mask_n[None, :]
-    tl.store(out_ptrs, acc.to(OUTPUT_DTYPE), mask=out_mask)
+    # Validity mask for this tile
+    mask_tile = (mask_r[:, None]) & (mask_n[None, :]) & mask_m
+
+    # Load and accumulate along R axis (0) in fp32
+    x_tile = tl.load(x_ptr + idx, mask=mask_tile, other=0.0)
+    x_tile = x_tile.to(tl.float32)
+    tile_sum = tl.sum(x_tile, axis=0)  # [BLOCK_N]
+
+    # Atomic-add partial sums into global output [M, 1, N]
+    out_base = m * N + n_offsets
+    mask_out = mask_n & mask_m
+    tl.atomic_add(out_ptr + out_base, tile_sum, mask=mask_out)
 
 
-_TORCH_DTYPE_TO_TL = {
-    torch.float16: tl.float16,
-    torch.bfloat16: tl.bfloat16,
-    torch.float32: tl.float32,
-}
-
-
-def sum_reduce_keepdim(x: torch.Tensor, dim: int) -> torch.Tensor:
-    if dim < 0:
-        dim += x.ndim
-    if not (0 <= dim < x.ndim):
-        raise RuntimeError(f"Invalid reduction dimension {dim} for tensor with {x.ndim} dims.")
-    if x.numel() == 0 or x.shape[dim] == 0 or x.dtype not in _TORCH_DTYPE_TO_TL:
+def triton_sum_keepdim(x: torch.Tensor, dim: int) -> torch.Tensor:
+    """Sum reduction over a given dim with keepdim=True using Triton."""
+    # Fallback for non-CUDA or unsupported dtypes
+    if (not x.is_cuda) or (x.dtype not in (torch.float16, torch.bfloat16, torch.float32)):
         return torch.sum(x, dim=dim, keepdim=True)
 
+    ndim = x.ndim
+    if dim < 0:
+        dim += ndim
+    assert 0 <= dim < ndim
+
+    orig_shape = list(x.shape)
+
+    # Helper to compute product of a list of ints without extra imports
+    def _prod(seq):
+        out = 1
+        for v in seq:
+            out *= int(v)
+        return out
+
+    # Flatten to [M, R, N] where we reduce over R (axis=1)
+    if dim == 0:
+        M = 1
+        R = orig_shape[0]
+        if ndim > 1:
+            N = _prod(orig_shape[1:])
+        else:
+            N = 1
+    elif dim == ndim - 1:
+        if ndim > 1:
+            M = _prod(orig_shape[:-1])
+        else:
+            M = 1
+        R = orig_shape[-1]
+        N = 1
+    else:
+        M = _prod(orig_shape[:dim])
+        R = orig_shape[dim]
+        if dim + 1 < ndim:
+            N = _prod(orig_shape[dim + 1 :])
+        else:
+            N = 1
+
+    # Ensure contiguous before reshape for predictable layout
     x_contig = x.contiguous()
-    shape = x_contig.shape
+    x_reshaped = x_contig.reshape(M, R, N)
 
-    M = 1
-    for i in range(dim):
-        M *= shape[i]
-    R = shape[dim]
-    N = 1
-    for i in range(dim + 1, x_contig.ndim):
-        N *= shape[i]
+    # Accumulate in fp32 for numerical stability
+    out_reshaped = torch.zeros((M, 1, N), device=x.device, dtype=torch.float32)
 
-    x_view = x_contig.view(M, R, N)
-    out_buffer = torch.empty((M, 1, N), dtype=x.dtype, device=x.device)
-    out_matrix = out_buffer.view(M, N)
+    def grid(meta):
+        # 3D grid:
+        #   axis 0: tiles along N
+        #   axis 1: M
+        #   axis 2: chunks along R (for parallel reduction)
+        return (
+            triton.cdiv(N, meta['BLOCK_N']),  # along N
+            M,                                # along M
+            triton.cdiv(R, meta['BLOCK_R']),  # along R (chunks)
+        )
 
-    grid = lambda META: (
-        triton.cdiv(M, META['BLOCK_M']),
-        triton.cdiv(N, META['BLOCK_N']),
-    )
-    dtype_enum = _TORCH_DTYPE_TO_TL[x.dtype]
-
+    # Launch autotuned kernel; BLOCK_* and num_warps/num_stages come from configs
     sum_reduce_dim_kernel[grid](
-        x_view,
-        out_matrix,
+        x_reshaped,
+        out_reshaped,
         M,
         R,
         N,
-        R * N,
-        N,
-        1,
-        N,
-        1,
-        OUTPUT_DTYPE=dtype_enum,
     )
 
-    return out_buffer.reshape(*shape[:dim], 1, *shape[dim + 1:])
+    # Cast back to original dtype if needed
+    if x.dtype != torch.float32:
+        out_reshaped = out_reshaped.to(x.dtype)
+
+    # Reshape back to original shape with reduced dim kept as size 1
+    out_shape = orig_shape.copy()
+    out_shape[dim] = 1
+    return out_reshaped.reshape(out_shape)
 
 
 class ModelNew(nn.Module):
+    """
+    Triton-optimized model that performs sum reduction over a specified dimension.
+    """
     def __init__(self, dim: int):
         super().__init__()
         self.dim = dim
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return sum_reduce_keepdim(x, self.dim)
+        return triton_sum_keepdim(x, self.dim)
 ```

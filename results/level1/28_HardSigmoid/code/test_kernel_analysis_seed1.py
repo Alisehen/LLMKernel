@@ -1,0 +1,91 @@
+# <complete ModelNew code with optimized Triton kernels>
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+# Autotuned for RTX 4090: focus on grid layout & parallelism.
+# 1D mapping: each program handles BLOCK_SIZE contiguous elements.
+BLOCK_SIZE = 256  # power-of-2 as required
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=4, num_stages=2),
+        triton.Config({}, num_warps=8, num_stages=2),
+        triton.Config({}, num_warps=8, num_stages=3),
+    ],
+    key=["N"],  # autotune based on total elements
+)
+@triton.jit
+def hardsigmoid_kernel(
+    x_ptr,
+    y_ptr,
+    N,  # total number of elements
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Elementwise HardSigmoid:
+        y = max(0, min(1, (x + 3) / 6))
+
+    1D grid:
+        pid = program_id(0) in [0, grid_size)
+        each program processes BLOCK_SIZE contiguous elements
+    """
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < N
+
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+
+    # Compute y = max(0, min(1, (x + 3) / 6))
+    y = (x + 3.0) * (1.0 / 6.0)
+    y = tl.maximum(y, 0.0)
+    y = tl.minimum(y, 1.0)
+
+    tl.store(y_ptr + offsets, y, mask=mask)
+
+
+def triton_hardsigmoid(x: torch.Tensor) -> torch.Tensor:
+    """
+    High-performance HardSigmoid using Triton.
+
+    - Flattens all dimensions into 1D (elementwise op, all dims independent).
+    - 1D grid: grid = (cdiv(N, BLOCK_SIZE),)
+    - Falls back to PyTorch for non-CUDA tensors.
+    """
+    if not x.is_cuda:
+        return nn.functional.hardsigmoid(x)
+
+    x_contig = x.contiguous()
+    N = x_contig.numel()
+    y = torch.empty_like(x_contig)
+
+    if N == 0:
+        return y.view_as(x)
+
+    grid = lambda meta: (triton.cdiv(N, BLOCK_SIZE),)
+
+    hardsigmoid_kernel[grid](
+        x_contig,
+        y,
+        N,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+
+    return y.view_as(x)
+
+
+class ModelNew(nn.Module):
+    """
+    Model that applies a highly optimized Triton HardSigmoid activation.
+    """
+
+    def __init__(self):
+        super(ModelNew, self).__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_hardsigmoid(x)

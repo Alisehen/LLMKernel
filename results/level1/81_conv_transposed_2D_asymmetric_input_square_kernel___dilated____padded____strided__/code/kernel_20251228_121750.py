@@ -1,0 +1,177 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def conv_transpose2d_kernel(
+    x_ptr,      # float32 [N, Cin, H_in, W_in]
+    w_ptr,      # float32 [Cin, Cout, K, K]
+    b_ptr,      # float32 [Cout] (unused if HAS_BIAS=False)
+    y_ptr,      # float32 [N, Cout, H_out, W_out]
+    N, Cin, Cout,
+    H_in, W_in,
+    H_out, W_out,
+    num_w_blocks,
+    BLOCK_P: tl.constexpr,
+    KERNEL_SIZE: tl.constexpr,
+    STRIDE: tl.constexpr,
+    PADDING: tl.constexpr,
+    DILATION: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+
+    # Decompose program id into (n, co, ho, w_block_id)
+    row_id = pid // num_w_blocks  # over N * Cout * H_out
+    w_block_id = pid % num_w_blocks
+
+    NC_out_H = Cout * H_out
+    n = row_id // NC_out_H
+    rem = row_id % NC_out_H
+    co = rem // H_out
+    ho = rem % H_out
+
+    # Output width indices handled by this program
+    w_start = w_block_id * BLOCK_P
+    w_offsets = w_start + tl.arange(0, BLOCK_P)
+    mask_w = w_offsets < W_out
+
+    # Accumulator for this (n, co, ho, w_offsets) slice
+    acc = tl.zeros([BLOCK_P], dtype=tl.float32)
+    if HAS_BIAS:
+        bias_val = tl.load(b_ptr + co)
+        acc = acc + bias_val
+
+    # Loop over input channels and kernel positions
+    for ic in range(0, Cin):
+        for kh in range(0, KERNEL_SIZE):
+            # Compute input height index (scalar)
+            h_in_numer = ho + PADDING - kh * DILATION
+            h_in = h_in_numer // STRIDE
+            h_in_times_stride = h_in * STRIDE
+            valid_h = (h_in_numer == h_in_times_stride) & (h_in >= 0) & (h_in < H_in)
+            safe_h_in = tl.where(valid_h, h_in, 0)
+
+            for kw in range(0, KERNEL_SIZE):
+                # Compute input width indices (vector)
+                w_in_numer = w_offsets + PADDING - kw * DILATION
+                w_in = w_in_numer // STRIDE
+                w_in_times_stride = w_in * STRIDE
+                valid_w = (w_in_numer == w_in_times_stride) & (w_in >= 0) & (w_in < W_in)
+
+                mask = mask_w & valid_w & valid_h
+                safe_w_in = tl.where(valid_w & valid_h, w_in, 0)
+
+                # Compute input offsets: ((n * Cin + ic) * H_in + h_in) * W_in + w_in
+                base_nc = n * Cin + ic
+                base_nch = base_nc * H_in + safe_h_in
+                in_offsets = base_nch * W_in + safe_w_in
+
+                x_vals = tl.load(x_ptr + in_offsets, mask=mask, other=0.0)
+
+                # Weight offset: ((ic * Cout + co) * K + kh) * K + kw
+                w_offset = ((ic * Cout + co) * KERNEL_SIZE + kh) * KERNEL_SIZE + kw
+                w_val = tl.load(w_ptr + w_offset)
+
+                acc += x_vals * w_val
+
+    # Store result to output: ((n * Cout + co) * H_out + ho) * W_out + w_offsets
+    out_base_nc = n * Cout + co
+    out_base_nch = out_base_nc * H_out + ho
+    out_offsets = out_base_nch * W_out + w_offsets
+    tl.store(y_ptr + out_offsets, acc, mask=mask_w)
+
+
+def triton_conv_transpose2d(x: torch.Tensor,
+                            weight: torch.Tensor,
+                            bias: torch.Tensor,
+                            stride: int,
+                            padding: int,
+                            dilation: int) -> torch.Tensor:
+    # Ensure CUDA tensors and contiguous layout
+    assert x.is_cuda and weight.is_cuda, "Inputs must be CUDA tensors"
+    x_f32 = x.contiguous().to(torch.float32)
+    w_f32 = weight.contiguous().to(torch.float32)
+
+    if bias is not None:
+        b_f32 = bias.contiguous().to(torch.float32)
+        has_bias = True
+    else:
+        # Dummy tensor (never read when HAS_BIAS=False)
+        b_f32 = torch.empty(1, device=x.device, dtype=torch.float32)
+        has_bias = False
+
+    N, Cin, H_in, W_in = x_f32.shape
+    Cin_w, Cout, K_h, K_w = w_f32.shape
+    assert Cin_w == Cin, "Weight Cin must match input Cin"
+    assert K_h == K_w, "Kernel must be square"
+    K = K_h
+
+    stride_int = int(stride)
+    padding_int = int(padding)
+    dilation_int = int(dilation)
+
+    # Output size formula (no output_padding)
+    H_out = (H_in - 1) * stride_int - 2 * padding_int + dilation_int * (K - 1) + 1
+    W_out = (W_in - 1) * stride_int - 2 * padding_int + dilation_int * (K - 1) + 1
+
+    y = torch.empty((N, Cout, H_out, W_out), device=x.device, dtype=torch.float32)
+
+    BLOCK_P = 128  # power-of-2 block size for W dimension
+    num_w_blocks = triton.cdiv(W_out, BLOCK_P)
+    total_rows = N * Cout * H_out
+    grid = (total_rows * num_w_blocks,)
+
+    conv_transpose2d_kernel[grid](
+        x_f32, w_f32, b_f32, y,
+        N, Cin, Cout,
+        H_in, W_in,
+        H_out, W_out,
+        num_w_blocks,
+        BLOCK_P=BLOCK_P,
+        KERNEL_SIZE=K,
+        STRIDE=stride_int,
+        PADDING=padding_int,
+        DILATION=dilation_int,
+        HAS_BIAS=has_bias,
+    )
+
+    return y.to(dtype=x.dtype)
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized version of ConvTranspose2d forward.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        stride: int = 1,
+        padding: int = 0,
+        dilation: int = 1,
+        bias: bool = False,
+    ):
+        super().__init__()
+        # Keep an nn.ConvTranspose2d for parameter storage / state_dict compatibility
+        self.conv_transpose2d = nn.ConvTranspose2d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            bias=bias,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        w = self.conv_transpose2d.weight
+        b = self.conv_transpose2d.bias
+        stride = self.conv_transpose2d.stride[0]
+        padding = self.conv_transpose2d.padding[0]
+        dilation = self.conv_transpose2d.dilation[0]
+        return triton_conv_transpose2d(x, w, b, stride, padding, dilation)

@@ -1,0 +1,230 @@
+You are optimizing a Triton kernel based on algorithmic analysis.
+
+# PyTorch Reference (Target Behavior)
+
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs a single matrix multiplication (C = A * B) where one of the matrices is tall and skinny (M >> N or N >> M)
+    """
+    def __init__(self):
+        super(Model, self).__init__()
+    
+    def forward(self, A, B):
+        """
+        Performs the matrix multiplication.
+
+        Args:
+            A (torch.Tensor): Input matrix of shape (M, K) or (K, M) where M >> N or N >> M.
+            B (torch.Tensor): Input matrix of shape (K, N) or (N, K) where M >> N or N >> M.
+
+        Returns:
+            torch.Tensor: Output matrix of shape (M, N) or (N, M)
+        """
+        return torch.matmul(A, B)
+
+M = 16384 * 2
+N = 16 * 2
+
+def get_inputs():
+    A = torch.rand(M, N)
+    B = torch.rand(N, M)
+    return [A, B]
+
+def get_init_inputs():
+    return []  # No special initialization inputs needed
+```
+
+**CRITICAL**: Study the PyTorch code carefully to understand:
+- What does `forward()` return? (full output sequence vs final hidden state only)
+- What is the computational pattern?
+- What are the input/output shapes?
+
+Your optimized kernel MUST match this exact behavior.
+
+---
+
+# Analysis Results
+
+**Bottleneck**: The kernel treats the operation as a generic MxK @ KxN GEMM, using a 2D grid over (M,N); when N is very small (e.g., N=32) many program instances redundantly load the same columns of B and do relatively little work, leading to poor cache reuse and launch/memory overhead dominating.
+
+**Optimization Strategy**: Replace the generic 2D-tiled GEMM with a GEMV-style specialized algorithm for tall-skinny cases, where each program computes the entire N-dimensional output vector for one (or a few) rows of C, turning the problem into many independent dot products and maximizing reuse of the skinny B matrix in registers/L1.
+
+**Implementation Plan**: Introduce a shape-aware dispatch in `triton_matmul`: when min(M,N) is small (e.g., <= 32), launch a 1D grid over the large dimension only (M in your example). In the Triton kernel, have each program: (1) load one row of A (size K), (2) iteratively load tiles of B along K while keeping the full N columns in registers, and (3) accumulate the full length-N output vector for that row; use BLOCK_N = N (or a small multiple) and tile only over K. This reduces redundant loads of B, increases arithmetic intensity per program, and better matches the tall-skinny GEMV-like structure.
+
+**Expected Speedup**: 30-50%
+
+---
+
+# Current Kernel (needs optimization)
+
+```python
+# High-performance Triton matmul (replacement for torch.matmul)
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def matmul_kernel(
+    a_ptr, b_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # 2D program id: each program computes a BLOCK_M x BLOCK_N tile of C
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # pointers to the first K-tile for A and B
+    a_ptrs = a_ptr + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
+
+    # accumulator in fp32 for numerical accuracy
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # loop over K dimension
+    k_iter = 0
+    while k_iter < K:
+        k_offsets = k_iter + offs_k
+
+        a_mask = (offs_m[:, None] < M) & (k_offsets[None, :] < K)
+        b_mask = (k_offsets[:, None] < K) & (offs_n[None, :] < N)
+
+        a = tl.load(a_ptrs + k_iter * stride_ak, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs + k_iter * stride_bk, mask=b_mask, other=0.0)
+
+        acc += tl.dot(a, b, allow_tf32=True)
+        k_iter += BLOCK_K
+
+    # write back
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    c_ptrs = c_ptr + (offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn)
+    # let Triton cast acc to the output dtype automatically
+    tl.store(c_ptrs, acc, mask=c_mask)
+
+
+def triton_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """
+    High-performance Triton matmul: C = A @ B
+    A: [M, K], B: [K, N], returns C: [M, N]
+    Works best when one dimension is tall/skinny (e.g., M >> N or N >> M).
+    """
+    assert a.ndim == 2 and b.ndim == 2, "Inputs must be 2D matrices"
+    M, K = a.shape
+    Kb, N = b.shape
+    assert K == Kb, "Incompatible matrix shapes"
+
+    # Allocate output
+    c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+
+    # Extract strides (row-major assumed but supports non-contiguous via strides)
+    stride_am, stride_ak = a.stride()
+    stride_bk, stride_bn = b.stride()
+    stride_cm, stride_cn = c.stride()
+
+    # Choose tiling tuned for tall/skinny shapes:
+    # If one dimension is very small, use narrow tiles on that dimension.
+    if min(M, N) <= 32:
+        BLOCK_M = 128
+        BLOCK_N = 32
+        BLOCK_K = 32
+        num_warps = 4
+    else:
+        BLOCK_M = 128
+        BLOCK_N = 128
+        BLOCK_K = 32
+        num_warps = 8
+
+    grid = (
+        triton.cdiv(M, BLOCK_M),
+        triton.cdiv(N, BLOCK_N),
+    )
+
+    matmul_kernel[grid](
+        a, b, c,
+        M, N, K,
+        stride_am, stride_ak,
+        stride_bk, stride_bn,
+        stride_cm, stride_cn,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        num_warps=num_warps,
+        num_stages=3,
+    )
+    return c
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-accelerated model that performs a single matrix multiplication (C = A @ B).
+    Optimized for cases where one matrix dimension is tall and skinny.
+    """
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, A, B):
+        return triton_matmul(A, B)
+```
+
+---
+
+# Your Task
+
+Implement the optimization strategy above. Focus on the specific bottleneck identified.
+
+## Key Requirements
+
+1. **Preserve correctness**: Maintain the same input/output behavior
+2. **Apply the optimization**: Follow the implementation plan exactly
+3. **Use valid Triton syntax**:
+   - Every kernel MUST have `@triton.jit` decorator
+   - Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+   - BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+   - No `continue`, `break`, `return` inside kernels (use masking)
+   - Prefer `tl.dot(a, b, allow_tf32=True)` for matmul operations
+
+4. **CRITICAL for RNN/GRU/LSTM Persistent Kernels**:
+   - Time loop MUST be inside @triton.jit kernel, NOT in Python forward()
+   - **HYBRID computation strategy** (CRITICAL for performance):
+     * Precompute input-side gates OUTSIDE kernel: `gates_x = (T*B, In) @ W_ih` (ONE large GEMM)
+     * INSIDE kernel: only recurrent-side: `for t: gates_h = h @ W_hh` (T small GEMMs)
+   - CORRECT (FAST - use this):
+     ```python
+     # Python forward():
+     gates_x_all = x.reshape(T*B, In) @ W_ih + b_ih  # ONE large GEMM
+     gates_x_all = gates_x_all.view(T, B, 3*H)
+     gru_persistent_kernel[grid](gates_x_all, h0, W_hh, ...)  # Launch ONCE
+
+     @triton.jit
+     def gru_persistent_kernel(gates_x_ptr, h_ptr, W_hh_ptr, ...):
+         for t in range(T):  # Inside kernel
+             gates_x_t = tl.load(gates_x_ptr + t*...)  # Precomputed
+             gates_h = h @ W_hh  # Only recurrent GEMM
+             h = (1-z)*n + z*h   # Fuse and update
+     ```
+
+5. **Output format**:
+   - Imports: `import torch, torch.nn as nn, triton, triton.language as tl`
+   - `@triton.jit` kernel(s)
+   - Wrapper function(s)
+   - `class ModelNew(nn.Module)` — REQUIRED
+   - NO testing code, NO `if __name__ == "__main__"`
+
+---
+
+Generate the optimized kernel now. Output ONLY the complete Python code.

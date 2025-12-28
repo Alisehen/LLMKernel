@@ -1,0 +1,10 @@
+```json
+{
+  "worth_optimizing": "yes",
+  "reason": "The current kernel uses a naive, branch-heavy direct algorithm for transposed convolution and is ~20x slower than PyTorch.",
+  "bottleneck": "Each program instance loops serially over all input channels and kernel elements with integer div/mod and condition checks per (ky, kx, ho, wo), leading to poor parallelization of the C_in×K×K dimension and very low arithmetic intensity relative to indexing overhead.",
+  "optimisation method": "Replace the direct per-output-loop implementation with an im2col+GEMM-style algorithm (or its implicit equivalent) so that conv_transpose2d is computed as a matrix multiplication using Triton’s optimized matmul kernel instead of scalar loops over C_in and K×K.",
+  "modification plan": "Reformulate the transposed convolution as a GEMM where the K dimension is C_in×KERNEL_SIZE×KERNEL_SIZE and the M/N dimensions tile the output spatial positions and output channels, respectively. Implement an im2col-style mapping (or an implicit variant that computes the necessary indices inside the matmul kernel) so that each Triton block loads tiles of the input and weight into shared/block-local memory and performs a dense matmul, accumulating over the K dimension. Reuse or adapt Triton’s existing matmul template for this GEMM, and move the current (ho, wo) inverse-stride logic into a precomputation or simplified index transform to avoid per-multiply div/mod and branches.",
+  "expected_speedup": "10-30x over the current Triton kernel (bringing it to at least parity or faster than the PyTorch baseline)"
+}
+```

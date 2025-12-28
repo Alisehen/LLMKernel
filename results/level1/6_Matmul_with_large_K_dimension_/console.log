@@ -1,0 +1,124 @@
+[Seed] Generating seed kernel...
+[Seed 1/2] Generating...
+[92mFinish reason: stop[0m
+Usage: In=1151, Out=4351, Total=5502
+[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 644, in compare_and_bench
+    raise ValueError(
+ValueError: Outputs are not close (atol=1, rtol=1). max_abs_err=nan, mean_abs_err=nan
+
+[seed_0] failed. See metrics.message for details.
+[seed_0] metrics saved to: /home/hyc/LLMKernel/run/20251228_103146_batch_range4to9_openai_deepseek/6_Matmul_with_large_K_dimension_/evaluation/eval_0014.json
+[Seed 1] Failed, attempting repair...
+[92mFinish reason: stop[0m
+Usage: In=1761, Out=6820, Total=8581
+[seed_0_repair_1] score=0.1656 (baseline=1.6701ms)
+[seed_0_repair_1] metrics saved to: /home/hyc/LLMKernel/run/20251228_103146_batch_range4to9_openai_deepseek/6_Matmul_with_large_K_dimension_/evaluation/eval_0015.json
+[Seed 1 Repair] Score: 0.1656 ✓
+[Seed 1] Final score: 0.1656 ✓
+[Seed 2/2] Generating...
+[92mFinish reason: stop[0m
+Usage: In=1151, Out=4298, Total=5449
+[seed_1] score=0.1668 (baseline=1.6720ms)
+[seed_1] metrics saved to: /home/hyc/LLMKernel/run/20251228_103146_batch_range4to9_openai_deepseek/6_Matmul_with_large_K_dimension_/evaluation/eval_0016.json
+[Seed 2] Final score: 0.1668 ✓
+
+================================================================================
+[Hybrid Strategy] Analyzing all seeds for algorithmic optimization...
+[Hybrid Strategy] - 2 seed(s) with score < 1.0 (rescue)
+================================================================================
+
+[Hybrid] Seed 1: score=0.1656 < 1.0
+[Hybrid] Attempting algorithm analysis rescue...
+[ncu] Using GPU device 0 (CUDA_VISIBLE_DEVICES=0)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_2912279.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_2912279.py /home/hyc/LLMKernel/KernelBench/select2/6_Matmul_with_large_K_dimension_.py /home/hyc/LLMKernel/run/20251228_103146_batch_range4to9_openai_deepseek/6_Matmul_with_large_K_dimension_/code/test_kernel_analysis_seed0.py --repeat 1
+[ncu] ⚠️ Command timed out after 300 seconds
+[93mWarning: NCU profiling failed: NCU CSV file is empty (benchmark script likely failed): /home/hyc/LLMKernel/ncu_temp_2912279.csv[0m
+[Hybrid] Requesting LLM analysis for seed 1...
+[92mFinish reason: stop[0m
+Usage: In=2144, Out=1473, Total=3617
+[Hybrid] Worth optimizing: yes
+[Hybrid] Reason: The kernel is ~6x slower than cuBLAS for a tall-K GEMM, and the current launch scheme leaves most SMs idle.
+[Hybrid] Analysis complete for seed 1, generating optimized kernel...
+[Hybrid] Bottleneck: All work over the huge K dimension (K=524288) is done serially inside each progr...
+[Hybrid] Optimization: Introduce a split-K parallelization scheme: partition the K dimension across mul...
+[Hybrid] Expected speedup: 4-6x vs the current Triton kernel (bringing it close to or within ~20-30% of the PyTorch/cuBLAS baseline).
+[92mFinish reason: stop[0m
+Usage: In=2502, Out=5942, Total=8444
+[algorithm_optimized_seed0] score=1.3712 (baseline=1.6720ms)
+[algorithm_optimized_seed0] metrics saved to: /home/hyc/LLMKernel/run/20251228_103146_batch_range4to9_openai_deepseek/6_Matmul_with_large_K_dimension_/evaluation/eval_0017.json
+[Hybrid] ✓ Rescue successful: 0.1656 → 1.3712
+
+[Hybrid] Seed 2: score=0.1668 < 1.0
+[Hybrid] Attempting algorithm analysis rescue...
+[ncu] Using GPU device 0 (CUDA_VISIBLE_DEVICES=0)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_2912279.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_2912279.py /home/hyc/LLMKernel/KernelBench/select2/6_Matmul_with_large_K_dimension_.py /home/hyc/LLMKernel/run/20251228_103146_batch_range4to9_openai_deepseek/6_Matmul_with_large_K_dimension_/code/test_kernel_analysis_seed1.py --repeat 1
+[ncu stdout]: [bench] Completed 1 iterations successfully
+
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_2912279.csv
+[Hybrid] Requesting LLM analysis for seed 2...
+[92mFinish reason: stop[0m
+Usage: In=1979, Out=758, Total=2737
+[Hybrid] Worth optimizing: yes
+[Hybrid] Reason: The custom Triton matmul is ~6x slower than the PyTorch/cuBLAS baseline, indicating a major algorithmic underutilization of the GPU.
+[Hybrid] Analysis complete for seed 2, generating optimized kernel...
+[Hybrid] Bottleneck: The kernel maps work only over the (M, N) tile grid and processes the enormous K...
+[Hybrid] Optimization: Introduce a split-K (parallel-K) matmul algorithm: shard the large K dimension a...
+[Hybrid] Expected speedup: 300-500%
+[92mFinish reason: stop[0m
+Usage: In=2290, Out=9535, Total=11825
+[algorithm_optimized_seed1] score=1.2707 (baseline=1.6720ms)
+[algorithm_optimized_seed1] metrics saved to: /home/hyc/LLMKernel/run/20251228_103146_batch_range4to9_openai_deepseek/6_Matmul_with_large_K_dimension_/evaluation/eval_0018.json
+[Hybrid] ✓ Rescue successful: 0.1668 → 1.2707
+
+================================================================================
+[Hybrid] Candidate Selection
+================================================================================
+[Hybrid] Total candidates: 4
+  [1] seed 1: 0.1656
+  [2] seed 2: 0.1668
+  [3] algo-optimized (from seed 1): 1.3712
+  [4] algo-optimized (from seed 2): 1.2707
+
+[Hybrid] ★ Selected best candidate: score=1.3712
+
+[Optimization] Starting 3-stage optimization...
+
+================================================================================
+[Stage 1/2] grid_and_parallel
+Description: Optimize grid layout and parallel work distribution across SMs.
+Current candidates: 1, best score: 1.3712
+================================================================================
+[Stage 1] Profiling best candidate...
+[ncu] Using GPU device 0 (CUDA_VISIBLE_DEVICES=0)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_2912279.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_2912279.py /home/hyc/LLMKernel/KernelBench/select2/6_Matmul_with_large_K_dimension_.py /home/hyc/LLMKernel/run/20251228_103146_batch_range4to9_openai_deepseek/6_Matmul_with_large_K_dimension_/code/test_kernel_analysis_seed1.py --repeat 1
+[ncu stdout]: [bench] Completed 1 iterations successfully
+
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_2912279.csv
+[Stage 1] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=2424, Out=5880, Total=8304
+[stage1_grid_and_parallel] score=0.1866 (baseline=1.6720ms)
+[stage1_grid_and_parallel] metrics saved to: /home/hyc/LLMKernel/run/20251228_103146_batch_range4to9_openai_deepseek/6_Matmul_with_large_K_dimension_/evaluation/eval_0019.json
+  Optimized kernel score: 0.1866 ✓
+[Stage 1] Current: 0.1866 (global best: 1.3712)
+
+================================================================================
+[Stage 2/2] block_tiling
+Description: Tune BLOCK_M/N/K sizes for optimal register/memory balance.
+Current candidates: 1, best score: 1.3712
+================================================================================
+[Stage 2] Profiling best candidate...
+[ncu] Using GPU device 0 (CUDA_VISIBLE_DEVICES=0)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_2912279.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_2912279.py /home/hyc/LLMKernel/KernelBench/select2/6_Matmul_with_large_K_dimension_.py /home/hyc/LLMKernel/run/20251228_103146_batch_range4to9_openai_deepseek/6_Matmul_with_large_K_dimension_/code/test_kernel_analysis_seed1.py --repeat 1
+[ncu stdout]: [bench] Completed 1 iterations successfully
+
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_2912279.csv
+[Stage 2] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=2158, Out=3760, Total=5918
+[stage2_block_tiling] score=0.1645 (baseline=1.6720ms)
+[stage2_block_tiling] metrics saved to: /home/hyc/LLMKernel/run/20251228_103146_batch_range4to9_openai_deepseek/6_Matmul_with_large_K_dimension_/evaluation/eval_0020.json
+  Optimized kernel score: 0.1645 ✓
+[Stage 2] Current: 0.1645 (global best: 1.3712)
+[6_Matmul_with_large_K_dimension_.py] Figure saved to: /home/hyc/LLMKernel/run/20251228_103146_batch_range4to9_openai_deepseek/6_Matmul_with_large_K_dimension_/figures/6_Matmul_with_large_K_dimension__score.png

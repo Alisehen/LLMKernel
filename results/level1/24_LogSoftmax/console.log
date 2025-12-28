@@ -1,0 +1,113 @@
+[Seed] Generating seed kernel...
+[Seed 1/2] Generating...
+[92mFinish reason: stop[0m
+Usage: In=1136, Out=5909, Total=7045
+[seed_0] score=0.7553 (baseline=27.8050ms)
+[seed_0] metrics saved to: /home/hyc/LLMKernel/run/20251228_103241_batch_range23to31_openai_deepseek/24_LogSoftmax/evaluation/eval_0007.json
+[Seed 1] Final score: 0.7553 ✓
+[Seed 2/2] Generating...
+[92mFinish reason: stop[0m
+Usage: In=1136, Out=8462, Total=9598
+[seed_1] score=0.7865 (baseline=27.8050ms)
+[seed_1] metrics saved to: /home/hyc/LLMKernel/run/20251228_103241_batch_range23to31_openai_deepseek/24_LogSoftmax/evaluation/eval_0008.json
+[Seed 2] Final score: 0.7865 ✓
+
+================================================================================
+[Hybrid Strategy] Analyzing all seeds for algorithmic optimization...
+[Hybrid Strategy] - 2 seed(s) with score < 1.0 (rescue)
+================================================================================
+
+[Hybrid] Seed 1: score=0.7553 < 1.0
+[Hybrid] Attempting algorithm analysis rescue...
+[ncu] Using GPU device 7 (CUDA_VISIBLE_DEVICES=7)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_2912908.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_2912908.py /home/hyc/LLMKernel/KernelBench/select2/24_LogSoftmax.py /home/hyc/LLMKernel/run/20251228_103241_batch_range23to31_openai_deepseek/24_LogSoftmax/code/test_kernel_analysis_seed0.py --repeat 1
+[ncu stdout]: [bench] Completed 1 iterations successfully
+
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_2912908.csv
+[Hybrid] Requesting LLM analysis for seed 1...
+[92mFinish reason: stop[0m
+Usage: In=1879, Out=1292, Total=3171
+[Hybrid] Worth optimizing: yes
+[Hybrid] Reason: The Triton kernel is ~32% slower than the PyTorch baseline and performs three full passes over a very large dimension, causing excessive global memory traffic.
+[Hybrid] Analysis complete for seed 1, generating optimized kernel...
+[Hybrid] Bottleneck: Each element of a 4096×393216 tensor is loaded from global memory three times (f...
+[Hybrid] Optimization: Algorithm Replacement: use an online, numerically stable log-sum-exp algorithm t...
+[Hybrid] Expected speedup: 30-40%
+[92mFinish reason: stop[0m
+Usage: In=2195, Out=6396, Total=8591
+[algorithm_optimized_seed0] score=0.9261 (baseline=27.8050ms)
+[algorithm_optimized_seed0] metrics saved to: /home/hyc/LLMKernel/run/20251228_103241_batch_range23to31_openai_deepseek/24_LogSoftmax/evaluation/eval_0009.json
+[Hybrid] ✓ Rescue successful: 0.7553 → 0.9261
+
+[Hybrid] Seed 2: score=0.7865 < 1.0
+[Hybrid] Attempting algorithm analysis rescue...
+[ncu] Using GPU device 7 (CUDA_VISIBLE_DEVICES=7)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_2912908.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_2912908.py /home/hyc/LLMKernel/KernelBench/select2/24_LogSoftmax.py /home/hyc/LLMKernel/run/20251228_103241_batch_range23to31_openai_deepseek/24_LogSoftmax/code/test_kernel_analysis_seed1.py --repeat 1
+[ncu stdout]: [bench] Completed 1 iterations successfully
+
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_2912908.csv
+[Hybrid] Requesting LLM analysis for seed 2...
+[92mFinish reason: stop[0m
+Usage: In=2017, Out=2895, Total=4912
+[Hybrid] Worth optimizing: yes
+[Hybrid] Reason: The Triton implementation is ~27% slower than PyTorch and performs an extra full read pass over the large 2D tensor.
+[Hybrid] Analysis complete for seed 2, generating optimized kernel...
+[Hybrid] Bottleneck: The current design uses two kernels and three full reads of the (batch, dim) mat...
+[Hybrid] Optimization: Replace the separate row_max kernel + naive sum-exp pass with a single-kernel, o...
+[Hybrid] Expected speedup: 30-40%
+[92mFinish reason: stop[0m
+Usage: In=2300, Out=5974, Total=8274
+[algorithm_optimized_seed1] score=0.9748 (baseline=27.8050ms)
+[algorithm_optimized_seed1] metrics saved to: /home/hyc/LLMKernel/run/20251228_103241_batch_range23to31_openai_deepseek/24_LogSoftmax/evaluation/eval_0010.json
+[Hybrid] ✓ Rescue successful: 0.7865 → 0.9748
+
+================================================================================
+[Hybrid] Candidate Selection
+================================================================================
+[Hybrid] Total candidates: 4
+  [1] seed 1: 0.7553
+  [2] seed 2: 0.7865
+  [3] algo-optimized (from seed 1): 0.9261
+  [4] algo-optimized (from seed 2): 0.9748
+
+[Hybrid] ★ Selected best candidate: score=0.9748
+
+[Optimization] Starting 3-stage optimization...
+
+================================================================================
+[Stage 1/2] grid_and_parallel
+Description: Optimize grid layout and parallel work distribution across SMs.
+Current candidates: 1, best score: 0.9748
+================================================================================
+[Stage 1] Profiling best candidate...
+[ncu] Using GPU device 7 (CUDA_VISIBLE_DEVICES=7)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_2912908.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_2912908.py /home/hyc/LLMKernel/KernelBench/select2/24_LogSoftmax.py /home/hyc/LLMKernel/run/20251228_103241_batch_range23to31_openai_deepseek/24_LogSoftmax/code/test_kernel_analysis_seed1.py --repeat 1
+[ncu stdout]: [bench] Completed 1 iterations successfully
+
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_2912908.csv
+[Stage 1] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=1815, Out=10388, Total=12203
+[stage1_grid_and_parallel] score=0.9759 (baseline=27.8050ms)
+[stage1_grid_and_parallel] metrics saved to: /home/hyc/LLMKernel/run/20251228_103241_batch_range23to31_openai_deepseek/24_LogSoftmax/evaluation/eval_0011.json
+  Optimized kernel score: 0.9759 ✓
+[Stage 1] ★ New best score: 0.9759
+
+================================================================================
+[Stage 2/2] block_tiling
+Description: Tune BLOCK_M/N/K sizes for optimal register/memory balance.
+Current candidates: 1, best score: 0.9759
+================================================================================
+[Stage 2] Profiling best candidate...
+[ncu] Using GPU device 7 (CUDA_VISIBLE_DEVICES=7)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_2912908.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_2912908.py /home/hyc/LLMKernel/KernelBench/select2/24_LogSoftmax.py /home/hyc/LLMKernel/run/20251228_103241_batch_range23to31_openai_deepseek/24_LogSoftmax/code/test_kernel_analysis_seed1.py --repeat 1
+[ncu] ⚠️ Command timed out after 300 seconds
+[93mWarning: NCU profiling failed: NCU CSV file is empty (benchmark script likely failed): /home/hyc/LLMKernel/ncu_temp_2912908.csv[0m
+[Stage 2] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=1967, Out=3510, Total=5477
+[stage2_block_tiling] score=0.9236 (baseline=27.8050ms)
+[stage2_block_tiling] metrics saved to: /home/hyc/LLMKernel/run/20251228_103241_batch_range23to31_openai_deepseek/24_LogSoftmax/evaluation/eval_0012.json
+  Optimized kernel score: 0.9236 ✓
+[Stage 2] Current: 0.9236 (global best: 0.9759)
+[24_LogSoftmax.py] Figure saved to: /home/hyc/LLMKernel/run/20251228_103241_batch_range23to31_openai_deepseek/24_LogSoftmax/figures/24_LogSoftmax_score.png

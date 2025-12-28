@@ -1,0 +1,255 @@
+You are optimizing a Triton kernel based on algorithmic analysis.
+
+# PyTorch Reference (Target Behavior)
+
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs sum reduction over a specified dimension.
+    """
+    def __init__(self, dim: int):
+        """
+        Initializes the model with the dimension to reduce over.
+
+        Args:
+            dim (int): Dimension to reduce over.
+        """
+        super(Model, self).__init__()
+        self.dim = dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies sum reduction over the specified dimension.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (..., dim, ...).
+
+        Returns:
+            torch.Tensor: Output tensor after sum reduction, shape (..., 1, ...).
+        """
+        return torch.sum(x, dim=self.dim, keepdim=True)
+
+batch_size = 128
+dim1 = 4096
+dim2 = 4095
+reduce_dim = 1
+
+def get_inputs():
+    x = torch.rand(batch_size, dim1, dim2)
+    return [x]
+
+def get_init_inputs():
+    return [reduce_dim]
+```
+
+**CRITICAL**: Study the PyTorch code carefully to understand:
+- What does `forward()` return? (full output sequence vs final hidden state only)
+- What is the computational pattern?
+- What are the input/output shapes?
+
+Your optimized kernel MUST match this exact behavior.
+
+---
+
+# Analysis Results
+
+**Bottleneck**: Each program instance reduces along the R dimension using a large stride (stride_r = inner = 4095), causing highly non-coalesced global memory loads and poor memory bandwidth utilization compared to PyTorch’s optimized reduction.
+
+**Optimization Strategy**: Perform a layout transform so that the reduction dimension is contiguous (innermost) in memory before launching the Triton kernel, and then implement the kernel assuming stride_r = 1 to load contiguous blocks along the reduction axis.
+
+**Implementation Plan**: In triton_sum_keepdim, first permute the input so that the reduction dimension moves to the last axis (e.g., via x_perm = x_contiguous.permute(..., dim, ... -> ..., -1)), then call .contiguous() and reshape to (outer, inner, R) where R is now the innermost and contiguous. Adjust the kernel to index as base_in = x_ptr + b*stride_b + n*stride_n and ptrs = base_in + r_offsets (i.e., no large stride_r), and keep the same reduction logic but over contiguous ranges. Finally, permute the output back to the original dimension order (with keepdim=True) so that the external API remains unchanged.
+
+**Expected Speedup**: 200-300%
+
+---
+
+# Current Kernel (needs optimization)
+
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def sum_reduce_dim1_kernel(
+    x_ptr,            # *f32
+    y_ptr,            # *f32
+    B,                # int32: outer dimension
+    R,                # int32: reduction dimension
+    N,                # int32: inner dimension
+    stride_b,         # int32: x.stride(0)
+    stride_r,         # int32: x.stride(1)
+    stride_n,         # int32: x.stride(2)
+    out_stride_b,     # int32: y.stride(0)
+    out_stride_r,     # int32: y.stride(1) (reduced dim, size 1)
+    out_stride_n,     # int32: y.stride(2)
+    BLOCK_R: tl.constexpr,  # power-of-2 block size along reduction dim
+):
+    pid = tl.program_id(axis=0)
+    num_rows = B * N
+    if pid >= num_rows:
+        return
+
+    # Map linear row id -> (b, n)
+    b = pid // N
+    n = pid % N
+
+    # Base pointer for this (b, n) slice at r = 0
+    base_in = x_ptr + b * stride_b + n * stride_n
+
+    acc = 0.0
+
+    # Loop over reduction dimension in chunks of BLOCK_R
+    for r_start in range(0, R, BLOCK_R):
+        r_offsets = r_start + tl.arange(0, BLOCK_R)
+        mask = r_offsets < R
+
+        ptrs = base_in + r_offsets * stride_r
+        vals = tl.load(ptrs, mask=mask, other=0.0)
+        acc += tl.sum(vals, axis=0)
+
+    # Store result at (b, 0, n) in output
+    out_ptr = y_ptr + b * out_stride_b + 0 * out_stride_r + n * out_stride_n
+    tl.store(out_ptr, acc)
+
+
+def triton_sum_keepdim(x: torch.Tensor, dim: int) -> torch.Tensor:
+    """
+    Sum reduction with keepdim=True implemented via Triton.
+
+    Supports arbitrary tensor rank by reshaping to (outer, R, inner)
+    and always reducing along the middle dimension.
+    """
+    assert x.is_cuda, "Input must be a CUDA tensor"
+    if x.numel() == 0:
+        # Fallback to PyTorch for degenerate case
+        return torch.sum(x, dim=dim, keepdim=True)
+
+    orig_shape = x.shape
+    ndim = x.ndim
+
+    if dim < 0:
+        dim += ndim
+    assert 0 <= dim < ndim
+
+    # Make contiguous for predictable strides
+    x_contig = x.contiguous()
+
+    # Compute outer, R (reduction size), inner
+    sizes = list(orig_shape)
+    R = sizes[dim]
+    outer = 1
+    for i in range(dim):
+        outer *= sizes[i]
+    inner = 1
+    for i in range(dim + 1, ndim):
+        inner *= sizes[i]
+
+    # Reshape to (outer, R, inner)
+    x_reshaped = x_contig.view(outer, R, inner)
+
+    # Output has shape (outer, 1, inner)
+    y_reshaped = torch.empty(
+        (outer, 1, inner),
+        device=x.device,
+        dtype=x.dtype,
+    )
+
+    B = outer
+    N = inner
+
+    stride_b, stride_r, stride_n = x_reshaped.stride()
+    out_stride_b, out_stride_r, out_stride_n = y_reshaped.stride()
+
+    num_rows = B * N
+    BLOCK_R = 256  # power-of-2 as required and good for 4096-size reductions
+
+    grid = lambda meta: (triton.cdiv(num_rows, 1),)
+
+    sum_reduce_dim1_kernel[grid](
+        x_reshaped,
+        y_reshaped,
+        B,
+        R,
+        N,
+        stride_b,
+        stride_r,
+        stride_n,
+        out_stride_b,
+        out_stride_r,
+        out_stride_n,
+        BLOCK_R=BLOCK_R,
+        num_warps=4,
+    )
+
+    # Reshape back to original shape with keepdim=True
+    out_shape = list(orig_shape[:dim]) + [1] + list(orig_shape[dim + 1 :])
+    y = y_reshaped.view(*out_shape)
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-accelerated model that performs sum reduction over a specified dimension.
+    """
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_sum_keepdim(x, self.dim)
+```
+
+---
+
+# Your Task
+
+Implement the optimization strategy above. Focus on the specific bottleneck identified.
+
+## Key Requirements
+
+1. **Preserve correctness**: Maintain the same input/output behavior
+2. **Apply the optimization**: Follow the implementation plan exactly
+3. **Use valid Triton syntax**:
+   - Every kernel MUST have `@triton.jit` decorator
+   - Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+   - BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+   - No `continue`, `break`, `return` inside kernels (use masking)
+   - Prefer `tl.dot(a, b, allow_tf32=True)` for matmul operations
+
+4. **CRITICAL for RNN/GRU/LSTM Persistent Kernels**:
+   - Time loop MUST be inside @triton.jit kernel, NOT in Python forward()
+   - **HYBRID computation strategy** (CRITICAL for performance):
+     * Precompute input-side gates OUTSIDE kernel: `gates_x = (T*B, In) @ W_ih` (ONE large GEMM)
+     * INSIDE kernel: only recurrent-side: `for t: gates_h = h @ W_hh` (T small GEMMs)
+   - CORRECT (FAST - use this):
+     ```python
+     # Python forward():
+     gates_x_all = x.reshape(T*B, In) @ W_ih + b_ih  # ONE large GEMM
+     gates_x_all = gates_x_all.view(T, B, 3*H)
+     gru_persistent_kernel[grid](gates_x_all, h0, W_hh, ...)  # Launch ONCE
+
+     @triton.jit
+     def gru_persistent_kernel(gates_x_ptr, h_ptr, W_hh_ptr, ...):
+         for t in range(T):  # Inside kernel
+             gates_x_t = tl.load(gates_x_ptr + t*...)  # Precomputed
+             gates_h = h @ W_hh  # Only recurrent GEMM
+             h = (1-z)*n + z*h   # Fuse and update
+     ```
+
+5. **Output format**:
+   - Imports: `import torch, torch.nn as nn, triton, triton.language as tl`
+   - `@triton.jit` kernel(s)
+   - Wrapper function(s)
+   - `class ModelNew(nn.Module)` — REQUIRED
+   - NO testing code, NO `if __name__ == "__main__"`
+
+---
+
+Generate the optimized kernel now. Output ONLY the complete Python code.

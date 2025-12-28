@@ -1,0 +1,235 @@
+You are optimizing a Triton kernel based on algorithmic analysis.
+
+# PyTorch Reference (Target Behavior)
+
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs Max reduction over a specific dimension.
+    """
+    def __init__(self, dim: int):
+        """
+        Initializes the model with the dimension to reduce over.
+
+        Args:
+            dim (int): The dimension to reduce over.
+        """
+        super(Model, self).__init__()
+        self.dim = dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies Max reduction over the specified dimension to the input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            torch.Tensor: Output tensor after Max reduction over the specified dimension.
+        """
+        return torch.max(x, dim=self.dim)[0]
+
+batch_size = 128
+dim1 = 4096
+dim2 = 4095
+
+def get_inputs():
+    x = torch.rand(batch_size, dim1, dim2)
+    return [x]
+
+def get_init_inputs():
+    return [1] # Example, change to desired dimension
+```
+
+**CRITICAL**: Study the PyTorch code carefully to understand:
+- What does `forward()` return? (full output sequence vs final hidden state only)
+- What is the computational pattern?
+- What are the input/output shapes?
+
+Your optimized kernel MUST match this exact behavior.
+
+---
+
+# Analysis Results
+
+**Bottleneck**: The `.permute(...).contiguous()` step materializes a transposed copy of the entire tensor, dominating runtime and negating the benefit of the custom reduction kernel, especially for large tensors.
+
+**Optimization Strategy**: Remove the explicit permutation/contiguous copy and implement the reduction directly over the original strided layout, making the Triton kernel stride-aware for an arbitrary reduction dimension.
+
+**Implementation Plan**: Change the host-side code to avoid `permute().contiguous()` and `view(M, K)`; instead, compute M and K logically while passing the original base pointer and all relevant strides to the kernel. Inside the Triton kernel, derive per-row and per-reduction indices using these strides so each program reduces along the target dimension without any prior data re-layout. Keep the reduction loop and BLOCK_SIZE logic the same, but adjust pointer arithmetic to use general strides rather than assuming a 2D contiguous layout.
+
+**Expected Speedup**: 4-6x vs the current Triton kernel, likely bringing performance close to or better than the PyTorch baseline for large tensors.
+
+---
+
+# Current Kernel (needs optimization)
+
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def max_reduce_lastdim_kernel(
+    x_ptr,            # *f32 / *f16
+    out_ptr,          # *f32 / *f16
+    M,                # number of rows
+    stride_m,         # stride between rows
+    stride_k,         # stride along reduction dimension
+    stride_out,       # stride for output rows
+    K: tl.constexpr,  # reduction size (last dimension)
+    BLOCK_SIZE: tl.constexpr,  # tile size along K
+):
+    pid = tl.program_id(axis=0)
+    m = pid  # row index
+
+    # Base pointer for this row
+    row_start = x_ptr + m * stride_m
+
+    # Running maximum in FP32 for better accuracy
+    running_max = tl.full((BLOCK_SIZE,), -float("inf"), tl.float32)
+
+    # Iterate over the reduction dimension in BLOCK_SIZE chunks
+    for k in range(0, K, BLOCK_SIZE):
+        offs = k + tl.arange(0, BLOCK_SIZE)
+        mask = offs < K
+        ptrs = row_start + offs * stride_k
+
+        vals = tl.load(ptrs, mask=mask, other=-float("inf"))
+        vals_f32 = vals.to(tl.float32)
+        running_max = tl.maximum(running_max, vals_f32)
+
+    # Reduce across the BLOCK_SIZE lanes to get a single scalar max
+    max_val = tl.max(running_max, axis=0)
+
+    # Store result for this row
+    out_ptr_m = out_ptr + m * stride_out
+    tl.store(out_ptr_m, max_val)
+
+
+def triton_max_dim(x: torch.Tensor, dim: int) -> torch.Tensor:
+    """
+    Max reduction over a given dimension using a high-performance Triton kernel.
+    Returns only the values (same as torch.max(x, dim=dim)[0]).
+    """
+    assert x.is_cuda, "Input must be a CUDA tensor"
+    assert x.dtype in (torch.float16, torch.bfloat16, torch.float32), "Supported dtypes: fp16, bf16, fp32"
+
+    ndim = x.ndim
+    if dim < 0:
+        dim += ndim
+    assert 0 <= dim < ndim
+
+    # Move the reduction dimension to the last position: [other_dims..., dim]
+    if dim == ndim - 1:
+        x_perm = x.contiguous()
+    else:
+        perm = [i for i in range(ndim) if i != dim] + [dim]
+        x_perm = x.permute(perm).contiguous()
+
+    # Collapse all non-reduced dims into a single leading dimension
+    K = x_perm.size(-1)                # reduction size
+    M = x_perm.numel() // K            # number of rows
+    x_2d = x_perm.view(M, K)
+
+    # Prepare output: one value per row
+    out = torch.empty(M, device=x.device, dtype=x.dtype)
+
+    # Strides in elements
+    stride_m = x_2d.stride(0)
+    stride_k = x_2d.stride(1)
+    stride_out = out.stride(0)
+
+    BLOCK_SIZE = 128  # power-of-2 as required
+
+    # One program per row
+    grid = lambda meta: (M,)
+
+    max_reduce_lastdim_kernel[grid](
+        x_2d,
+        out,
+        M,
+        stride_m,
+        stride_k,
+        stride_out,
+        K=K,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=4,
+        num_stages=2,
+    )
+
+    # Reshape back to original shape with the reduced dim removed
+    out_shape = x_perm.shape[:-1]
+    out_view = out.view(*out_shape)
+
+    # The permutation [other_dims..., dim] followed by reduction on last
+    # already yields the correct order of remaining dimensions, so no
+    # inverse permutation is needed.
+    return out_view
+
+
+class ModelNew(nn.Module):
+    """
+    Simple model that performs Max reduction over a specific dimension
+    using a high-performance Triton kernel.
+    """
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_max_dim(x, self.dim)
+```
+
+---
+
+# Your Task
+
+Implement the optimization strategy above. Focus on the specific bottleneck identified.
+
+## Key Requirements
+
+1. **Preserve correctness**: Maintain the same input/output behavior
+2. **Apply the optimization**: Follow the implementation plan exactly
+3. **Use valid Triton syntax**:
+   - Every kernel MUST have `@triton.jit` decorator
+   - Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+   - BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+   - No `continue`, `break`, `return` inside kernels (use masking)
+   - Prefer `tl.dot(a, b, allow_tf32=True)` for matmul operations
+
+4. **CRITICAL for RNN/GRU/LSTM Persistent Kernels**:
+   - Time loop MUST be inside @triton.jit kernel, NOT in Python forward()
+   - **HYBRID computation strategy** (CRITICAL for performance):
+     * Precompute input-side gates OUTSIDE kernel: `gates_x = (T*B, In) @ W_ih` (ONE large GEMM)
+     * INSIDE kernel: only recurrent-side: `for t: gates_h = h @ W_hh` (T small GEMMs)
+   - CORRECT (FAST - use this):
+     ```python
+     # Python forward():
+     gates_x_all = x.reshape(T*B, In) @ W_ih + b_ih  # ONE large GEMM
+     gates_x_all = gates_x_all.view(T, B, 3*H)
+     gru_persistent_kernel[grid](gates_x_all, h0, W_hh, ...)  # Launch ONCE
+
+     @triton.jit
+     def gru_persistent_kernel(gates_x_ptr, h_ptr, W_hh_ptr, ...):
+         for t in range(T):  # Inside kernel
+             gates_x_t = tl.load(gates_x_ptr + t*...)  # Precomputed
+             gates_h = h @ W_hh  # Only recurrent GEMM
+             h = (1-z)*n + z*h   # Fuse and update
+     ```
+
+5. **Output format**:
+   - Imports: `import torch, torch.nn as nn, triton, triton.language as tl`
+   - `@triton.jit` kernel(s)
+   - Wrapper function(s)
+   - `class ModelNew(nn.Module)` — REQUIRED
+   - NO testing code, NO `if __name__ == "__main__"`
+
+---
+
+Generate the optimized kernel now. Output ONLY the complete Python code.

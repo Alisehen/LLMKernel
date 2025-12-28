@@ -1,0 +1,292 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=4, num_stages=2),
+        triton.Config({}, num_warps=8, num_stages=2),
+    ],
+    key=['H_out', 'W_out', 'C_OUT', 'C_IN'],
+)
+@triton.jit
+def fused_depthwise_pointwise_conv2d_kernel(
+    x_ptr,        # float32[N, C_IN, H, W]
+    w_dw_ptr,     # float32[C_IN, 1, K, K] treated as [C_IN, K, K]
+    w_pw_ptr,     # float32[C_OUT, C_IN, 1, 1] treated as [C_OUT, C_IN]
+    b_pw_ptr,     # float32[C_OUT] or dummy
+    y_ptr,        # float32[N, C_OUT, H_out, W_out]
+    N, C_IN, H, W,
+    C_OUT,
+    H_out, W_out,
+    stride,
+    padding,
+    dilation,
+    KERNEL_SIZE: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """
+    Fused depthwise (groups=in_channels) + pointwise (1x1) convolution.
+
+    Grid layout (optimized for parallelism on 4090):
+        pid_hw (axis=0): tiles over H_out * W_out
+        pid_co (axis=1): tiles over C_OUT
+        pid_n  (axis=2): batch dimension N
+
+    Each program processes:
+        - One batch index (pid_n)
+        - BLOCK_M output spatial positions
+        - BLOCK_N output channels
+    """
+    # -------------------------------------------------------------------------
+    # Program IDs
+    # -------------------------------------------------------------------------
+    pid_hw = tl.program_id(axis=0)  # tiling over spatial positions
+    pid_co = tl.program_id(axis=1)  # tiling over output channels
+    pid_n = tl.program_id(axis=2)   # batch index
+
+    HW_out = H_out * W_out
+
+    # Offsets in spatial and channel dimensions
+    offs_hw = pid_hw * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_co = pid_co * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    hw_mask = offs_hw < HW_out
+    co_mask = offs_co < C_OUT
+
+    # Decode spatial index: offs_hw -> (h_out, w_out)
+    h_out = offs_hw // W_out
+    w_out = offs_hw % W_out
+
+    h_out_mat = h_out[:, None]           # [BLOCK_M, 1]
+    w_out_mat = w_out[:, None]           # [BLOCK_M, 1]
+    offs_co_mat = offs_co[None, :]       # [1, BLOCK_N]
+
+    # Precompute base input coordinates for each output position
+    h_in0 = h_out_mat * stride - padding
+    w_in0 = w_out_mat * stride - padding
+
+    # Accumulator for final outputs [BLOCK_M, BLOCK_N]
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # -------------------------------------------------------------------------
+    # Loop over input channels (reduction dimension for pointwise conv)
+    # -------------------------------------------------------------------------
+    for k0 in range(0, C_IN, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+        k_mask = offs_k < C_IN
+
+        # Tile of depthwise outputs: [BLOCK_M, BLOCK_K]
+        a = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
+        k_mat = offs_k[None, :]  # [1, BLOCK_K]
+
+        # Depthwise spatial kernel loop (per-channel)
+        for kh in range(0, KERNEL_SIZE):
+            for kw in range(0, KERNEL_SIZE):
+                h_in = h_in0 + kh * dilation
+                w_in = w_in0 + kw * dilation
+
+                in_bounds = (h_in >= 0) & (h_in < H) & (w_in >= 0) & (w_in < W)
+
+                mask_hw = hw_mask[:, None] & in_bounds & k_mask[None, :]
+
+                # x[n, c, h, w] flattened index
+                idx_x = ((pid_n * C_IN + k_mat) * H + h_in) * W + w_in
+                x_vals = tl.load(x_ptr + idx_x, mask=mask_hw, other=0.0)
+
+                # depthwise weights: [C_IN, K, K] flattened as c*K*K + kh*K + kw
+                w_dw_idx = offs_k * (KERNEL_SIZE * KERNEL_SIZE) + kh * KERNEL_SIZE + kw
+                w_dw_vals = tl.load(w_dw_ptr + w_dw_idx, mask=k_mask, other=0.0)
+
+                a += x_vals * w_dw_vals[None, :]
+
+        # Pointwise weights tile: [BLOCK_K, BLOCK_N]
+        k_col = offs_k[:, None]
+        co_col = offs_co[None, :]
+        idx_pw = k_col + co_col * C_IN
+        mask_pw = k_mask[:, None] & co_mask[None, :]
+        b = tl.load(w_pw_ptr + idx_pw, mask=mask_pw, other=0.0)
+
+        # Matmul: [BLOCK_M, BLOCK_K] @ [BLOCK_K, BLOCK_N] -> [BLOCK_M, BLOCK_N]
+        acc += tl.dot(a, b, allow_tf32=True)
+
+    # -------------------------------------------------------------------------
+    # Add fused bias (depthwise bias folded into pointwise bias on host)
+    # -------------------------------------------------------------------------
+    if HAS_BIAS:
+        b_pw = tl.load(b_pw_ptr + offs_co, mask=co_mask, other=0.0)
+        acc += b_pw[None, :]
+
+    # -------------------------------------------------------------------------
+    # Store result: y[n, co, h_out, w_out]
+    # -------------------------------------------------------------------------
+    idx_out = ((pid_n * C_OUT + offs_co_mat) * H_out + h_out_mat) * W_out + w_out_mat
+    mask_out = hw_mask[:, None] & co_mask[None, :]
+    tl.store(y_ptr + idx_out, acc, mask=mask_out)
+
+
+def depthwise_separable_conv2d_fused_triton(
+    x: torch.Tensor,
+    weight_dw: torch.Tensor,
+    bias_dw: torch.Tensor,
+    weight_pw: torch.Tensor,
+    bias_pw: torch.Tensor,
+    stride: int,
+    padding: int,
+    dilation: int,
+):
+    """
+    Fused depthwise-separable 2D convolution:
+        depthwise (groups=in_channels, KxK) + pointwise (1x1).
+
+    x:         [N, C_IN, H, W]
+    weight_dw: [C_IN, 1, K, K]
+    bias_dw:   [C_IN] or None
+    weight_pw: [C_OUT, C_IN, 1, 1]
+    bias_pw:   [C_OUT] or None
+    """
+    assert x.is_cuda and weight_dw.is_cuda and weight_pw.is_cuda
+    N, C_IN, H, W = x.shape
+    C_OUT = weight_pw.shape[0]
+    K = weight_dw.shape[2]
+
+    # Output spatial size (as in PyTorch Conv2d)
+    H_out = (H + 2 * padding - dilation * (K - 1) - 1) // stride + 1
+    W_out = (W + 2 * padding - dilation * (K - 1) - 1) // stride + 1
+
+    y = torch.empty((N, C_OUT, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    # --------------------------- Fused bias computation -----------------------
+    # y = Conv1x1(ConvDW(x) + b_dw) + b_pw
+    #   = Conv1x1(ConvDW(x)) + (W_pw @ b_dw) + b_pw
+    # We precompute fused_bias = (W_pw @ b_dw) + b_pw on host/GPU and
+    # only add it once in the kernel. This removes a reduction over C_IN
+    # from the hot loop.
+    HAS_BIAS_DW = bias_dw is not None
+    HAS_BIAS_PW = bias_pw is not None
+
+    if HAS_BIAS_DW or HAS_BIAS_PW:
+        # bias from depthwise bias propagated through pointwise conv
+        if HAS_BIAS_DW:
+            # weight_pw: [C_OUT, C_IN, 1, 1] -> [C_OUT, C_IN]
+            w_pw_2d = weight_pw.view(C_OUT, C_IN)
+            # [C_OUT] = [C_OUT, C_IN] @ [C_IN]
+            bias_from_dw = torch.matmul(w_pw_2d, bias_dw)
+        else:
+            bias_from_dw = torch.zeros(
+                C_OUT, device=weight_pw.device, dtype=weight_pw.dtype
+            )
+
+        if HAS_BIAS_PW:
+            fused_bias = bias_from_dw + bias_pw
+        else:
+            fused_bias = bias_from_dw
+        HAS_BIAS = True
+    else:
+        # Dummy tensor; not used when HAS_BIAS is False
+        fused_bias = x
+        HAS_BIAS = False
+
+    # ---------------------------- Launch configuration ------------------------
+    # Use 3D grid: (spatial, channels, batch)
+    BLOCK_M = 64
+    BLOCK_N = 64
+    BLOCK_K = 32
+
+    HW_out = H_out * W_out
+    grid = (
+        triton.cdiv(HW_out, BLOCK_M),   # spatial tiles
+        triton.cdiv(C_OUT, BLOCK_N),    # output channel tiles
+        N,                              # batch dimension
+    )
+
+    fused_depthwise_pointwise_conv2d_kernel[grid](
+        x,
+        weight_dw,
+        weight_pw,
+        fused_bias if HAS_BIAS else x,  # dummy if no bias
+        y,
+        N,
+        C_IN,
+        H,
+        W,
+        C_OUT,
+        H_out,
+        W_out,
+        stride,
+        padding,
+        dilation,
+        KERNEL_SIZE=K,
+        HAS_BIAS=HAS_BIAS,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+    )
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Depthwise-separable 2D convolution implemented with a single fused Triton kernel.
+    Matches the behavior of the reference PyTorch model:
+        depthwise = Conv2d(in_channels, in_channels, K, groups=in_channels)
+        pointwise = Conv2d(in_channels, out_channels, 1)
+        forward(x) = pointwise(depthwise(x))
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        stride: int = 1,
+        padding: int = 0,
+        dilation: int = 1,
+        bias: bool = False,
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+
+        # Keep Conv2d modules so state_dict is fully compatible with the reference model
+        self.depthwise = nn.Conv2d(
+            in_channels,
+            in_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            groups=in_channels,
+            bias=bias,
+        )
+        self.pointwise = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=1,
+            bias=bias,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Ensure input is on the same device as the weights
+        x = x.to(self.depthwise.weight.device)
+
+        y = depthwise_separable_conv2d_fused_triton(
+            x,
+            self.depthwise.weight,
+            self.depthwise.bias,
+            self.pointwise.weight,
+            self.pointwise.bias,
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation,
+        )
+        return y

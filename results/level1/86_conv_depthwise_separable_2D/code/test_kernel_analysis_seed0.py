@@ -1,0 +1,301 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def depthwise_conv2d_kernel(
+    x_ptr,        # float32[N, C, H, W]
+    w_ptr,        # float32[C, 1, K, K] (treated as [C, K, K])
+    b_ptr,        # float32[C] or dummy
+    y_ptr,        # float32[N, C, H_out, W_out]
+    N, C, H, W,
+    H_out, W_out,
+    stride,
+    padding,
+    dilation,
+    KERNEL_SIZE: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+):
+    pid_nc = tl.program_id(axis=0)
+    pid_h = tl.program_id(axis=1)
+    pid_w = tl.program_id(axis=2)
+
+    # Decompose pid_nc into (n, c)
+    n = pid_nc // C
+    c = pid_nc % C
+
+    # If pid_nc exceeds N*C (can happen if grid over-provisioned), just mask everything
+    valid_nc = n < N
+
+    h_start = pid_h * BLOCK_H
+    w_start = pid_w * BLOCK_W
+
+    offs_h = h_start + tl.arange(0, BLOCK_H)
+    offs_w = w_start + tl.arange(0, BLOCK_W)
+
+    hh = offs_h[:, None]
+    ww = offs_w[None, :]
+
+    # Output indices
+    h_out_idx = hh
+    w_out_idx = ww
+
+    mask_o = (h_out_idx < H_out) & (w_out_idx < W_out) & valid_nc
+
+    # Compute top-left input index for each output location
+    h_in0 = h_out_idx * stride - padding
+    w_in0 = w_out_idx * stride - padding
+
+    # Base pointer offset for (n, c, 0, 0)
+    base_nc = (n * C + c) * H * W
+
+    acc = tl.zeros((BLOCK_H, BLOCK_W), dtype=tl.float32)
+
+    # Convolution over kernel window
+    for kh in range(0, KERNEL_SIZE):
+        for kw in range(0, KERNEL_SIZE):
+            h_in = h_in0 + kh * dilation
+            w_in = w_in0 + kw * dilation
+
+            in_bounds = (h_in >= 0) & (h_in < H) & (w_in >= 0) & (w_in < W) & mask_o
+
+            idx_in = base_nc + h_in * W + w_in
+            x = tl.load(x_ptr + idx_in, mask=in_bounds, other=0.0)
+
+            w_idx = c * (KERNEL_SIZE * KERNEL_SIZE) + kh * KERNEL_SIZE + kw
+            w_val = tl.load(w_ptr + w_idx)
+
+            acc += x * w_val
+
+    if HAS_BIAS:
+        b_val = tl.load(b_ptr + c)
+        acc += b_val
+
+    out_idx = ((n * C + c) * H_out + h_out_idx) * W_out + w_out_idx
+    tl.store(y_ptr + out_idx, acc, mask=mask_o)
+
+
+def depthwise_conv2d_triton(x, weight, bias, stride: int, padding: int, dilation: int):
+    """
+    x:       [N, C, H, W]
+    weight:  [C, 1, K, K] (depthwise)
+    bias:    [C] or None
+    """
+    assert x.is_cuda and weight.is_cuda
+    N, C, H, W = x.shape
+    K = weight.shape[2]
+
+    # Compute output spatial size (PyTorch Conv2d formula)
+    H_out = (H + 2 * padding - dilation * (K - 1) - 1) // stride + 1
+    W_out = (W + 2 * padding - dilation * (K - 1) - 1) // stride + 1
+
+    y = torch.empty((N, C, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    BLOCK_H = 16
+    BLOCK_W = 16
+    HAS_BIAS = bias is not None
+
+    grid = (
+        N * C,
+        triton.cdiv(H_out, BLOCK_H),
+        triton.cdiv(W_out, BLOCK_W),
+    )
+
+    depthwise_conv2d_kernel[grid](
+        x,
+        weight,
+        bias if HAS_BIAS else x,  # dummy pointer when no bias
+        y,
+        N,
+        C,
+        H,
+        W,
+        H_out,
+        W_out,
+        stride,
+        padding,
+        dilation,
+        KERNEL_SIZE=K,
+        HAS_BIAS=HAS_BIAS,
+        BLOCK_H=BLOCK_H,
+        BLOCK_W=BLOCK_W,
+    )
+    return y
+
+
+@triton.jit
+def pointwise_conv1x1_kernel(
+    x_ptr,   # float32[N, C_IN, H, W]
+    w_ptr,   # float32[C_OUT, C_IN, 1, 1] treated as [C_OUT, C_IN]
+    b_ptr,   # float32[C_OUT] or dummy
+    y_ptr,   # float32[N, C_OUT, H, W]
+    N, H, W,
+    C_OUT,
+    C_IN: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # Treat as matmul: [M, K] @ [K, C_OUT] -> [M, C_OUT]
+    # where M = N * H * W, K = C_IN
+    M = N * H * W
+
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    m_mask = offs_m < M
+    n_mask = offs_n < C_OUT
+
+    # Decode m -> (n_idx, h_idx, w_idx)
+    HW = H * W
+    n_idx = offs_m // HW
+    rem = offs_m % HW
+    h_idx = rem // W
+    w_idx = rem % W
+
+    n_idx_mat = n_idx[:, None]
+    h_idx_mat = h_idx[:, None]
+    w_idx_mat = w_idx[:, None]
+    n_out_mat = offs_n[None, :]
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # K-loop
+    for k0 in range(0, C_IN, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+        k_mask = offs_k < C_IN
+
+        # Load A tile: [BLOCK_M, BLOCK_K] from x
+        k_mat = offs_k[None, :]
+        idx_a = ((n_idx_mat * C_IN + k_mat) * H + h_idx_mat) * W + w_idx_mat
+        mask_a = m_mask[:, None] & k_mask[None, :]
+        a = tl.load(x_ptr + idx_a, mask=mask_a, other=0.0)
+
+        # Load B tile: [BLOCK_K, BLOCK_N] from w (treated as [K, C_OUT] with stride_K=1, stride_N=C_IN)
+        k_col = offs_k[:, None]
+        n_col = offs_n[None, :]
+        idx_b = k_col + n_col * C_IN
+        mask_b = k_mask[:, None] & n_mask[None, :]
+        b = tl.load(w_ptr + idx_b, mask=mask_b, other=0.0)
+
+        acc += tl.dot(a, b, allow_tf32=True)
+
+    if HAS_BIAS:
+        bias = tl.load(b_ptr + offs_n, mask=n_mask, other=0.0)
+        acc += bias[None, :]
+
+    # Store result to y: [N, C_OUT, H, W]
+    idx_out = ((n_idx_mat * C_OUT + n_out_mat) * H + h_idx_mat) * W + w_idx_mat
+    mask_out = m_mask[:, None] & n_mask[None, :]
+    tl.store(y_ptr + idx_out, acc, mask=mask_out)
+
+
+def pointwise_conv1x1_triton(x, weight, bias):
+    """
+    x:       [N, C_IN, H, W]
+    weight:  [C_OUT, C_IN, 1, 1]
+    bias:    [C_OUT] or None
+    """
+    assert x.is_cuda and weight.is_cuda
+    N, C_IN, H, W = x.shape
+    C_OUT = weight.shape[0]
+
+    y = torch.empty((N, C_OUT, H, W), device=x.device, dtype=x.dtype)
+
+    BLOCK_M = 64
+    BLOCK_N = 64
+    BLOCK_K = 32
+    HAS_BIAS = bias is not None
+
+    M = N * H * W
+    grid = (
+        triton.cdiv(M, BLOCK_M),
+        triton.cdiv(C_OUT, BLOCK_N),
+    )
+
+    pointwise_conv1x1_kernel[grid](
+        x,
+        weight,
+        bias if HAS_BIAS else x,  # dummy pointer when no bias
+        y,
+        N,
+        H,
+        W,
+        C_OUT,
+        C_IN=C_IN,
+        HAS_BIAS=HAS_BIAS,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+    )
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Depthwise-separable 2D convolution implemented with Triton kernels.
+    Matches the behavior of the reference PyTorch Model.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        stride: int = 1,
+        padding: int = 0,
+        dilation: int = 1,
+        bias: bool = False,
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+
+        # Keep Conv2d modules so state_dict is compatible with the original model.
+        self.depthwise = nn.Conv2d(
+            in_channels,
+            in_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            groups=in_channels,
+            bias=bias,
+        )
+        self.pointwise = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=1,
+            bias=bias,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Ensure tensors are on the same device as weights
+        x = x.to(self.depthwise.weight.device)
+
+        x = depthwise_conv2d_triton(
+            x,
+            self.depthwise.weight,
+            self.depthwise.bias,
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation,
+        )
+        x = pointwise_conv1x1_triton(
+            x,
+            self.pointwise.weight,
+            self.pointwise.bias,
+        )
+        return x

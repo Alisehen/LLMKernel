@@ -1,0 +1,264 @@
+Fix the Triton kernel errors. Generate correct code.
+
+## ERROR LOG
+```
+Traceback (most recent call last):
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 43, in wrapper
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 2192, in store
+    return _semantic.store(pointer, value, mask, boundary_check, cache_modifier, eviction_policy)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/semantic.py", line 1297, in store
+    return self._store_legacy(ptr, val, mask, boundary_check, cache, eviction)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/semantic.py", line 1253, in _store_legacy
+    raise ValueError("Value argument cannot be block type if pointer argument is not a block")
+ValueError: Value argument cannot be block type if pointer argument is not a block
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 555, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251228_121433_batch_range47to63_openai_deepseek/49_Max_reduction_over_a_dimension/code/kernel_20251228_122507.py", line 167, in forward
+    return triton_max_reduce(x, self.dim)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251228_121433_batch_range47to63_openai_deepseek/49_Max_reduction_over_a_dimension/code/kernel_20251228_122507.py", line 141, in triton_max_reduce
+    max_final_kernel[grid_final](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 419, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 733, in run
+    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 861, in _do_compile
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 300, in compile
+    module = src.make_ir(target, options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 80, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 31:4:
+    # Loop over partial blocks in chunks of BLOCK_B (compile-time constant)
+    for start in range(0, NUM_BLOCKS, BLOCK_B):
+        offs = start + tl.arange(0, BLOCK_B)
+        mask = offs < NUM_BLOCKS
+
+        vals = tl.load(row_ptr + offs * stride_pn, mask=mask, other=-float('inf'))
+        vals_f32 = vals.to(tl.float32)
+        block_max = tl.max(vals_f32, axis=0)
+        running_max = tl.maximum(running_max, block_max)
+
+    # Store result; Triton will cast to out_ptr dtype if needed
+    tl.store(out_ptr + pid_m, running_max)
+    ^
+Value argument cannot be block type if pointer argument is not a block
+```
+
+## Broken Code
+```python
+import torch, torch.nn as nn, triton, triton.language as tl
+
+
+@triton.jit
+def max_partial_kernel(
+    x_ptr,            # *f32 or *f16
+    partial_ptr,      # *same dtype as x
+    M, N,             # rows, reduction length
+    stride_xm, stride_xn,
+    stride_pm, stride_pn,
+    BLOCK_N: tl.constexpr,
+):
+    """
+    First-stage reduction: compute per-block maxima along the last dimension.
+    Grid:
+      axis 0: row index in [0, M)
+      axis 1: block index along N in [0, num_blocks)
+    """
+    pid_m = tl.program_id(axis=0)
+    pid_bn = tl.program_id(axis=1)
+
+    # Row pointer
+    x_row_ptr = x_ptr + pid_m * stride_xm
+
+    # Offsets within the reduction dimension for this block
+    offs_n = pid_bn * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask = offs_n < N
+
+    vals = tl.load(x_row_ptr + offs_n * stride_xn, mask=mask, other=-float('inf'))
+    block_max = tl.max(vals, axis=0)  # scalar
+
+    # Store partial max to [M, num_blocks]
+    partial_row_ptr = partial_ptr + pid_m * stride_pm
+    tl.store(partial_row_ptr + pid_bn * stride_pn, block_max)
+
+
+@triton.jit
+def max_final_kernel(
+    partial_ptr,      # *f32 or *f16
+    out_ptr,          # *same dtype as partial
+    M,                # number of rows
+    stride_pm, stride_pn,
+    NUM_BLOCKS: tl.constexpr,  # number of partial blocks per row
+    BLOCK_B: tl.constexpr,     # block width for final reduction
+):
+    """
+    Second-stage reduction: reduce partial maxima for each row into a single max.
+    Grid:
+      axis 0: row index in [0, M)
+    """
+    pid_m = tl.program_id(axis=0)
+    row_ptr = partial_ptr + pid_m * stride_pm
+
+    # Accumulator in FP32 for numeric robustness
+    running_max = tl.full((1,), -float('inf'), tl.float32)
+
+    # Loop over partial blocks in chunks of BLOCK_B (compile-time constant)
+    for start in range(0, NUM_BLOCKS, BLOCK_B):
+        offs = start + tl.arange(0, BLOCK_B)
+        mask = offs < NUM_BLOCKS
+
+        vals = tl.load(row_ptr + offs * stride_pn, mask=mask, other=-float('inf'))
+        vals_f32 = vals.to(tl.float32)
+        block_max = tl.max(vals_f32, axis=0)
+        running_max = tl.maximum(running_max, block_max)
+
+    # Store result; Triton will cast to out_ptr dtype if needed
+    tl.store(out_ptr + pid_m, running_max)
+
+
+def triton_max_reduce(x: torch.Tensor, dim: int) -> torch.Tensor:
+    """
+    High-performance max reduction along an arbitrary dimension using Triton.
+    Equivalent to torch.max(x, dim=dim)[0].
+    """
+    assert x.is_cuda, "Input tensor must be on CUDA device for Triton kernel"
+
+    ndim = x.dim()
+    if ndim == 0:
+        # Scalar: max over no dimension is itself (PyTorch doesn't support dim on scalars)
+        return x
+
+    dim = dim if dim >= 0 else dim + ndim
+    if not (0 <= dim < ndim):
+        raise ValueError(f"Invalid dim={dim} for tensor of dim {ndim}")
+
+    # If there are no elements or the outer volume is zero, fall back to PyTorch
+    if x.numel() == 0:
+        return torch.max(x, dim=dim)[0]
+
+    # Move the reduction dimension to the last axis, keeping others in order
+    # perm = [all dims except 'dim'] + [dim]
+    perm = [i for i in range(ndim) if i != dim] + [dim]
+    x_perm = x.permute(perm).contiguous()
+
+    # Make it 2D: [M, N] where N is the reduction length
+    N = x_perm.shape[-1]
+    if N == 0:
+        # PyTorch raises for reduction over empty dimension; defer to it
+        return torch.max(x, dim=dim)[0]
+
+    M = x_perm.numel() // N
+    if M == 0:
+        # Nothing to compute, rely on PyTorch semantics
+        return torch.max(x, dim=dim)[0]
+
+    x_2d = x_perm.view(M, N)
+
+    # Strides for row-major [M, N]
+    stride_xm = x_2d.stride(0)
+    stride_xn = x_2d.stride(1)
+
+    # First-stage: partial maxima along N in blocks of BLOCK_N
+    BLOCK_N = 256
+    num_blocks = triton.cdiv(N, BLOCK_N)
+
+    partial = torch.empty((M, num_blocks), device=x.device, dtype=x.dtype)
+    stride_pm = partial.stride(0)
+    stride_pn = partial.stride(1)
+
+    grid_partial = lambda meta: (M, num_blocks)
+    max_partial_kernel[grid_partial](
+        x_2d,
+        partial,
+        M,
+        N,
+        stride_xm,
+        stride_xn,
+        stride_pm,
+        stride_pn,
+        BLOCK_N=BLOCK_N,
+        num_warps=4,
+    )
+
+    # Second-stage: reduce partial maxima across num_blocks
+    out_flat = torch.empty((M,), device=x.device, dtype=x.dtype)
+    NUM_BLOCKS = num_blocks
+    BLOCK_B = 256
+
+    grid_final = lambda meta: (M,)
+    max_final_kernel[grid_final](
+        partial,
+        out_flat,
+        M,
+        stride_pm,
+        stride_pn,
+        NUM_BLOCKS=NUM_BLOCKS,
+        BLOCK_B=BLOCK_B,
+        num_warps=4,
+    )
+
+    # Reshape back to original output shape: original tensor with `dim` removed
+    out_shape = x_perm.shape[:-1]
+    out = out_flat.view(*out_shape)
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized model that performs Max reduction over a specific dimension.
+    """
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_max_reduce(x, self.dim)
+```
+
+## CRITICAL — These cause 60%+ of failures:
+1. EVERY kernel function MUST have `@triton.jit` decorator — MANDATORY
+2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+3. BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+4. `tl.program_id(axis)` only supports axis = 0, 1, 2
+5. No `continue`, `break`, `return` inside loops — use masking
+6. No tensor indexing with loop vars: `x[:, i]` is INVALID
+7. mask shape MUST match data shape in tl.load/tl.store
+
+## Missing Triton Functions (implement manually):
+- tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+## OUTPUT FORMAT (STRICT):
+1. Imports: torch, torch.nn, triton, triton.language as tl (and math if needed)
+2. @triton.jit decorated kernel function(s)
+3. Wrapper function(s) for grid calculation and kernel launch
+4. class ModelNew(nn.Module) — REQUIRED
+
+Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <corrected code>
+```

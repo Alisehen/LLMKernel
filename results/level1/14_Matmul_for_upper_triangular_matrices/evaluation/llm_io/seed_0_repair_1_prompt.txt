@@ -1,0 +1,171 @@
+Fix the Triton kernel errors. Generate correct code.
+
+## ERROR LOG
+```
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 644, in compare_and_bench
+    raise ValueError(
+ValueError: Outputs are not close (atol=1, rtol=1). max_abs_err=nan, mean_abs_err=nan
+```
+
+## Broken Code
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def matmul_triu_kernel(
+    A_ptr, B_ptr, C_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # Program ids for 2D launch grid
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+
+    # Block indices
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Create accumulator in FP32 for better precision
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Loop over K dimension
+    k = 0
+    while k < K:
+        # Current K offsets
+        k_offsets = k + offs_k
+
+        # Pointers for A and B tiles
+        a_ptrs = A_ptr + (offs_m[:, None] * stride_am + k_offsets[None, :] * stride_ak)
+        b_ptrs = B_ptr + (k_offsets[:, None] * stride_bk + offs_n[None, :] * stride_bn)
+
+        # Masks for loads
+        a_mask = (offs_m[:, None] < M) & (k_offsets[None, :] < K)
+        b_mask = (k_offsets[:, None] < K) & (offs_n[None, :] < N)
+
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+        # Matrix multiply accumulation
+        acc += tl.dot(a, b, allow_tf32=True)
+
+        k += BLOCK_K
+
+    # Compute global row/col indices
+    row_idx = offs_m[:, None]
+    col_idx = offs_n[None, :]
+
+    # Mask for valid output elements and upper triangular (including diagonal)
+    out_mask = (row_idx < M) & (col_idx < N) & (col_idx >= row_idx)
+
+    # Store result; automatic cast to output dtype
+    c_ptrs = C_ptr + row_idx * stride_cm + col_idx * stride_cn
+    tl.store(c_ptrs, acc, mask=out_mask)
+
+
+def triton_matmul_triu(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    """
+    Compute torch.triu(A @ B) using a high-performance Triton kernel.
+
+    A: (M, K)
+    B: (K, N)
+    Returns: (M, N) upper-triangular result.
+    """
+    assert A.dim() == 2 and B.dim() == 2, "Only 2D matrices are supported"
+    assert A.size(1) == B.size(0), "Incompatible matrix dimensions"
+
+    # Ensure same device and dtype, and contiguous layout
+    assert A.device == B.device, "A and B must be on the same device"
+    assert A.is_cuda, "Triton matmul requires CUDA tensors"
+
+    A_mat = A.contiguous()
+    B_mat = B.contiguous()
+
+    M, K = A_mat.shape
+    Kb, N = B_mat.shape
+    assert K == Kb
+
+    C = torch.empty((M, N), device=A_mat.device, dtype=A_mat.dtype)
+
+    # Strides (row-major)
+    stride_am, stride_ak = A_mat.stride()
+    stride_bk, stride_bn = B_mat.stride()
+    stride_cm, stride_cn = C.stride()
+
+    BLOCK_M = 128
+    BLOCK_N = 128
+    BLOCK_K = 32
+
+    grid = lambda meta: (
+        max(1, triton.cdiv(M, meta["BLOCK_M"])),
+        max(1, triton.cdiv(N, meta["BLOCK_N"])),
+    )
+
+    matmul_triu_kernel[grid](
+        A_mat,
+        B_mat,
+        C,
+        M,
+        N,
+        K,
+        stride_am,
+        stride_ak,
+        stride_bk,
+        stride_bn,
+        stride_cm,
+        stride_cn,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        num_warps=8,
+        num_stages=4,
+    )
+
+    return C
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-accelerated model computing C = triu(A @ B) for square matrices.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, A, B):
+        return triton_matmul_triu(A, B)
+```
+
+## CRITICAL — These cause 60%+ of failures:
+1. EVERY kernel function MUST have `@triton.jit` decorator — MANDATORY
+2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+3. BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+4. `tl.program_id(axis)` only supports axis = 0, 1, 2
+5. No `continue`, `break`, `return` inside loops — use masking
+6. No tensor indexing with loop vars: `x[:, i]` is INVALID
+7. mask shape MUST match data shape in tl.load/tl.store
+
+## Missing Triton Functions (implement manually):
+- tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+## OUTPUT FORMAT (STRICT):
+1. Imports: torch, torch.nn, triton, triton.language as tl (and math if needed)
+2. @triton.jit decorated kernel function(s)
+3. Wrapper function(s) for grid calculation and kernel launch
+4. class ModelNew(nn.Module) — REQUIRED
+
+Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <corrected code>
+```

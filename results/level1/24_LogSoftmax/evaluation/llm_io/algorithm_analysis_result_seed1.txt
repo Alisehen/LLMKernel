@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The Triton implementation is ~27% slower than PyTorch and performs an extra full read pass over the large 2D tensor.",
+  "bottleneck": "The current design uses two kernels and three full reads of the (batch, dim) matrix (max kernel + two passes inside logsoftmax kernel), making it strongly memory-bandwidth bound and incurring extra kernel launch and row_max buffer traffic.",
+  "optimisation method": "Replace the separate row_max kernel + naive sum-exp pass with a single-kernel, online log-sum-exp algorithm per row that computes both the row maximum and logsumexp in one streaming pass, leaving only one additional pass to form the outputs.",
+  "modification plan": "Write a single Triton kernel that, for each row, first performs one loop over columns using an online log-sum-exp recurrence (maintaining running row_max and a scaled sum in registers) to obtain the final logsumexp without needing a prior row_max pass. Then perform a second loop over columns that reloads x, computes y = x - logsumexp, and stores to y_ptr. Remove the row_max kernel and row_max buffer entirely so the overall algorithm does only two global read passes and one write pass per row instead of three reads and one write.",
+  "expected_speedup": "30-40%"
+}

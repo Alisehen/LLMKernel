@@ -1,0 +1,10 @@
+```json
+{
+  "worth_optimizing": "yes",
+  "reason": "The current implementation uses atomic-based partial reductions across chunks and two separate kernels, which leaves significant room to cut synchronization and memory traffic with a better reduction algorithm.",
+  "bottleneck": "Per-(N,C) statistics are computed via many atomic_add operations across NUM_CHUNKS and a separate normalization kernel, causing high contention on atomics, extra global memory traffic for intermediate sums, and two kernel launches over the full tensor.",
+  "optimisation method": "Replace the two-kernel, atomic-based partial-sum scheme with a single-kernel, block-per-instance reduction using a numerically stable algorithm (e.g., Welford) that first reduces over S in-kernel and then immediately normalizes, eliminating atomics and the intermediate sum buffers.",
+  "modification plan": "Launch one Triton program per (N*C) row with sufficient BLOCK_SIZE, and iterate over S in a loop inside the kernel to compute mean and variance using Welford or a standard parallel reduction in registers/SMEM, without atomics. After the reduction, broadcast mean and inv_std to the same block and perform a second in-kernel sweep over S to normalize x and write y, so the entire instance norm is done in a single kernel (two passes over x, but no global atomics or separate stats kernel). Adjust BLOCK_SIZE and loop stride to maintain coalesced loads over the flattened S dimension and ensure good occupancy.",
+  "expected_speedup": "20-30%"
+}
+```

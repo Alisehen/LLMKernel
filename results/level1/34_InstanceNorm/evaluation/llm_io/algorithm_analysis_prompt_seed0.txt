@@ -1,0 +1,208 @@
+You are a GPU kernel optimization architect. Analyze the kernel and identify **ONE high-level algorithmic optimization**.
+
+# PyTorch Reference
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs Instance Normalization.
+    """
+    def __init__(self, num_features: int):
+        """
+        Initializes the InstanceNorm layer.
+
+        Args:
+            num_features (int): Number of features in the input tensor.
+        """
+        super(Model, self).__init__()
+        self.inorm = nn.InstanceNorm2d(num_features=num_features)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies Instance Normalization to the input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, num_features, height, width).
+
+        Returns:
+            torch.Tensor: Output tensor with Instance Normalization applied, same shape as input.
+        """
+        return self.inorm(x)
+
+batch_size = 112  # heavier workload
+features = 64
+dim1 = 512
+dim2 = 512
+
+def get_inputs():
+    x = torch.rand(batch_size, features, dim1, dim2)
+    return [x]
+
+def get_init_inputs():
+    return [features]
+```
+
+# Current Triton Kernel
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def instance_norm_2d_kernel(
+    x_ptr,         # *fp32
+    y_ptr,         # *fp32
+    inv_hw,        # scalar float32 = 1.0 / (H * W)
+    eps,           # scalar float32
+    HW: tl.constexpr,          # H * W, compile-time for specialization
+    BLOCK_SIZE: tl.constexpr,  # number of elements processed per step
+):
+    pid = tl.program_id(axis=0)
+    base = pid * HW
+
+    # First pass: compute sum and sum of squares over spatial dimensions
+    sum_vec = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+    sum_sq_vec = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+
+    for off in range(0, HW, BLOCK_SIZE):
+        idx = off + tl.arange(0, BLOCK_SIZE)
+        mask = idx < HW
+
+        x = tl.load(x_ptr + base + idx, mask=mask, other=0.0)
+        x_f32 = x.to(tl.float32)
+
+        sum_vec += x_f32
+        sum_sq_vec += x_f32 * x_f32
+
+    total_sum = tl.sum(sum_vec, axis=0)
+    total_sq = tl.sum(sum_sq_vec, axis=0)
+
+    mean = total_sum * inv_hw
+    var = total_sq * inv_hw - mean * mean
+    rstd = 1.0 / tl.sqrt(var + eps)
+
+    # Second pass: normalize and store
+    for off in range(0, HW, BLOCK_SIZE):
+        idx = off + tl.arange(0, BLOCK_SIZE)
+        mask = idx < HW
+
+        x = tl.load(x_ptr + base + idx, mask=mask, other=0.0)
+        x_f32 = x.to(tl.float32)
+
+        y = (x_f32 - mean) * rstd
+        tl.store(y_ptr + base + idx, y, mask=mask)
+
+
+def triton_instance_norm_2d(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+    assert x.is_cuda, "Triton kernel requires CUDA tensor"
+    x = x.contiguous()
+    N, C, H, W = x.shape
+    HW = H * W
+    NC = N * C
+
+    y = torch.empty_like(x)
+    inv_hw = 1.0 / float(HW)
+
+    BLOCK_SIZE = 256
+
+    grid = lambda meta: (max(1, NC),)
+
+    instance_norm_2d_kernel[grid](
+        x, y,
+        inv_hw,
+        eps,
+        HW=HW,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=8,
+    )
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    InstanceNorm2d implemented with a high-performance Triton kernel on CUDA.
+    Falls back to PyTorch's InstanceNorm2d for non-CUDA or unsupported dtypes.
+    """
+    def __init__(self, num_features: int):
+        super().__init__()
+        # PyTorch InstanceNorm2d for fallback (CPU / non-fp32 / non-contiguous)
+        self.inorm = nn.InstanceNorm2d(num_features=num_features)
+        self.eps = self.inorm.eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Fast Triton path: CUDA, float32, contiguous NCHW
+        if x.is_cuda and x.dtype == torch.float32 and x.is_contiguous():
+            return triton_instance_norm_2d(x, eps=self.eps)
+        # Fallback to PyTorch implementation otherwise
+        return self.inorm(x)
+```
+
+# Performance
+- **PyTorch baseline**: 32.91 ms
+- **Current Triton**: 33.61 ms
+- **Current speedup**: 0.98x (-2.1% vs baseline)
+
+
+---
+
+## Analysis Steps
+
+1. **Code Analysis**: Count kernels, identify operations, check for inefficiencies
+2. **Performance Diagnosis**: Use metrics/latency to identify bottleneck type
+3. **Root Cause**: Combine code + performance to find the core issue
+
+## Optimization Categories (pick ONE if worth optimizing):
+
+### 1. Operator Fusion
+Fuse consecutive ops into fewer kernels to reduce memory traffic and launch overhead.
+
+### 2. Algorithm Replacement
+Replace naive algorithm with optimized variant.
+- For Attention: Flash Attention, online softmax
+- For Convolution: Winograd, im2col
+- **For RNN/GRU/LSTM**: Persistent kernel with HYBRID computation
+  - **CRITICAL**: Use hybrid approach for best performance:
+    * Precompute input-side gates ONCE (outside kernel): `gates_x = (T*B, In) @ W_ih`
+    * Persistent kernel (inside): only recurrent-side: `for t: gates_h = h @ W_hh`
+  - Time loop `for t in range(T)` must be inside kernel, NOT in Python
+  - Launch kernel once per layer, not once per timestep
+  - Expected speedup: 10-100x (vs per-timestep launches)
+
+### 3. Kernel Launch Reduction
+Combine multiple small kernels to reduce overhead.
+- **For RNN/GRU/LSTM**: See "Algorithm Replacement" above for persistent kernel approach
+
+### 4. Memory Layout Optimization
+Use in-place operations, buffer reuse, or better layouts.
+
+## Should We Optimize?
+
+Before proposing optimization, determine if it's worthwhile:
+- **Not worth optimizing** if:
+  - Code is already near-optimal (expected speedup < 10%)
+  - Bottleneck cannot be addressed (hardware limited, already optimal algorithm)
+  - Optimization would add significant complexity with minimal gain
+
+- **Worth optimizing** if:
+  - Clear algorithmic inefficiency exists (multiple kernels, suboptimal algorithm)
+  - Expected speedup >= 20%
+  - Concrete optimization path available
+
+## Output (JSON)
+
+```json
+{
+  "worth_optimizing": "yes/no",
+  "reason": "<Why worth or not worth optimizing, 1 sentence>",
+  "bottleneck": "<Root cause in 1-2 sentences, empty if not worth optimizing>",
+  "optimisation method": "<Specific optimization in 1-2 sentences, empty if not worth optimizing>",
+  "modification plan": "<Implementation steps in 2-3 sentences, empty if not worth optimizing>",
+  "expected_speedup": "<e.g., '30-40%', empty if not worth optimizing>"
+}
+```
+
+Return JSON only.

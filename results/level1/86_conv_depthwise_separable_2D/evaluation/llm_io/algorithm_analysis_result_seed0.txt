@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The Triton implementation is 2× slower than the PyTorch baseline and performs a full extra global-memory round trip between depthwise and pointwise stages.",
+  "bottleneck": "Depthwise and pointwise convolutions are executed as two separate kernels with an intermediate tensor [N, C, H, W] written to and read from global memory, causing high memory bandwidth usage and launch overhead relative to the amount of compute.",
+  "optimisation method": "Fuse the depthwise and pointwise convolutions into a single Triton kernel that directly accumulates depthwise results into the pointwise outputs, keeping intermediate per-channel depthwise results in registers/shared memory instead of writing them to global memory.",
+  "modification plan": "Write a single fused kernel that iterates over output tiles in (N, H_out, W_out, C_OUT), and for each ci-tile: (1) compute the depthwise 3×3 convolution for those ci for the current spatial tile, (2) immediately multiply these depthwise results by the corresponding pointwise weights and accumulate into co registers. Organize loops as `for ci_tile` over C_IN with BLOCK_K, performing both depthwise accumulation and pointwise dot-product in one pass, and eliminate the intermediate tensor and its associated kernel launch.",
+  "expected_speedup": "40-70% vs current Triton (likely matching or modestly exceeding the PyTorch baseline for this configuration)"
+}

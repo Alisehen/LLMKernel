@@ -1,0 +1,244 @@
+You are optimizing a Triton kernel based on algorithmic analysis.
+
+# PyTorch Reference (Target Behavior)
+
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs a single matrix multiplication (C = A * B) with a large K dimension
+    """
+    def __init__(self):
+        super(Model, self).__init__()
+    
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        """
+        Performs matrix multiplication of A and B.
+
+        Args:
+            A: Input tensor of shape (M, K)
+            B: Input tensor of shape (K, N)
+
+        Returns:
+            Output tensor of shape (M, N)
+        """
+        return torch.matmul(A, B)
+
+M = 256
+N = 256
+K = 131072 * 4
+
+def get_inputs():
+    A = torch.rand(M, K)
+    B = torch.rand(K, N)
+    return [A, B]
+
+def get_init_inputs():
+    return []  # No special initialization inputs needed
+```
+
+**CRITICAL**: Study the PyTorch code carefully to understand:
+- What does `forward()` return? (full output sequence vs final hidden state only)
+- What is the computational pattern?
+- What are the input/output shapes?
+
+Your optimized kernel MUST match this exact behavior.
+
+---
+
+# Analysis Results
+
+**Bottleneck**: The kernel maps work only over the (M, N) tile grid and processes the enormous K dimension serially inside each program, yielding very few concurrent programs (e.g., ~4 blocks) and extremely long inner loops over K, which leads to poor occupancy and latency-bound execution.
+
+**Optimization Strategy**: Introduce a split-K (parallel-K) matmul algorithm: shard the large K dimension across multiple programs per (M, N) tile so that many more Triton programs run in parallel and then reduce their partial results, instead of a single long serial loop over K in each program.
+
+**Implementation Plan**: Add a third program_id axis (e.g., pid_k) to partition K into K_splits chunks; each kernel instance only loops over its assigned K slice and accumulates a partial C tile. Then either (1) use atomic_add on C to accumulate partial tiles from different pid_k slices, or (2) write partial results to a temporary workspace (C_partial[pid_k, m, n]) and launch a small follow-up reduction kernel over the split-K dimension. Autotune over K_splits together with BLOCK_M/N/K to balance per-program work and overall occupancy for this large-K, small-M/N regime.
+
+**Expected Speedup**: 300-500%
+
+---
+
+# Current Kernel (needs optimization)
+
+```python
+import torch, torch.nn as nn, triton, triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=3,
+        ),
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32},
+            num_warps=8,
+            num_stages=3,
+        ),
+        triton.Config(
+            {'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_warps=8,
+            num_stages=3,
+        ),
+        triton.Config(
+            {'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64},
+            num_warps=8,
+            num_stages=4,
+        ),
+    ],
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def matmul_kernel(
+    A_ptr, B_ptr, C_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr,  # power-of-2
+    BLOCK_N: tl.constexpr,  # power-of-2
+    BLOCK_K: tl.constexpr,  # power-of-2
+):
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    offs_m_broadcast = offs_m[:, None]
+    offs_n_broadcast = offs_n[None, :]
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    k_range = tl.arange(0, BLOCK_K)
+
+    for k_start in range(0, K, BLOCK_K):
+        offs_k = k_start + k_range
+
+        a_ptrs = A_ptr + offs_m_broadcast * stride_am + offs_k[None, :] * stride_ak
+        b_ptrs = B_ptr + offs_k[:, None] * stride_bk + offs_n_broadcast * stride_bn
+
+        a_mask = (offs_m_broadcast < M) & (offs_k[None, :] < K)
+        b_mask = (offs_k[:, None] < K) & (offs_n_broadcast < N)
+
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+        acc += tl.dot(a, b, allow_tf32=True)
+
+    c_ptrs = C_ptr + offs_m_broadcast * stride_cm + offs_n_broadcast * stride_cn
+    c_mask = (offs_m_broadcast < M) & (offs_n_broadcast < N)
+
+    tl.store(c_ptrs, acc, mask=c_mask)
+
+
+def triton_matmul(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    """
+    High-performance Triton matmul: C = A @ B
+    A: (M, K), B: (K, N)
+    """
+    assert A.dim() == 2 and B.dim() == 2, "Inputs must be 2D matrices"
+    M, K = A.shape
+    Kb, N = B.shape
+    assert K == Kb, "Inner dimensions must match for matmul"
+
+    orig_device = A.device
+    # Compute on CUDA for Triton; move if necessary
+    if orig_device.type != "cuda":
+        A = A.to("cuda")
+        B = B.to("cuda")
+    else:
+        # Ensure both on same CUDA device
+        if B.device != orig_device:
+            B = B.to(orig_device)
+
+    A = A.contiguous()
+    B = B.contiguous()
+
+    C = torch.empty((M, N), device=A.device, dtype=A.dtype)
+
+    stride_am, stride_ak = A.stride()
+    stride_bk, stride_bn = B.stride()
+    stride_cm, stride_cn = C.stride()
+
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta['BLOCK_M']),
+            triton.cdiv(N, meta['BLOCK_N']),
+        )
+
+    matmul_kernel[grid](
+        A, B, C,
+        M, N, K,
+        stride_am, stride_ak,
+        stride_bk, stride_bn,
+        stride_cm, stride_cn,
+    )
+
+    if orig_device.type != "cuda":
+        C = C.to(orig_device)
+    return C
+
+
+class ModelNew(nn.Module):
+    """
+    Simple model that performs a single matrix multiplication (C = A * B) with a large K dimension,
+    implemented with a high-performance Triton kernel.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        return triton_matmul(A, B)
+```
+
+---
+
+# Your Task
+
+Implement the optimization strategy above. Focus on the specific bottleneck identified.
+
+## Key Requirements
+
+1. **Preserve correctness**: Maintain the same input/output behavior
+2. **Apply the optimization**: Follow the implementation plan exactly
+3. **Use valid Triton syntax**:
+   - Every kernel MUST have `@triton.jit` decorator
+   - Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+   - BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+   - No `continue`, `break`, `return` inside kernels (use masking)
+   - Prefer `tl.dot(a, b, allow_tf32=True)` for matmul operations
+
+4. **CRITICAL for RNN/GRU/LSTM Persistent Kernels**:
+   - Time loop MUST be inside @triton.jit kernel, NOT in Python forward()
+   - **HYBRID computation strategy** (CRITICAL for performance):
+     * Precompute input-side gates OUTSIDE kernel: `gates_x = (T*B, In) @ W_ih` (ONE large GEMM)
+     * INSIDE kernel: only recurrent-side: `for t: gates_h = h @ W_hh` (T small GEMMs)
+   - CORRECT (FAST - use this):
+     ```python
+     # Python forward():
+     gates_x_all = x.reshape(T*B, In) @ W_ih + b_ih  # ONE large GEMM
+     gates_x_all = gates_x_all.view(T, B, 3*H)
+     gru_persistent_kernel[grid](gates_x_all, h0, W_hh, ...)  # Launch ONCE
+
+     @triton.jit
+     def gru_persistent_kernel(gates_x_ptr, h_ptr, W_hh_ptr, ...):
+         for t in range(T):  # Inside kernel
+             gates_x_t = tl.load(gates_x_ptr + t*...)  # Precomputed
+             gates_h = h @ W_hh  # Only recurrent GEMM
+             h = (1-z)*n + z*h   # Fuse and update
+     ```
+
+5. **Output format**:
+   - Imports: `import torch, torch.nn as nn, triton, triton.language as tl`
+   - `@triton.jit` kernel(s)
+   - Wrapper function(s)
+   - `class ModelNew(nn.Module)` — REQUIRED
+   - NO testing code, NO `if __name__ == "__main__"`
+
+---
+
+Generate the optimized kernel now. Output ONLY the complete Python code.

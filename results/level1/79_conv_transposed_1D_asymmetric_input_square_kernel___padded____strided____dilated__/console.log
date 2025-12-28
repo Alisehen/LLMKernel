@@ -1,0 +1,114 @@
+[Seed] Generating seed kernel...
+[Seed 1/2] Generating...
+[92mFinish reason: stop[0m
+Usage: In=1395, Out=7388, Total=8783
+[seed_0] score=0.5255 (baseline=5.1294ms)
+[seed_0] metrics saved to: /home/hyc/LLMKernel/run/20251228_121522_batch_range75to79_openai_deepseek/79_conv_transposed_1D_asymmetric_input_square_kernel___padded____strided____dilated__/evaluation/eval_0020.json
+[Seed 1] Final score: 0.5255 ✓
+[Seed 2/2] Generating...
+[92mFinish reason: stop[0m
+Usage: In=1395, Out=12000, Total=13395
+[seed_1] score=0.2092 (baseline=5.1294ms)
+[seed_1] metrics saved to: /home/hyc/LLMKernel/run/20251228_121522_batch_range75to79_openai_deepseek/79_conv_transposed_1D_asymmetric_input_square_kernel___padded____strided____dilated__/evaluation/eval_0021.json
+[Seed 2] Final score: 0.2092 ✓
+
+================================================================================
+[Hybrid Strategy] Analyzing all seeds for algorithmic optimization...
+[Hybrid Strategy] - 2 seed(s) with score < 1.0 (rescue)
+================================================================================
+
+[Hybrid] Seed 1: score=0.5255 < 1.0
+[Hybrid] Attempting algorithm analysis rescue...
+[ncu] Using GPU device 1 (CUDA_VISIBLE_DEVICES=1)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_2994922.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_2994922.py /home/hyc/LLMKernel/KernelBench/select2/79_conv_transposed_1D_asymmetric_input_square_kernel___padded____strided____dilated__.py /home/hyc/LLMKernel/run/20251228_121522_batch_range75to79_openai_deepseek/79_conv_transposed_1D_asymmetric_input_square_kernel___padded____strided____dilated__/code/test_kernel_analysis_seed0.py --repeat 1
+[ncu stdout]: [bench] Completed 1 iterations successfully
+
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_2994922.csv
+[Hybrid] Requesting LLM analysis for seed 1...
+[92mFinish reason: stop[0m
+Usage: In=2627, Out=1082, Total=3709
+[Hybrid] Worth optimizing: yes
+[Hybrid] Reason: The custom Triton kernel is about 2x slower than the cuDNN-backed PyTorch ConvTranspose1d, indicating a clear algorithmic inefficiency.
+[Hybrid] Analysis complete for seed 1, generating optimized kernel...
+[Hybrid] Bottleneck: Each program instance performs a naive per-output accumulation over all C_IN and...
+[Hybrid] Optimization: Replace the direct nested (C_IN, K) loops with a GEMM-style algorithm by re-expr...
+[Hybrid] Expected speedup: 2-3x over the current Triton kernel, bringing performance to at least parity and likely modestly faster than the PyTorch/cuDNN baseline.
+[92mFinish reason: stop[0m
+Usage: In=3070, Out=6639, Total=9709
+[algorithm_optimized_seed0] score=0.9809 (baseline=5.1294ms)
+[algorithm_optimized_seed0] metrics saved to: /home/hyc/LLMKernel/run/20251228_121522_batch_range75to79_openai_deepseek/79_conv_transposed_1D_asymmetric_input_square_kernel___padded____strided____dilated__/evaluation/eval_0022.json
+[Hybrid] ✓ Rescue successful: 0.5255 → 0.9809
+
+[Hybrid] Seed 2: score=0.2092 < 1.0
+[Hybrid] Attempting algorithm analysis rescue...
+[ncu] Using GPU device 1 (CUDA_VISIBLE_DEVICES=1)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_2994922.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_2994922.py /home/hyc/LLMKernel/KernelBench/select2/79_conv_transposed_1D_asymmetric_input_square_kernel___padded____strided____dilated__.py /home/hyc/LLMKernel/run/20251228_121522_batch_range75to79_openai_deepseek/79_conv_transposed_1D_asymmetric_input_square_kernel___padded____strided____dilated__/code/test_kernel_analysis_seed1.py --repeat 1
+[ncu stdout]: [bench] Completed 1 iterations successfully
+
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_2994922.csv
+[Hybrid] Requesting LLM analysis for seed 2...
+[92mFinish reason: stop[0m
+Usage: In=2790, Out=1655, Total=4445
+[Hybrid] Worth optimizing: yes
+[Hybrid] Reason: The current kernel is ~5x slower than PyTorch and spends a lot of work on per-element index math and masking instead of dense math, so there is clear headroom.
+[Hybrid] Analysis complete for seed 2, generating optimized kernel...
+[Hybrid] Bottleneck: The kernel computes each output position independently with nested loops over Ci...
+[Hybrid] Optimization: Replace the direct index-based transposed convolution with an im2col/GEMM-style ...
+[Hybrid] Expected speedup: 3-6x
+[92mFinish reason: stop[0m
+Usage: In=3148, Out=10005, Total=13153
+[algorithm_optimized_seed1] score=1.8914 (baseline=5.1294ms)
+[algorithm_optimized_seed1] metrics saved to: /home/hyc/LLMKernel/run/20251228_121522_batch_range75to79_openai_deepseek/79_conv_transposed_1D_asymmetric_input_square_kernel___padded____strided____dilated__/evaluation/eval_0023.json
+[Hybrid] ✓ Rescue successful: 0.2092 → 1.8914
+
+================================================================================
+[Hybrid] Candidate Selection
+================================================================================
+[Hybrid] Total candidates: 4
+  [1] seed 1: 0.5255
+  [2] seed 2: 0.2092
+  [3] algo-optimized (from seed 1): 0.9809
+  [4] algo-optimized (from seed 2): 1.8914
+
+[Hybrid] ★ Selected best candidate: score=1.8914
+
+[Optimization] Starting 3-stage optimization...
+
+================================================================================
+[Stage 1/2] grid_and_parallel
+Description: Optimize grid layout and parallel work distribution across SMs.
+Current candidates: 1, best score: 1.8914
+================================================================================
+[Stage 1] Profiling best candidate...
+[ncu] Using GPU device 1 (CUDA_VISIBLE_DEVICES=1)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_2994922.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_2994922.py /home/hyc/LLMKernel/KernelBench/select2/79_conv_transposed_1D_asymmetric_input_square_kernel___padded____strided____dilated__.py /home/hyc/LLMKernel/run/20251228_121522_batch_range75to79_openai_deepseek/79_conv_transposed_1D_asymmetric_input_square_kernel___padded____strided____dilated__/code/test_kernel_analysis_seed1.py --repeat 1
+[ncu stdout]: [bench] Completed 1 iterations successfully
+
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_2994922.csv
+[Stage 1] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=3306, Out=5043, Total=8349
+[stage1_grid_and_parallel] score=1.7988 (baseline=5.1294ms)
+[stage1_grid_and_parallel] metrics saved to: /home/hyc/LLMKernel/run/20251228_121522_batch_range75to79_openai_deepseek/79_conv_transposed_1D_asymmetric_input_square_kernel___padded____strided____dilated__/evaluation/eval_0024.json
+  Optimized kernel score: 1.7988 ✓
+[Stage 1] Current: 1.7988 (global best: 1.8914)
+
+================================================================================
+[Stage 2/2] block_tiling
+Description: Tune BLOCK_M/N/K sizes for optimal register/memory balance.
+Current candidates: 1, best score: 1.8914
+================================================================================
+[Stage 2] Profiling best candidate...
+[ncu] Using GPU device 1 (CUDA_VISIBLE_DEVICES=1)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_2994922.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_2994922.py /home/hyc/LLMKernel/KernelBench/select2/79_conv_transposed_1D_asymmetric_input_square_kernel___padded____strided____dilated__.py /home/hyc/LLMKernel/run/20251228_121522_batch_range75to79_openai_deepseek/79_conv_transposed_1D_asymmetric_input_square_kernel___padded____strided____dilated__/code/test_kernel_analysis_seed1.py --repeat 1
+[ncu stdout]: [bench] Completed 1 iterations successfully
+
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_2994922.csv
+[Stage 2] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=3044, Out=5120, Total=8164
+[stage2_block_tiling] score=1.8141 (baseline=5.1294ms)
+[stage2_block_tiling] metrics saved to: /home/hyc/LLMKernel/run/20251228_121522_batch_range75to79_openai_deepseek/79_conv_transposed_1D_asymmetric_input_square_kernel___padded____strided____dilated__/evaluation/eval_0025.json
+  Optimized kernel score: 1.8141 ✓
+[Stage 2] Current: 1.8141 (global best: 1.8914)
+[79_conv_transposed_1D_asymmetric_input_square_kernel___padded____strided____dilated__.py] Figure saved to: /home/hyc/LLMKernel/run/20251228_121522_batch_range75to79_openai_deepseek/79_conv_transposed_1D_asymmetric_input_square_kernel___padded____strided____dilated__/figures/79_conv_transposed_1D_asymmetric_input_square_kernel___padded____strided____dilated___score.png

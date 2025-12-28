@@ -1,0 +1,107 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        # Smaller tile for small N, good cache behavior, fewer masked threads
+        triton.Config({"BLOCK_SIZE": 64}, num_warps=2, num_stages=2),
+        # Baseline / general-purpose tile
+        triton.Config({"BLOCK_SIZE": 128}, num_warps=4, num_stages=2),
+        # Larger tile for very wide rows, better memory throughput
+        triton.Config({"BLOCK_SIZE": 256}, num_warps=4, num_stages=2),
+    ],
+    key=["N"],  # autotune based on row length
+)
+@triton.jit
+def _scale_matrix_scalar_kernel(
+    A_ptr,  # *const T
+    C_ptr,  # *T
+    s,      # scalar
+    B,      # int32: number of rows (flattened batch)
+    N,      # int32: number of columns (last-dim size)
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Kernel: C[b, n] = A[b, n] * s
+    2D grid:
+        pid_b = program_id(0) in [0, B)
+        pid_n = program_id(1) in [0, ceil_div(N, BLOCK_SIZE))
+    Each program processes a 1D tile along the last dimension.
+    """
+    pid_b = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    # Offsets along the last dimension
+    offs_n = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+
+    # Row start index in the flattened buffer
+    row_start = pid_b * N
+
+    # Global indices into the flattened tensors
+    idx = row_start + offs_n
+
+    # Guard against out-of-bounds in the last dimension
+    # (pid_b is always in-bounds since grid(0) == B and B > 0)
+    mask = offs_n < N
+
+    a = tl.load(A_ptr + idx, mask=mask, other=0.0)
+    c = a * s
+    tl.store(C_ptr + idx, c, mask=mask)
+
+
+def scale_matrix_scalar_triton(A: torch.Tensor, s: float) -> torch.Tensor:
+    """
+    High-throughput Triton implementation of C = A * s for arbitrary-shaped,
+    contiguous tensors. Uses a 2D grid over (flattened batch, last dimension).
+    """
+    assert A.is_cuda, "Input must be on CUDA device"
+    # Handle degenerate/empty tensors via PyTorch to avoid 0-sized grid launches
+    if A.numel() == 0:
+        return A * s
+
+    # Ensure contiguous layout for coalesced memory access
+    A_contig = A.contiguous()
+    total_elems = A_contig.numel()
+    last_dim = A_contig.shape[-1]
+    B = total_elems // last_dim  # flattened batch size
+    N = last_dim
+
+    # Output tensor
+    C = torch.empty_like(A_contig)
+
+    # Grid: 2D over (batch, last-dim tiles)
+    def grid(meta):
+        return (
+            B,
+            triton.cdiv(N, meta["BLOCK_SIZE"]),
+        )
+
+    # Cast scalar to Python float; Triton will cast to tensor dtype
+    s_scalar = float(s)
+
+    _scale_matrix_scalar_kernel[grid](
+        A_contig,
+        C,
+        s_scalar,
+        B,
+        N,
+    )
+
+    # Reshape back to original shape
+    return C.view_as(A)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs matrix-scalar multiplication (C = A * s)
+    using a high-throughput Triton kernel with 2D grid parallelism.
+    """
+
+    def __init__(self):
+        super(ModelNew, self).__init__()
+
+    def forward(self, A: torch.Tensor, s: float) -> torch.Tensor:
+        return scale_matrix_scalar_triton(A, s)

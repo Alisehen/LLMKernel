@@ -1,0 +1,107 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def l2norm_fused_kernel(
+    x_ptr,              # *f32 / *f16, [B, D]
+    y_ptr,              # *f32 / *f16, [B, D]
+    stride_x_batch,     # int32
+    stride_x_dim,       # int32
+    stride_y_batch,     # int32
+    stride_y_dim,       # int32
+    D: tl.constexpr,    # number of columns (dim=1), compile-time for this specialization
+    BLOCK_SIZE: tl.constexpr,  # columns per tile, power-of-2
+):
+    pid_batch = tl.program_id(axis=0)
+
+    # Pointers to the start of this row in x and y
+    row_x_ptr = x_ptr + pid_batch * stride_x_batch
+    row_y_ptr = y_ptr + pid_batch * stride_y_batch
+
+    # ----------------------------------------
+    # 1) Compute sum of squares for this row
+    # ----------------------------------------
+    acc = tl.zeros((), dtype=tl.float32)
+
+    NUM_TILES = (D + BLOCK_SIZE - 1) // BLOCK_SIZE
+
+    for tile in range(0, NUM_TILES):
+        col_start = tile * BLOCK_SIZE
+        offs = col_start + tl.arange(0, BLOCK_SIZE)
+        mask = offs < D
+
+        x = tl.load(row_x_ptr + offs * stride_x_dim, mask=mask, other=0.0)
+        x_f32 = x.to(tl.float32)
+        acc += tl.sum(x_f32 * x_f32, axis=0)
+
+    # L2 norm (no epsilon to match torch.norm behavior)
+    norm = tl.sqrt(acc)
+
+    # ----------------------------------------
+    # 2) Normalize the row by its L2 norm
+    # ----------------------------------------
+    for tile in range(0, NUM_TILES):
+        col_start = tile * BLOCK_SIZE
+        offs = col_start + tl.arange(0, BLOCK_SIZE)
+        mask = offs < D
+
+        x = tl.load(row_x_ptr + offs * stride_x_dim, mask=mask, other=0.0)
+        x_f32 = x.to(tl.float32)
+        y = (x_f32 / norm).to(x.dtype)
+
+        tl.store(row_y_ptr + offs * stride_y_dim, y, mask=mask)
+
+
+def triton_l2norm(x: torch.Tensor) -> torch.Tensor:
+    """
+    L2-normalize each row of a 2D tensor [B, D] using a single fused Triton kernel.
+    The output has the same dtype and device as the input.
+    """
+    assert x.ndim == 2, "Input must be 2D tensor [batch, dim]"
+    if not x.is_cuda:
+        raise ValueError("Input tensor must be on CUDA device for Triton kernels.")
+
+    B, D = x.shape
+    if B == 0 or D == 0:
+        # Degenerate case: nothing to normalize
+        return x.clone()
+
+    y = torch.empty_like(x)
+
+    stride_x_batch, stride_x_dim = x.stride()
+    stride_y_batch, stride_y_dim = y.stride()
+
+    BLOCK_SIZE = 256  # power-of-2, good trade-off for large D
+
+    grid = lambda meta: (B,)
+
+    l2norm_fused_kernel[grid](
+        x,
+        y,
+        stride_x_batch,
+        stride_x_dim,
+        stride_y_batch,
+        stride_y_dim,
+        D=D,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=8,
+        num_stages=2,
+    )
+
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized model that performs L2 normalization along dim=1,
+    matching `x / torch.norm(x, p=2, dim=1, keepdim=True)`.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_l2norm(x)

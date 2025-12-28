@@ -1,50 +1,37 @@
 You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
 
-# Target GPU
-GPU Name: 4090
-Architecture: Ada Lovelace
-• Compute Capability: 8.9
-• Number of SMs: 128
-• Memory Bandwidth: 1008 GB/s
-• TF32 Tensor Core TFLOPS: 82.6 with dense
-• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
-• FP16 Tensor Core TFLOPS: 165.2 with dense
-• Maximum number of registers per thread: 255
-• Maximum threads per block: 1024
-• Maximum threads per SM: 1536
-• Warp size: 32
-• Maximum concurrent warps per SM: 48
-• Shared memory capacity per SM: 100 KB
-• Maximum shared memory per thread block: 99 KB
-• L2 cache (global, all SM shared): 72 MB
+# Target GPU: 4090
 
 [OPTIMIZATION STAGE]
 
 ## Current Optimization Stage
 
-**Focus**: Optimize grid layout and parallel work distribution.
+Focus: Grid layout & parallelism.
 
-**NCU Metrics**:
-• `sm__throughput.avg.pct_of_peak_sustained_elapsed` (target >60%)
-• `launch__grid_size` (primarily determined by grid mapping)
+Metrics:
+- sm__throughput.avg.pct_of_peak_sustained_elapsed (>60%)
+- launch__grid_size
 
-**Guidelines**:
-- 1D → `(cdiv(N, BLOCK))`
-- 2D → `(cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))`
-- 3D (batch×M×N) → `(batch, cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))`
-- 4D+ → flatten **independent parallel dims** to 3D
-- Prefer batch / head / expert parallelism when available, before shrinking BLOCK sizes
+Rules:
+- 1D: (cdiv(N, BLOCK))
+- 2D: (cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))
+- 3D: (batch, cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))
+- >3D: flatten ONLY independent dims
+- Prefer batch / head / expert / group parallelism before shrinking BLOCK
+- For grouped operations: ensure group dimension is in grid (e.g., program_id(2) for groups)
 - Change grid only if SM utilization is clearly low
-- Ensure `grid = (...)` matches `tl.program_id(axis)` logic
 
-**Safety Rules**:
-- Max 3 grid dimensions; grid rank must be static
-- If unsure about correctness, do not modify grid
+Safety:
+- Max 3 grid dims, static rank
+- grid=(G0,G1,G2) must match tl.program_id(0/1/2)
+- For grouped ops: verify group indexing is correct
+- If unsure about correctness, do NOT change grid
 
-**Autotune (safe)**:
-- Autotune **either** BLOCK_* **or** (`num_warps`, `num_stages`)
-- If BLOCK_* are autotuned, use `grid = lambda META: (...)` with `META["BLOCK_*"]`
-- Never redefine BLOCK_* in both configs and launch
+Autotune:
+- Autotune either BLOCK_* OR (num_warps, num_stages)
+- If autotuning BLOCK_*, use grid=lambda META: (...)
+- Never redefine BLOCK_* in both kernel and launch
+- Max 2-3 configs to reduce compilation time
 
 
 
@@ -55,213 +42,149 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
-@triton.jit
-def softmax_max_kernel(
-    x_ptr,
-    max_ptr,
-    stride_x0,
-    stride_x1,
-    n_rows,
-    n_cols,
-    BLOCK_SIZE: tl.constexpr,
-):
-    """Compute max along dim=1 for 2D tensor."""
-    row_idx = tl.program_id(0)
-    
-    if row_idx >= n_rows:
-        return
-    
-    row_start_ptr = x_ptr + row_idx * stride_x0
-    row_max = float('-inf')
-    
-    col_offsets = tl.arange(0, BLOCK_SIZE)
-    for block_start in range(0, n_cols, BLOCK_SIZE):
-        col_indices = block_start + col_offsets
-        mask = col_indices < n_cols
-        
-        ptrs = row_start_ptr + col_indices * stride_x1
-        x_block = tl.load(ptrs, mask=mask, other=float('-inf'))
-        row_max = tl.maximum(row_max, tl.max(x_block, axis=0))
-    
-    tl.store(max_ptr + row_idx, row_max)
 
 @triton.jit
-def softmax_exp_sum_kernel(
-    x_ptr,
-    max_ptr,
-    sum_ptr,
-    stride_x0,
-    stride_x1,
-    n_rows,
-    n_cols,
+def softmax_row_kernel_streaming(
+    x_ptr,           # *f32/f16/bf16, input [M, N]
+    y_ptr,           # same type as x, output [M, N]
+    stride_row,      # row stride for x/y
+    stride_col,      # col stride for x/y (usually 1)
+    n_cols,          # N
     BLOCK_SIZE: tl.constexpr,
 ):
-    """Compute sum of exp(x - max) along dim=1."""
-    row_idx = tl.program_id(0)
-    
-    if row_idx >= n_rows:
-        return
-    
-    row_max = tl.load(max_ptr + row_idx)
-    row_start_ptr = x_ptr + row_idx * stride_x0
-    
+    # One program per row
+    pid = tl.program_id(axis=0)
+    row_start_x = x_ptr + pid * stride_row
+    row_start_y = y_ptr + pid * stride_row
+
+    offsets = tl.arange(0, BLOCK_SIZE)
+
+    # -------------------------------------------------------------------------
+    # Pass 1: online (streaming) numerically-stable softmax statistics
+    #         Compute row_max and row_sum in a single sweep over the row.
+    # -------------------------------------------------------------------------
+    row_max = -float("inf")
     row_sum = 0.0
-    
-    col_offsets = tl.arange(0, BLOCK_SIZE)
-    for block_start in range(0, n_cols, BLOCK_SIZE):
-        col_indices = block_start + col_offsets
-        mask = col_indices < n_cols
-        
-        ptrs = row_start_ptr + col_indices * stride_x1
-        x_block = tl.load(ptrs, mask=mask, other=0.0)
-        shifted = x_block - row_max
-        exp_block = tl.exp(shifted)
-        
-        row_sum += tl.sum(exp_block, axis=0)
-    
-    tl.store(sum_ptr + row_idx, row_sum)
 
-@triton.jit
-def softmax_final_kernel(
-    x_ptr,
-    max_ptr,
-    sum_ptr,
-    output_ptr,
-    stride_x0,
-    stride_x1,
-    stride_out0,
-    stride_out1,
-    n_rows,
-    n_cols,
-    BLOCK_SIZE: tl.constexpr,
-):
-    """Compute final softmax: exp(x - max) / sum."""
-    row_idx = tl.program_id(0)
-    
-    if row_idx >= n_rows:
-        return
-    
-    row_max = tl.load(max_ptr + row_idx)
-    row_sum = tl.load(sum_ptr + row_idx)
-    
-    row_start_x = x_ptr + row_idx * stride_x0
-    row_start_out = output_ptr + row_idx * stride_out0
-    
-    inv_sum = 1.0 / (row_sum + 1e-8)
-    
-    col_offsets = tl.arange(0, BLOCK_SIZE)
-    for block_start in range(0, n_cols, BLOCK_SIZE):
-        col_indices = block_start + col_offsets
-        mask = col_indices < n_cols
-        
-        x_ptrs = row_start_x + col_indices * stride_x1
-        x_block = tl.load(x_ptrs, mask=mask, other=0.0)
-        
-        shifted = x_block - row_max
-        exp_block = tl.exp(shifted)
-        output_block = exp_block * inv_sum
-        
-        out_ptrs = row_start_out + col_indices * stride_out1
-        tl.store(out_ptrs, output_block, mask=mask)
+    for col_start in range(0, n_cols, BLOCK_SIZE):
+        cols = col_start + offsets
+        mask = cols < n_cols
 
-def triton_softmax(x: torch.Tensor) -> torch.Tensor:
+        x = tl.load(row_start_x + cols * stride_col,
+                    mask=mask,
+                    other=-float("inf"))
+        x = x.to(tl.float32)
+
+        # Max over this block
+        block_max = tl.max(x, axis=0)
+
+        # New global max for the row
+        new_row_max = tl.maximum(row_max, block_max)
+
+        # Rescale old sum to the new max and add contributions from this block
+        scale = tl.exp(row_max - new_row_max)
+        shifted = x - new_row_max
+        exp_shifted = tl.exp(shifted)
+        block_exp_sum = tl.sum(exp_shifted, axis=0)
+
+        row_sum = row_sum * scale + block_exp_sum
+        row_max = new_row_max
+
+    # -------------------------------------------------------------------------
+    # Pass 2: compute final softmax values using the finalized row_max/row_sum
+    # -------------------------------------------------------------------------
+    inv_row_sum = 1.0 / row_sum
+
+    for col_start in range(0, n_cols, BLOCK_SIZE):
+        cols = col_start + offsets
+        mask = cols < n_cols
+
+        x = tl.load(row_start_x + cols * stride_col,
+                    mask=mask,
+                    other=-float("inf"))
+        x_f32 = x.to(tl.float32)
+
+        out = tl.exp(x_f32 - row_max) * inv_row_sum
+
+        # Cast back to original dtype
+        out = out.to(x.dtype)
+        tl.store(row_start_y + cols * stride_col, out, mask=mask)
+
+
+def triton_softmax_dim1(x: torch.Tensor) -> torch.Tensor:
     """
-    Softmax along dim=1 using Triton kernels.
-    Memory-efficient three-stage approach.
+    Softmax over dim=1 for a 2D tensor using a highly optimized Triton kernel.
+    Matches torch.softmax(x, dim=1).
     """
-    output = torch.empty_like(x)
-    batch_size, n_cols = x.shape
-    
-    # Small intermediate tensors only
-    max_vals = torch.empty(batch_size, dtype=x.dtype, device=x.device)
-    row_sums = torch.empty(batch_size, dtype=x.dtype, device=x.device)
-    
-    # Choose block size based on column dimension
-    BLOCK_SIZE = 1024 if n_cols % 1024 == 0 else 512
-    
-    grid = (batch_size,)
-    
-    # 1. Compute max per row
-    softmax_max_kernel[grid](
-        x, max_vals,
-        x.stride(0), x.stride(1),
-        batch_size, n_cols,
-        BLOCK_SIZE=BLOCK_SIZE
+    assert x.dim() == 2, "Input must be 2D (batch_size, num_features)"
+    x = x.contiguous()
+    M, N = x.shape
+
+    y = torch.empty_like(x)
+
+    stride_row, stride_col = x.stride()
+    BLOCK_SIZE = 256  # power-of-two, good trade-off for large N
+
+    # One program per row
+    grid = lambda meta: (triton.cdiv(M, 1),)
+
+    softmax_row_kernel_streaming[grid](
+        x,
+        y,
+        stride_row,
+        stride_col,
+        N,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=8,
+        num_stages=2,
     )
-    
-    # 2. Compute sum of exp per row
-    softmax_exp_sum_kernel[grid](
-        x, max_vals, row_sums,
-        x.stride(0), x.stride(1),
-        batch_size, n_cols,
-        BLOCK_SIZE=BLOCK_SIZE
-    )
-    
-    # 3. Compute final softmax
-    softmax_final_kernel[grid](
-        x, max_vals, row_sums, output,
-        x.stride(0), x.stride(1),
-        output.stride(0), output.stride(1),
-        batch_size, n_cols,
-        BLOCK_SIZE=BLOCK_SIZE
-    )
-    
-    return output
+    return y
+
 
 class ModelNew(nn.Module):
     """
-    Simple model that performs a Softmax activation using optimized Triton kernels.
+    Triton-accelerated model performing softmax over dim=1.
+    Behavior matches torch.softmax(x, dim=1).
     """
     def __init__(self):
         super().__init__()
-    
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Applies Softmax activation to the input tensor along dim=1.
-
-        Args:
-            x (torch.Tensor): Input tensor of shape (batch_size, num_features).
-
-        Returns:
-            torch.Tensor: Output tensor with Softmax applied, same shape as input.
-        """
-        return triton_softmax(x)
+        return triton_softmax_dim1(x)
 ```
 
 [NCU PROFILING METRICS]
 {
-  "softmax_max_kernel": {
-    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 8.41,
+  "softmax_row_kernel_streaming": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 41.1,
     "launch__grid_size": 4096,
-    "sm__warps_active.avg.pct_of_peak_sustained_active": 92.56,
-    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 96.46,
-    "lts__t_sector_hit_rate.pct": 0.01
-  },
-  "softmax_exp_sum_kernel": {
-    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 8.42,
-    "launch__grid_size": 4096,
-    "sm__warps_active.avg.pct_of_peak_sustained_active": 92.59,
-    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 96.5,
-    "lts__t_sector_hit_rate.pct": 0.01
-  },
-  "softmax_final_kernel": {
-    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 2.73,
-    "launch__grid_size": 4096,
-    "sm__warps_active.avg.pct_of_peak_sustained_active": 91.99,
-    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 88.8,
-    "lts__t_sector_hit_rate.pct": 50.0
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 96.15,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 84.67,
+    "lts__t_sector_hit_rate.pct": 33.33
   }
 }
 
 **Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
 
-OUTPUT RULES (STRICT):
-1. Follow this exact order:
-   1. Imports: torch, torch.nn, triton, triton.language as tl
-   2. @triton.jit decorated kernel function(s)
-   3. Wrapper function(s) for grid calculation and kernel launch
-   4. class ModelNew(nn.Module) that calls your kernels
-2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+## CRITICAL — Code MUST compile and run:
+1. EVERY kernel function MUST have `@triton.jit` decorator
+2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+3. BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+4. `tl.program_id(axis)` only supports axis = 0, 1, 2
+5. No `continue`, `break`, `return` inside loops — use masking
+6. No tensor indexing with loop vars: `x[:, i]` is INVALID
+7. mask shape MUST match data shape in tl.load/tl.store
+
+## Missing Triton Functions (implement manually):
+- tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+## OUTPUT FORMAT (STRICT):
+1. Imports: torch, torch.nn, triton, triton.language as tl
+2. @triton.jit decorated kernel function(s)
+3. Wrapper function(s) for grid calculation and kernel launch
+4. class ModelNew(nn.Module) that calls your kernels
+
+Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
 
 ```python
 # <optimized Triton code>

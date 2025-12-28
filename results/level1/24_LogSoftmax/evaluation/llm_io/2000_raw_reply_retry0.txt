@@ -1,0 +1,162 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def log_softmax_kernel(
+    x_ptr,
+    y_ptr,
+    stride_xm,
+    stride_xn,
+    stride_ym,
+    stride_yn,
+    M,
+    N,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid_m = tl.program_id(axis=0)
+    row_mask = pid_m < M
+
+    # Base pointers for this row (may be out-of-range if row_mask is False,
+    # but all loads/stores will be masked accordingly).
+    row_x_ptr = x_ptr + pid_m * stride_xm
+    row_y_ptr = y_ptr + pid_m * stride_ym
+
+    offsets = tl.arange(0, BLOCK_SIZE)
+    n_cols = N
+
+    # ---------------------------------------------
+    # Pass 1: streaming, numerically stable log-sum-exp
+    # ---------------------------------------------
+    col = 0
+    m = -float("inf")  # running max
+    s = 0.0            # running "scaled" sum (see below)
+
+    # We maintain (m, s) such that:
+    #   sum(exp(x_i)) over processed elements = s * exp(m)
+    # For each block, we compute its own (block_max, block_sum), then merge.
+    while col < n_cols:
+        idx = col + offsets
+        mask = (idx < n_cols) & row_mask
+
+        x = tl.load(
+            row_x_ptr + idx * stride_xn,
+            mask=mask,
+            other=-float("inf"),
+        )
+
+        # Block-level log-sum-exp
+        block_max = tl.max(x, axis=0)  # scalar
+        exp_x = tl.exp(x - block_max)
+        block_sum = tl.sum(exp_x, axis=0)  # scalar
+
+        # Merge previous (m, s) with current block's (block_max, block_sum)
+        # Previous sum = s * exp(m)
+        # Block sum    = block_sum * exp(block_max)
+        # New m = max(m, block_max)
+        m_new = tl.maximum(m, block_max)
+        # Both exponents are <= 1, ensuring numerical stability.
+        prev_term = s * tl.exp(m - m_new)
+        block_term = block_sum * tl.exp(block_max - m_new)
+        s = prev_term + block_term
+        m = m_new
+
+        col += BLOCK_SIZE
+
+    # log_row_sum = log(sum_j exp(x_j)) = m + log(s)
+    log_row_sum = m + tl.log(s)
+
+    # ---------------------------------
+    # Pass 2: write log_softmax outputs
+    # ---------------------------------
+    col = 0
+    while col < n_cols:
+        idx = col + offsets
+        mask = (idx < n_cols) & row_mask
+
+        x = tl.load(
+            row_x_ptr + idx * stride_xn,
+            mask=mask,
+            other=0.0,
+        )
+        y = x - log_row_sum
+        tl.store(
+            row_y_ptr + idx * stride_yn,
+            y,
+            mask=mask,
+        )
+
+        col += BLOCK_SIZE
+
+
+def triton_log_softmax(x: torch.Tensor, dim: int = 1) -> torch.Tensor:
+    """
+    High-performance log_softmax using Triton.
+    Computes log_softmax over the specified dimension (must be the last dim).
+    """
+    if not x.is_cuda:
+        raise ValueError("Input tensor must be on CUDA device for Triton kernel.")
+
+    # Normalize dim to positive and ensure it's the last dimension
+    if dim < 0:
+        dim = x.ndim + dim
+    if dim != x.ndim - 1:
+        raise NotImplementedError(
+            "triton_log_softmax only supports softmax over the last dimension."
+        )
+
+    # Collapse all leading dimensions into a single batch dimension
+    orig_shape = x.shape
+    if len(orig_shape) == 0:
+        # Scalar: log_softmax is just 0
+        return torch.zeros_like(x)
+
+    batch = int(torch.prod(torch.tensor(orig_shape[:-1], device=x.device)).item())
+    n_cols = orig_shape[-1]
+
+    x_2d = x.contiguous().view(batch, n_cols)
+    y_2d = torch.empty_like(x_2d)
+
+    M, N = x_2d.shape
+    BLOCK_SIZE = 256  # power-of-2 per requirements
+
+    x_ptr = x_2d
+    y_ptr = y_2d
+
+    stride_xm, stride_xn = x_2d.stride()
+    stride_ym, stride_yn = y_2d.stride()
+
+    grid = lambda meta: (max(M, 1),)
+
+    log_softmax_kernel[grid](
+        x_ptr,
+        y_ptr,
+        stride_xm,
+        stride_xn,
+        stride_ym,
+        stride_yn,
+        M,
+        N,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=8,
+        num_stages=2,
+    )
+
+    return y_2d.view(orig_shape)
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized model that performs a LogSoftmax activation along a given dimension.
+    Matches the behavior of the reference PyTorch Model.
+    """
+    def __init__(self, dim: int = 1):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_log_softmax(x, dim=self.dim)
+```

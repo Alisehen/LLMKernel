@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The custom Triton reduction is over 3x slower than PyTorch, indicating a major inefficiency that can be addressed algorithmically via better memory layout.",
+  "bottleneck": "Each program instance reduces along the R dimension using a large stride (stride_r = inner = 4095), causing highly non-coalesced global memory loads and poor memory bandwidth utilization compared to PyTorch’s optimized reduction.",
+  "optimisation method": "Perform a layout transform so that the reduction dimension is contiguous (innermost) in memory before launching the Triton kernel, and then implement the kernel assuming stride_r = 1 to load contiguous blocks along the reduction axis.",
+  "modification plan": "In triton_sum_keepdim, first permute the input so that the reduction dimension moves to the last axis (e.g., via x_perm = x_contiguous.permute(..., dim, ... -> ..., -1)), then call .contiguous() and reshape to (outer, inner, R) where R is now the innermost and contiguous. Adjust the kernel to index as base_in = x_ptr + b*stride_b + n*stride_n and ptrs = base_in + r_offsets (i.e., no large stride_r), and keep the same reduction logic but over contiguous ranges. Finally, permute the output back to the original dimension order (with keepdim=True) so that the external API remains unchanged.",
+  "expected_speedup": "200-300%"
+}

@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The kernel is ~6x slower than cuBLAS for a tall-K GEMM, and the current launch scheme leaves most SMs idle.",
+  "bottleneck": "All work over the huge K dimension (K=524288) is done serially inside each program, and the grid only tiles over M and N (2x2 tiles for 128x128), so you have very few programs running and extremely low parallelism/occupancy while each program iterates over ~16K BLOCK_K steps.",
+  "optimisation method": "Introduce a split-K parallelization scheme: partition the K dimension across multiple independent programs (3D launch grid over M, N, and K-splits), have each program compute a partial C tile over its K slice, then reduce partial tiles (e.g., via atomic adds into C or a separate reduction kernel).",
+  "modification plan": "Add a third grid dimension pid_k corresponding to a split_K factor (e.g., 8–32); in the kernel, adjust the K-loop to cover only the [pid_k * K_chunk, (pid_k+1) * K_chunk) range and accumulate into a local partial accumulator. For the writeback, either store into an intermediate buffer C_partial[pid_k, :, :] and launch a second small Triton kernel that reduces along the split_K axis, or directly atomically add partial results into C to avoid the second kernel if contention is manageable. Tune split_K and BLOCK_K jointly to maximize active programs and memory throughput.",
+  "expected_speedup": "4-6x vs the current Triton kernel (bringing it close to or within ~20-30% of the PyTorch/cuBLAS baseline)."
+}

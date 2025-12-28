@@ -1,0 +1,295 @@
+You are optimizing a Triton kernel based on algorithmic analysis.
+
+# PyTorch Reference (Target Behavior)
+
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs Max reduction over a specific dimension.
+    """
+    def __init__(self, dim: int):
+        """
+        Initializes the model with the dimension to reduce over.
+
+        Args:
+            dim (int): The dimension to reduce over.
+        """
+        super(Model, self).__init__()
+        self.dim = dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies Max reduction over the specified dimension to the input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            torch.Tensor: Output tensor after Max reduction over the specified dimension.
+        """
+        return torch.max(x, dim=self.dim)[0]
+
+batch_size = 128
+dim1 = 4096
+dim2 = 4095
+
+def get_inputs():
+    x = torch.rand(batch_size, dim1, dim2)
+    return [x]
+
+def get_init_inputs():
+    return [1] # Example, change to desired dimension
+```
+
+**CRITICAL**: Study the PyTorch code carefully to understand:
+- What does `forward()` return? (full output sequence vs final hidden state only)
+- What is the computational pattern?
+- What are the input/output shapes?
+
+Your optimized kernel MUST match this exact behavior.
+
+---
+
+# Analysis Results
+
+**Bottleneck**: The call to `x.permute(...).contiguous()` materializes a full transposed copy of the input before reduction, and the reduction itself is done in two passes with an intermediate `partial` tensor, causing excessive global memory traffic and kernel launches compared to PyTorch’s single-pass, strided reduction.
+
+**Optimization Strategy**: Eliminate the explicit `contiguous()` transpose and two-stage reduction by implementing a single-pass max-reduction kernel that operates directly on the original tensor with arbitrary strides (i.e., reduce along `dim` using its stride, without reordering or copying data).
+
+**Implementation Plan**: Redesign the Triton kernel to take the full shape and per-dimension strides of `x` plus the reduction dimension `dim`, compute the logical index for each program instance, and iterate over that dimension using its stride to accumulate a max directly into the output tensor. Remove `permute(...).contiguous()` and the intermediate `partial` tensor; instead, launch one kernel where each program reduces one (or a small tile of) output elements across the reduction dimension in-register, then writes the final max to the correctly strided output. This keeps the data in-place, avoids the large copy, and collapses the reduction to a single global-memory pass similar to PyTorch’s optimized kernel.
+
+**Expected Speedup**: 400-600% (bringing performance to at least on par with, and likely modestly faster than, the PyTorch baseline for large tensors)
+
+---
+
+# Current Kernel (needs optimization)
+
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def max_partial_kernel(
+    x_ptr,            # *f32 or *f16
+    partial_ptr,      # *same dtype as x
+    M, N,             # rows, reduction length
+    stride_xm, stride_xn,
+    stride_pm, stride_pn,
+    BLOCK_N: tl.constexpr,
+):
+    """
+    First-stage reduction: compute per-block maxima along the last dimension.
+    Grid:
+      axis 0: row index in [0, M)
+      axis 1: block index along N in [0, num_blocks)
+    """
+    pid_m = tl.program_id(axis=0)
+    pid_bn = tl.program_id(axis=1)
+
+    if pid_m >= M:
+        return
+
+    # Row pointer
+    x_row_ptr = x_ptr + pid_m * stride_xm
+
+    # Offsets within the reduction dimension for this block
+    offs_n = pid_bn * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask = offs_n < N
+
+    vals = tl.load(x_row_ptr + offs_n * stride_xn, mask=mask, other=-float("inf"))
+    block_max = tl.max(vals, axis=0)  # scalar
+
+    # Store partial max to [M, num_blocks]
+    partial_row_ptr = partial_ptr + pid_m * stride_pm
+    tl.store(partial_row_ptr + pid_bn * stride_pn, block_max)
+
+
+@triton.jit
+def max_final_kernel(
+    partial_ptr,      # *f32 or *f16
+    out_ptr,          # *same dtype as partial
+    M,                # number of rows
+    stride_pm, stride_pn,
+    NUM_BLOCKS: tl.constexpr,  # number of partial blocks per row
+    BLOCK_B: tl.constexpr,     # block width for final reduction
+):
+    """
+    Second-stage reduction: reduce partial maxima for each row into a single max.
+    Grid:
+      axis 0: row index in [0, M)
+    """
+    pid_m = tl.program_id(axis=0)
+    if pid_m >= M:
+        return
+
+    row_ptr = partial_ptr + pid_m * stride_pm
+
+    # Accumulator in FP32 for numeric robustness; scalar (not block)
+    running_max = tl.full((), -float("inf"), tl.float32)
+
+    # Loop over partial blocks in chunks of BLOCK_B (compile-time constant)
+    for start in range(0, NUM_BLOCKS, BLOCK_B):
+        offs = start + tl.arange(0, BLOCK_B)
+        mask = offs < NUM_BLOCKS
+
+        vals = tl.load(row_ptr + offs * stride_pn, mask=mask, other=-float("inf"))
+        vals_f32 = vals.to(tl.float32)
+        block_max = tl.max(vals_f32, axis=0)  # scalar
+        running_max = tl.maximum(running_max, block_max)
+
+    # Store result; Triton will cast to out_ptr dtype if needed
+    tl.store(out_ptr + pid_m, running_max)
+
+
+def triton_max_reduce(x: torch.Tensor, dim: int) -> torch.Tensor:
+    """
+    High-performance max reduction along an arbitrary dimension using Triton.
+    Equivalent to torch.max(x, dim=dim)[0].
+    """
+    assert x.is_cuda, "Input tensor must be on CUDA device for Triton kernel"
+
+    ndim = x.dim()
+    if ndim == 0:
+        # Scalar: max over no dimension is itself (PyTorch doesn't support dim on scalars)
+        return x
+
+    dim = dim if dim >= 0 else dim + ndim
+    if not (0 <= dim < ndim):
+        raise ValueError(f"Invalid dim={dim} for tensor of dim {ndim}")
+
+    # If there are no elements or the outer volume is zero, fall back to PyTorch
+    if x.numel() == 0:
+        return torch.max(x, dim=dim)[0]
+
+    # Move the reduction dimension to the last axis, keeping others in order
+    perm = [i for i in range(ndim) if i != dim] + [dim]
+    x_perm = x.permute(perm).contiguous()
+
+    # Make it 2D: [M, N] where N is the reduction length
+    N = x_perm.shape[-1]
+    if N == 0:
+        # PyTorch raises for reduction over empty dimension; defer to it
+        return torch.max(x, dim=dim)[0]
+
+    M = x_perm.numel() // N
+    if M == 0:
+        # Nothing to compute, rely on PyTorch semantics
+        return torch.max(x, dim=dim)[0]
+
+    x_2d = x_perm.view(M, N)
+
+    # Strides for row-major [M, N]
+    stride_xm = x_2d.stride(0)
+    stride_xn = x_2d.stride(1)
+
+    # First-stage: partial maxima along N in blocks of BLOCK_N
+    BLOCK_N = 256  # power-of-2 as required
+    num_blocks = triton.cdiv(N, BLOCK_N)
+    num_blocks = max(num_blocks, 1)
+
+    partial = torch.empty((M, num_blocks), device=x.device, dtype=x.dtype)
+    stride_pm = partial.stride(0)
+    stride_pn = partial.stride(1)
+
+    grid_partial = lambda meta: (M, num_blocks)
+    max_partial_kernel[grid_partial](
+        x_2d,
+        partial,
+        M,
+        N,
+        stride_xm,
+        stride_xn,
+        stride_pm,
+        stride_pn,
+        BLOCK_N=BLOCK_N,
+        num_warps=4,
+    )
+
+    # Second-stage: reduce partial maxima across num_blocks
+    out_flat = torch.empty((M,), device=x.device, dtype=x.dtype)
+    NUM_BLOCKS = num_blocks
+    BLOCK_B = 256  # power-of-2 as required
+
+    grid_final = lambda meta: (M,)
+    max_final_kernel[grid_final](
+        partial,
+        out_flat,
+        M,
+        stride_pm,
+        stride_pn,
+        NUM_BLOCKS=NUM_BLOCKS,
+        BLOCK_B=BLOCK_B,
+        num_warps=4,
+    )
+
+    # Reshape back to original output shape: original tensor with `dim` removed
+    out_shape = x_perm.shape[:-1]
+    out = out_flat.view(*out_shape)
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized model that performs Max reduction over a specific dimension.
+    """
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_max_reduce(x, self.dim)
+```
+
+---
+
+# Your Task
+
+Implement the optimization strategy above. Focus on the specific bottleneck identified.
+
+## Key Requirements
+
+1. **Preserve correctness**: Maintain the same input/output behavior
+2. **Apply the optimization**: Follow the implementation plan exactly
+3. **Use valid Triton syntax**:
+   - Every kernel MUST have `@triton.jit` decorator
+   - Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+   - BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+   - No `continue`, `break`, `return` inside kernels (use masking)
+   - Prefer `tl.dot(a, b, allow_tf32=True)` for matmul operations
+
+4. **CRITICAL for RNN/GRU/LSTM Persistent Kernels**:
+   - Time loop MUST be inside @triton.jit kernel, NOT in Python forward()
+   - **HYBRID computation strategy** (CRITICAL for performance):
+     * Precompute input-side gates OUTSIDE kernel: `gates_x = (T*B, In) @ W_ih` (ONE large GEMM)
+     * INSIDE kernel: only recurrent-side: `for t: gates_h = h @ W_hh` (T small GEMMs)
+   - CORRECT (FAST - use this):
+     ```python
+     # Python forward():
+     gates_x_all = x.reshape(T*B, In) @ W_ih + b_ih  # ONE large GEMM
+     gates_x_all = gates_x_all.view(T, B, 3*H)
+     gru_persistent_kernel[grid](gates_x_all, h0, W_hh, ...)  # Launch ONCE
+
+     @triton.jit
+     def gru_persistent_kernel(gates_x_ptr, h_ptr, W_hh_ptr, ...):
+         for t in range(T):  # Inside kernel
+             gates_x_t = tl.load(gates_x_ptr + t*...)  # Precomputed
+             gates_h = h @ W_hh  # Only recurrent GEMM
+             h = (1-z)*n + z*h   # Fuse and update
+     ```
+
+5. **Output format**:
+   - Imports: `import torch, torch.nn as nn, triton, triton.language as tl`
+   - `@triton.jit` kernel(s)
+   - Wrapper function(s)
+   - `class ModelNew(nn.Module)` — REQUIRED
+   - NO testing code, NO `if __name__ == "__main__"`
+
+---
+
+Generate the optimized kernel now. Output ONLY the complete Python code.

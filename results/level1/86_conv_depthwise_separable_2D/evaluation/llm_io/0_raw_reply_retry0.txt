@@ -7,196 +7,245 @@ import triton.language as tl
 
 @triton.jit
 def depthwise_conv2d_kernel(
-    x_ptr,
-    w_ptr,
-    b_ptr,
-    out_ptr,
-    N,
-    C,
-    H,
-    W,
-    H_OUT,
-    W_OUT,
-    K_H,
-    K_W,
-    STRIDE_H,
-    STRIDE_W,
-    PAD_H,
-    PAD_W,
-    DIL_H,
-    DIL_W,
+    x_ptr,        # float32[N, C, H, W]
+    w_ptr,        # float32[C, 1, K, K] (treated as [C, K, K])
+    b_ptr,        # float32[C] or dummy
+    y_ptr,        # float32[N, C, H_out, W_out]
+    N, C, H, W,
+    H_out, W_out,
+    stride,
+    padding,
+    dilation,
+    KERNEL_SIZE: tl.constexpr,
     HAS_BIAS: tl.constexpr,
-    BLOCK_HW: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_W: tl.constexpr,
 ):
     pid_nc = tl.program_id(axis=0)
-    pid_hw = tl.program_id(axis=1)
+    pid_h = tl.program_id(axis=1)
+    pid_w = tl.program_id(axis=2)
 
-    if pid_nc >= N * C:
-        return
-
-    hw_total = H_OUT * W_OUT
-    hw_start = pid_hw * BLOCK_HW
-    hw_offsets = hw_start + tl.arange(0, BLOCK_HW)
-    mask_hw = hw_offsets < hw_total
-
-    w_out_idx = hw_offsets % W_OUT
-    h_out_idx = hw_offsets // W_OUT
-
+    # Decompose pid_nc into (n, c)
     n = pid_nc // C
     c = pid_nc % C
 
-    base_in_nc = (n * C + c) * H * W
-    base_out_nc = (n * C + c) * H_OUT * W_OUT
+    # If pid_nc exceeds N*C (can happen if grid over-provisioned), just mask everything
+    valid_nc = n < N
 
-    acc = tl.zeros([BLOCK_HW], dtype=tl.float32)
+    h_start = pid_h * BLOCK_H
+    w_start = pid_w * BLOCK_W
 
-    for kh in range(K_H):
-        in_h = h_out_idx * STRIDE_H + kh * DIL_H - PAD_H
-        valid_h = (in_h >= 0) & (in_h < H)
-        for kw in range(K_W):
-            in_w = w_out_idx * STRIDE_W + kw * DIL_W - PAD_W
-            valid_w = (in_w >= 0) & (in_w < W)
-            mask = mask_hw & valid_h & valid_w
+    offs_h = h_start + tl.arange(0, BLOCK_H)
+    offs_w = w_start + tl.arange(0, BLOCK_W)
 
-            input_offsets = base_in_nc + in_h * W + in_w
-            vals = tl.load(x_ptr + input_offsets, mask=mask, other=0.0)
-            vals = vals.to(tl.float32)
+    hh = offs_h[:, None]
+    ww = offs_w[None, :]
 
-            w_idx = c * K_H * K_W + kh * K_W + kw
-            weight = tl.load(w_ptr + w_idx).to(tl.float32)
+    # Output indices
+    h_out_idx = hh
+    w_out_idx = ww
 
-            acc += vals * weight
+    mask_o = (h_out_idx < H_out) & (w_out_idx < W_out) & valid_nc
+
+    # Compute top-left input index for each output location
+    h_in0 = h_out_idx * stride - padding
+    w_in0 = w_out_idx * stride - padding
+
+    # Base pointer offset for (n, c, 0, 0)
+    base_nc = (n * C + c) * H * W
+
+    acc = tl.zeros((BLOCK_H, BLOCK_W), dtype=tl.float32)
+
+    # Convolution over kernel window
+    for kh in range(0, KERNEL_SIZE):
+        for kw in range(0, KERNEL_SIZE):
+            h_in = h_in0 + kh * dilation
+            w_in = w_in0 + kw * dilation
+
+            in_bounds = (h_in >= 0) & (h_in < H) & (w_in >= 0) & (w_in < W) & mask_o
+
+            idx_in = base_nc + h_in * W + w_in
+            x = tl.load(x_ptr + idx_in, mask=in_bounds, other=0.0)
+
+            w_idx = c * (KERNEL_SIZE * KERNEL_SIZE) + kh * KERNEL_SIZE + kw
+            w_val = tl.load(w_ptr + w_idx)
+
+            acc += x * w_val
 
     if HAS_BIAS:
-        bias = tl.load(b_ptr + c).to(tl.float32)
-        acc += bias
+        b_val = tl.load(b_ptr + c)
+        acc += b_val
 
-    tl.store(out_ptr + base_out_nc + hw_offsets, acc, mask=mask_hw)
-
-
-@triton.jit
-def pointwise_conv2d_kernel(
-    x_ptr,
-    w_ptr,
-    b_ptr,
-    out_ptr,
-    N,
-    C_IN,
-    C_OUT,
-    H,
-    W,
-    HAS_BIAS: tl.constexpr,
-    BLOCK_OC: tl.constexpr,
-    BLOCK_HW: tl.constexpr,
-):
-    pid_oc = tl.program_id(axis=0)
-    pid_hw = tl.program_id(axis=1)
-
-    hw_total = N * H * W
-    hw_start = pid_hw * BLOCK_HW
-    hw_offsets = hw_start + tl.arange(0, BLOCK_HW)
-    mask_hw = hw_offsets < hw_total
-
-    HW = H * W
-    plane_offsets = hw_offsets % HW
-    n_offsets = hw_offsets // HW
-
-    for oc_inner in tl.static_range(BLOCK_OC):
-        oc = pid_oc * BLOCK_OC + oc_inner
-        if oc >= C_OUT:
-            continue
-
-        acc = tl.zeros([BLOCK_HW], dtype=tl.float32)
-        for c in range(C_IN):
-            weight = tl.load(w_ptr + oc * C_IN + c).to(tl.float32)
-            input_offsets = (n_offsets * C_IN + c) * HW + plane_offsets
-            vals = tl.load(x_ptr + input_offsets, mask=mask_hw, other=0.0).to(tl.float32)
-            acc += vals * weight
-
-        if HAS_BIAS:
-            bias = tl.load(b_ptr + oc).to(tl.float32)
-            acc += bias
-
-        out_offsets = (n_offsets * C_OUT + oc) * HW + plane_offsets
-        tl.store(out_ptr + out_offsets, acc, mask=mask_hw)
+    out_idx = ((n * C + c) * H_out + h_out_idx) * W_out + w_out_idx
+    tl.store(y_ptr + out_idx, acc, mask=mask_o)
 
 
-def depthwise_conv2d_triton(x, weight, bias, stride, padding, dilation):
-    stride_h, stride_w = (stride, stride) if isinstance(stride, int) else stride
-    pad_h, pad_w = (padding, padding) if isinstance(padding, int) else padding
-    dil_h, dil_w = (dilation, dilation) if isinstance(dilation, int) else dilation
-
+def depthwise_conv2d_triton(x, weight, bias, stride: int, padding: int, dilation: int):
+    """
+    x:       [N, C, H, W]
+    weight:  [C, 1, K, K] (depthwise)
+    bias:    [C] or None
+    """
+    assert x.is_cuda and weight.is_cuda
     N, C, H, W = x.shape
-    K_H, K_W = weight.shape[-2], weight.shape[-1]
+    K = weight.shape[2]
 
-    H_OUT = (H + 2 * pad_h - dil_h * (K_H - 1) - 1) // stride_h + 1
-    W_OUT = (W + 2 * pad_w - dil_w * (K_W - 1) - 1) // stride_w + 1
+    # Compute output spatial size (PyTorch Conv2d formula)
+    H_out = (H + 2 * padding - dilation * (K - 1) - 1) // stride + 1
+    W_out = (W + 2 * padding - dilation * (K - 1) - 1) // stride + 1
 
-    out = torch.empty((N, C, H_OUT, W_OUT), device=x.device, dtype=x.dtype)
+    y = torch.empty((N, C, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    BLOCK_H = 16
+    BLOCK_W = 16
+    HAS_BIAS = bias is not None
 
     grid = (
         N * C,
-        triton.cdiv(H_OUT * W_OUT, 128),
+        triton.cdiv(H_out, BLOCK_H),
+        triton.cdiv(W_out, BLOCK_W),
     )
 
     depthwise_conv2d_kernel[grid](
-        x.contiguous(),
-        weight.contiguous(),
-        bias.contiguous() if bias is not None else weight,
-        out,
+        x,
+        weight,
+        bias if HAS_BIAS else x,  # dummy pointer when no bias
+        y,
         N,
         C,
         H,
         W,
-        H_OUT,
-        W_OUT,
-        K_H,
-        K_W,
-        stride_h,
-        stride_w,
-        pad_h,
-        pad_w,
-        dil_h,
-        dil_w,
-        HAS_BIAS=int(bias is not None),
-        BLOCK_HW=128,
+        H_out,
+        W_out,
+        stride,
+        padding,
+        dilation,
+        KERNEL_SIZE=K,
+        HAS_BIAS=HAS_BIAS,
+        BLOCK_H=BLOCK_H,
+        BLOCK_W=BLOCK_W,
     )
+    return y
 
-    return out
+
+@triton.jit
+def pointwise_conv1x1_kernel(
+    x_ptr,   # float32[N, C_IN, H, W]
+    w_ptr,   # float32[C_OUT, C_IN, 1, 1] treated as [C_OUT, C_IN]
+    b_ptr,   # float32[C_OUT] or dummy
+    y_ptr,   # float32[N, C_OUT, H, W]
+    N, H, W,
+    C_OUT,
+    C_IN: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # Treat as matmul: [M, K] @ [K, C_OUT] -> [M, C_OUT]
+    # where M = N * H * W, K = C_IN
+    M = N * H * W
+
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    m_mask = offs_m < M
+    n_mask = offs_n < C_OUT
+
+    # Decode m -> (n_idx, h_idx, w_idx)
+    HW = H * W
+    n_idx = offs_m // HW
+    rem = offs_m % HW
+    h_idx = rem // W
+    w_idx = rem % W
+
+    n_idx_mat = n_idx[:, None]
+    h_idx_mat = h_idx[:, None]
+    w_idx_mat = w_idx[:, None]
+    n_out_mat = offs_n[None, :]
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # K-loop
+    for k0 in range(0, C_IN, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+        k_mask = offs_k < C_IN
+
+        # Load A tile: [BLOCK_M, BLOCK_K] from x
+        k_mat = offs_k[None, :]
+        idx_a = ((n_idx_mat * C_IN + k_mat) * H + h_idx_mat) * W + w_idx_mat
+        mask_a = m_mask[:, None] & k_mask[None, :]
+        a = tl.load(x_ptr + idx_a, mask=mask_a, other=0.0)
+
+        # Load B tile: [BLOCK_K, BLOCK_N] from w (treated as [K, C_OUT] with stride_K=1, stride_N=C_IN)
+        k_col = offs_k[:, None]
+        n_col = offs_n[None, :]
+        idx_b = k_col + n_col * C_IN
+        mask_b = k_mask[:, None] & n_mask[None, :]
+        b = tl.load(w_ptr + idx_b, mask=mask_b, other=0.0)
+
+        acc += tl.dot(a, b, allow_tf32=True)
+
+    if HAS_BIAS:
+        bias = tl.load(b_ptr + offs_n, mask=n_mask, other=0.0)
+        acc += bias[None, :]
+
+    # Store result to y: [N, C_OUT, H, W]
+    idx_out = ((n_idx_mat * C_OUT + n_out_mat) * H + h_idx_mat) * W + w_idx_mat
+    mask_out = m_mask[:, None] & n_mask[None, :]
+    tl.store(y_ptr + idx_out, acc, mask=mask_out)
 
 
-def pointwise_conv2d_triton(x, weight, bias):
+def pointwise_conv1x1_triton(x, weight, bias):
+    """
+    x:       [N, C_IN, H, W]
+    weight:  [C_OUT, C_IN, 1, 1]
+    bias:    [C_OUT] or None
+    """
+    assert x.is_cuda and weight.is_cuda
     N, C_IN, H, W = x.shape
     C_OUT = weight.shape[0]
 
-    weight_2d = weight.view(C_OUT, C_IN)
+    y = torch.empty((N, C_OUT, H, W), device=x.device, dtype=x.dtype)
 
-    out = torch.empty((N, C_OUT, H, W), device=x.device, dtype=x.dtype)
+    BLOCK_M = 64
+    BLOCK_N = 64
+    BLOCK_K = 32
+    HAS_BIAS = bias is not None
 
+    M = N * H * W
     grid = (
-        triton.cdiv(C_OUT, 4),
-        triton.cdiv(N * H * W, 128),
+        triton.cdiv(M, BLOCK_M),
+        triton.cdiv(C_OUT, BLOCK_N),
     )
 
-    pointwise_conv2d_kernel[grid](
-        x.contiguous(),
-        weight_2d.contiguous(),
-        bias.contiguous() if bias is not None else weight_2d,
-        out,
+    pointwise_conv1x1_kernel[grid](
+        x,
+        weight,
+        bias if HAS_BIAS else x,  # dummy pointer when no bias
+        y,
         N,
-        C_IN,
-        C_OUT,
         H,
         W,
-        HAS_BIAS=int(bias is not None),
-        BLOCK_OC=4,
-        BLOCK_HW=128,
+        C_OUT,
+        C_IN=C_IN,
+        HAS_BIAS=HAS_BIAS,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
     )
-
-    return out
+    return y
 
 
 class ModelNew(nn.Module):
+    """
+    Depthwise-separable 2D convolution implemented with Triton kernels.
+    Matches the behavior of the reference PyTorch Model.
+    """
+
     def __init__(
         self,
         in_channels: int,
@@ -208,6 +257,14 @@ class ModelNew(nn.Module):
         bias: bool = False,
     ):
         super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+
+        # Keep Conv2d modules so state_dict is compatible with the original model.
         self.depthwise = nn.Conv2d(
             in_channels,
             in_channels,
@@ -224,11 +281,11 @@ class ModelNew(nn.Module):
             kernel_size=1,
             bias=bias,
         )
-        self.stride = stride
-        self.padding = padding
-        self.dilation = dilation
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Ensure tensors are on the same device as weights
+        x = x.to(self.depthwise.weight.device)
+
         x = depthwise_conv2d_triton(
             x,
             self.depthwise.weight,
@@ -237,7 +294,7 @@ class ModelNew(nn.Module):
             padding=self.padding,
             dilation=self.dilation,
         )
-        x = pointwise_conv2d_triton(
+        x = pointwise_conv1x1_triton(
             x,
             self.pointwise.weight,
             self.pointwise.bias,

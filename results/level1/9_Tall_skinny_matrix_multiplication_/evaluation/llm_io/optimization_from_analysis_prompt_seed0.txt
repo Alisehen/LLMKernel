@@ -1,0 +1,222 @@
+You are optimizing a Triton kernel based on algorithmic analysis.
+
+# PyTorch Reference (Target Behavior)
+
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs a single matrix multiplication (C = A * B) where one of the matrices is tall and skinny (M >> N or N >> M)
+    """
+    def __init__(self):
+        super(Model, self).__init__()
+    
+    def forward(self, A, B):
+        """
+        Performs the matrix multiplication.
+
+        Args:
+            A (torch.Tensor): Input matrix of shape (M, K) or (K, M) where M >> N or N >> M.
+            B (torch.Tensor): Input matrix of shape (K, N) or (N, K) where M >> N or N >> M.
+
+        Returns:
+            torch.Tensor: Output matrix of shape (M, N) or (N, M)
+        """
+        return torch.matmul(A, B)
+
+M = 16384 * 2
+N = 16 * 2
+
+def get_inputs():
+    A = torch.rand(M, N)
+    B = torch.rand(N, M)
+    return [A, B]
+
+def get_init_inputs():
+    return []  # No special initialization inputs needed
+```
+
+**CRITICAL**: Study the PyTorch code carefully to understand:
+- What does `forward()` return? (full output sequence vs final hidden state only)
+- What is the computational pattern?
+- What are the input/output shapes?
+
+Your optimized kernel MUST match this exact behavior.
+
+---
+
+# Analysis Results
+
+**Bottleneck**: For the given shapes (A: [M,K] with M>>K, B: [K,N] with K small and N large), B is stored row-major so advancing along the reduction dimension K uses a very large stride (stride_bk = N ≈ 32K), leading to non-coalesced global memory access for B and underutilized memory bandwidth.
+
+**Optimization Strategy**: Reformulate the matmul to operate on transposed operands so that the reduction dimension K is contiguous in memory for both inputs (e.g., compute C^T = B^T @ A^T or explicitly pass B_t = B.t().contiguous() to the kernel), turning the strided access on B into contiguous loads.
+
+**Implementation Plan**: In the Python wrapper, detect that B has stride_bk ≫ stride_bn (i.e., reduction dimension is not contiguous) and either: (1) materialize B_t = B.t().contiguous() once and adjust the kernel to treat it as [N, K] with bk stride = 1, or (2) launch a variant kernel that computes C^T = B^T @ A^T and then returns C^T.t(), ensuring both A^T and B^T are accessed with the reduction dimension contiguous. This layout-aware reformulation keeps K as the fastest-varying index in both operands, enabling fully coalesced loads and much closer-to-cuBLAS performance.
+
+**Expected Speedup**: 40-60%
+
+---
+
+# Current Kernel (needs optimization)
+
+```python
+# Optimized Triton-based replacement for torch.matmul in the given model
+
+import torch, torch.nn as nn, triton, triton.language as tl
+
+
+@triton.jit
+def matmul_kernel(
+    A_ptr, B_ptr, C_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # 2D program id: (pid_m, pid_n)
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Pointer to the first block of A and B this program will process
+    a_ptrs = A_ptr + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = B_ptr + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    k_remaining = K
+    k_start = 0
+    while k_remaining > 0:
+        k_mask = offs_k[None, :] + k_start < K
+
+        a_mask = (offs_m[:, None] < M) & k_mask
+        b_mask = k_mask.T & (offs_n[None, :] < N)
+
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+        acc += tl.dot(a, b, allow_tf32=True)
+
+        k_start += BLOCK_K
+        k_remaining -= BLOCK_K
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Write back
+    c_ptrs = C_ptr + (offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn)
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    c = acc.to(tl.float32)
+    tl.store(c_ptrs, c, mask=c_mask)
+
+
+def triton_matmul(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    # Fallback for non-CUDA tensors
+    if A.device.type != "cuda" or B.device.type != "cuda":
+        return torch.matmul(A, B)
+
+    assert A.dim() == 2 and B.dim() == 2, "Only 2D matmul is supported"
+    assert A.size(1) == B.size(0), "Incompatible shapes for matmul"
+
+    M, K = A.shape
+    K2, N = B.shape
+    assert K == K2
+
+    C = torch.empty((M, N), device=A.device, dtype=torch.float32)
+
+    # Strides in elements
+    stride_am, stride_ak = A.stride()
+    stride_bk, stride_bn = B.stride()
+    stride_cm, stride_cn = C.stride()
+
+    BLOCK_M = 128
+    BLOCK_N = 128
+    BLOCK_K = 32
+
+    grid = (
+        triton.cdiv(M, BLOCK_M),
+        triton.cdiv(N, BLOCK_N),
+    )
+
+    matmul_kernel[grid](
+        A, B, C,
+        M, N, K,
+        stride_am, stride_ak,
+        stride_bk, stride_bn,
+        stride_cm, stride_cn,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        num_warps=4,
+        num_stages=2,
+    )
+
+    return C
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-accelerated model performing a single matrix multiplication (C = A * B).
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, A, B):
+        return triton_matmul(A, B)
+```
+
+---
+
+# Your Task
+
+Implement the optimization strategy above. Focus on the specific bottleneck identified.
+
+## Key Requirements
+
+1. **Preserve correctness**: Maintain the same input/output behavior
+2. **Apply the optimization**: Follow the implementation plan exactly
+3. **Use valid Triton syntax**:
+   - Every kernel MUST have `@triton.jit` decorator
+   - Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+   - BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+   - No `continue`, `break`, `return` inside kernels (use masking)
+   - Prefer `tl.dot(a, b, allow_tf32=True)` for matmul operations
+
+4. **CRITICAL for RNN/GRU/LSTM Persistent Kernels**:
+   - Time loop MUST be inside @triton.jit kernel, NOT in Python forward()
+   - **HYBRID computation strategy** (CRITICAL for performance):
+     * Precompute input-side gates OUTSIDE kernel: `gates_x = (T*B, In) @ W_ih` (ONE large GEMM)
+     * INSIDE kernel: only recurrent-side: `for t: gates_h = h @ W_hh` (T small GEMMs)
+   - CORRECT (FAST - use this):
+     ```python
+     # Python forward():
+     gates_x_all = x.reshape(T*B, In) @ W_ih + b_ih  # ONE large GEMM
+     gates_x_all = gates_x_all.view(T, B, 3*H)
+     gru_persistent_kernel[grid](gates_x_all, h0, W_hh, ...)  # Launch ONCE
+
+     @triton.jit
+     def gru_persistent_kernel(gates_x_ptr, h_ptr, W_hh_ptr, ...):
+         for t in range(T):  # Inside kernel
+             gates_x_t = tl.load(gates_x_ptr + t*...)  # Precomputed
+             gates_h = h @ W_hh  # Only recurrent GEMM
+             h = (1-z)*n + z*h   # Fuse and update
+     ```
+
+5. **Output format**:
+   - Imports: `import torch, torch.nn as nn, triton, triton.language as tl`
+   - `@triton.jit` kernel(s)
+   - Wrapper function(s)
+   - `class ModelNew(nn.Module)` — REQUIRED
+   - NO testing code, NO `if __name__ == "__main__"`
+
+---
+
+Generate the optimized kernel now. Output ONLY the complete Python code.

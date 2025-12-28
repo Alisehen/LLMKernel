@@ -4,168 +4,67 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
-@triton.jit
-def sigmoid_kernel_2d(
-    x_ptr,
-    output_ptr,
-    M, N, stride_m, stride_n,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-):
-    # 2D grid for better work distribution
-    pid_m = tl.program_id(axis=0)
-    pid_n = tl.program_id(axis=1)
-    
-    # Create block offsets
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    
-    # Create masks for boundaries
-    mask_m = offs_m < M
-    mask_n = offs_n < N
-    mask = mask_m[:, None] & mask_n[None, :]
-    
-    # Load input tile
-    x_ptrs = x_ptr + offs_m[:, None] * stride_m + offs_n[None, :] * stride_n
-    x = tl.load(x_ptrs, mask=mask, other=0.0)
-    
-    # Compute sigmoid
-    exp_neg_x = tl.exp(-x)
-    output = 1.0 / (1.0 + exp_neg_x)
-    
-    # Store output tile
-    output_ptrs = output_ptr + offs_m[:, None] * stride_m + offs_n[None, :] * stride_n
-    tl.store(output_ptrs, output, mask=mask)
 
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=4, num_stages=2),
+        triton.Config({}, num_warps=8, num_stages=1),
+        triton.Config({}, num_warps=8, num_stages=2),
+    ],
+    key=["n_elements"],
+)
 @triton.jit
-def sigmoid_kernel_batched(
+def sigmoid_kernel(
     x_ptr,
-    output_ptr,
-    batch, M, N,
-    stride_batch, stride_m, stride_n,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
+    y_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
 ):
-    # 3D grid for batch processing
-    pid_batch = tl.program_id(axis=0)
-    pid_m = tl.program_id(axis=1)
-    pid_n = tl.program_id(axis=2)
-    
-    # Boundary checks
-    if pid_batch >= batch:
-        return
-        
-    # Create block offsets
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    
-    # Create masks for boundaries
-    mask_m = offs_m < M
-    mask_n = offs_n < N
-    mask = mask_m[:, None] & mask_n[None, :]
-    
-    # Calculate base pointers for this batch
-    batch_offset = pid_batch * stride_batch
-    x_batch_ptr = x_ptr + batch_offset
-    output_batch_ptr = output_ptr + batch_offset
-    
-    # Load input tile
-    x_ptrs = x_batch_ptr + offs_m[:, None] * stride_m + offs_n[None, :] * stride_n
-    x = tl.load(x_ptrs, mask=mask, other=0.0)
-    
-    # Compute sigmoid
-    exp_neg_x = tl.exp(-x)
-    output = 1.0 / (1.0 + exp_neg_x)
-    
-    # Store output tile
-    output_ptrs = output_batch_ptr + offs_m[:, None] * stride_m + offs_n[None, :] * stride_n
-    tl.store(output_ptrs, output, mask=mask)
+    pid = tl.program_id(0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+
+    mask = offsets < n_elements
+
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    # sigmoid(x) = 1 / (1 + exp(-x))
+    y = 1.0 / (1.0 + tl.exp(-x))
+
+    tl.store(y_ptr + offsets, y, mask=mask)
+
 
 def triton_sigmoid(x: torch.Tensor) -> torch.Tensor:
-    output = torch.empty_like(x)
-    
-    # Handle different tensor dimensions
-    if x.dim() == 1:
-        # For 1D, treat as 2D with N=1
-        M, N = x.shape[0], 1
-        stride_m, stride_n = 1, 1
-        
-        BLOCK_M = 1024
-        BLOCK_N = 1
-        
-        grid = (
-            triton.cdiv(M, BLOCK_M),
-            triton.cdiv(N, BLOCK_N),
-        )
-        
-        sigmoid_kernel_2d[grid](
-            x, output, M, N, stride_m, stride_n,
-            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
-            num_warps=8, num_stages=3
-        )
-        
-    elif x.dim() == 2:
-        M, N = x.shape
-        stride_m, stride_n = x.stride(0), x.stride(1)
-        
-        # Use 2D grid for better SM utilization
-        BLOCK_M, BLOCK_N = 128, 128
-        
-        grid = (
-            triton.cdiv(M, BLOCK_M),
-            triton.cdiv(N, BLOCK_N),
-        )
-        
-        sigmoid_kernel_2d[grid](
-            x, output, M, N, stride_m, stride_n,
-            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
-            num_warps=8, num_stages=3
-        )
-        
-    elif x.dim() >= 3:
-        # Flatten leading dimensions as batch
-        original_shape = x.shape
-        batch_dim = x.shape[:-2].numel() if x.dim() > 2 else 1
-        M, N = x.shape[-2:]
-        
-        # Reshape to 3D (batch, M, N)
-        x_3d = x.view(batch_dim, M, N)
-        output_3d = output.view(batch_dim, M, N)
-        
-        stride_batch = x_3d.stride(0)
-        stride_m = x_3d.stride(1)
-        stride_n = x_3d.stride(2)
-        
-        # Optimize block sizes for 3D grid
-        BLOCK_M, BLOCK_N = 64, 64
-        
-        grid = (
-            batch_dim,
-            triton.cdiv(M, BLOCK_M),
-            triton.cdiv(N, BLOCK_N),
-        )
-        
-        sigmoid_kernel_batched[grid](
-            x_3d, output_3d, batch_dim, M, N,
-            stride_batch, stride_m, stride_n,
-            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
-            num_warps=4, num_stages=3
-        )
-        
-        output = output_3d.view(original_shape)
-    
-    return output
+    """
+    High-performance Triton implementation of torch.sigmoid(x).
+    """
+    assert x.is_cuda, "Input tensor must be on CUDA device for Triton kernels."
+    x_contig = x.contiguous()
+    y = torch.empty_like(x_contig)
+
+    n_elements = x_contig.numel()
+    BLOCK_SIZE = 256  # power-of-two, tuned for 4090 bandwidth
+
+    def grid(meta):
+        # 1D grid over flattened elements; ensure >0 even for empty tensors
+        return (max(1, triton.cdiv(n_elements, BLOCK_SIZE)),)
+
+    sigmoid_kernel[grid](
+        x_contig,
+        y,
+        n_elements,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+
+    return y.view_as(x)
+
 
 class ModelNew(nn.Module):
     """
-    Optimized model that performs Sigmoid activation using multi-dimensional Triton kernels.
+    Simple model that performs a Sigmoid activation using a Triton kernel.
     """
     def __init__(self):
         super(ModelNew, self).__init__()
-    
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Applies Sigmoid activation to the input tensor using optimized Triton kernels.
-        """
         return triton_sigmoid(x)
 ```

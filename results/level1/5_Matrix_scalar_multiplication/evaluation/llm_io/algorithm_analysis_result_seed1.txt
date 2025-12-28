@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The custom Triton kernel is ~47% slower than PyTorch for a purely memory-bound elementwise op, so the only way to significantly improve is to reduce global memory traffic and kernel launches via fusion.",
+  "bottleneck": "The scalar multiply is bandwidth-bound and currently implemented as a standalone pass over memory, doing a full read and write of the tensor just to scale it, with its own kernel launch overhead. Since the arithmetic intensity is extremely low, this separate pass cannot outperform PyTorch’s highly tuned kernel and wastes memory bandwidth.",
+  "optimisation method": "Use operator fusion to merge this scalar multiply with adjacent elementwise operations (e.g., adds, biases, activations, normalizations) into a single fused Triton kernel so that the data is read and written only once instead of multiple times.",
+  "modification plan": "Refactor the model code so that this scalar multiply is not called as an isolated Triton kernel, but is instead expressed as part of a larger fused elementwise expression, then implement a Triton kernel that computes the entire fused expression in one pass over the data (e.g., C = activation((A * s + bias) * scale2)). Ensure the fused kernel handles broadcasting and arbitrary shapes similarly to the current implementation, and validate numerics against the unfused PyTorch graph. Benchmark the fused kernel end-to-end (including the ops it replaced) to confirm reduced memory traffic and kernel launch count translate to net speedup.",
+  "expected_speedup": "40-60%"
+}

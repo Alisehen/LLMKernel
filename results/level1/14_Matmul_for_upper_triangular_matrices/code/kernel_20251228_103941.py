@@ -1,0 +1,213 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def upper_tri_matmul_kernel_generic(
+    A_ptr, B_ptr, C_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # 2D tiling over full MxN, then zero out strictly lower-triangular outputs.
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    a_ptrs = A_ptr + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = B_ptr + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    k = 0
+    while k < K:
+        k_offsets = k + offs_k
+
+        a_mask = (offs_m[:, None] < M) & (k_offsets[None, :] < K)
+        b_mask = (k_offsets[:, None] < K) & (offs_n[None, :] < N)
+
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+        acc += tl.dot(a, b, allow_tf32=True)
+
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+        k += BLOCK_K
+
+    c_ptrs = C_ptr + (offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn)
+
+    mask_mn = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tri_mask = offs_m[:, None] <= offs_n[None, :]
+    acc = tl.where(tri_mask, acc, 0.0)
+
+    tl.store(c_ptrs, acc, mask=mask_mn)
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=4, num_stages=3),
+        triton.Config({}, num_warps=8, num_stages=4),
+    ],
+    key=["M", "N", "K"],
+)
+@triton.jit
+def upper_tri_matmul_kernel_optimized_2d(
+    A_ptr, B_ptr, C_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # 2D grid over tiles, but each program only computes tiles that intersect the
+    # upper-triangular region. Fully lower-triangular tiles return immediately.
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+
+    row_start = pid_m * BLOCK_M
+    col_start = pid_n * BLOCK_N
+
+    # Out-of-bounds tiles (from cdiv tiling) do nothing.
+    if (row_start >= M) | (col_start >= N):
+        return
+
+    # Fully below-diagonal tile: all (i, j) in this tile satisfy i > j.
+    # Condition: smallest i in tile > largest j in tile.
+    # smallest i = row_start, largest j = col_start + BLOCK_N - 1
+    if row_start >= col_start + BLOCK_N:
+        return
+
+    offs_m = row_start + tl.arange(0, BLOCK_M)
+    offs_n = col_start + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Exploit structure: for C[i, j] with i <= j, relevant k lie in [i, j].
+    # For this tile, union over all (i, j) gives k in [row_start, col_start + BLOCK_N - 1].
+    k_start = row_start
+    k_end = tl.minimum(col_start + BLOCK_N, K)
+
+    a_ptrs = A_ptr + (offs_m[:, None] * stride_am + (k_start + offs_k)[None, :] * stride_ak)
+    b_ptrs = B_ptr + ((k_start + offs_k)[:, None] * stride_bk + offs_n[None, :] * stride_bn)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    k = k_start
+    while k < k_end:
+        k_offsets = k + offs_k
+
+        # In-bounds masks
+        a_mask = (offs_m[:, None] < M) & (k_offsets[None, :] < K)
+        b_mask = (k_offsets[:, None] < K) & (offs_n[None, :] < N)
+
+        # Upper-triangular structure:
+        # A[i, k] != 0 only if i <= k
+        a_mask = a_mask & (offs_m[:, None] <= k_offsets[None, :])
+        # B[k, j] != 0 only if k <= j
+        b_mask = b_mask & (k_offsets[:, None] <= offs_n[None, :])
+
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+        acc += tl.dot(a, b, allow_tf32=True)
+
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+        k += BLOCK_K
+
+    c_ptrs = C_ptr + (offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn)
+
+    mask_mn = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tri_mask = offs_m[:, None] <= offs_n[None, :]
+    acc = tl.where(tri_mask, acc, 0.0)
+
+    tl.store(c_ptrs, acc, mask=mask_mn)
+
+
+def triton_upper_triangular_matmul(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    """
+    Computes torch.triu(A @ B) using high-performance Triton kernels.
+
+    A and B are expected to be upper-triangular square matrices (N, N) for the
+    optimized path; non-square shapes fall back to a generic kernel.
+    """
+    assert A.ndim == 2 and B.ndim == 2, "Inputs must be 2D matrices"
+    assert A.shape[1] == B.shape[0], "Incompatible matrix shapes"
+
+    assert A.is_cuda and B.is_cuda, "Inputs must be CUDA tensors"
+    A_contig = A.contiguous()
+    B_contig = B.contiguous()
+
+    M, K = A_contig.shape
+    K2, N = B_contig.shape
+    assert K == K2, "Inner dimensions must match"
+
+    C = torch.zeros((M, N), device=A_contig.device, dtype=A_contig.dtype)
+
+    if M == 0 or N == 0 or K == 0:
+        return C
+
+    stride_am, stride_ak = A_contig.stride()
+    stride_bk, stride_bn = B_contig.stride()
+    stride_cm, stride_cn = C.stride()
+
+    # Power-of-2 tile sizes tuned for RTX 4090
+    BLOCK_M = 128
+    BLOCK_N = 128
+    BLOCK_K = 32
+
+    tiles_m = triton.cdiv(M, BLOCK_M)
+    tiles_n = triton.cdiv(N, BLOCK_N)
+
+    if (M == N == K) and (tiles_m == tiles_n):
+        # Optimized 2D grid over upper-triangular tiles
+        grid = (max(tiles_m, 1), max(tiles_n, 1))
+        upper_tri_matmul_kernel_optimized_2d[grid](
+            A_contig, B_contig, C,
+            M, N, K,
+            stride_am, stride_ak,
+            stride_bk, stride_bn,
+            stride_cm, stride_cn,
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            BLOCK_K=BLOCK_K,
+        )
+    else:
+        # Generic GEMM tiling + output triangular masking
+        grid = (max(tiles_m, 1), max(tiles_n, 1))
+        upper_tri_matmul_kernel_generic[grid](
+            A_contig, B_contig, C,
+            M, N, K,
+            stride_am, stride_ak,
+            stride_bk, stride_bn,
+            stride_cm, stride_cn,
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            BLOCK_K=BLOCK_K,
+            num_warps=4,
+            num_stages=3,
+        )
+
+    return C
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-accelerated model that computes the upper triangular part of A @ B.
+    """
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, A, B):
+        return triton_upper_triangular_matmul(A, B)

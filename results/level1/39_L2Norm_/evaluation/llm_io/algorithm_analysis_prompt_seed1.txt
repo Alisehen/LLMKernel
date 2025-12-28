@@ -1,0 +1,271 @@
+You are a GPU kernel optimization architect. Analyze the kernel and identify **ONE high-level algorithmic optimization**.
+
+# PyTorch Reference
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs L2 normalization.
+    """
+    def __init__(self):
+        """
+        Initializes the L2Norm layer.
+
+        Args:
+            dim (int): Dimension along which to normalize.
+        """
+        super(Model, self).__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies L2 normalization to the input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (*, dim, *).
+
+        Returns:
+            torch.Tensor: Output tensor with L2 normalization applied, same shape as input.
+        """
+        return x / torch.norm(x, p=2, dim=1, keepdim=True)
+
+batch_size = 32768
+# choose dim so total <2^31
+dim = 65535
+
+def get_inputs():
+    x = torch.rand(batch_size, dim)
+    return [x]
+
+def get_init_inputs():
+    return []
+```
+
+# Current Triton Kernel
+```python
+import torch, torch.nn as nn, triton, triton.language as tl
+
+
+@triton.jit
+def l2norm_sumsq_kernel(
+    x_ptr,
+    norm_ptr,
+    B,
+    D,
+    stride_xm,
+    stride_xn,
+    stride_nm,
+    BLOCK_N: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    row = pid
+
+    # Vectorized row mask to satisfy "mask shape must match data shape"
+    offs_n = tl.arange(0, BLOCK_N)
+    row_ids = row + tl.zeros((BLOCK_N,), dtype=tl.int32)
+    valid_row = row_ids < B
+
+    row_x_ptr = x_ptr + row * stride_xm
+    row_norm_ptr = norm_ptr + row * stride_nm
+
+    sum_sq = tl.zeros((1,), dtype=tl.float32)
+
+    col_start = 0
+    while col_start < D:
+        cols = col_start + offs_n
+        col_mask = cols < D
+        mask = col_mask & valid_row
+
+        x = tl.load(row_x_ptr + cols * stride_xn, mask=mask, other=0.0)
+        x_f32 = x.to(tl.float32)
+        tile_sum = tl.sum(x_f32 * x_f32, axis=0)
+        sum_sq += tile_sum
+        col_start += BLOCK_N
+
+    norm = tl.sqrt(sum_sq)
+
+    norm_offs = tl.arange(0, 1)
+    norm_mask = (row + norm_offs) < B
+    tl.store(row_norm_ptr + norm_offs, norm, mask=norm_mask)
+
+
+@triton.jit
+def l2norm_normalize_kernel(
+    x_ptr,
+    norm_ptr,
+    y_ptr,
+    B,
+    D,
+    stride_xm,
+    stride_xn,
+    stride_nm,
+    stride_nn,
+    stride_ym,
+    stride_yn,
+    BLOCK_N: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    row = pid
+
+    offs_n = tl.arange(0, BLOCK_N)
+    row_ids = row + tl.zeros((BLOCK_N,), dtype=tl.int32)
+    valid_row = row_ids < B
+
+    row_x_ptr = x_ptr + row * stride_xm
+    row_y_ptr = y_ptr + row * stride_ym
+
+    # Load per-row norm (shape (1,)) and broadcast
+    norm_offs = tl.arange(0, 1)
+    norm_mask = (row + norm_offs) < B
+    norm = tl.load(norm_ptr + row * stride_nm + norm_offs * stride_nn, mask=norm_mask, other=1.0)
+    norm_block = tl.broadcast_to(norm, offs_n.shape)
+
+    col_start = 0
+    while col_start < D:
+        cols = col_start + offs_n
+        col_mask = cols < D
+        mask = col_mask & valid_row
+
+        x = tl.load(row_x_ptr + cols * stride_xn, mask=mask, other=0.0)
+        y = x / norm_block
+        tl.store(row_y_ptr + cols * stride_yn, y, mask=mask)
+        col_start += BLOCK_N
+
+
+def triton_l2norm(x: torch.Tensor) -> torch.Tensor:
+    """
+    L2-normalize along dim=1 using Triton.
+    Expects 2D input [B, D] on CUDA.
+    """
+    assert x.ndim == 2, "Only 2D tensors are supported"
+    B, D = x.shape
+    if B == 0:
+        return x.clone()
+
+    x_contig = x.contiguous()
+    y = torch.empty_like(x_contig)
+
+    # norms has shape [B, 1] to match keepdim=True behavior
+    norms = torch.empty((B, 1), device=x.device, dtype=torch.float32)
+
+    stride_xm, stride_xn = x_contig.stride()
+    stride_ym, stride_yn = y.stride()
+    stride_nm, stride_nn = norms.stride()
+
+    BLOCK_N = 256
+
+    grid = lambda meta: (max(1, B),)
+
+    l2norm_sumsq_kernel[grid](
+        x_contig,
+        norms,
+        B,
+        D,
+        stride_xm,
+        stride_xn,
+        stride_nm,
+        BLOCK_N=BLOCK_N,
+        num_warps=4,
+        num_stages=2,
+    )
+
+    l2norm_normalize_kernel[grid](
+        x_contig,
+        norms,
+        y,
+        B,
+        D,
+        stride_xm,
+        stride_xn,
+        stride_nm,
+        stride_nn,
+        stride_ym,
+        stride_yn,
+        BLOCK_N=BLOCK_N,
+        num_warps=4,
+        num_stages=2,
+    )
+
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-accelerated L2 normalization along dim=1.
+    """
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Fallback to PyTorch on CPU; use Triton on CUDA
+        if not x.is_cuda:
+            return x / torch.norm(x, p=2, dim=1, keepdim=True)
+        return triton_l2norm(x)
+```
+
+# Performance
+- **PyTorch baseline**: 27.57 ms
+- **Current Triton**: 41.56 ms
+- **Current speedup**: 0.66x (-50.7% vs baseline)
+
+
+---
+
+## Analysis Steps
+
+1. **Code Analysis**: Count kernels, identify operations, check for inefficiencies
+2. **Performance Diagnosis**: Use metrics/latency to identify bottleneck type
+3. **Root Cause**: Combine code + performance to find the core issue
+
+## Optimization Categories (pick ONE if worth optimizing):
+
+### 1. Operator Fusion
+Fuse consecutive ops into fewer kernels to reduce memory traffic and launch overhead.
+
+### 2. Algorithm Replacement
+Replace naive algorithm with optimized variant.
+- For Attention: Flash Attention, online softmax
+- For Convolution: Winograd, im2col
+- **For RNN/GRU/LSTM**: Persistent kernel with HYBRID computation
+  - **CRITICAL**: Use hybrid approach for best performance:
+    * Precompute input-side gates ONCE (outside kernel): `gates_x = (T*B, In) @ W_ih`
+    * Persistent kernel (inside): only recurrent-side: `for t: gates_h = h @ W_hh`
+  - Time loop `for t in range(T)` must be inside kernel, NOT in Python
+  - Launch kernel once per layer, not once per timestep
+  - Expected speedup: 10-100x (vs per-timestep launches)
+
+### 3. Kernel Launch Reduction
+Combine multiple small kernels to reduce overhead.
+- **For RNN/GRU/LSTM**: See "Algorithm Replacement" above for persistent kernel approach
+
+### 4. Memory Layout Optimization
+Use in-place operations, buffer reuse, or better layouts.
+
+## Should We Optimize?
+
+Before proposing optimization, determine if it's worthwhile:
+- **Not worth optimizing** if:
+  - Code is already near-optimal (expected speedup < 10%)
+  - Bottleneck cannot be addressed (hardware limited, already optimal algorithm)
+  - Optimization would add significant complexity with minimal gain
+
+- **Worth optimizing** if:
+  - Clear algorithmic inefficiency exists (multiple kernels, suboptimal algorithm)
+  - Expected speedup >= 20%
+  - Concrete optimization path available
+
+## Output (JSON)
+
+```json
+{
+  "worth_optimizing": "yes/no",
+  "reason": "<Why worth or not worth optimizing, 1 sentence>",
+  "bottleneck": "<Root cause in 1-2 sentences, empty if not worth optimizing>",
+  "optimisation method": "<Specific optimization in 1-2 sentences, empty if not worth optimizing>",
+  "modification plan": "<Implementation steps in 2-3 sentences, empty if not worth optimizing>",
+  "expected_speedup": "<e.g., '30-40%', empty if not worth optimizing>"
+}
+```
+
+Return JSON only.

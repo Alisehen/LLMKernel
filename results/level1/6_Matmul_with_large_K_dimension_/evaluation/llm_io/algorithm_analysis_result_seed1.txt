@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The custom Triton matmul is ~6x slower than the PyTorch/cuBLAS baseline, indicating a major algorithmic underutilization of the GPU.",
+  "bottleneck": "The kernel maps work only over the (M, N) tile grid and processes the enormous K dimension serially inside each program, yielding very few concurrent programs (e.g., ~4 blocks) and extremely long inner loops over K, which leads to poor occupancy and latency-bound execution.",
+  "optimisation method": "Introduce a split-K (parallel-K) matmul algorithm: shard the large K dimension across multiple programs per (M, N) tile so that many more Triton programs run in parallel and then reduce their partial results, instead of a single long serial loop over K in each program.",
+  "modification plan": "Add a third program_id axis (e.g., pid_k) to partition K into K_splits chunks; each kernel instance only loops over its assigned K slice and accumulates a partial C tile. Then either (1) use atomic_add on C to accumulate partial tiles from different pid_k slices, or (2) write partial results to a temporary workspace (C_partial[pid_k, m, n]) and launch a small follow-up reduction kernel over the split-K dimension. Autotune over K_splits together with BLOCK_M/N/K to balance per-program work and overall occupancy for this large-K, small-M/N regime.",
+  "expected_speedup": "300-500%"
+}

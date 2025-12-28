@@ -1,0 +1,200 @@
+You are a GPU kernel optimization architect. Analyze the kernel and identify **ONE high-level algorithmic optimization**.
+
+# PyTorch Reference
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs a Softmax activation.
+    """
+    def __init__(self):
+        super(Model, self).__init__()
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies Softmax activation to the input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, num_features).
+
+        Returns:
+            torch.Tensor: Output tensor with Softmax applied, same shape as input.
+        """
+        return torch.softmax(x, dim=1)
+
+batch_size = 4096
+dim = 393216
+
+def get_inputs():
+    x = torch.rand(batch_size, dim)
+    return [x]
+
+def get_init_inputs():
+    return []  # No special initialization inputs needed
+```
+
+# Current Triton Kernel
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def softmax_row_kernel(
+    x_ptr,           # pointer to input [M, N]
+    y_ptr,           # pointer to output [M, N]
+    stride_row,      # row stride for x/y
+    stride_col,      # col stride for x/y (usually 1)
+    n_cols,          # N
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)  # each program handles one row
+    row_start_x = x_ptr + pid * stride_row
+    row_start_y = y_ptr + pid * stride_row
+
+    offsets = tl.arange(0, BLOCK_SIZE)
+
+    # 1) compute row-wise max for numerical stability
+    row_max = -float("inf")
+    for col_start in range(0, n_cols, BLOCK_SIZE):
+        cols = col_start + offsets
+        mask = cols < n_cols
+        x = tl.load(row_start_x + cols * stride_col, mask=mask, other=-float("inf"))
+        current_max = tl.max(x, axis=0)
+        row_max = tl.maximum(row_max, current_max)
+
+    # 2) compute sum of exp(x - row_max)
+    sum_exp = 0.0
+    for col_start in range(0, n_cols, BLOCK_SIZE):
+        cols = col_start + offsets
+        mask = cols < n_cols
+        x = tl.load(row_start_x + cols * stride_col, mask=mask, other=-float("inf"))
+        x = x - row_max
+        exp_x = tl.exp(x)
+        sum_exp += tl.sum(exp_x, axis=0)
+
+    # 3) normalize to get softmax
+    inv_sum = 1.0 / sum_exp
+    for col_start in range(0, n_cols, BLOCK_SIZE):
+        cols = col_start + offsets
+        mask = cols < n_cols
+        x = tl.load(row_start_x + cols * stride_col, mask=mask, other=-float("inf"))
+        x = x - row_max
+        exp_x = tl.exp(x)
+        out = exp_x * inv_sum
+        tl.store(row_start_y + cols * stride_col, out, mask=mask)
+
+
+def triton_softmax_dim1(x: torch.Tensor) -> torch.Tensor:
+    """
+    Softmax over dim=1 for a 2D tensor using a highly optimized Triton kernel.
+    """
+    assert x.dim() == 2, "Input must be 2D (batch_size, num_features)"
+    # Ensure contiguous layout for predictable strides and coalesced memory access
+    x = x.contiguous()
+    M, N = x.shape
+
+    y = torch.empty_like(x)
+
+    stride_row, stride_col = x.stride()
+
+    BLOCK_SIZE = 256  # power-of-two, fits constraint and gives good occupancy
+
+    # One program per row
+    grid = lambda meta: (triton.cdiv(M, 1),)
+
+    softmax_row_kernel[grid](
+        x,
+        y,
+        stride_row,
+        stride_col,
+        N,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=8,
+        num_stages=2,
+    )
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-accelerated model performing softmax over dim=1.
+    Matches the behavior of torch.softmax(x, dim=1).
+    """
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Keep semantics identical to the original model: softmax over dim=1
+        return triton_softmax_dim1(x)
+```
+
+# Performance
+- **PyTorch baseline**: 27.95 ms
+- **Current Triton**: 36.90 ms
+- **Current speedup**: 0.76x (-32.0% vs baseline)
+
+
+---
+
+## Analysis Steps
+
+1. **Code Analysis**: Count kernels, identify operations, check for inefficiencies
+2. **Performance Diagnosis**: Use metrics/latency to identify bottleneck type
+3. **Root Cause**: Combine code + performance to find the core issue
+
+## Optimization Categories (pick ONE if worth optimizing):
+
+### 1. Operator Fusion
+Fuse consecutive ops into fewer kernels to reduce memory traffic and launch overhead.
+
+### 2. Algorithm Replacement
+Replace naive algorithm with optimized variant.
+- For Attention: Flash Attention, online softmax
+- For Convolution: Winograd, im2col
+- **For RNN/GRU/LSTM**: Persistent kernel with HYBRID computation
+  - **CRITICAL**: Use hybrid approach for best performance:
+    * Precompute input-side gates ONCE (outside kernel): `gates_x = (T*B, In) @ W_ih`
+    * Persistent kernel (inside): only recurrent-side: `for t: gates_h = h @ W_hh`
+  - Time loop `for t in range(T)` must be inside kernel, NOT in Python
+  - Launch kernel once per layer, not once per timestep
+  - Expected speedup: 10-100x (vs per-timestep launches)
+
+### 3. Kernel Launch Reduction
+Combine multiple small kernels to reduce overhead.
+- **For RNN/GRU/LSTM**: See "Algorithm Replacement" above for persistent kernel approach
+
+### 4. Memory Layout Optimization
+Use in-place operations, buffer reuse, or better layouts.
+
+## Should We Optimize?
+
+Before proposing optimization, determine if it's worthwhile:
+- **Not worth optimizing** if:
+  - Code is already near-optimal (expected speedup < 10%)
+  - Bottleneck cannot be addressed (hardware limited, already optimal algorithm)
+  - Optimization would add significant complexity with minimal gain
+
+- **Worth optimizing** if:
+  - Clear algorithmic inefficiency exists (multiple kernels, suboptimal algorithm)
+  - Expected speedup >= 20%
+  - Concrete optimization path available
+
+## Output (JSON)
+
+```json
+{
+  "worth_optimizing": "yes/no",
+  "reason": "<Why worth or not worth optimizing, 1 sentence>",
+  "bottleneck": "<Root cause in 1-2 sentences, empty if not worth optimizing>",
+  "optimisation method": "<Specific optimization in 1-2 sentences, empty if not worth optimizing>",
+  "modification plan": "<Implementation steps in 2-3 sentences, empty if not worth optimizing>",
+  "expected_speedup": "<e.g., '30-40%', empty if not worth optimizing>"
+}
+```
+
+Return JSON only.

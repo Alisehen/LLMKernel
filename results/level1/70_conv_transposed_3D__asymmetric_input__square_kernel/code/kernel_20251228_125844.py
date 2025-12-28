@@ -1,0 +1,272 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def conv_transpose3d_igemm_kernel(
+    x_ptr,          # float32[N, Cin, Di, Hi, Wi]
+    w_ptr,          # float32[Cin, Cout, kD, kH, kW]
+    b_ptr,          # float32[Cout]
+    y_ptr,          # float32[N, Cout, Do, Ho, Wo]
+    N, Cin, Cout,
+    Di, Hi, Wi,
+    Do, Ho, Wo,
+    kD, kH, kW,
+    BLOCK_M: tl.constexpr,  # tile over flattened (N, Do, Ho, Wo)
+    BLOCK_N: tl.constexpr,  # tile over Cout
+    BLOCK_K: tl.constexpr,  # tile over K = Cin * kD * kH * kW
+):
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+
+    # Flattened output positions per batch: M = N * Do * Ho * Wo
+    total_positions = N * Do * Ho * Wo
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    mask_m = offs_m < total_positions
+    mask_n = offs_n < Cout
+
+    # Decode (n, z, y, x) from flattened position offs_m
+    pos = offs_m
+    x_out = pos % Wo
+    pos = pos // Wo
+    y_out = pos % Ho
+    pos = pos // Ho
+    z_out = pos % Do
+    n = pos // Do
+
+    # Input strides (N, Cin, Di, Hi, Wi) in elements
+    sW_in = 1
+    sH_in = Wi
+    sD_in = Hi * Wi
+    sC_in = Di * sD_in
+    sN_in = Cin * sC_in
+
+    # Output strides (N, Cout, Do, Ho, Wo) in elements
+    sW_out = 1
+    sH_out = Wo
+    sD_out = Ho * Wo
+    sC_out = Do * sD_out
+    sN_out = Cout * sC_out
+
+    # Reduction dimension: K_total = Cin * kD * kH * kW
+    Ki = kD * kH * kW
+    K_total = Cin * Ki
+    kHW = kH * kW
+
+    # Accumulator tile [BLOCK_M, BLOCK_N]
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Broadcasted output coordinates for this tile
+    z_mat = z_out[:, None]
+    y_mat = y_out[:, None]
+    x_mat = x_out[:, None]
+    n_mat = n[:, None]
+
+    # Loop over reduction dimension in BLOCK_K chunks
+    for k_start in range(0, K_total, BLOCK_K):
+        offs_k = k_start + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < K_total
+
+        # Map K index -> (ci, kz, ky, kx)
+        ci = offs_k // Ki
+        k_rel = offs_k % Ki
+
+        kz = k_rel // kHW
+        rem = k_rel % kHW
+        ky = rem // kW
+        kx = rem % kW
+
+        # Broadcast kernel indices to match [BLOCK_M, BLOCK_K]
+        kz_mat = kz[None, :]
+        ky_mat = ky[None, :]
+        kx_mat = kx[None, :]
+
+        # Compute input coordinates for each (output_pos, k)
+        iz = z_mat - kz_mat
+        iy = y_mat - ky_mat
+        ix = x_mat - kx_mat
+
+        # In-bounds mask for input
+        in_bounds = (
+            (iz >= 0) & (iz < Di) &
+            (iy >= 0) & (iy < Hi) &
+            (ix >= 0) & (ix < Wi)
+        )
+
+        # Combine masks: valid output positions, valid K indices, and in-bounds input
+        mask_x = mask_m[:, None] & mask_k[None, :] & in_bounds
+
+        # Compute input pointers: x[n, ci, iz, iy, ix]
+        ptr_x = (
+            n_mat * sN_in +
+            ci[None, :] * sC_in +
+            iz * sD_in +
+            iy * sH_in +
+            ix * sW_in
+        )
+        x_tile = tl.load(x_ptr + ptr_x, mask=mask_x, other=0.0)
+
+        # Compute weight pointers: w[ci, co, kz, ky, kx]
+        # Layout: linear = ci*Cout*Ki + co*Ki + k_rel
+        ptr_w = (
+            ci[:, None] * (Cout * Ki) +
+            offs_n[None, :] * Ki +
+            k_rel[:, None]
+        )
+        mask_w = mask_k[:, None] & mask_n[None, :]
+        w_tile = tl.load(w_ptr + ptr_w, mask=mask_w, other=0.0)
+
+        # GEMM-style accumulation: [BLOCK_M, BLOCK_K] @ [BLOCK_K, BLOCK_N]
+        acc += tl.dot(x_tile, w_tile, allow_tf32=True)
+
+    # Add bias
+    bias_vals = tl.load(b_ptr + offs_n, mask=mask_n, other=0.0)
+    acc += bias_vals[None, :]
+
+    # Store results
+    base_out = (
+        n * sN_out +
+        z_out * sD_out +
+        y_out * sH_out +
+        x_out * sW_out
+    )  # [BLOCK_M]
+    out_ptrs = base_out[:, None] + offs_n[None, :] * sC_out
+    out_mask = mask_m[:, None] & mask_n[None, :]
+    tl.store(y_ptr + out_ptrs, acc, mask=out_mask)
+
+
+def triton_conv_transpose3d(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Fast path: ConvTranspose3d for stride=1, padding=0, dilation=1, output_padding=0, groups=1.
+
+    x:      (N, Cin, Di, Hi, Wi), float32, CUDA, contiguous
+    weight: (Cin, Cout, kD, kH, kW), float32, CUDA, contiguous
+    bias:   (Cout,), float32, CUDA, contiguous
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+    assert x.dtype == torch.float32
+    assert weight.dtype == torch.float32
+    assert bias.dtype == torch.float32
+
+    x = x.contiguous()
+    weight = weight.contiguous()
+    bias = bias.contiguous()
+
+    N, Cin, Di, Hi, Wi = x.shape
+    Cin_w, Cout, kD, kH, kW = weight.shape
+    assert Cin == Cin_w, "Input channels and weight channels must match"
+
+    # For stride=1, padding=0, dilation=1, output_padding=0:
+    Do = Di + kD - 1
+    Ho = Hi + kH - 1
+    Wo = Wi + kW - 1
+
+    y = torch.empty((N, Cout, Do, Ho, Wo), device=x.device, dtype=x.dtype)
+
+    # Tiling parameters (power-of-two as required)
+    BLOCK_M = 32
+    BLOCK_N = 32
+    BLOCK_K = 32
+
+    total_positions = N * Do * Ho * Wo
+
+    grid = lambda meta: (
+        triton.cdiv(total_positions, meta["BLOCK_M"]),
+        triton.cdiv(Cout, meta["BLOCK_N"]),
+    )
+
+    conv_transpose3d_igemm_kernel[grid](
+        x, weight, bias, y,
+        N, Cin, Cout,
+        Di, Hi, Wi,
+        Do, Ho, Wo,
+        kD, kH, kW,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+    )
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-accelerated ConvTranspose3d for the common case:
+      stride=1, padding=0, dilation=1, output_padding=0, groups=1.
+
+    Falls back to nn.ConvTranspose3d for other configurations or non-CUDA tensors.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        stride: int = 1,
+        padding: int = 0,
+        output_padding: int = 0,
+        dilation: int = 1,
+        groups: int = 1,
+        bias: bool = False,
+    ):
+        super().__init__()
+        # Use PyTorch layer for parameter initialization and fallback
+        self.conv_transpose3d = nn.ConvTranspose3d(
+            in_channels,
+            out_channels,
+            (kernel_size, kernel_size, kernel_size),
+            stride=stride,
+            padding=padding,
+            output_padding=output_padding,
+            dilation=dilation,
+            groups=groups,
+            bias=bias,
+        )
+
+        # Cache configuration for fast-path checks
+        self.stride = stride
+        self.padding = padding
+        self.output_padding = output_padding
+        self.dilation = dilation
+        self.groups = groups
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Conditions for Triton fast path
+        use_triton = (
+            x.is_cuda
+            and self.groups == 1
+            and self.stride == 1
+            and self.padding == 0
+            and self.output_padding == 0
+            and self.dilation == 1
+            and x.dtype == torch.float32
+            and self.conv_transpose3d.weight.dtype == torch.float32
+            and (
+                self.conv_transpose3d.bias is None
+                or self.conv_transpose3d.bias.dtype == torch.float32
+            )
+        )
+
+        if use_triton:
+            weight = self.conv_transpose3d.weight
+            if self.conv_transpose3d.bias is None:
+                # Create a zero bias on-the-fly (kept on the same device)
+                bias = torch.zeros(
+                    weight.shape[1],
+                    device=weight.device,
+                    dtype=weight.dtype,
+                )
+            else:
+                bias = self.conv_transpose3d.bias
+            return triton_conv_transpose3d(x, weight, bias)
+
+        # Fallback: full-featured PyTorch implementation
+        return self.conv_transpose3d(x)

@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The current kernel is ~5x slower than PyTorch and spends a lot of work on per-element index math and masking instead of dense math, so there is clear headroom.",
+  "bottleneck": "The kernel computes each output position independently with nested loops over Cin and K and per-iteration integer arithmetic (div/mod, range checks, masks) to invert the transposed-convolution indexing, leading to huge scalar overhead and very poor data reuse along the long L dimension.",
+  "optimisation method": "Replace the direct index-based transposed convolution with an im2col/GEMM-style algorithm (i.e., express conv_transpose1d as a dense matrix multiplication over Cin*K × Cout with an implicit unfold of the input), so the Triton kernel becomes a matmul-like kernel with regular memory access and much higher arithmetic intensity.",
+  "modification plan": "Reformulate conv_transpose1d as a regular 1D convolution / GEMM: view the weights as a (Cin*K, Cout) matrix and the relevant input contributions for a block of output positions as a (Cin*K, L_block) matrix built via an implicit unfold that encodes stride, padding, and dilation. Implement a Triton kernel that tiles over (Cin*K, Cout, L_out) and performs a block GEMM, loading tiles of x and w into shared memory and accumulating into a y tile, thereby avoiding per-output integer divides, masks, and scattered loads. Ensure the unfold is done implicitly inside the kernel (no explicit full im2col buffer) by computing contiguous ranges of l_in for a tile of l_out, so that input loads are mostly coalesced and reused across multiple output positions.",
+  "expected_speedup": "3-6x"
+}

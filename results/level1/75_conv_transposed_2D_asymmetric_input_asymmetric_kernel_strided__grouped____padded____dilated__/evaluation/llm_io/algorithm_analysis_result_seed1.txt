@@ -1,0 +1,10 @@
+```json
+{
+  "worth_optimizing": "yes",
+  "reason": "The custom Triton kernel is ~4x slower than PyTorch’s highly‑optimized implementation, indicating a clearly suboptimal algorithmic structure.",
+  "bottleneck": "The kernel uses a direct nested-loop formulation over (ky, kx, ic) with per-element integer divisions, conditionals for stride/dilation alignment, and scattered scalar loads, leading to poor arithmetic intensity, heavy control-flow overhead, and non-coalesced memory access compared to GEMM-style convolution implementations.",
+  "optimisation method": "Replace the current direct spatial-loop transposed convolution with a GEMM-based (im2col / implicit-GEMM) algorithm, i.e., express conv_transpose2d as a matrix multiplication between a lowered input tensor and a reshaped weight tensor (or as a regular conv GEMM on an upsampled input), then use a highly-tuned Triton matmul kernel to perform the bulk of the work.",
+  "modification plan": "Reformulate conv_transpose2d as an implicit GEMM: for each (n, oy, ox) tile, precompute the corresponding contiguous input patch indices (taking stride, padding, dilation, and groups into account) and conceptually form an A matrix of shape [N*H_out*W_out, C_in*kH*kW/groups]; reshape the weights into a B matrix of shape [C_in*kH*kW/groups, C_out] with appropriate per-group blocks. Implement the core as a batched/grouped matmul in Triton using the standard matmul template (tiling over the K dimension and leveraging coalesced loads/LDMatrix/Tensor Cores where available), and only perform a final reshape back to [N, C_out, H_out, W_out]. Bias addition can be fused into the epilogue of the matmul to avoid a separate pass.",
+  "expected_speedup": "300-500% vs the current Triton kernel (3-5x), and likely 20-50% relative to the PyTorch baseline if well-tuned."
+}
+```

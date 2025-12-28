@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The current implementation uses two kernels and an intermediate norms buffer for a simple L2-normalization, introducing avoidable global memory traffic and launch overhead.",
+  "bottleneck": "The algorithm computes the squared norm in one kernel and applies normalization in a second kernel, forcing an extra global read/write of the norms tensor and a second launch, while also reading the input twice from global memory.",
+  "optimisation method": "Fuse the reduction and normalization into a single Triton kernel that, for each row, first computes the L2 norm via a loop, then in the same kernel normalizes the row in a second loop using the computed norm, eliminating the intermediate norms tensor and one kernel launch.",
+  "modification plan": "Write a single l2norm_kernel where each program_id processes one row: (1) loop over D with BLOCK_N tiles to accumulate sum of squares into a scalar; (2) compute norm = sqrt(sum_sq); (3) loop again over D with the same tiling to load x, divide by norm, and store y. Remove l2norm_sumsq_kernel and the norms tensor entirely, and adjust the Python wrapper to launch only this fused kernel. Optionally tune BLOCK_N and num_warps after fusion, but keep the algorithmic structure as a two-pass per-row kernel.",
+  "expected_speedup": "20-30%"
+}

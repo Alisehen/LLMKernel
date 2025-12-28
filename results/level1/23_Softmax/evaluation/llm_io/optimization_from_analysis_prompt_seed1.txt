@@ -1,0 +1,237 @@
+You are optimizing a Triton kernel based on algorithmic analysis.
+
+# PyTorch Reference (Target Behavior)
+
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs a Softmax activation.
+    """
+    def __init__(self):
+        super(Model, self).__init__()
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies Softmax activation to the input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, num_features).
+
+        Returns:
+            torch.Tensor: Output tensor with Softmax applied, same shape as input.
+        """
+        return torch.softmax(x, dim=1)
+
+batch_size = 4096
+dim = 393216
+
+def get_inputs():
+    x = torch.rand(batch_size, dim)
+    return [x]
+
+def get_init_inputs():
+    return []  # No special initialization inputs needed
+```
+
+**CRITICAL**: Study the PyTorch code carefully to understand:
+- What does `forward()` return? (full output sequence vs final hidden state only)
+- What is the computational pattern?
+- What are the input/output shapes?
+
+Your optimized kernel MUST match this exact behavior.
+
+---
+
+# Analysis Results
+
+**Bottleneck**: Each element is read three times and written twice because the kernel materializes exp(x - max) into y_ptr as a temporary, leading to 5 global memory transactions per element across three sweeps of a very long row (N≈3.9e5). This excessive global-memory traffic dominates runtime for such large rows.
+
+**Optimization Strategy**: Replace the current 3-pass softmax that stores exp(x - max) into an intermediate buffer with a recomputation-based softmax that never materializes the numerator, i.e., compute row_max (pass 1), compute row_sum by recomputing exp(x - row_max) without storing (pass 2), then in a final pass recompute exp(x - row_max)/row_sum and write directly to the output, trading extra flops for substantially less global-memory traffic.
+
+**Implementation Plan**: Keep the first loop unchanged to compute row_max. In the second loop, remove the tl.store of exp_x to y_ptr; instead, only accumulate row_sum using exp(x - row_max) and discard the per-element numerators. In the third loop, load x again, recompute exp(x - row_max), multiply by inv_row_sum, and write the final result directly to y_ptr; this reduces one global write and one global read per element, which should noticeably improve a bandwidth-bound kernel on very long rows.
+
+**Expected Speedup**: 20-30%
+
+---
+
+# Current Kernel (needs optimization)
+
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def softmax_kernel_2d(
+    x_ptr, y_ptr,
+    stride_xm, stride_xn,
+    stride_ym, stride_yn,
+    N_COLS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Row-wise softmax over dim=1 for a 2D tensor [M, N_COLS].
+    Each program handles one row and iterates over it in chunks of BLOCK_SIZE.
+    """
+    row_id = tl.program_id(axis=0)
+
+    # Base pointers for this row
+    row_x_ptr = x_ptr + row_id * stride_xm
+    row_y_ptr = y_ptr + row_id * stride_ym
+
+    offs = tl.arange(0, BLOCK_SIZE)
+
+    # --------------------------------------------------------------------- #
+    # Pass 1: compute row-wise maximum for numerical stability
+    # --------------------------------------------------------------------- #
+    row_max = -float("inf")
+    for col_start in range(0, N_COLS, BLOCK_SIZE):
+        cols = col_start + offs
+        mask = cols < N_COLS
+        x = tl.load(
+            row_x_ptr + cols * stride_xn,
+            mask=mask,
+            other=-float("inf"),
+        )
+        chunk_max = tl.max(x, axis=0)
+        row_max = tl.maximum(row_max, chunk_max)
+
+    # --------------------------------------------------------------------- #
+    # Pass 2: compute exp(x - max) and accumulate row-wise sum
+    #         We store the numerators (exp(x - max)) in y_ptr as a temporary.
+    # --------------------------------------------------------------------- #
+    row_sum = 0.0
+    for col_start in range(0, N_COLS, BLOCK_SIZE):
+        cols = col_start + offs
+        mask = cols < N_COLS
+        x = tl.load(
+            row_x_ptr + cols * stride_xn,
+            mask=mask,
+            other=-float("inf"),
+        )
+        x = x - row_max
+        exp_x = tl.exp(x)
+        row_sum = row_sum + tl.sum(exp_x, axis=0)
+        tl.store(
+            row_y_ptr + cols * stride_yn,
+            exp_x,
+            mask=mask,
+        )
+
+    # --------------------------------------------------------------------- #
+    # Pass 3: normalize stored numerators by the row-wise sum
+    # --------------------------------------------------------------------- #
+    inv_row_sum = 1.0 / row_sum
+    for col_start in range(0, N_COLS, BLOCK_SIZE):
+        cols = col_start + offs
+        mask = cols < N_COLS
+        y = tl.load(
+            row_y_ptr + cols * stride_yn,
+            mask=mask,
+            other=0.0,
+        )
+        y = y * inv_row_sum
+        tl.store(
+            row_y_ptr + cols * stride_yn,
+            y,
+            mask=mask,
+        )
+
+
+def triton_softmax_2d(x: torch.Tensor) -> torch.Tensor:
+    """
+    High-performance Triton implementation of softmax over dim=1 for 2D tensors.
+    """
+    assert x.dim() == 2, "triton_softmax_2d expects a 2D tensor"
+    assert x.is_cuda, "Input must be a CUDA tensor for Triton execution"
+
+    M, N = x.shape
+    y = torch.empty_like(x)
+
+    stride_xm, stride_xn = x.stride()
+    stride_ym, stride_yn = y.stride()
+
+    BLOCK_SIZE = 256  # power-of-2 as required
+
+    grid = lambda meta: (M,)  # one program per row; grid size > 0 by construction
+
+    softmax_kernel_2d[grid](
+        x, y,
+        stride_xm, stride_xn,
+        stride_ym, stride_yn,
+        N_COLS=N,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=8,
+        num_stages=2,
+    )
+
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model using a Triton kernel for softmax over dim=1.
+    Falls back to PyTorch softmax on non-CUDA tensors.
+    """
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.is_cuda:
+            return triton_softmax_2d(x)
+        else:
+            return torch.softmax(x, dim=1)
+```
+
+---
+
+# Your Task
+
+Implement the optimization strategy above. Focus on the specific bottleneck identified.
+
+## Key Requirements
+
+1. **Preserve correctness**: Maintain the same input/output behavior
+2. **Apply the optimization**: Follow the implementation plan exactly
+3. **Use valid Triton syntax**:
+   - Every kernel MUST have `@triton.jit` decorator
+   - Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+   - BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+   - No `continue`, `break`, `return` inside kernels (use masking)
+   - Prefer `tl.dot(a, b, allow_tf32=True)` for matmul operations
+
+4. **CRITICAL for RNN/GRU/LSTM Persistent Kernels**:
+   - Time loop MUST be inside @triton.jit kernel, NOT in Python forward()
+   - **HYBRID computation strategy** (CRITICAL for performance):
+     * Precompute input-side gates OUTSIDE kernel: `gates_x = (T*B, In) @ W_ih` (ONE large GEMM)
+     * INSIDE kernel: only recurrent-side: `for t: gates_h = h @ W_hh` (T small GEMMs)
+   - CORRECT (FAST - use this):
+     ```python
+     # Python forward():
+     gates_x_all = x.reshape(T*B, In) @ W_ih + b_ih  # ONE large GEMM
+     gates_x_all = gates_x_all.view(T, B, 3*H)
+     gru_persistent_kernel[grid](gates_x_all, h0, W_hh, ...)  # Launch ONCE
+
+     @triton.jit
+     def gru_persistent_kernel(gates_x_ptr, h_ptr, W_hh_ptr, ...):
+         for t in range(T):  # Inside kernel
+             gates_x_t = tl.load(gates_x_ptr + t*...)  # Precomputed
+             gates_h = h @ W_hh  # Only recurrent GEMM
+             h = (1-z)*n + z*h   # Fuse and update
+     ```
+
+5. **Output format**:
+   - Imports: `import torch, torch.nn as nn, triton, triton.language as tl`
+   - `@triton.jit` kernel(s)
+   - Wrapper function(s)
+   - `class ModelNew(nn.Module)` — REQUIRED
+   - NO testing code, NO `if __name__ == "__main__"`
+
+---
+
+Generate the optimized kernel now. Output ONLY the complete Python code.

@@ -1,50 +1,37 @@
 You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
 
-# Target GPU
-GPU Name: 4090
-Architecture: Ada Lovelace
-• Compute Capability: 8.9
-• Number of SMs: 128
-• Memory Bandwidth: 1008 GB/s
-• TF32 Tensor Core TFLOPS: 82.6 with dense
-• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
-• FP16 Tensor Core TFLOPS: 165.2 with dense
-• Maximum number of registers per thread: 255
-• Maximum threads per block: 1024
-• Maximum threads per SM: 1536
-• Warp size: 32
-• Maximum concurrent warps per SM: 48
-• Shared memory capacity per SM: 100 KB
-• Maximum shared memory per thread block: 99 KB
-• L2 cache (global, all SM shared): 72 MB
+# Target GPU: 4090
 
 [OPTIMIZATION STAGE]
 
 ## Current Optimization Stage
 
-**Focus**: Optimize grid layout and parallel work distribution.
+Focus: Grid layout & parallelism.
 
-**NCU Metrics**:
-• `sm__throughput.avg.pct_of_peak_sustained_elapsed` (target >60%)
-• `launch__grid_size` (primarily determined by grid mapping)
+Metrics:
+- sm__throughput.avg.pct_of_peak_sustained_elapsed (>60%)
+- launch__grid_size
 
-**Guidelines**:
-- 1D → `(cdiv(N, BLOCK))`
-- 2D → `(cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))`
-- 3D (batch×M×N) → `(batch, cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))`
-- 4D+ → flatten **independent parallel dims** to 3D
-- Prefer batch / head / expert parallelism when available, before shrinking BLOCK sizes
+Rules:
+- 1D: (cdiv(N, BLOCK))
+- 2D: (cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))
+- 3D: (batch, cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))
+- >3D: flatten ONLY independent dims
+- Prefer batch / head / expert / group parallelism before shrinking BLOCK
+- For grouped operations: ensure group dimension is in grid (e.g., program_id(2) for groups)
 - Change grid only if SM utilization is clearly low
-- Ensure `grid = (...)` matches `tl.program_id(axis)` logic
 
-**Safety Rules**:
-- Max 3 grid dimensions; grid rank must be static
-- If unsure about correctness, do not modify grid
+Safety:
+- Max 3 grid dims, static rank
+- grid=(G0,G1,G2) must match tl.program_id(0/1/2)
+- For grouped ops: verify group indexing is correct
+- If unsure about correctness, do NOT change grid
 
-**Autotune (safe)**:
-- Autotune **either** BLOCK_* **or** (`num_warps`, `num_stages`)
-- If BLOCK_* are autotuned, use `grid = lambda META: (...)` with `META["BLOCK_*"]`
-- Never redefine BLOCK_* in both configs and launch
+Autotune:
+- Autotune either BLOCK_* OR (num_warps, num_stages)
+- If autotuning BLOCK_*, use grid=lambda META: (...)
+- Never redefine BLOCK_* in both kernel and launch
+- Max 2-3 configs to reduce compilation time
 
 
 
@@ -55,96 +42,100 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
+
 @triton.jit
 def sigmoid_kernel(
     x_ptr,
-    output_ptr,
+    y_ptr,
     n_elements,
     BLOCK_SIZE: tl.constexpr,
 ):
-    # 1D grid of blocks
     pid = tl.program_id(axis=0)
-    
-    # Compute block start and offsets
     block_start = pid * BLOCK_SIZE
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    
-    # Mask for boundary checks
+
     mask = offsets < n_elements
-    
-    # Load input
+
     x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
-    
-    # Compute sigmoid: 1 / (1 + exp(-x))
-    # Use exp2 for better precision and faster computation
+    # sigmoid(x) = 1 / (1 + exp(-x))
     neg_x = -x
-    # Compute exp(-x) using exp2 for stability
-    exp_neg_x = tl.exp(neg_x)
-    denominator = 1.0 + exp_neg_x
-    output = 1.0 / denominator
-    
-    # Store result
-    tl.store(output_ptr + offsets, output, mask=mask)
+    exp_neg = tl.exp(neg_x)
+    denom = 1.0 + exp_neg
+    y = 1.0 / denom
+
+    tl.store(y_ptr + offsets, y, mask=mask)
+
 
 def triton_sigmoid(x: torch.Tensor) -> torch.Tensor:
-    # Preserve input shape
-    output = torch.empty_like(x)
-    
-    # Flatten for 1D kernel
-    x_flatten = x.flatten()
-    output_flatten = output.flatten()
-    
-    # Compute kernel parameters
-    n_elements = x_flatten.numel()
-    if n_elements == 0:
-        return output
-    
-    # Optimal block size: 1024 for maximum occupancy on target hardware
-    BLOCK_SIZE = 1024
-    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
-    
-    # Launch kernel
+    """
+    High-performance Triton implementation of torch.sigmoid(x).
+    """
+    assert x.is_cuda, "Input tensor must be on CUDA device for Triton kernels."
+    x_contig = x.contiguous()
+    y = torch.empty_like(x_contig)
+
+    n_elements = x_contig.numel()
+    BLOCK_SIZE = 256
+
+    def grid(meta):
+        # ensure grid size > 0 even for empty tensors
+        return (max(1, triton.cdiv(n_elements, meta["BLOCK_SIZE"])),)
+
     sigmoid_kernel[grid](
-        x_flatten, output_flatten, n_elements,
-        BLOCK_SIZE=BLOCK_SIZE
+        x_contig,
+        y,
+        n_elements,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=8,
+        num_stages=2,
     )
-    
-    return output
+
+    return y.view_as(x)
+
 
 class ModelNew(nn.Module):
     """
-    Optimized model that performs Sigmoid activation using Triton kernels.
+    Simple model that performs a Sigmoid activation using a Triton kernel.
     """
     def __init__(self):
         super(ModelNew, self).__init__()
-    
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Applies Sigmoid activation to the input tensor using Triton kernel.
-        """
         return triton_sigmoid(x)
 ```
 
 [NCU PROFILING METRICS]
 {
   "sigmoid_kernel": {
-    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 5.01,
-    "launch__grid_size": 1572864,
-    "sm__warps_active.avg.pct_of_peak_sustained_active": 81.66,
-    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 92.98,
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 9.77,
+    "launch__grid_size": 6291456,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 80.92,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 93.49,
     "lts__t_sector_hit_rate.pct": 50.0
   }
 }
 
 **Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
 
-OUTPUT RULES (STRICT):
-1. Follow this exact order:
-   1. Imports: torch, torch.nn, triton, triton.language as tl
-   2. @triton.jit decorated kernel function(s)
-   3. Wrapper function(s) for grid calculation and kernel launch
-   4. class ModelNew(nn.Module) that calls your kernels
-2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+## CRITICAL — Code MUST compile and run:
+1. EVERY kernel function MUST have `@triton.jit` decorator
+2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+3. BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+4. `tl.program_id(axis)` only supports axis = 0, 1, 2
+5. No `continue`, `break`, `return` inside loops — use masking
+6. No tensor indexing with loop vars: `x[:, i]` is INVALID
+7. mask shape MUST match data shape in tl.load/tl.store
+
+## Missing Triton Functions (implement manually):
+- tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+## OUTPUT FORMAT (STRICT):
+1. Imports: torch, torch.nn, triton, triton.language as tl
+2. @triton.jit decorated kernel function(s)
+3. Wrapper function(s) for grid calculation and kernel launch
+4. class ModelNew(nn.Module) that calls your kernels
+
+Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
 
 ```python
 # <optimized Triton code>

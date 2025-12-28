@@ -1,0 +1,173 @@
+You are optimizing a Triton kernel based on algorithmic analysis.
+
+# PyTorch Reference (Target Behavior)
+
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs a ReLU activation.
+    """
+    def __init__(self):
+        super(Model, self).__init__()
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies ReLU activation to the input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor of any shape.
+
+        Returns:
+            torch.Tensor: Output tensor with ReLU applied, same shape as input.
+        """
+        return torch.relu(x)
+
+batch_size = 4096
+dim = 393216
+
+def get_inputs():
+    x = torch.rand(batch_size, dim)
+    return [x]
+
+def get_init_inputs():
+    return []  # No special initialization inputs needed
+```
+
+**CRITICAL**: Study the PyTorch code carefully to understand:
+- What does `forward()` return? (full output sequence vs final hidden state only)
+- What is the computational pattern?
+- What are the input/output shapes?
+
+Your optimized kernel MUST match this exact behavior.
+
+---
+
+# Analysis Results
+
+**Bottleneck**: The Triton kernel always writes to a separate output tensor, doubling global memory traffic (read x, write y) and incurring an extra allocation, while the operation is elementwise and could be done in-place like torch.relu_.
+
+**Optimization Strategy**: Switch to an in-place ReLU kernel that updates the input tensor directly (x := max(x, 0)), eliminating the separate output buffer and halving global memory writes.
+
+**Implementation Plan**: Change the Triton kernel signature so x_ptr is both the input and output, performing tl.store(x_ptr + offsets, y, mask=mask), and modify triton_relu to operate in-place (or provide a separate triton_relu_ API) without allocating a new tensor or doing x.contiguous() unless strictly necessary. Update ModelNew to use the in-place version when semantics allow, mirroring torch.relu_ behavior for maximal performance.
+
+**Expected Speedup**: 30-40%
+
+---
+
+# Current Kernel (needs optimization)
+
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def relu_kernel(
+    x_ptr,
+    y_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+    VEC: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE * VEC
+    offsets = block_start + tl.arange(0, BLOCK_SIZE * VEC)
+    mask = offsets < n_elements
+
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    y = tl.maximum(x, 0.0)
+
+    tl.store(y_ptr + offsets, y, mask=mask)
+
+
+def triton_relu(x: torch.Tensor) -> torch.Tensor:
+    """
+    High-performance ReLU using Triton.
+    Works on contiguous CUDA tensors of any shape.
+    """
+    assert x.is_cuda, "Input must be a CUDA tensor"
+    x_contig = x.contiguous()
+    y = torch.empty_like(x_contig)
+
+    n_elements = y.numel()
+    BLOCK_SIZE = 256  # power-of-2 as required
+    VEC = 4           # process 4*BLOCK_SIZE elements per program for higher throughput
+
+    def grid(meta):
+        # ensure grid size > 0
+        return (triton.cdiv(max(n_elements, 1), meta["BLOCK_SIZE"] * meta["VEC"]),)
+
+    relu_kernel[grid](
+        x_contig,
+        y,
+        n_elements,
+        BLOCK_SIZE=BLOCK_SIZE,
+        VEC=VEC,
+        num_warps=8,
+    )
+    return y.view_as(x)
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-accelerated model that performs a ReLU activation.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_relu(x)
+```
+
+---
+
+# Your Task
+
+Implement the optimization strategy above. Focus on the specific bottleneck identified.
+
+## Key Requirements
+
+1. **Preserve correctness**: Maintain the same input/output behavior
+2. **Apply the optimization**: Follow the implementation plan exactly
+3. **Use valid Triton syntax**:
+   - Every kernel MUST have `@triton.jit` decorator
+   - Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+   - BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+   - No `continue`, `break`, `return` inside kernels (use masking)
+   - Prefer `tl.dot(a, b, allow_tf32=True)` for matmul operations
+
+4. **CRITICAL for RNN/GRU/LSTM Persistent Kernels**:
+   - Time loop MUST be inside @triton.jit kernel, NOT in Python forward()
+   - **HYBRID computation strategy** (CRITICAL for performance):
+     * Precompute input-side gates OUTSIDE kernel: `gates_x = (T*B, In) @ W_ih` (ONE large GEMM)
+     * INSIDE kernel: only recurrent-side: `for t: gates_h = h @ W_hh` (T small GEMMs)
+   - CORRECT (FAST - use this):
+     ```python
+     # Python forward():
+     gates_x_all = x.reshape(T*B, In) @ W_ih + b_ih  # ONE large GEMM
+     gates_x_all = gates_x_all.view(T, B, 3*H)
+     gru_persistent_kernel[grid](gates_x_all, h0, W_hh, ...)  # Launch ONCE
+
+     @triton.jit
+     def gru_persistent_kernel(gates_x_ptr, h_ptr, W_hh_ptr, ...):
+         for t in range(T):  # Inside kernel
+             gates_x_t = tl.load(gates_x_ptr + t*...)  # Precomputed
+             gates_h = h @ W_hh  # Only recurrent GEMM
+             h = (1-z)*n + z*h   # Fuse and update
+     ```
+
+5. **Output format**:
+   - Imports: `import torch, torch.nn as nn, triton, triton.language as tl`
+   - `@triton.jit` kernel(s)
+   - Wrapper function(s)
+   - `class ModelNew(nn.Module)` — REQUIRED
+   - NO testing code, NO `if __name__ == "__main__"`
+
+---
+
+Generate the optimized kernel now. Output ONLY the complete Python code.

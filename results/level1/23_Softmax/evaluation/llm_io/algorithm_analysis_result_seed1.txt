@@ -1,0 +1,10 @@
+```json
+{
+  "worth_optimizing": "yes",
+  "reason": "The Triton softmax is significantly slower than PyTorch and is clearly memory-bandwidth bound due to multiple full passes and extra global-memory traffic.",
+  "bottleneck": "Each element is read three times and written twice because the kernel materializes exp(x - max) into y_ptr as a temporary, leading to 5 global memory transactions per element across three sweeps of a very long row (N≈3.9e5). This excessive global-memory traffic dominates runtime for such large rows.",
+  "optimisation method": "Replace the current 3-pass softmax that stores exp(x - max) into an intermediate buffer with a recomputation-based softmax that never materializes the numerator, i.e., compute row_max (pass 1), compute row_sum by recomputing exp(x - row_max) without storing (pass 2), then in a final pass recompute exp(x - row_max)/row_sum and write directly to the output, trading extra flops for substantially less global-memory traffic.",
+  "modification plan": "Keep the first loop unchanged to compute row_max. In the second loop, remove the tl.store of exp_x to y_ptr; instead, only accumulate row_sum using exp(x - row_max) and discard the per-element numerators. In the third loop, load x again, recompute exp(x - row_max), multiply by inv_row_sum, and write the final result directly to y_ptr; this reduces one global write and one global read per element, which should noticeably improve a bandwidth-bound kernel on very long rows.",
+  "expected_speedup": "20-30%"
+}
+```

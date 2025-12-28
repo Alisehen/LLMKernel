@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The current Triton kernel performs the entire reduction along the R dimension serially per thread, underutilizing intra-block parallelism and losing to PyTorch’s highly optimized reduction.",
+  "bottleneck": "Each output element is computed by a single thread looping over all R=4096 elements, with no parallel reduction across the reduction dimension, leading to poor latency hiding and weaker use of SM resources compared to a hierarchical/tree reduction.",
+  "optimisation method": "Algorithm Replacement: replace the purely per-thread serial reduction over R with a block-level parallel tree reduction, where multiple threads in a block collaboratively reduce chunks of the R dimension using shared memory and warp-level reductions.",
+  "modification plan": "Redesign the kernel so that each program/block is responsible for a tile of (M, N) and splits the R dimension into tiles processed in parallel by threads (e.g., each warp handles a subset of R for a given output). Within each block, load a tile of R into registers/shared memory, perform a parallel intra-block reduction (warp shuffles or shared-memory tree reduce) to produce one partial sum per output, and, if needed, iterate over multiple R-tiles accumulating these partial sums. Finally, write the reduced result to global memory, keeping the same [M,1,N] layout so the Python wrapper stays unchanged.",
+  "expected_speedup": "20-30%"
+}

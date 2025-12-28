@@ -1,0 +1,181 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def l2norm_partial_sums_kernel(
+    x_ptr,            # *f32, [B, D]
+    partials_ptr,     # *f32, [B, T]
+    D,                # int32, number of columns
+    T,                # int32, number of tiles per row
+    stride_x_batch,   # int32
+    stride_x_dim,     # int32
+    stride_p_batch,   # int32
+    stride_p_tile,    # int32
+    CHUNK_SIZE: tl.constexpr,        # columns per tile (256)
+    TILES_PER_PROGRAM: tl.constexpr  # how many tiles one program processes
+):
+    pid_batch = tl.program_id(axis=0)
+    pid_tile_group = tl.program_id(axis=1)
+
+    row_x_ptr = x_ptr + pid_batch * stride_x_batch
+    row_p_ptr = partials_ptr + pid_batch * stride_p_batch
+
+    # process up to TILES_PER_PROGRAM tiles per program
+    for t in range(TILES_PER_PROGRAM):
+        tile_id = pid_tile_group * TILES_PER_PROGRAM + t  # scalar tl.int32
+        tile_mask = tile_id < T
+
+        col_start = tile_id * CHUNK_SIZE
+        offs = col_start + tl.arange(0, CHUNK_SIZE)
+        mask = (offs < D) & tile_mask
+
+        x = tl.load(row_x_ptr + offs * stride_x_dim, mask=mask, other=0.0)
+        sq = x * x
+        partial = tl.sum(sq, axis=0)
+
+        # store one scalar per tile (masked if tile_id >= T)
+        tl.store(row_p_ptr + tile_id * stride_p_tile, partial, mask=tile_mask)
+
+
+@triton.jit
+def l2norm_reduce_rows_kernel(
+    partials_ptr,   # *f32, [B, T]
+    norms_ptr,      # *f32, [B]
+    T,              # int32, number of tiles per row
+    stride_p_batch, # int32
+    stride_p_tile,  # int32
+    BLOCK_SIZE: tl.constexpr  # 256
+):
+    pid_batch = tl.program_id(axis=0)
+
+    row_p_ptr = partials_ptr + pid_batch * stride_p_batch
+
+    offs = tl.arange(0, BLOCK_SIZE)
+    mask = offs < T
+
+    vals = tl.load(row_p_ptr + offs * stride_p_tile, mask=mask, other=0.0)
+    total = tl.sum(vals, axis=0)
+    norm = tl.sqrt(total)
+
+    tl.store(norms_ptr + pid_batch, norm)
+
+
+@triton.jit
+def l2norm_normalize_kernel(
+    x_ptr,        # *f32, [B, D] flattened
+    norms_ptr,    # *f32, [B]
+    y_ptr,        # *f32, [B, D] flattened
+    n_elements,   # int32, B * D
+    D,            # int32, number of columns
+    BLOCK_SIZE: tl.constexpr,  # 256
+):
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offs = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offs < n_elements
+
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+
+    rows = offs // D
+    norms = tl.load(norms_ptr + rows, mask=mask)
+
+    y = x / norms
+    tl.store(y_ptr + offs, y, mask=mask)
+
+
+def triton_l2norm(x: torch.Tensor) -> torch.Tensor:
+    assert x.ndim == 2, "Input must be 2D tensor [batch, dim]"
+    if not x.is_cuda:
+        raise ValueError("Input tensor must be on CUDA device for Triton kernels.")
+
+    B, D = x.shape
+    if B == 0 or D == 0:
+        # Degenerate case: nothing to normalize
+        return x.clone()
+
+    x_c = x.contiguous()
+    device = x_c.device
+    dtype = x_c.dtype
+
+    CHUNK_SIZE = 256
+    TILES_PER_PROGRAM = 4
+
+    # number of tiles per row (each tile covers CHUNK_SIZE columns)
+    T = triton.cdiv(D, CHUNK_SIZE)
+
+    # Allocate intermediate buffers
+    partials = torch.empty((B, T), device=device, dtype=dtype)
+    norms = torch.empty((B,), device=device, dtype=dtype)
+    y = torch.empty_like(x_c)
+
+    stride_x_batch = x_c.stride(0)
+    stride_x_dim = x_c.stride(1)
+
+    stride_p_batch = partials.stride(0)
+    stride_p_tile = partials.stride(1)
+
+    # 1) Compute partial sums of squares for each (row, tile)
+    grid_partial = lambda meta: (
+        B,
+        max(1, triton.cdiv(T, meta["TILES_PER_PROGRAM"])),
+    )
+    l2norm_partial_sums_kernel[grid_partial](
+        x_c,
+        partials,
+        D,
+        T,
+        stride_x_batch,
+        stride_x_dim,
+        stride_p_batch,
+        stride_p_tile,
+        CHUNK_SIZE=CHUNK_SIZE,
+        TILES_PER_PROGRAM=TILES_PER_PROGRAM,
+        num_warps=4,
+        num_stages=2,
+    )
+
+    # 2) Reduce partial sums per row to get L2 norms
+    grid_reduce = lambda meta: (B,)
+    l2norm_reduce_rows_kernel[grid_reduce](
+        partials,
+        norms,
+        T,
+        stride_p_batch,
+        stride_p_tile,
+        BLOCK_SIZE=256,
+        num_warps=4,
+        num_stages=2,
+    )
+
+    # 3) Normalize x by its L2 norm along dim=1
+    n_elements = B * D
+    grid_norm = lambda meta: (
+        max(1, triton.cdiv(n_elements, meta["BLOCK_SIZE"])),
+    )
+    l2norm_normalize_kernel[grid_norm](
+        x_c,
+        norms,
+        y,
+        n_elements,
+        D,
+        BLOCK_SIZE=256,
+        num_warps=4,
+        num_stages=2,
+    )
+
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized model that performs L2 normalization along dim=1.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_l2norm(x)

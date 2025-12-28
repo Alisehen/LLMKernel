@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The kernel currently ignores the triangular structure of the output and performs essentially a full dense matmul, so a sizable fraction of work is provably useless.",
+  "bottleneck": "All BLOCK_M x BLOCK_N tiles for the full M x N domain are launched and fully computed even when they correspond to the strictly lower-triangular region of C, which is later masked out. This wastes both compute and memory bandwidth on tiles whose results are ultimately discarded.",
+  "optimisation method": "Exploit the upper-triangular structure at the tiling level by launching and computing only tiles with col_block >= row_block (triangular grid scheduling), instead of a full rectangular grid plus masking.",
+  "modification plan": "Change the launch grid to be 1D over the number of upper-triangular tiles, e.g. num_tiles = num_block_rows * (num_block_rows + 1) / 2, and inside the kernel map the 1D program_id to (pid_m, pid_n) in the upper triangle via inverse triangular-number mapping. With this mapping, skip the is_triu mask (only keep in-bounds checks), as no program is ever assigned to strictly lower-triangular tiles, thereby halving the number of tiles executed and eliminating their unnecessary loads and dot products.",
+  "expected_speedup": "30-40%"
+}

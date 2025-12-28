@@ -1,0 +1,247 @@
+You are optimizing a Triton kernel based on algorithmic analysis.
+
+# PyTorch Reference (Target Behavior)
+
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs a LogSoftmax activation.
+    """
+    def __init__(self, dim: int = 1):
+        super(Model, self).__init__()
+        self.dim = dim
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies LogSoftmax activation to the input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, dim).
+
+        Returns:
+            torch.Tensor: Output tensor with LogSoftmax applied, same shape as input.
+        """
+        return torch.log_softmax(x, dim=self.dim)
+
+batch_size = 4096
+dim = 393216
+
+def get_inputs():
+    x = torch.rand(batch_size, dim)
+    return [x]
+
+def get_init_inputs():
+    return []  # No special initialization inputs needed
+```
+
+**CRITICAL**: Study the PyTorch code carefully to understand:
+- What does `forward()` return? (full output sequence vs final hidden state only)
+- What is the computational pattern?
+- What are the input/output shapes?
+
+Your optimized kernel MUST match this exact behavior.
+
+---
+
+# Analysis Results
+
+**Bottleneck**: The current design uses two kernels and three full reads of the (batch, dim) matrix (max kernel + two passes inside logsoftmax kernel), making it strongly memory-bandwidth bound and incurring extra kernel launch and row_max buffer traffic.
+
+**Optimization Strategy**: Replace the separate row_max kernel + naive sum-exp pass with a single-kernel, online log-sum-exp algorithm per row that computes both the row maximum and logsumexp in one streaming pass, leaving only one additional pass to form the outputs.
+
+**Implementation Plan**: Write a single Triton kernel that, for each row, first performs one loop over columns using an online log-sum-exp recurrence (maintaining running row_max and a scaled sum in registers) to obtain the final logsumexp without needing a prior row_max pass. Then perform a second loop over columns that reloads x, computes y = x - logsumexp, and stores to y_ptr. Remove the row_max kernel and row_max buffer entirely so the overall algorithm does only two global read passes and one write pass per row instead of three reads and one write.
+
+**Expected Speedup**: 30-40%
+
+---
+
+# Current Kernel (needs optimization)
+
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def row_max_kernel(
+    x_ptr,             # *f32 / *f16
+    row_max_ptr,       # *f32 / *f16
+    N_COLS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)  # row index
+    row_start = pid * N_COLS
+
+    offs = tl.arange(0, BLOCK_SIZE)
+    max_val = -float("inf")
+
+    # Pass 1: row-wise maximum
+    for col_start in range(0, N_COLS, BLOCK_SIZE):
+        idx = col_start + offs
+        mask = idx < N_COLS
+        x = tl.load(x_ptr + row_start + idx, mask=mask, other=-float("inf"))
+        block_max = tl.max(x, axis=0)
+        max_val = tl.maximum(max_val, block_max)
+
+    tl.store(row_max_ptr + pid, max_val)
+
+
+@triton.jit
+def logsoftmax_kernel(
+    x_ptr,             # *f32 / *f16
+    row_max_ptr,       # *f32 / *f16
+    y_ptr,             # *f32 / *f16
+    N_COLS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)  # row index
+    row_start = pid * N_COLS
+    offs = tl.arange(0, BLOCK_SIZE)
+
+    # Load precomputed row max
+    max_val = tl.load(row_max_ptr + pid)
+
+    # Pass 1: compute sum(exp(x - max))
+    sum_exp = 0.0
+    for col_start in range(0, N_COLS, BLOCK_SIZE):
+        idx = col_start + offs
+        mask = idx < N_COLS
+        x = tl.load(x_ptr + row_start + idx, mask=mask, other=-float("inf"))
+        x_centered = x - max_val
+        exp_x = tl.exp(x_centered)
+        sum_exp = sum_exp + tl.sum(exp_x, axis=0)
+
+    logsumexp = tl.log(sum_exp)
+
+    # Pass 2: write log_softmax = (x - max) - logsumexp
+    for col_start in range(0, N_COLS, BLOCK_SIZE):
+        idx = col_start + offs
+        mask = idx < N_COLS
+        x = tl.load(x_ptr + row_start + idx, mask=mask, other=-float("inf"))
+        x_centered = x - max_val
+        out = x_centered - logsumexp
+        tl.store(y_ptr + row_start + idx, out, mask=mask)
+
+
+def triton_logsoftmax_2d(x: torch.Tensor) -> torch.Tensor:
+    """
+    High-performance Triton implementation of log_softmax over dimension 1
+    for a 2D tensor of shape (batch, dim).
+    """
+    assert x.ndim == 2, "triton_logsoftmax_2d only supports 2D tensors (batch, dim)"
+    assert x.is_cuda, "Input must be on CUDA device for Triton kernels"
+
+    x = x.contiguous()
+    batch, dim = x.shape
+    y = torch.empty_like(x)
+
+    # Buffer to hold per-row maxima
+    row_max = torch.empty(
+        batch, device=x.device, dtype=x.dtype
+    )
+
+    BLOCK_SIZE = 256
+
+    # Grid along rows; ensure > 0 using cdiv as requested
+    grid = lambda meta: (triton.cdiv(batch, 1),)
+
+    # Kernel 1: row-wise max
+    row_max_kernel[grid](
+        x,
+        row_max,
+        N_COLS=dim,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=4,
+        num_stages=2,
+    )
+
+    # Kernel 2: log_softmax using row_max
+    logsoftmax_kernel[grid](
+        x,
+        row_max,
+        y,
+        N_COLS=dim,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=4,
+        num_stages=2,
+    )
+
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-accelerated model that performs LogSoftmax activation along dim=1.
+    """
+    def __init__(self, dim: int = 1):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # This implementation is specialized for log_softmax over dim=1
+        assert self.dim in (1, -1), "ModelNew only supports dim=1 or dim=-1 for now"
+        if not x.is_cuda:
+            x = x.cuda(non_blocking=True)
+        # Reshape to 2D if necessary (treat all leading dims as batch)
+        if x.ndim != 2:
+            new_dim = x.shape[self.dim]
+            batch = x.numel() // new_dim
+            x = x.contiguous().view(batch, new_dim)
+            y = triton_logsoftmax_2d(x)
+            return y.view(*([d for i, d in enumerate(x.shape) if i != 1] + [x.shape[1]]))
+        else:
+            return triton_logsoftmax_2d(x)
+```
+
+---
+
+# Your Task
+
+Implement the optimization strategy above. Focus on the specific bottleneck identified.
+
+## Key Requirements
+
+1. **Preserve correctness**: Maintain the same input/output behavior
+2. **Apply the optimization**: Follow the implementation plan exactly
+3. **Use valid Triton syntax**:
+   - Every kernel MUST have `@triton.jit` decorator
+   - Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+   - BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+   - No `continue`, `break`, `return` inside kernels (use masking)
+   - Prefer `tl.dot(a, b, allow_tf32=True)` for matmul operations
+
+4. **CRITICAL for RNN/GRU/LSTM Persistent Kernels**:
+   - Time loop MUST be inside @triton.jit kernel, NOT in Python forward()
+   - **HYBRID computation strategy** (CRITICAL for performance):
+     * Precompute input-side gates OUTSIDE kernel: `gates_x = (T*B, In) @ W_ih` (ONE large GEMM)
+     * INSIDE kernel: only recurrent-side: `for t: gates_h = h @ W_hh` (T small GEMMs)
+   - CORRECT (FAST - use this):
+     ```python
+     # Python forward():
+     gates_x_all = x.reshape(T*B, In) @ W_ih + b_ih  # ONE large GEMM
+     gates_x_all = gates_x_all.view(T, B, 3*H)
+     gru_persistent_kernel[grid](gates_x_all, h0, W_hh, ...)  # Launch ONCE
+
+     @triton.jit
+     def gru_persistent_kernel(gates_x_ptr, h_ptr, W_hh_ptr, ...):
+         for t in range(T):  # Inside kernel
+             gates_x_t = tl.load(gates_x_ptr + t*...)  # Precomputed
+             gates_h = h @ W_hh  # Only recurrent GEMM
+             h = (1-z)*n + z*h   # Fuse and update
+     ```
+
+5. **Output format**:
+   - Imports: `import torch, torch.nn as nn, triton, triton.language as tl`
+   - `@triton.jit` kernel(s)
+   - Wrapper function(s)
+   - `class ModelNew(nn.Module)` — REQUIRED
+   - NO testing code, NO `if __name__ == "__main__"`
+
+---
+
+Generate the optimized kernel now. Output ONLY the complete Python code.

@@ -1,0 +1,232 @@
+```python
+import torch, torch.nn as nn, triton, triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=3,
+        ),
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32},
+            num_warps=8,
+            num_stages=3,
+        ),
+        triton.Config(
+            {'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_warps=8,
+            num_stages=3,
+        ),
+        triton.Config(
+            {'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64},
+            num_warps=8,
+            num_stages=4,
+        ),
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64},
+            num_warps=4,
+            num_stages=4,
+        ),
+        triton.Config(
+            {'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=4,
+        ),
+    ],
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def matmul_splitk_kernel(
+    A_ptr, B_ptr, C_partial_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cpk, stride_cpm, stride_cpn,
+    K_SPLIT, K_PER_SPLIT,
+    BLOCK_M: tl.constexpr,  # power-of-2
+    BLOCK_N: tl.constexpr,  # power-of-2
+    BLOCK_K: tl.constexpr,  # power-of-2
+):
+    """
+    Compute partial tiles of C = A @ B for a slice of the K dimension.
+
+    Grid:
+      axis 0: blocks along M
+      axis 1: blocks along N
+      axis 2: K-split id in [0, K_SPLIT)
+    """
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+    pid_k = tl.program_id(axis=2)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_m_broadcast = offs_m[:, None]
+    offs_n_broadcast = offs_n[None, :]
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    k_range = tl.arange(0, BLOCK_K)
+    k_base = pid_k * K_PER_SPLIT
+
+    # Loop over this program's K slice
+    for k_start in range(0, K_PER_SPLIT, BLOCK_K):
+        offs_k = k_base + k_start + k_range
+
+        a_ptrs = A_ptr + offs_m_broadcast * stride_am + offs_k[None, :] * stride_ak
+        b_ptrs = B_ptr + offs_k[:, None] * stride_bk + offs_n_broadcast * stride_bn
+
+        a_mask = (offs_m_broadcast < M) & (offs_k[None, :] < K)
+        b_mask = (offs_k[:, None] < K) & (offs_n_broadcast < N)
+
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+        acc += tl.dot(a, b, allow_tf32=True)
+
+    # Store partial result for this K-split
+    c_ptrs = (
+        C_partial_ptr
+        + pid_k * stride_cpk
+        + offs_m_broadcast * stride_cpm
+        + offs_n_broadcast * stride_cpn
+    )
+    c_mask = (offs_m_broadcast < M) & (offs_n_broadcast < N)
+    tl.store(c_ptrs, acc, mask=c_mask)
+
+
+@triton.jit
+def reduce_splitk_kernel(
+    C_partial_ptr, C_ptr,
+    M, N, K_SPLIT,
+    stride_cpk, stride_cpm, stride_cpn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr,  # power-of-2
+    BLOCK_N: tl.constexpr,  # power-of-2
+):
+    """
+    Reduce K-split partial results into final C.
+
+    Grid:
+      axis 0: blocks along M
+      axis 1: blocks along N
+    """
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_m_broadcast = offs_m[:, None]
+    offs_n_broadcast = offs_n[None, :]
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    mask = (offs_m_broadcast < M) & (offs_n_broadcast < N)
+
+    # Accumulate across the split-K dimension
+    for k_id in range(0, K_SPLIT):
+        c_ptrs = (
+            C_partial_ptr
+            + k_id * stride_cpk
+            + offs_m_broadcast * stride_cpm
+            + offs_n_broadcast * stride_cpn
+        )
+        val = tl.load(c_ptrs, mask=mask, other=0.0)
+        acc += val
+
+    c_out_ptrs = C_ptr + offs_m_broadcast * stride_cm + offs_n_broadcast * stride_cn
+    tl.store(c_out_ptrs, acc, mask=mask)
+
+
+def triton_matmul(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    """
+    High-performance Triton matmul with split-K parallelism: C = A @ B
+    A: (M, K), B: (K, N)
+    """
+    assert A.dim() == 2 and B.dim() == 2, "Inputs must be 2D matrices"
+    M, K = A.shape
+    Kb, N = B.shape
+    assert K == Kb, "Inner dimensions must match for matmul"
+
+    orig_device = A.device
+    if orig_device.type != "cuda":
+        A = A.to("cuda")
+        B = B.to("cuda")
+    else:
+        if B.device != orig_device:
+            B = B.to(orig_device)
+
+    A = A.contiguous()
+    B = B.contiguous()
+
+    # Heuristic for split-K: aggressive splitting for very large K
+    # Limit to keep workspace reasonable and avoid oversplitting small K.
+    max_splits = 64
+    if K <= 4096:
+        K_SPLIT = 1
+    else:
+        # Aim for ~8k elements of K per split, capped at max_splits
+        K_SPLIT = min(max_splits, max(1, K // 8192))
+
+    # Ceil-div for per-split K length
+    K_PER_SPLIT = (K + K_SPLIT - 1) // K_SPLIT
+
+    # Workspace for partial results: shape (K_SPLIT, M, N)
+    C_partial = torch.empty((K_SPLIT, M, N), device=A.device, dtype=A.dtype)
+    C = torch.empty((M, N), device=A.device, dtype=A.dtype)
+
+    stride_am, stride_ak = A.stride()
+    stride_bk, stride_bn = B.stride()
+    stride_cpk, stride_cpm, stride_cpn = C_partial.stride()
+    stride_cm, stride_cn = C.stride()
+
+    def grid_partial(meta):
+        return (
+            triton.cdiv(M, meta['BLOCK_M']),
+            triton.cdiv(N, meta['BLOCK_N']),
+            K_SPLIT,
+        )
+
+    matmul_splitk_kernel[grid_partial](
+        A, B, C_partial,
+        M, N, K,
+        stride_am, stride_ak,
+        stride_bk, stride_bn,
+        stride_cpk, stride_cpm, stride_cpn,
+        K_SPLIT, K_PER_SPLIT,
+    )
+
+    # Use a fixed, efficient tile size for the reduction
+    REDUCE_BLOCK_M = 64
+    REDUCE_BLOCK_N = 64
+    grid_reduce = (
+        triton.cdiv(M, REDUCE_BLOCK_M),
+        triton.cdiv(N, REDUCE_BLOCK_N),
+    )
+
+    reduce_splitk_kernel[grid_reduce](
+        C_partial, C,
+        M, N, K_SPLIT,
+        stride_cpk, stride_cpm, stride_cpn,
+        stride_cm, stride_cn,
+        BLOCK_M=REDUCE_BLOCK_M,
+        BLOCK_N=REDUCE_BLOCK_N,
+    )
+
+    if orig_device.type != "cuda":
+        C = C.to(orig_device)
+    return C
+
+
+class ModelNew(nn.Module):
+    """
+    Simple model that performs a single matrix multiplication (C = A * B) with a large K dimension,
+    implemented with a high-performance split-K Triton kernel.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        return triton_matmul(A, B)
+```

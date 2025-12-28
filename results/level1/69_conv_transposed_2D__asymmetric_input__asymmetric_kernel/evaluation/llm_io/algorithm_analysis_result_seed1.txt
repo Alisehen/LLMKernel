@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The current Triton kernel is ~15x slower than PyTorch, indicating a fundamental algorithmic inefficiency rather than a minor tuning issue.",
+  "bottleneck": "Each thread computes one output element by looping over all input channels and kernel positions with scalar-style index math, leading to enormous per-element work, poor data reuse, and non-coalesced memory accesses across (C_in, kH, kW).",
+  "optimisation method": "Algorithm Replacement: reformulate transposed convolution as an implicit GEMM (im2col-style) or equivalent forward convolution and implement it with a matmul-like, block-tiled Triton kernel that computes tiles of the (N*H_out*W_out, C_out) output matrix using shared/register-resident tiles of input and weights.",
+  "modification plan": "Replace the per-output-element nested loops over C_in, kH, kW with a GEMM formulation: view the operation as Y_{(N,H_out,W_out),C_out} = X_col_{(N,H_out,W_out),C_in*kH*kW} @ W_col_{(C_in*kH*kW),C_out}, where X_col is generated implicitly via stride/padding/dilation arithmetic inside the kernel. Implement a Triton kernel where each program_id computes a 2D tile of Y, cooperatively loading a tile of X_col and W_col into shared memory/regs and using a loop over the reduction dimension (C_in*kH*kW) with fused FMA. Handle groups by partitioning C_in/C_out ranges per group and incorporate bias add as a simple epilogue on the output tiles.",
+  "expected_speedup": "10-15x vs the current Triton kernel (900–1400% improvement), likely reaching parity or modest speedup (~1–1.5x) over the PyTorch baseline."
+}

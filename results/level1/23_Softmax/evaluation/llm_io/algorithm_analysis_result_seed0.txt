@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The kernel performs three full passes over the extremely wide feature dimension, causing redundant global-memory reads and making it strongly bandwidth-bound.",
+  "bottleneck": "The current implementation does max, then sum(exp(x - max)), then normalize in three separate sweeps over each row, reading the same data from global memory three times and recomputing exp twice per element. For N=393,216 this redundant memory traffic dominates runtime and explains why the Triton kernel is slower than PyTorch.",
+  "optimisation method": "Replace the 3-pass softmax with an online (streaming) numerically-stable softmax that computes the row-wise max and the sum of exp in a single pass over the row, followed by a second pass that only normalizes, thereby reducing the number of global reads of x from 3 to 2.",
+  "modification plan": "Inside each program handling a row, implement the standard online softmax update: as you stream over blocks, maintain a running row_max and row_sum such that when a new block x_block arrives, you update (row_max, row_sum) using the rescaling formula (if new_max > row_max, rescale the old sum by exp(row_max - new_max)); this yields the final row_max and row_sum in one pass without storing per-element intermediates. Then run a second loop over the row that reloads x once, computes exp(x - row_max) / row_sum, and writes the result to y; this eliminates the third read of x and the redundant exp computation while keeping numerical stability and the same API.",
+  "expected_speedup": "20-30%"
+}

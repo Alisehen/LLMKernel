@@ -1,0 +1,10 @@
+```json
+{
+  "worth_optimizing": "yes",
+  "reason": "The Triton kernel runs ~3x slower than cuDNN, indicating substantial algorithmic inefficiency that can be improved by changing how the convolution is computed.",
+  "bottleneck": "The kernel implements a naïve direct convolution with nested scalar loops over C_in and K_d*K_h*K_w, performing many small outer-products with poor data reuse and memory access efficiency instead of leveraging a GEMM-like structure.",
+  "optimisation method": "Replace the current direct-convolution loop nest with a GEMM-style formulation (im2col-on-the-fly + block-K reduction) and use a matmul-like Triton kernel where (N*D_out*H_out*W_out) is the M dimension, C_out is the N dimension, and (C_in*K_d*K_h*K_w) is the K dimension.",
+  "modification plan": "Redesign the kernel so each program instance computes a tile of [M_tile, N_tile] in the output matrix and iterates over the K dimension in chunks: (1) compute per-tile input indices to load a contiguous block of input patches (im2col view) into shared/register memory, (2) load the corresponding weight block, (3) perform a block matmul accumulation over K, and (4) write the resulting tile back to y with appropriate reshaping to (N, C_out, D_out, H_out, W_out). This reuses standard Triton matmul tiling patterns, maximizes coalesced loads, and enables vectorization/fusion over the reduction dimension.",
+  "expected_speedup": "2-4x vs current Triton kernel (bringing it closer to cuDNN performance, potentially within ~20-40% of the PyTorch baseline)."
+}
+```

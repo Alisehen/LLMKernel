@@ -1,0 +1,276 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def conv_transpose2d_kernel_stride1_pad0(
+    x_ptr,          # float32[N, C_in, H_in, W_in]
+    w_ptr,          # float32[C_in, C_out, K_h, K_w]
+    y_ptr,          # float32[N, C_out, H_out, W_out]
+    N, C_in, H_in, W_in,
+    C_out, K_h, K_w,
+    x_sN, x_sC, x_sH, x_sW,
+    w_sIC, w_sOC, w_sKH, w_sKW,
+    y_sN, y_sC, y_sH, y_sW,
+    H_out, W_out,
+    M_total,        # = N * H_out * W_out
+    K_total,        # = C_in * K_h * K_w
+    BLOCK_M: tl.constexpr,  # tile in M dimension (N * H_out * W_out)
+    BLOCK_N: tl.constexpr,  # tile in C_out dimension
+    BLOCK_K: tl.constexpr,  # reduction tile (C_in * K_h * K_w)
+):
+    # Program IDs for 2D grid
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+
+    # Offsets in the flattened M and N dimensions
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    # Bounds masks
+    mask_m = offs_m < M_total
+    mask_n = offs_n < C_out
+
+    # Decode M index into (n, oh, ow)
+    hw_out = H_out * W_out
+    n_idx = offs_m // hw_out
+    rem_m = offs_m % hw_out
+    oh_idx = rem_m // W_out
+    ow_idx = rem_m % W_out
+
+    # Prepare for broadcasting
+    n_bc = n_idx[:, None]          # (BM, 1)
+    oh_bc = oh_idx[:, None]        # (BM, 1)
+    ow_bc = ow_idx[:, None]        # (BM, 1)
+    oc_bc = offs_n[None, :]        # (1, BN)
+
+    # Accumulator
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Reduction over K = C_in * K_h * K_w
+    k = 0
+    while k < K_total:
+        k_offsets = k + tl.arange(0, BLOCK_K)
+        mask_k = k_offsets < K_total
+
+        # Decode K index into (ic, kh, kw)
+        kw_total = K_w
+        khkw_total = K_h * K_w
+        ic_idx = k_offsets // khkw_total
+        rem_k = k_offsets % khkw_total
+        kh_idx = rem_k // kw_total
+        kw_idx = rem_k % kw_total
+
+        ic_bc = ic_idx[None, :]     # (1, BK)
+        kh_bc = kh_idx[None, :]     # (1, BK)
+        kw_bc = kw_idx[None, :]     # (1, BK)
+
+        # Compute input spatial positions for this tile:
+        # ih = oh - kh, iw = ow - kw  (full convolution)
+        ih = oh_bc - kh_bc          # (BM, BK)
+        iw = ow_bc - kw_bc          # (BM, BK)
+
+        # Valid input mask
+        mask_in = (ih >= 0) & (ih < H_in) & (iw >= 0) & (iw < W_in)
+        # Combine with M and K bounds
+        mask_in = mask_in & mask_m[:, None] & mask_k[None, :]
+
+        # Clamp indices where mask is false, to keep ptrs in-bounds
+        ih = tl.where(mask_in, ih, 0)
+        iw = tl.where(mask_in, iw, 0)
+
+        # Build pointers for A = implicit im2col(x)
+        x_ptrs = (
+            x_ptr
+            + n_bc * x_sN
+            + ic_bc * x_sC
+            + ih * x_sH
+            + iw * x_sW
+        )
+        a = tl.load(x_ptrs, mask=mask_in, other=0.0)
+
+        # Build pointers for B = reshaped weights
+        # w[ic, oc, kh, kw]
+        mask_w = mask_k[:, None] & mask_n[None, :]
+        w_ptrs = (
+            w_ptr
+            + ic_bc.T * w_sIC
+            + oc_bc * w_sOC
+            + kh_bc.T * w_sKH
+            + kw_bc.T * w_sKW
+        )
+        b = tl.load(w_ptrs, mask=mask_w, other=0.0)
+
+        # Matrix multiply-accumulate
+        acc += tl.dot(a, b, out_dtype=tl.float32, allow_tf32=True)
+
+        k += BLOCK_K
+
+    # Store results to y[n, oc, oh, ow]
+    oh_out_bc = oh_idx[:, None]
+    ow_out_bc = ow_idx[:, None]
+    n_out_bc = n_idx[:, None]
+
+    y_ptrs = (
+        y_ptr
+        + n_out_bc * y_sN
+        + oc_bc * y_sC
+        + oh_out_bc * y_sH
+        + ow_out_bc * y_sW
+    )
+    mask_out = mask_m[:, None] & mask_n[None, :]
+    tl.store(y_ptrs, acc, mask=mask_out)
+
+
+def triton_conv_transpose2d_stride1_pad0(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """
+    High-performance ConvTranspose2d for:
+      - stride = (1, 1)
+      - padding = (0, 0)
+      - dilation = (1, 1)
+      - groups = 1
+      - bias handled outside (if needed)
+
+    Shapes:
+      x:       [N, C_in, H_in, W_in]
+      weight:  [C_in, C_out, K_h, K_w]
+      output:  [N, C_out, H_out, W_out]
+      with H_out = H_in + K_h - 1, W_out = W_in + K_w - 1
+    """
+    assert x.is_cuda and weight.is_cuda, "Inputs must be CUDA tensors"
+    assert x.dtype == weight.dtype == torch.float32, "Kernel currently assumes float32"
+    assert x.ndim == 4 and weight.ndim == 4
+
+    N, C_in, H_in, W_in = x.shape
+    C_in_w, C_out, K_h, K_w = weight.shape
+    assert C_in == C_in_w, "Input channels mismatch between x and weight"
+
+    H_out = H_in + K_h - 1
+    W_out = W_in + K_w - 1
+
+    y = torch.empty((N, C_out, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    x_sN, x_sC, x_sH, x_sW = x.stride()
+    w_sIC, w_sOC, w_sKH, w_sKW = weight.stride()
+    y_sN, y_sC, y_sH, y_sW = y.stride()
+
+    M_total = N * H_out * W_out
+    K_total = C_in * K_h * K_w
+
+    BLOCK_M = 64
+    BLOCK_N = 64
+    BLOCK_K = 32
+
+    grid = lambda meta: (
+        triton.cdiv(M_total, meta["BLOCK_M"]),
+        triton.cdiv(C_out, meta["BLOCK_N"]),
+    )
+
+    conv_transpose2d_kernel_stride1_pad0[grid](
+        x,
+        weight,
+        y,
+        N,
+        C_in,
+        H_in,
+        W_in,
+        C_out,
+        K_h,
+        K_w,
+        x_sN,
+        x_sC,
+        x_sH,
+        x_sW,
+        w_sIC,
+        w_sOC,
+        w_sKH,
+        w_sKW,
+        y_sN,
+        y_sC,
+        y_sH,
+        y_sW,
+        H_out,
+        W_out,
+        M_total,
+        K_total,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+    )
+
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized replacement for nn.ConvTranspose2d with:
+      - stride = (1, 1)
+      - padding = (0, 0)
+      - output_padding = (0, 0)
+      - dilation = (1, 1)
+      - groups = 1
+
+    Other configurations are not supported and will raise an assertion.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: tuple,
+        stride: tuple = (1, 1),
+        padding: tuple = (0, 0),
+        output_padding: tuple = (0, 0),
+        dilation: tuple = (1, 1),
+        groups: int = 1,
+        bias: bool = False,
+    ):
+        super().__init__()
+
+        # Only the default configuration used in the given example is supported
+        assert groups == 1, "groups != 1 not supported in Triton kernel"
+        assert stride == (1, 1), "Only stride = (1, 1) supported in Triton kernel"
+        assert padding == (0, 0), "Only padding = (0, 0) supported in Triton kernel"
+        assert output_padding == (0, 0), "Only output_padding = (0, 0) supported"
+        assert dilation == (1, 1), "Only dilation = (1, 1) supported"
+
+        if isinstance(kernel_size, int):
+            kernel_size = (kernel_size, kernel_size)
+        kH, kW = kernel_size
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = (kH, kW)
+        self.bias_flag = bias
+
+        # Use PyTorch ConvTranspose2d only to initialize weights & bias
+        ref = nn.ConvTranspose2d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            output_padding=output_padding,
+            dilation=dilation,
+            groups=groups,
+            bias=bias,
+        )
+
+        self.weight = nn.Parameter(ref.weight.detach().clone())
+        if bias:
+            self.bias = nn.Parameter(ref.bias.detach().clone())
+        else:
+            self.bias = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Ensure CUDA for Triton
+        assert x.is_cuda, "Input must be a CUDA tensor"
+
+        y = triton_conv_transpose2d_stride1_pad0(x, self.weight)
+
+        if self.bias is not None:
+            y = y + self.bias[None, :, None, None]
+
+        return y

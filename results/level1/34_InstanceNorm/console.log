@@ -1,0 +1,105 @@
+[Seed] Generating seed kernel...
+[Seed 1/2] Generating...
+[92mFinish reason: stop[0m
+Usage: In=1182, Out=7402, Total=8584
+[seed_0] score=0.9792 (baseline=32.9073ms)
+[seed_0] metrics saved to: /home/hyc/LLMKernel/run/20251228_110340_34_InstanceNorm_openai_deepseek/34_InstanceNorm/evaluation/eval_0000.json
+[Seed 1] Final score: 0.9792 ✓
+[Seed 2/2] Generating...
+[92mFinish reason: stop[0m
+Usage: In=1182, Out=6516, Total=7698
+[seed_1] score=0.9769 (baseline=32.9073ms)
+[seed_1] metrics saved to: /home/hyc/LLMKernel/run/20251228_110340_34_InstanceNorm_openai_deepseek/34_InstanceNorm/evaluation/eval_0001.json
+[Seed 2] Final score: 0.9769 ✓
+
+================================================================================
+[Hybrid Strategy] Analyzing all seeds for algorithmic optimization...
+[Hybrid Strategy] - 2 seed(s) with score < 1.0 (rescue)
+================================================================================
+
+[Hybrid] Seed 1: score=0.9792 < 1.0
+[Hybrid] Attempting algorithm analysis rescue...
+[ncu] Using GPU device 5 (CUDA_VISIBLE_DEVICES=5)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_2942884.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_2942884.py /home/hyc/LLMKernel/KernelBench/select2/34_InstanceNorm.py /home/hyc/LLMKernel/run/20251228_110340_34_InstanceNorm_openai_deepseek/34_InstanceNorm/code/test_kernel_analysis_seed0.py --repeat 1
+[ncu stdout]: [bench] Completed 1 iterations successfully
+
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_2942884.csv
+[Hybrid] Requesting LLM analysis for seed 1...
+[92mFinish reason: stop[0m
+Usage: In=1714, Out=2788, Total=4502
+[Hybrid] Worth optimizing: no
+[Hybrid] Reason: The kernel is already operating near the memory-bandwidth limit for this problem size, so any algorithmic change would yield <20% speedup unless you change the math or data type.
+[Hybrid] ⊘ Skipping optimization for seed 1 (not worth optimizing)
+
+[Hybrid] Seed 2: score=0.9769 < 1.0
+[Hybrid] Attempting algorithm analysis rescue...
+[ncu] Using GPU device 5 (CUDA_VISIBLE_DEVICES=5)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_2942884.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_2942884.py /home/hyc/LLMKernel/KernelBench/select2/34_InstanceNorm.py /home/hyc/LLMKernel/run/20251228_110340_34_InstanceNorm_openai_deepseek/34_InstanceNorm/code/test_kernel_analysis_seed1.py --repeat 1
+[ncu stdout]: [bench] Completed 1 iterations successfully
+
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_2942884.csv
+[Hybrid] Requesting LLM analysis for seed 2...
+[92mFinish reason: stop[0m
+Usage: In=2087, Out=768, Total=2855
+[Hybrid] Worth optimizing: yes
+[Hybrid] Reason: The current implementation uses atomic-based partial reductions across chunks and two separate kernels, which leaves significant room to cut synchronization and memory traffic with a better reduction algorithm.
+[Hybrid] Analysis complete for seed 2, generating optimized kernel...
+[Hybrid] Bottleneck: Per-(N,C) statistics are computed via many atomic_add operations across NUM_CHUN...
+[Hybrid] Optimization: Replace the two-kernel, atomic-based partial-sum scheme with a single-kernel, bl...
+[Hybrid] Expected speedup: 20-30%
+[92mFinish reason: stop[0m
+Usage: In=2392, Out=3788, Total=6180
+[algorithm_optimized_seed1] score=1.0070 (baseline=32.9073ms)
+[algorithm_optimized_seed1] metrics saved to: /home/hyc/LLMKernel/run/20251228_110340_34_InstanceNorm_openai_deepseek/34_InstanceNorm/evaluation/eval_0002.json
+[Hybrid] ✓ Rescue successful: 0.9769 → 1.0070
+
+================================================================================
+[Hybrid] Candidate Selection
+================================================================================
+[Hybrid] Total candidates: 3
+  [1] seed 1: 0.9792
+  [2] seed 2: 0.9769
+  [3] algo-optimized (from seed 1): 1.0070
+
+[Hybrid] ★ Selected best candidate: score=1.0070
+
+[Optimization] Starting 3-stage optimization...
+
+================================================================================
+[Stage 1/2] grid_and_parallel
+Description: Optimize grid layout and parallel work distribution across SMs.
+Current candidates: 1, best score: 1.0070
+================================================================================
+[Stage 1] Profiling best candidate...
+[ncu] Using GPU device 5 (CUDA_VISIBLE_DEVICES=5)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_2942884.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_2942884.py /home/hyc/LLMKernel/KernelBench/select2/34_InstanceNorm.py /home/hyc/LLMKernel/run/20251228_110340_34_InstanceNorm_openai_deepseek/34_InstanceNorm/code/test_kernel_analysis_seed1.py --repeat 1
+[ncu stdout]: [bench] Completed 1 iterations successfully
+
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_2942884.csv
+[Stage 1] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=1771, Out=3411, Total=5182
+[stage1_grid_and_parallel] score=1.5994 (baseline=32.9073ms)
+[stage1_grid_and_parallel] metrics saved to: /home/hyc/LLMKernel/run/20251228_110340_34_InstanceNorm_openai_deepseek/34_InstanceNorm/evaluation/eval_0003.json
+  Optimized kernel score: 1.5994 ✓
+[Stage 1] ★ New best score: 1.5994
+
+================================================================================
+[Stage 2/2] block_tiling
+Description: Tune BLOCK_M/N/K sizes for optimal register/memory balance.
+Current candidates: 1, best score: 1.5994
+================================================================================
+[Stage 2] Profiling best candidate...
+[ncu] Using GPU device 5 (CUDA_VISIBLE_DEVICES=5)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_2942884.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_2942884.py /home/hyc/LLMKernel/KernelBench/select2/34_InstanceNorm.py /home/hyc/LLMKernel/run/20251228_110340_34_InstanceNorm_openai_deepseek/34_InstanceNorm/code/test_kernel_analysis_seed1.py --repeat 1
+[ncu stdout]: [bench] Completed 1 iterations successfully
+
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_2942884.csv
+[Stage 2] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=1724, Out=4972, Total=6696
+[stage2_block_tiling] score=1.0066 (baseline=32.9073ms)
+[stage2_block_tiling] metrics saved to: /home/hyc/LLMKernel/run/20251228_110340_34_InstanceNorm_openai_deepseek/34_InstanceNorm/evaluation/eval_0004.json
+  Optimized kernel score: 1.0066 ✓
+[Stage 2] Current: 1.0066 (global best: 1.5994)
+[34_InstanceNorm.py] Figure saved to: /home/hyc/LLMKernel/run/20251228_110340_34_InstanceNorm_openai_deepseek/34_InstanceNorm/figures/34_InstanceNorm_score.png

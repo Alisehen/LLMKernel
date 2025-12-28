@@ -1,111 +1,71 @@
 ```python
+# <optimized Triton code>
 import torch
 import torch.nn as nn
 import triton
 import triton.language as tl
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_SIZE": 64}, num_warps=2, num_stages=2),
+        triton.Config({"BLOCK_SIZE": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_SIZE": 256}, num_warps=8, num_stages=2),
+    ],
+    key=["n_elements"],
+)
 @triton.jit
-def tanh_kernel_optimized(
+def tanh_kernel(
     x_ptr,
-    output_ptr,
+    y_ptr,
     n_elements,
     BLOCK_SIZE: tl.constexpr,
-    TILE_SIZE: tl.constexpr,
 ):
-    # 1D grid with tiling for better SM utilization
     pid = tl.program_id(axis=0)
-    
-    # Each block processes BLOCK_SIZE * TILE_SIZE elements
-    block_start = pid * BLOCK_SIZE * TILE_SIZE
-    thread_idx = tl.arange(0, BLOCK_SIZE)
-    
-    # Process multiple elements per thread to increase arithmetic intensity
-    for i in tl.static_range(TILE_SIZE):
-        offset = block_start + thread_idx + i * BLOCK_SIZE
-        mask = offset < n_elements
-        
-        # Load input with mask
-        x = tl.load(x_ptr + offset, mask=mask, other=0.0)
-        
-        # Optimized tanh computation
-        # tanh(x) = (exp(2x) - 1) / (exp(2x) + 1)
-        exp_2x = tl.exp(2.0 * x)
-        output = (exp_2x - 1.0) / (exp_2x + 1.0)
-        
-        # Store result with mask
-        tl.store(output_ptr + offset, output, mask=mask)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+
+    # tanh(x) = (e^{2x} - 1) / (e^{2x} + 1)
+    x2 = x + x
+    exp_2x = tl.exp(x2)
+    y = (exp_2x - 1.0) / (exp_2x + 1.0)
+
+    tl.store(y_ptr + offsets, y, mask=mask)
 
 
-def triton_tanh_optimized(x: torch.Tensor) -> torch.Tensor:
-    """
-    Apply tanh activation using optimized Triton kernel.
-    
-    Args:
-        x: Input tensor of any shape
-        
-    Returns:
-        Output tensor with tanh applied, same shape as input
-    """
-    output = torch.empty_like(x)
-    output_flat = output.view(-1)
-    x_flat = x.view(-1)
-    n_elements = x_flat.numel()
-    
-    # Autotune configurations for different problem sizes
-    configs = [
-        triton.Config({'BLOCK_SIZE': 256, 'TILE_SIZE': 4}, num_warps=8),
-        triton.Config({'BLOCK_SIZE': 512, 'TILE_SIZE': 2}, num_warps=16),
-        triton.Config({'BLOCK_SIZE': 1024, 'TILE_SIZE': 1}, num_warps=32),
-        triton.Config({'BLOCK_SIZE': 128, 'TILE_SIZE': 8}, num_warps=4),
-    ]
-    
-    # Launch kernel with autotuned grid
-    @triton.autotune(configs=configs, key=['n_elements'])
-    def _tanh_kernel(grid, meta):
-        tanh_kernel_optimized[grid](
-            x_flat, output_flat, n_elements,
-            BLOCK_SIZE=meta['BLOCK_SIZE'],
-            TILE_SIZE=meta['TILE_SIZE']
-        )
-    
-    # Grid calculation based on autotuned parameters
-    def grid_fn(meta):
-        return (triton.cdiv(n_elements, meta['BLOCK_SIZE'] * meta['TILE_SIZE']),)
-    
-    _tanh_kernel(grid=grid_fn, n_elements=n_elements)
-    
-    return output
+def triton_tanh(x: torch.Tensor) -> torch.Tensor:
+    # Fallback for non-CUDA tensors (Triton requires GPU)
+    if not x.is_cuda:
+        return torch.tanh(x)
+
+    x_contig = x.contiguous()
+    y = torch.empty_like(x_contig)
+    n_elements = x_contig.numel()
+
+    # Ensure grid size > 0 even for empty tensors
+    def grid(meta):
+        block = meta["BLOCK_SIZE"]
+        return (triton.cdiv(max(n_elements, 1), block),)
+
+    tanh_kernel[grid](
+        x_contig,
+        y,
+        n_elements,
+    )
+
+    return y
 
 
 class ModelNew(nn.Module):
     """
-    Optimized model that performs Tanh activation using Triton kernels.
+    Model that applies a high-performance Triton-based Tanh activation.
     """
     def __init__(self):
         super(ModelNew, self).__init__()
-    
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Applies Tanh activation to the input tensor using optimized Triton kernel.
-
-        Args:
-            x (torch.Tensor): Input tensor of any shape.
-
-        Returns:
-            torch.Tensor: Output tensor with Tanh applied, same shape as input.
-        """
-        return triton_tanh_optimized(x)
+        return triton_tanh(x)
 ```
-
-This optimized code addresses the low SM throughput (5.01%) from the NCU metrics by:
-
-1. **Tiled Processing**: Each thread now processes multiple elements (TILE_SIZE), increasing arithmetic intensity and better utilizing the GPU's compute resources. This addresses the low SM throughput by giving each thread more work.
-
-2. **Autotuned Configurations**: Multiple kernel configurations are provided for different problem sizes, allowing Triton to select the optimal BLOCK_SIZE and TILE_SIZE combination for each input size. This replaces the static if-else logic with dynamic optimization.
-
-3. **Increased Warp Utilization**: The configurations specify appropriate num_warps values (4-32) to better match the SM's warp scheduler capacity (48 max warps per SM).
-
-4. **Reduced Grid Overhead**: By processing multiple elements per thread, the grid size is reduced from `cdiv(N, BLOCK_SIZE)` to `cdiv(N, BLOCK_SIZE * TILE_SIZE)`, which reduces kernel launch overhead and improves SM utilization.
-
-The key optimization is the tiled approach, which transforms the kernel from memory-bound to more compute-bound, increasing the SM throughput from ~5% to potentially >60% by giving each thread more computational work per memory access.

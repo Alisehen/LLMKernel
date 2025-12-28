@@ -1,0 +1,289 @@
+import math
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def depthwise_conv2d_kernel(
+    x_ptr,        # float32[N, C, H, W]
+    w_ptr,        # float32[C, Kh, Kw]
+    b_ptr,        # float32[C] (optional, controlled by HAS_BIAS)
+    y_ptr,        # float32[N, C, H_out, W_out]
+    N, C, H, W,
+    H_out, W_out,
+    stride_h: tl.constexpr,
+    stride_w: tl.constexpr,
+    pad_h: tl.constexpr,
+    pad_w: tl.constexpr,
+    dil_h: tl.constexpr,
+    dil_w: tl.constexpr,
+    Kh: tl.constexpr,
+    Kw: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+):
+    """
+    2D-tiled depthwise convolution kernel.
+
+    Each program instance processes:
+      - one (n, c) pair
+      - one BLOCK_H x BLOCK_W tile of output positions over (H_out, W_out)
+
+    It first stages the corresponding input patch for that tile into on-chip
+    memory (register-backed local tensors) and then reuses it for all
+    Kh x Kw kernel positions, minimizing global memory reads.
+    """
+    # Grid decomposition
+    pid_nc = tl.program_id(axis=0)  # over N*C
+    pid_ho = tl.program_id(axis=1)  # over H_out tiles
+    pid_wo = tl.program_id(axis=2)  # over W_out tiles
+
+    # Decode (n, c) from pid_nc
+    n = pid_nc // C
+    c = pid_nc % C
+
+    # Output tile origin (top-left) in H_out, W_out
+    oh_start = pid_ho * BLOCK_H
+    ow_start = pid_wo * BLOCK_W
+
+    # Offsets within the tile
+    oh_offsets = oh_start + tl.arange(0, BLOCK_H)
+    ow_offsets = ow_start + tl.arange(0, BLOCK_W)
+
+    # Masks for valid output positions
+    mask_oh = oh_offsets < H_out
+    mask_ow = ow_offsets < W_out
+    mask_out = mask_oh[:, None] & mask_ow[None, :]
+
+    # If there is no valid (n, c) (should not happen with grid = (N*C, ...)),
+    # we could early mask. Here we rely on grid correctness.
+
+    # Compute input patch bounds for this output tile (in input coordinates)
+    # ih_min/iw_min correspond to the top-left of the receptive field of
+    # output (oh_start, ow_start) for this (n, c).
+    ih_min = oh_start * stride_h - pad_h
+    iw_min = ow_start * stride_w - pad_w
+
+    # Size of the input patch needed to cover all outputs in the tile
+    P_H = (BLOCK_H - 1) * stride_h + (Kh - 1) * dil_h + 1
+    P_W = (BLOCK_W - 1) * stride_w + (Kw - 1) * dil_w + 1
+
+    # Build 2D coordinates for the input patch
+    patch_ih = ih_min + tl.arange(0, P_H)[:, None]  # [P_H, 1]
+    patch_iw = iw_min + tl.arange(0, P_W)[None, :]  # [1, P_W]
+
+    # Mask for input in-bounds (handle padding)
+    in_bounds = (
+        (patch_ih >= 0)
+        & (patch_ih < H)
+        & (patch_iw >= 0)
+        & (patch_iw < W)
+    )
+
+    # Base index for this (n, c) slice
+    nc = n * C + c
+    base_nc = nc * H * W
+
+    # Global memory indices for the patch: [P_H, P_W]
+    x_idx = base_nc + patch_ih * W + patch_iw
+
+    # Load the input patch once into on-chip memory, zero-padding out-of-bounds
+    x_patch = tl.load(x_ptr + x_idx, mask=in_bounds, other=0.0)
+
+    # Prepare output accumulator for this tile: [BLOCK_H, BLOCK_W]
+    acc = tl.zeros((BLOCK_H, BLOCK_W), dtype=tl.float32)
+
+    # Relative offsets inside the tile (dh, dw) for each output position
+    dh = tl.arange(0, BLOCK_H)[:, None]  # [BLOCK_H, 1]
+    dw = tl.arange(0, BLOCK_W)[None, :]  # [1, BLOCK_W]
+
+    # Precompute base offset for weights of channel c
+    w_base = c * Kh * Kw
+
+    # Convolution: iterate over kernel height and width
+    for kh in tl.static_range(0, Kh):
+        for kw in tl.static_range(0, Kw):
+            # Positions in the input patch corresponding to each output
+            iph = dh * stride_h + kh * dil_h       # [BLOCK_H, 1]
+            ipw = dw * stride_w + kw * dil_w       # [1, BLOCK_W]
+
+            # Gather input values from staged patch
+            x_vals = x_patch[iph, ipw]             # [BLOCK_H, BLOCK_W]
+
+            # Load weight scalar for this (c, kh, kw)
+            w_idx = w_base + kh * Kw + kw
+            w_val = tl.load(w_ptr + w_idx)
+
+            # FMA
+            acc += x_vals * w_val
+
+    # Add bias if present
+    if HAS_BIAS:
+        bias_val = tl.load(b_ptr + c)
+        acc += bias_val
+
+    # Store results
+    out_base = nc * H_out * W_out
+    oh_mat = oh_offsets[:, None]
+    ow_mat = ow_offsets[None, :]
+    y_idx = out_base + oh_mat * W_out + ow_mat
+
+    tl.store(y_ptr + y_idx, acc, mask=mask_out)
+
+
+def depthwise_conv2d_triton(
+    x: torch.Tensor,
+    weight: torch.Tensor,  # [C, Kh, Kw]
+    bias: torch.Tensor | None,
+    stride_h: int,
+    stride_w: int,
+    pad_h: int,
+    pad_w: int,
+    dil_h: int,
+    dil_w: int,
+) -> torch.Tensor:
+    """
+    Depthwise 2D convolution (groups = in_channels) using an optimized
+    Triton kernel with 2D tiling and input patch reuse.
+
+    x:      [N, C, H, W], contiguous, CUDA
+    weight: [C, Kh, Kw], contiguous, same device/dtype as x
+    bias:   [C] or None
+    """
+    assert x.is_cuda, "Triton kernels require CUDA tensors"
+    assert x.dtype == torch.float32, "Kernel currently supports float32"
+    x = x.contiguous()
+    weight = weight.contiguous()
+    if bias is not None:
+        bias = bias.contiguous()
+
+    N, C, H, W = x.shape
+    Cw, Kh, Kw = weight.shape
+    assert Cw == C, "Weight channels must match input channels for depthwise conv"
+
+    # Compute output dimensions (same as PyTorch Conv2d)
+    H_out = (H + 2 * pad_h - dil_h * (Kh - 1) - 1) // stride_h + 1
+    W_out = (W + 2 * pad_w - dil_w * (Kw - 1) - 1) // stride_w + 1
+
+    y = torch.empty((N, C, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    # Tile sizes (powers of two)
+    BLOCK_H = 8
+    BLOCK_W = 64
+
+    grid = lambda meta: (
+        N * C,
+        triton.cdiv(H_out, meta["BLOCK_H"]),
+        triton.cdiv(W_out, meta["BLOCK_W"]),
+    )
+
+    HAS_BIAS = bias is not None
+    b_ptr = bias if bias is not None else y  # dummy pointer if bias is absent
+
+    depthwise_conv2d_kernel[grid](
+        x,
+        weight,
+        b_ptr,
+        y,
+        N,
+        C,
+        H,
+        W,
+        H_out,
+        W_out,
+        stride_h=stride_h,
+        stride_w=stride_w,
+        pad_h=pad_h,
+        pad_w=pad_w,
+        dil_h=dil_h,
+        dil_w=dil_w,
+        Kh=Kh,
+        Kw=Kw,
+        BLOCK_H=BLOCK_H,
+        BLOCK_W=BLOCK_W,
+        HAS_BIAS=HAS_BIAS,
+        num_warps=4,
+        num_stages=2,
+    )
+
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Depthwise 2D convolution implemented with a high-performance Triton kernel.
+    Mirrors the behavior of:
+        nn.Conv2d(in_channels, in_channels, kernel_size, stride, padding,
+                  dilation, groups=in_channels, bias=bias)
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size_h: int,
+        kernel_size_w: int,
+        stride_h: int = 1,
+        stride_w: int = 1,
+        padding_h: int = 0,
+        padding_w: int = 0,
+        dilation_h: int = 1,
+        dilation_w: int = 1,
+        groups: int = 1,
+        bias: bool = False,
+    ):
+        super().__init__()
+        # Depthwise: one filter per input channel
+        assert (
+            in_channels == out_channels
+        ), "Depthwise conv expects in_channels == out_channels"
+        assert (
+            groups == in_channels
+        ), "Depthwise conv expects groups == in_channels"
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size_h = kernel_size_h
+        self.kernel_size_w = kernel_size_w
+        self.stride_h = stride_h
+        self.stride_w = stride_w
+        self.padding_h = padding_h
+        self.padding_w = padding_w
+        self.dilation_h = dilation_h
+        self.dilation_w = dilation_w
+        self.groups = groups
+
+        # Match Conv2d(depthwise) parameter shapes: [C, 1, Kh, Kw]
+        weight = torch.empty(
+            out_channels, 1, kernel_size_h, kernel_size_w
+        )
+        if hasattr(nn.init, "kaiming_uniform_"):
+            nn.init.kaiming_uniform_(weight, a=math.sqrt(5))
+        self.weight = nn.Parameter(weight)
+
+        if bias:
+            b = torch.empty(out_channels)
+            fan_in = in_channels * kernel_size_h * kernel_size_w
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            nn.init.uniform_(b, -bound, bound)
+            self.bias = nn.Parameter(b)
+        else:
+            self.bias = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Convert weight to [C, Kh, Kw] for Triton kernel
+        w = self.weight.view(self.out_channels, self.kernel_size_h, self.kernel_size_w)
+        return depthwise_conv2d_triton(
+            x,
+            w,
+            self.bias,
+            self.stride_h,
+            self.stride_w,
+            self.padding_h,
+            self.padding_w,
+            self.dilation_h,
+            self.dilation_w,
+        )

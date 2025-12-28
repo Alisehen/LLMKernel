@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The custom Triton kernel is ~46% slower than PyTorch’s highly optimized softplus, indicating a clear optimization opportunity.",
+  "bottleneck": "The kernel computes expensive exp/log operations for every element regardless of value range, making it unnecessarily compute-bound for inputs where softplus saturates to x or exp(x).",
+  "optimisation method": "Replace the single-formula implementation with a piecewise softplus: for large positive x use softplus(x) ≈ x (no exp/log), for large negative x use softplus(x) ≈ exp(x) (no log), and only for moderate x use the numerically stable formula, reducing the number of transcendentals.",
+  "modification plan": "In the Triton kernel, introduce thresholds (e.g., T_pos, T_neg) and compute boolean masks: `pos_mask = x > T_pos`, `neg_mask = x < T_neg`, `mid_mask = ~pos_mask & ~neg_mask`. For `pos_mask`, set `out = x`; for `neg_mask`, set `out = tl.exp(x)`; for `mid_mask`, use the stable formulation (e.g., `softplus(x) = tl.maximum(x, 0) + tl.log1p(tl.exp(-tl.abs(x)))`). This keeps numerical stability while significantly reducing the number of exp/log evaluations on typical activation distributions.",
+  "expected_speedup": "20-40% depending on the fraction of elements falling into the saturated regions"
+}

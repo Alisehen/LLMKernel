@@ -1,61 +1,41 @@
 
-Write a correct and reasonably fast Triton kernel to replace the given PyTorch operator.
-This is a SEED implementation: prioritize correctness and stable compilation.
+Write high-performance Triton kernels to replace PyTorch operators.
+Generate the FASTEST kernel while maintaining correctness.
 
-Rules:
-- Use `tl.program_id(axis)` (axis=0/1/2 only)
-- Use `tl.arange()` for block indices
-- Operate on blocks (no CUDA thread model)
-- No manual shared memory or synchronization
+## CRITICAL — These cause 60%+ of failures:
+1. EVERY kernel function MUST have `@triton.jit` decorator — MANDATORY
+2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+3. BLOCK sizes MUST be power-of-2 constexpr: 16, 32, 64, 128, 256
+4. `tl.program_id(axis)` only supports axis = 0, 1, 2 (max 3D grid)
 
-Hard Constraints:
-- All BLOCK_* are `tl.constexpr` and powers of 2
-- `tl.arange(0, BLOCK)` requires BLOCK to be power-of-2
-- No dynamic `tl.reshape()` or view
-- `tl.load` / `tl.store`: scalar ptr → scalar, block ptr → block
-- No Python control flow on `tl.tensor` or BLOCK_*
-- Triton does NOT support `continue`, `break`, or `return` inside loops — use masking instead
-- Import ALL modules you use (e.g., `import math` if using `math.sqrt`)
-- Do NOT index tensors with loop variables: `tensor[:, i]` or `tensor[i, :]` where i is a loop var is INVALID
-- Shared memory limit ~100KB: for matmul, BLOCK_M*BLOCK_K + BLOCK_K*BLOCK_N < 25000 floats
+## Triton Syntax Rules:
+- For matmul/conv/linear ops, prefer `tl.dot(a, b, allow_tf32=True)` over element-wise multiply-add
+- No `continue`, `break`, `return` inside loops — use masking instead
+- No tensor indexing with loop vars: `x[:, i]` or `x[i, :]` is INVALID
+- No tuple unpacking inside kernel: `a, b = tl.load(...)` is INVALID
+- No nested functions inside @triton.jit
+- No Python control flow on tl.tensor or BLOCK_* values
+- No dynamic `tl.reshape()` or view operations
 
+## Missing Triton Functions (implement manually):
+- tl.tanh → `(tl.exp(2*x) - 1) / (tl.exp(2*x) + 1)`
+- tl.sigmoid → `1 / (1 + tl.exp(-x))`
+- tl.gelu, tl.silu, tl.softmax, tl.mish → implement from definition
 
-Performance Guidelines for Large-K Matrix Multiplication:
-For K > 100k, numerical precision is the PRIMARY challenge (more than performance).
+## Load/Store Rules:
+- Pointer + scalar offset → scalar value
+- Pointer + block offset (via tl.arange) → block of values
+- mask shape MUST match data shape exactly
 
-CRITICAL CONSTRAINTS:
-1. Shared memory limit ~100KB: BLOCK_M * BLOCK_K + BLOCK_K * BLOCK_N must fit
-   - BLOCK_M=128, BLOCK_N=128, BLOCK_K=128 needs 128KB → TOO LARGE!
-   - Safe config: BLOCK_M=64, BLOCK_N=64, BLOCK_K=64 or BLOCK_M=128, BLOCK_N=64, BLOCK_K=32
-2. Use larger BLOCK_K (64+) to reduce accumulation steps, but stay within shared memory
+## Output Format (STRICT):
+1. Imports: `import torch, torch.nn as nn, triton, triton.language as tl` (and math if needed)
+2. `@triton.jit` kernel(s) — MUST have this decorator
+3. Wrapper function with grid calculation
+4. `class ModelNew(nn.Module)` — REQUIRED
 
-RECOMMENDED APPROACH for extreme K (>500k):
-- Consider splitting K into chunks and accumulating in PyTorch:
-```python
-def large_k_matmul(A, B, chunk_size=65536):
-    M, K = A.shape
-    K_, N = B.shape
-    C = torch.zeros(M, N, device=A.device, dtype=A.dtype)
-    for k_start in range(0, K, chunk_size):
-        k_end = min(k_start + chunk_size, K)
-        C += triton_matmul(A[:, k_start:k_end], B[k_start:k_end, :])
-    return C
-```
-This reduces accumulation error by chunking.
-
-BLOCK SIZE GUIDE (for shared memory ~100KB):
-- BLOCK_M=64, BLOCK_N=64, BLOCK_K=64: uses ~32KB (safe)
-- BLOCK_M=128, BLOCK_N=64, BLOCK_K=32: uses ~24KB (safe)
-- BLOCK_M=128, BLOCK_N=128, BLOCK_K=32: uses ~32KB (safe)
+Do NOT include: testing code, `if __name__ == "__main__"`, get_inputs, get_init_inputs
 
 
-Output Format (STRICT):
-1. Imports (torch, torch.nn, triton, triton.language, and any other needed modules like math)
-2. `@triton.jit` kernel(s)
-3. Wrapper function(s)
-4. `class ModelNew(nn.Module)` — this class is REQUIRED
-
-Do NOT include testing code or `if __name__ == "__main__"`.
 
 Example PyTorch:
 '''
@@ -126,22 +106,6 @@ class ModelNew(nn.Module):
     def forward(self, a, b):
         return triton_add(a, b)
 '''
-
-Hardware:
-• Compute Capability: 8.9
-• Number of SMs: 128
-• Memory Bandwidth: 1008 GB/s
-• TF32 Tensor Core TFLOPS: 82.6 with dense
-• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
-• FP16 Tensor Core TFLOPS: 165.2 with dense
-• Maximum number of registers per thread: 255
-• Maximum threads per block: 1024
-• Maximum threads per SM: 1536
-• Warp size: 32
-• Maximum concurrent warps per SM: 48
-• Shared memory capacity per SM: 100 KB
-• Maximum shared memory per thread block: 99 KB
-• L2 cache (global, all SM shared): 72 MB
 
 Target:
 ```python

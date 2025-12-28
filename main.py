@@ -135,7 +135,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 OPTIMIZATION_STAGES = [
     {"name": "grid_and_parallel", "description": "Optimize grid layout and parallel work distribution across SMs."},
     {"name": "block_tiling", "description": "Tune BLOCK_M/N/K sizes for optimal register/memory balance."},
-    {"name": "memory_and_tuning", "description": "Optimize memory access patterns and fine-tune num_stages/num_warps."},
+    # {"name": "memory_and_tuning", "description": "Optimize memory access patterns and fine-tune num_stages/num_warps."},
 ]
 
 # ---------------------- early exit criteria (post-hoc) -----------------
@@ -930,7 +930,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
     # Generate multiple seeds (rely on model's inherent randomness for diversity)
     # Repair immediately after each seed generation to enable early stop
     seed_candidates: List[BeamCandidate] = []
-    max_repair_per_seed = 5
+    max_repair_per_seed = 4
 
     for seed_idx in range(num_seeds_actual):
         print(f"[Seed {seed_idx + 1}/{num_seeds_actual}] Generating...")

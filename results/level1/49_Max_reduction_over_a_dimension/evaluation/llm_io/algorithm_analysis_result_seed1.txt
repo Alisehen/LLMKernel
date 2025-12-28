@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The current Triton implementation performs a full contiguous permutation of the input tensor, adding a large O(N) data-relayout cost before the actual reduction.",
+  "bottleneck": "The `.permute(...).contiguous()` step materializes a transposed copy of the entire tensor, dominating runtime and negating the benefit of the custom reduction kernel, especially for large tensors.",
+  "optimisation method": "Remove the explicit permutation/contiguous copy and implement the reduction directly over the original strided layout, making the Triton kernel stride-aware for an arbitrary reduction dimension.",
+  "modification plan": "Change the host-side code to avoid `permute().contiguous()` and `view(M, K)`; instead, compute M and K logically while passing the original base pointer and all relevant strides to the kernel. Inside the Triton kernel, derive per-row and per-reduction indices using these strides so each program reduces along the target dimension without any prior data re-layout. Keep the reduction loop and BLOCK_SIZE logic the same, but adjust pointer arithmetic to use general strides rather than assuming a 2D contiguous layout.",
+  "expected_speedup": "4-6x vs the current Triton kernel, likely bringing performance close to or better than the PyTorch baseline for large tensors."
+}

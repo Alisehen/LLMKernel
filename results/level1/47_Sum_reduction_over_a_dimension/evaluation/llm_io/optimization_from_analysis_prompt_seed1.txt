@@ -1,0 +1,238 @@
+You are optimizing a Triton kernel based on algorithmic analysis.
+
+# PyTorch Reference (Target Behavior)
+
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs sum reduction over a specified dimension.
+    """
+    def __init__(self, dim: int):
+        """
+        Initializes the model with the dimension to reduce over.
+
+        Args:
+            dim (int): Dimension to reduce over.
+        """
+        super(Model, self).__init__()
+        self.dim = dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies sum reduction over the specified dimension.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (..., dim, ...).
+
+        Returns:
+            torch.Tensor: Output tensor after sum reduction, shape (..., 1, ...).
+        """
+        return torch.sum(x, dim=self.dim, keepdim=True)
+
+batch_size = 128
+dim1 = 4096
+dim2 = 4095
+reduce_dim = 1
+
+def get_inputs():
+    x = torch.rand(batch_size, dim1, dim2)
+    return [x]
+
+def get_init_inputs():
+    return [reduce_dim]
+```
+
+**CRITICAL**: Study the PyTorch code carefully to understand:
+- What does `forward()` return? (full output sequence vs final hidden state only)
+- What is the computational pattern?
+- What are the input/output shapes?
+
+Your optimized kernel MUST match this exact behavior.
+
+---
+
+# Analysis Results
+
+**Bottleneck**: Each output element is computed by a single thread looping over all R=4096 elements, with no parallel reduction across the reduction dimension, leading to poor latency hiding and weaker use of SM resources compared to a hierarchical/tree reduction.
+
+**Optimization Strategy**: Algorithm Replacement: replace the purely per-thread serial reduction over R with a block-level parallel tree reduction, where multiple threads in a block collaboratively reduce chunks of the R dimension using shared memory and warp-level reductions.
+
+**Implementation Plan**: Redesign the kernel so that each program/block is responsible for a tile of (M, N) and splits the R dimension into tiles processed in parallel by threads (e.g., each warp handles a subset of R for a given output). Within each block, load a tile of R into registers/shared memory, perform a parallel intra-block reduction (warp shuffles or shared-memory tree reduce) to produce one partial sum per output, and, if needed, iterate over multiple R-tiles accumulating these partial sums. Finally, write the reduced result to global memory, keeping the same [M,1,N] layout so the Python wrapper stays unchanged.
+
+**Expected Speedup**: 20-30%
+
+---
+
+# Current Kernel (needs optimization)
+
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def sum_reduce_dim_kernel(
+    x_ptr,       # *f32
+    out_ptr,     # *f32
+    M,           # number of outer batches
+    R,           # reduction length
+    N,           # number of inner elements
+    BLOCK_N: tl.constexpr,
+):
+    pid_n = tl.program_id(axis=0)  # along N
+    pid_m = tl.program_id(axis=1)  # along M
+
+    n_start = pid_n * BLOCK_N
+    n_offsets = n_start + tl.arange(0, BLOCK_N)
+    m = pid_m
+
+    # masks for valid indices
+    mask_n = n_offsets < N
+    mask_m = m < M
+    mask = mask_m & mask_n
+
+    # base linear index for (m, r=0, n_offsets)
+    base = m * R * N + n_offsets
+
+    acc = tl.zeros([BLOCK_N], dtype=tl.float32)
+
+    r = 0
+    # loop over reduction dimension
+    while r < R:
+        offs = base + r * N
+        x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+        x = x.to(tl.float32)
+        acc += x
+        r += 1
+
+    # write result at (m, 0, n_offsets)
+    out_base = m * N + n_offsets  # since out shape is [M, 1, N], contiguous
+    tl.store(out_ptr + out_base, acc, mask=mask)
+
+
+def triton_sum_keepdim(x: torch.Tensor, dim: int) -> torch.Tensor:
+    """Sum reduction over a given dim with keepdim=True using Triton."""
+    # Fallback for non-CUDA or unsupported dtypes
+    if (not x.is_cuda) or (x.dtype not in (torch.float16, torch.bfloat16, torch.float32)):
+        return torch.sum(x, dim=dim, keepdim=True)
+
+    ndim = x.ndim
+    if dim < 0:
+        dim += ndim
+    assert 0 <= dim < ndim
+
+    orig_shape = list(x.shape)
+
+    # Flatten to [M, R, N] where we reduce over R (axis=1)
+    if dim == 0:
+        M = 1
+        R = orig_shape[0]
+        N = int(torch.prod(torch.tensor(orig_shape[1:], device='cpu'))) if ndim > 1 else 1
+    elif dim == ndim - 1:
+        M = int(torch.prod(torch.tensor(orig_shape[:-1], device='cpu'))) if ndim > 1 else 1
+        R = orig_shape[-1]
+        N = 1
+    else:
+        M = int(torch.prod(torch.tensor(orig_shape[:dim], device='cpu')))
+        R = orig_shape[dim]
+        N = int(torch.prod(torch.tensor(orig_shape[dim + 1:], device='cpu'))) if dim + 1 < ndim else 1
+
+    # Ensure contiguous before reshape for predictable layout
+    x_contig = x.contiguous()
+    x_reshaped = x_contig.reshape(M, R, N)
+
+    out_reshaped = torch.empty((M, 1, N), device=x.device, dtype=torch.float32)
+
+    BLOCK_N = 128
+
+    def grid(meta):
+        return (
+            max(1, triton.cdiv(N, meta['BLOCK_N'])),
+            max(1, M),
+        )
+
+    sum_reduce_dim_kernel[grid](
+        x_reshaped,
+        out_reshaped,
+        M,
+        R,
+        N,
+        BLOCK_N=BLOCK_N,
+        num_warps=4,
+        num_stages=2,
+    )
+
+    # Cast back to original dtype if needed
+    if x.dtype != torch.float32:
+        out_reshaped = out_reshaped.to(x.dtype)
+
+    # Reshape back to original shape with reduced dim kept as size 1
+    out_shape = orig_shape.copy()
+    out_shape[dim] = 1
+    return out_reshaped.reshape(out_shape)
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized model that performs sum reduction over a specified dimension.
+    """
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_sum_keepdim(x, self.dim)
+```
+
+---
+
+# Your Task
+
+Implement the optimization strategy above. Focus on the specific bottleneck identified.
+
+## Key Requirements
+
+1. **Preserve correctness**: Maintain the same input/output behavior
+2. **Apply the optimization**: Follow the implementation plan exactly
+3. **Use valid Triton syntax**:
+   - Every kernel MUST have `@triton.jit` decorator
+   - Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+   - BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+   - No `continue`, `break`, `return` inside kernels (use masking)
+   - Prefer `tl.dot(a, b, allow_tf32=True)` for matmul operations
+
+4. **CRITICAL for RNN/GRU/LSTM Persistent Kernels**:
+   - Time loop MUST be inside @triton.jit kernel, NOT in Python forward()
+   - **HYBRID computation strategy** (CRITICAL for performance):
+     * Precompute input-side gates OUTSIDE kernel: `gates_x = (T*B, In) @ W_ih` (ONE large GEMM)
+     * INSIDE kernel: only recurrent-side: `for t: gates_h = h @ W_hh` (T small GEMMs)
+   - CORRECT (FAST - use this):
+     ```python
+     # Python forward():
+     gates_x_all = x.reshape(T*B, In) @ W_ih + b_ih  # ONE large GEMM
+     gates_x_all = gates_x_all.view(T, B, 3*H)
+     gru_persistent_kernel[grid](gates_x_all, h0, W_hh, ...)  # Launch ONCE
+
+     @triton.jit
+     def gru_persistent_kernel(gates_x_ptr, h_ptr, W_hh_ptr, ...):
+         for t in range(T):  # Inside kernel
+             gates_x_t = tl.load(gates_x_ptr + t*...)  # Precomputed
+             gates_h = h @ W_hh  # Only recurrent GEMM
+             h = (1-z)*n + z*h   # Fuse and update
+     ```
+
+5. **Output format**:
+   - Imports: `import torch, torch.nn as nn, triton, triton.language as tl`
+   - `@triton.jit` kernel(s)
+   - Wrapper function(s)
+   - `class ModelNew(nn.Module)` — REQUIRED
+   - NO testing code, NO `if __name__ == "__main__"`
+
+---
+
+Generate the optimized kernel now. Output ONLY the complete Python code.

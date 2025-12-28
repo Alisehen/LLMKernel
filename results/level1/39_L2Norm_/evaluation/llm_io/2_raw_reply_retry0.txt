@@ -4,172 +4,111 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
-@triton.jit
-def l2_norm_kernel(
-    x_ptr,
-    norm_ptr,
-    batch_size,
-    dim,
-    stride_x_batch,
-    stride_x_dim,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-):
-    """
-    Compute sum of squares for L2 normalization with proper reduction.
-    """
-    pid_batch = tl.program_id(0)
-    pid_dim = tl.program_id(1)
-    
-    # Optimized blocking for memory coalescing
-    batch_offsets = pid_batch * BLOCK_M + tl.arange(0, BLOCK_M)
-    dim_offsets = pid_dim * BLOCK_N + tl.arange(0, BLOCK_N)
-    
-    batch_mask = batch_offsets < batch_size
-    dim_mask = dim_offsets < dim
-    
-    # Coalesced loading: column-major access pattern
-    x_ptrs = x_ptr + (
-        dim_offsets[None, :] * stride_x_dim +
-        batch_offsets[:, None] * stride_x_batch
-    )
-    
-    # Load with broadcast mask
-    x_block = tl.load(x_ptrs, mask=batch_mask[:, None] & dim_mask[None, :], other=0.0)
-    
-    # Warp-level reduction with higher precision
-    squares = x_block * x_block
-    
-    # Reduce along dimension axis with tree reduction
-    local_sum = tl.sum(squares, axis=1)
-    
-    # Atomic accumulation for each batch element
-    # Each block in the dimension grid contributes to the same batch elements
-    for i in range(0, BLOCK_M):
-        if batch_mask[i]:
-            tl.atomic_add(norm_ptr + batch_offsets[i], local_sum[i])
 
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_SIZE": 64}, num_warps=2, num_stages=2),
+        triton.Config({"BLOCK_SIZE": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_SIZE": 256}, num_warps=8, num_stages=2),
+    ],
+    key=["D"],
+)
 @triton.jit
-def normalize_kernel(
-    x_ptr,
-    norm_ptr,
-    output_ptr,
-    batch_size,
-    dim,
-    epsilon,
-    stride_x_batch,
-    stride_x_dim,
-    stride_out_batch,
-    stride_out_dim,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
+def l2norm_fused_kernel(
+    x_ptr,              # *f32 / *f16, [B, D]
+    y_ptr,              # *f32 / *f16, [B, D]
+    stride_x_batch,     # int32
+    stride_x_dim,       # int32
+    stride_y_batch,     # int32
+    stride_y_dim,       # int32
+    D: tl.constexpr,    # number of columns (dim=1)
+    BLOCK_SIZE: tl.constexpr,  # columns per tile, power-of-2
 ):
-    """
-    Apply normalization using pre-computed sum of squares.
-    """
-    pid_batch = tl.program_id(0)
-    pid_dim = tl.program_id(1)
-    
-    # Optimized blocking for better cache utilization
-    batch_offsets = pid_batch * BLOCK_M + tl.arange(0, BLOCK_M)
-    dim_offsets = pid_dim * BLOCK_N + tl.arange(0, BLOCK_N)
-    
-    batch_mask = batch_offsets < batch_size
-    dim_mask = dim_offsets < dim
-    
-    # Load norm values (sum of squares) for the current batch block
-    norm_ptrs = norm_ptr + batch_offsets
-    norm_values = tl.load(norm_ptrs, mask=batch_mask, other=1.0)
-    
-    # Compute L2 norm with epsilon protection: sqrt(sum(x^2)) + epsilon
-    norm_values = tl.sqrt(norm_values) + epsilon
-    inv_norm = 1.0 / norm_values
-    
-    # Coalesced loading with broadcast
-    x_ptrs = x_ptr + (
-        dim_offsets[None, :] * stride_x_dim +
-        batch_offsets[:, None] * stride_x_batch
-    )
-    x_block = tl.load(x_ptrs, mask=batch_mask[:, None] & dim_mask[None, :], other=0.0)
-    
-    # Normalize with broadcast
-    normalized = x_block * inv_norm[:, None]
-    
-    # Coalesced storing
-    out_ptrs = output_ptr + (
-        dim_offsets[None, :] * stride_out_dim +
-        batch_offsets[:, None] * stride_out_batch
-    )
-    tl.store(out_ptrs, normalized, mask=batch_mask[:, None] & dim_mask[None, :])
+    # 1D grid over batch dimension
+    pid_batch = tl.program_id(axis=0)
 
-def triton_l2_norm(x: torch.Tensor, epsilon: float = 1e-8) -> torch.Tensor:
-    assert x.is_cuda, "Input must be on CUDA device"
-    assert x.dim() >= 2, "Input must have at least 2 dimensions"
-    
-    # Get input shape and strides
-    batch_size, dim = x.shape[0], x.shape[1]
-    output = torch.empty_like(x)
-    
-    # Ensure input is contiguous for optimal memory access
-    x = x.contiguous()
-    output = output.contiguous()
-    
-    # Get strides
-    stride_x_batch = x.stride(0)
-    stride_x_dim = x.stride(1)
-    stride_out_batch = output.stride(0)
-    stride_out_dim = output.stride(1)
-    
-    # Allocate tensor for sum of squares (use float32 for accumulation precision)
-    norm_sums = torch.zeros(batch_size, device=x.device, dtype=torch.float32)
-    
-    # Optimized block sizes for Ada Lovelace (RTX 4090)
-    # BLOCK_M × BLOCK_N must be ≤ 1024 threads
-    BLOCK_M = 64   # Optimized for batch dimension (warp-aligned)
-    BLOCK_N = 16   # Optimized for dimension reduction
-    
-    # Calculate optimized grid dimensions
-    grid_batch = triton.cdiv(batch_size, BLOCK_M)
-    grid_dim = triton.cdiv(dim, BLOCK_N)
-    
-    # Launch first kernel to compute sum of squares
-    l2_norm_kernel[(grid_batch, grid_dim)](
+    # Pointers to the start of this row in x and y
+    row_x_ptr = x_ptr + pid_batch * stride_x_batch
+    row_y_ptr = y_ptr + pid_batch * stride_y_batch
+
+    # ----------------------------------------
+    # 1) Compute sum of squares for this row
+    # ----------------------------------------
+    acc = tl.zeros((), dtype=tl.float32)
+    NUM_TILES = tl.cdiv(D, BLOCK_SIZE)
+
+    for tile in range(0, NUM_TILES):
+        col_start = tile * BLOCK_SIZE
+        offs = col_start + tl.arange(0, BLOCK_SIZE)
+        mask = offs < D
+
+        x = tl.load(row_x_ptr + offs * stride_x_dim, mask=mask, other=0.0)
+        x_f32 = x.to(tl.float32)
+        acc += tl.sum(x_f32 * x_f32, axis=0)
+
+    # L2 norm (no epsilon, to match torch.norm behavior)
+    norm = tl.sqrt(acc)
+    # Precompute reciprocal
+    inv_norm = 1.0 / norm
+
+    # ----------------------------------------
+    # 2) Normalize the row by its L2 norm
+    # ----------------------------------------
+    for tile in range(0, NUM_TILES):
+        col_start = tile * BLOCK_SIZE
+        offs = col_start + tl.arange(0, BLOCK_SIZE)
+        mask = offs < D
+
+        x = tl.load(row_x_ptr + offs * stride_x_dim, mask=mask, other=0.0)
+        x_f32 = x.to(tl.float32)
+        y = (x_f32 * inv_norm).to(x.dtype)
+
+        tl.store(row_y_ptr + offs * stride_y_dim, y, mask=mask)
+
+
+def triton_l2norm(x: torch.Tensor) -> torch.Tensor:
+    """
+    L2-normalize each row of a 2D tensor [B, D] using a single fused Triton kernel.
+    The output has the same dtype and device as the input.
+    """
+    assert x.ndim == 2, "Input must be 2D tensor [batch, dim]"
+    if not x.is_cuda:
+        raise ValueError("Input tensor must be on CUDA device for Triton kernels.")
+
+    B, D = x.shape
+    if B == 0 or D == 0:
+        return x.clone()
+
+    y = torch.empty_like(x)
+
+    stride_x_batch, stride_x_dim = x.stride()
+    stride_y_batch, stride_y_dim = y.stride()
+
+    # 1D grid over batch dimension
+    grid = lambda META: (B,)
+
+    l2norm_fused_kernel[grid](
         x,
-        norm_sums,
-        batch_size,
-        dim,
+        y,
         stride_x_batch,
         stride_x_dim,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
+        stride_y_batch,
+        stride_y_dim,
+        D=D,
     )
-    
-    # Launch second kernel for normalization
-    normalize_kernel[(grid_batch, grid_dim)](
-        x,
-        norm_sums,
-        output,
-        batch_size,
-        dim,
-        epsilon,
-        stride_x_batch,
-        stride_x_dim,
-        stride_out_batch,
-        stride_out_dim,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-    )
-    
-    return output
+
+    return y
+
 
 class ModelNew(nn.Module):
     """
-    L2 normalization layer with optimized Triton kernels for Ada Lovelace.
+    Triton-optimized model that performs L2 normalization along dim=1,
+    matching `x / torch.norm(x, p=2, dim=1, keepdim=True)`.
     """
-    def __init__(self, epsilon: float = 1e-8):
-        super(ModelNew, self).__init__()
-        self.epsilon = epsilon
+
+    def __init__(self) -> None:
+        super().__init__()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return triton_l2_norm(x, self.epsilon)
+        return triton_l2norm(x)
 ```

@@ -1,0 +1,251 @@
+You are a GPU kernel optimization architect. Analyze the kernel and identify **ONE high-level algorithmic optimization**.
+
+# PyTorch Reference
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs matrix multiplication (C = A * B) for upper triangular matrices.
+    """
+    def __init__(self):
+        super(Model, self).__init__()
+    
+    def forward(self, A, B):
+        """
+        Performs matrix multiplication for upper triangular matrices.
+
+        Args:
+            A (torch.Tensor): Upper triangular matrix of shape (N, N).
+            B (torch.Tensor): Upper triangular matrix of shape (N, N).
+
+        Returns:
+            torch.Tensor: The product of A and B, also an upper triangular matrix of shape (N, N).
+        """
+        return torch.triu(torch.matmul(A, B))
+
+N = 4096
+
+def get_inputs():
+    """
+    Generates upper triangular matrices for testing.
+
+    Returns:
+        list: A list containing two upper triangular matrices of shape (N, N).
+    """
+    A = torch.triu(torch.rand(N, N))
+    B = torch.triu(torch.rand(N, N))
+    return [A, B]
+
+def get_init_inputs():
+    """
+    No specific initialization inputs are needed for this model.
+
+    Returns:
+        list: An empty list.
+    """
+    return []
+```
+
+# Current Triton Kernel
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def upper_tri_matmul_kernel(
+    A_ptr, B_ptr, C_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # Program IDs for 2D tiling of C (M x N)
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+
+    # Offsets for this tile
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Create pointers for the first K-tile of A and B
+    a_ptrs = A_ptr + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = B_ptr + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
+
+    # Accumulator in FP32 for better numerical stability
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Loop over K dimension
+    k = 0
+    while k < K:
+        k_offsets = k + offs_k
+
+        # Masks for valid loads
+        a_mask = (offs_m[:, None] < M) & (k_offsets[None, :] < K)
+        b_mask = (k_offsets[:, None] < K) & (offs_n[None, :] < N)
+
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+        acc += tl.dot(a, b, allow_tf32=True)
+
+        # Move to next K tile
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+        k += BLOCK_K
+
+    # Compute output pointers
+    c_ptrs = C_ptr + (offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn)
+
+    # Valid in-bounds mask for C
+    mask_mn = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+
+    # Enforce upper-triangular structure: i <= j
+    tri_mask = offs_m[:, None] <= offs_n[None, :]
+    acc = acc * tri_mask
+
+    # Store result; Triton will cast to C_ptr dtype if needed
+    tl.store(c_ptrs, acc, mask=mask_mn)
+
+
+def triton_upper_triangular_matmul(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    """
+    Computes torch.triu(A @ B) using a high-performance Triton kernel.
+
+    Args:
+        A (torch.Tensor): (M, K) upper triangular (assumed, not enforced).
+        B (torch.Tensor): (K, N) upper triangular (assumed, not enforced).
+
+    Returns:
+        torch.Tensor: (M, N) upper triangular matrix equal to torch.triu(A @ B).
+    """
+    assert A.ndim == 2 and B.ndim == 2, "Inputs must be 2D matrices"
+    assert A.shape[1] == B.shape[0], "Incompatible matrix shapes"
+
+    # Ensure CUDA and contiguous layout
+    assert A.is_cuda and B.is_cuda, "Inputs must be CUDA tensors"
+    A_contig = A.contiguous()
+    B_contig = B.contiguous()
+
+    M, K = A_contig.shape
+    K2, N = B_contig.shape
+    assert K == K2
+
+    # Output tensor; dtype matches A (and B, assumed same)
+    C = torch.empty((M, N), device=A_contig.device, dtype=A_contig.dtype)
+
+    # Strides in elements
+    stride_am, stride_ak = A_contig.stride()
+    stride_bk, stride_bn = B_contig.stride()
+    stride_cm, stride_cn = C.stride()
+
+    # Block sizes: powers of two as required
+    BLOCK_M = 128
+    BLOCK_N = 128
+    BLOCK_K = 32
+
+    grid = (
+        triton.cdiv(M, BLOCK_M),
+        triton.cdiv(N, BLOCK_N),
+    )
+
+    upper_tri_matmul_kernel[grid](
+        A_contig, B_contig, C,
+        M, N, K,
+        stride_am, stride_ak,
+        stride_bk, stride_bn,
+        stride_cm, stride_cn,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        num_warps=8,
+        num_stages=3,
+    )
+
+    return C
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-accelerated model that computes the upper triangular part of A @ B.
+    """
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, A, B):
+        return triton_upper_triangular_matmul(A, B)
+```
+
+# Performance
+- **PyTorch baseline**: 2.77 ms
+- **Current Triton**: 3.58 ms
+- **Current speedup**: 0.78x (-28.9% vs baseline)
+
+
+---
+
+## Analysis Steps
+
+1. **Code Analysis**: Count kernels, identify operations, check for inefficiencies
+2. **Performance Diagnosis**: Use metrics/latency to identify bottleneck type
+3. **Root Cause**: Combine code + performance to find the core issue
+
+## Optimization Categories (pick ONE if worth optimizing):
+
+### 1. Operator Fusion
+Fuse consecutive ops into fewer kernels to reduce memory traffic and launch overhead.
+
+### 2. Algorithm Replacement
+Replace naive algorithm with optimized variant.
+- For Attention: Flash Attention, online softmax
+- For Convolution: Winograd, im2col
+- **For RNN/GRU/LSTM**: Persistent kernel with HYBRID computation
+  - **CRITICAL**: Use hybrid approach for best performance:
+    * Precompute input-side gates ONCE (outside kernel): `gates_x = (T*B, In) @ W_ih`
+    * Persistent kernel (inside): only recurrent-side: `for t: gates_h = h @ W_hh`
+  - Time loop `for t in range(T)` must be inside kernel, NOT in Python
+  - Launch kernel once per layer, not once per timestep
+  - Expected speedup: 10-100x (vs per-timestep launches)
+
+### 3. Kernel Launch Reduction
+Combine multiple small kernels to reduce overhead.
+- **For RNN/GRU/LSTM**: See "Algorithm Replacement" above for persistent kernel approach
+
+### 4. Memory Layout Optimization
+Use in-place operations, buffer reuse, or better layouts.
+
+## Should We Optimize?
+
+Before proposing optimization, determine if it's worthwhile:
+- **Not worth optimizing** if:
+  - Code is already near-optimal (expected speedup < 10%)
+  - Bottleneck cannot be addressed (hardware limited, already optimal algorithm)
+  - Optimization would add significant complexity with minimal gain
+
+- **Worth optimizing** if:
+  - Clear algorithmic inefficiency exists (multiple kernels, suboptimal algorithm)
+  - Expected speedup >= 20%
+  - Concrete optimization path available
+
+## Output (JSON)
+
+```json
+{
+  "worth_optimizing": "yes/no",
+  "reason": "<Why worth or not worth optimizing, 1 sentence>",
+  "bottleneck": "<Root cause in 1-2 sentences, empty if not worth optimizing>",
+  "optimisation method": "<Specific optimization in 1-2 sentences, empty if not worth optimizing>",
+  "modification plan": "<Implementation steps in 2-3 sentences, empty if not worth optimizing>",
+  "expected_speedup": "<e.g., '30-40%', empty if not worth optimizing>"
+}
+```
+
+Return JSON only.

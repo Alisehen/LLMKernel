@@ -1,0 +1,304 @@
+You are optimizing a Triton kernel based on algorithmic analysis.
+
+# PyTorch Reference (Target Behavior)
+
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs L2 normalization.
+    """
+    def __init__(self):
+        """
+        Initializes the L2Norm layer.
+
+        Args:
+            dim (int): Dimension along which to normalize.
+        """
+        super(Model, self).__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies L2 normalization to the input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (*, dim, *).
+
+        Returns:
+            torch.Tensor: Output tensor with L2 normalization applied, same shape as input.
+        """
+        return x / torch.norm(x, p=2, dim=1, keepdim=True)
+
+batch_size = 32768
+# choose dim so total <2^31
+dim = 65535
+
+def get_inputs():
+    x = torch.rand(batch_size, dim)
+    return [x]
+
+def get_init_inputs():
+    return []
+```
+
+**CRITICAL**: Study the PyTorch code carefully to understand:
+- What does `forward()` return? (full output sequence vs final hidden state only)
+- What is the computational pattern?
+- What are the input/output shapes?
+
+Your optimized kernel MUST match this exact behavior.
+
+---
+
+# Analysis Results
+
+**Bottleneck**: The current algorithm makes two full global-memory passes over `x` (one for sum-of-squares, one for normalization), uses atomics for the reduction, and launches three separate kernels, all of which are expensive for large B×D.
+
+**Optimization Strategy**: Fuse the sum-of-squares, sqrt, and normalization into a single kernel that performs a per-row reduction without atomics and then normalizes in a second loop over the row, eliminating intermediate global buffers and extra launches.
+
+**Implementation Plan**: Design a single Triton kernel with one program per row (or a small group of rows): in the first loop over D (in CHUNK_SIZE tiles), load `x`, accumulate `sum(x^2)` in registers using `tl.sum`, then compute `norm = sqrt(sum)` in-register. In a second loop over D, reload `x` tiles, divide by `norm`, and write directly to `y`, removing `norms_sqr`/`norms` buffers, atomics, and the two auxiliary kernels. Tune CHUNK_SIZE/num_warps so each program fully reduces its row without needing atomic_add across programs.
+
+**Expected Speedup**: 30-50%
+
+---
+
+# Current Kernel (needs optimization)
+
+```python
+# <complete ModelNew code with optimized Triton kernels>
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def l2norm_sumsq_kernel(
+    x_ptr,             # *f32 / *f16, [B, D]
+    norms_sqr_ptr,     # *f32 / *f16, [B]
+    D,                 # int32, number of columns
+    stride_x_batch,    # int32
+    stride_x_dim,      # int32
+    CHUNK_SIZE: tl.constexpr,        # columns per tile, power-of-2
+    TILES_PER_PROGRAM: tl.constexpr, # tiles per program along dim
+):
+    pid_batch = tl.program_id(axis=0)
+    pid_tile_group = tl.program_id(axis=1)
+
+    row_x_ptr = x_ptr + pid_batch * stride_x_batch
+
+    # number of tiles along D dimension
+    T = (D + CHUNK_SIZE - 1) // CHUNK_SIZE
+
+    acc = tl.zeros((), dtype=tl.float32)
+
+    # process up to TILES_PER_PROGRAM tiles per program
+    for t in range(TILES_PER_PROGRAM):
+        tile_id = pid_tile_group * TILES_PER_PROGRAM + t
+        tile_start = tile_id * CHUNK_SIZE
+
+        # skip completely out-of-range tiles
+        if tile_id < T:
+            offs = tile_start + tl.arange(0, CHUNK_SIZE)
+            mask = offs < D
+
+            x = tl.load(row_x_ptr + offs * stride_x_dim, mask=mask, other=0.0)
+            # accumulate in float32 for numerical stability
+            x_f32 = x.to(tl.float32)
+            acc += tl.sum(x_f32 * x_f32, axis=0)
+
+    # atomic add to the row's sum-of-squares
+    tl.atomic_add(norms_sqr_ptr + pid_batch, acc)
+
+
+@triton.jit
+def l2norm_sqrt_kernel(
+    norms_sqr_ptr,  # *f32 / *f16, [B]
+    norms_ptr,      # *f32 / *f16, [B]
+    B,              # int32, number of rows
+):
+    pid = tl.program_id(axis=0)
+
+    # grid is exactly B, so no extra bounds check needed
+    val = tl.load(norms_sqr_ptr + pid)
+    val_f32 = val.to(tl.float32)
+    norm = tl.sqrt(val_f32)
+    tl.store(norms_ptr + pid, norm.to(val.dtype))
+
+
+@triton.jit
+def l2norm_normalize_kernel(
+    x_ptr,            # *f32 / *f16, [B, D]
+    norms_ptr,        # *f32 / *f16, [B]
+    y_ptr,            # *f32 / *f16, [B, D]
+    D,                # int32, number of columns
+    stride_x_batch,   # int32
+    stride_x_dim,     # int32
+    stride_y_batch,   # int32
+    stride_y_dim,     # int32
+    CHUNK_SIZE: tl.constexpr,        # columns per program tile
+):
+    pid_batch = tl.program_id(axis=0)
+    pid_tile = tl.program_id(axis=1)
+
+    row_x_ptr = x_ptr + pid_batch * stride_x_batch
+    row_y_ptr = y_ptr + pid_batch * stride_y_batch
+
+    col_start = pid_tile * CHUNK_SIZE
+    offs = col_start + tl.arange(0, CHUNK_SIZE)
+    mask = offs < D
+
+    x = tl.load(row_x_ptr + offs * stride_x_dim, mask=mask, other=0.0)
+    norm = tl.load(norms_ptr + pid_batch)
+
+    # perform division in higher precision then cast back
+    x_f32 = x.to(tl.float32)
+    norm_f32 = norm.to(tl.float32)
+    y = (x_f32 / norm_f32).to(x.dtype)
+
+    tl.store(row_y_ptr + offs * stride_y_dim, y, mask=mask)
+
+
+def triton_l2norm(x: torch.Tensor) -> torch.Tensor:
+    """
+    L2-normalize each row of a 2D tensor [B, D] using Triton kernels.
+    The output has the same dtype and device as the input.
+    """
+    assert x.ndim == 2, "Input must be 2D tensor [batch, dim]"
+    if not x.is_cuda:
+        raise ValueError("Input tensor must be on CUDA device for Triton kernels.")
+
+    B, D = x.shape
+    if B == 0 or D == 0:
+        # Degenerate case: nothing to normalize
+        return x.clone()
+
+    device = x.device
+    dtype = x.dtype
+
+    CHUNK_SIZE = 256          # power-of-2, good for performance
+    TILES_PER_PROGRAM = 4     # how many tiles each program handles in sumsq kernel
+
+    # Allocate intermediate buffers: one scalar per row
+    norms_sqr = torch.zeros((B,), device=device, dtype=torch.float32)
+    norms = torch.empty((B,), device=device, dtype=torch.float32)
+
+    # Output tensor, same layout as input
+    y = torch.empty_like(x)
+
+    stride_x_batch, stride_x_dim = x.stride()
+    stride_y_batch, stride_y_dim = y.stride()
+
+    # 1) Compute sum of squares along dim=1 using atomics
+    grid_sumsq = lambda meta: (
+        B,
+        max(1, triton.cdiv(D, meta["CHUNK_SIZE"] * meta["TILES_PER_PROGRAM"])),
+    )
+    l2norm_sumsq_kernel[grid_sumsq](
+        x,
+        norms_sqr,
+        D,
+        stride_x_batch,
+        stride_x_dim,
+        CHUNK_SIZE=CHUNK_SIZE,
+        TILES_PER_PROGRAM=TILES_PER_PROGRAM,
+        num_warps=4,
+        num_stages=2,
+    )
+
+    # 2) Take square root to obtain L2 norms
+    grid_sqrt = lambda meta: (B,)
+    l2norm_sqrt_kernel[grid_sqrt](
+        norms_sqr,
+        norms,
+        B,
+        num_warps=1,
+        num_stages=1,
+    )
+
+    # 3) Normalize x by its L2 norm along dim=1
+    grid_norm = lambda meta: (
+        B,
+        max(1, triton.cdiv(D, meta["CHUNK_SIZE"])),
+    )
+    l2norm_normalize_kernel[grid_norm](
+        x,
+        norms,
+        y,
+        D,
+        stride_x_batch,
+        stride_x_dim,
+        stride_y_batch,
+        stride_y_dim,
+        CHUNK_SIZE=CHUNK_SIZE,
+        num_warps=4,
+        num_stages=2,
+    )
+
+    # Cast back to original dtype if needed
+    if dtype != torch.float32:
+        return y.to(dtype)
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized model that performs L2 normalization along dim=1.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_l2norm(x)
+```
+
+---
+
+# Your Task
+
+Implement the optimization strategy above. Focus on the specific bottleneck identified.
+
+## Key Requirements
+
+1. **Preserve correctness**: Maintain the same input/output behavior
+2. **Apply the optimization**: Follow the implementation plan exactly
+3. **Use valid Triton syntax**:
+   - Every kernel MUST have `@triton.jit` decorator
+   - Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+   - BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+   - No `continue`, `break`, `return` inside kernels (use masking)
+   - Prefer `tl.dot(a, b, allow_tf32=True)` for matmul operations
+
+4. **CRITICAL for RNN/GRU/LSTM Persistent Kernels**:
+   - Time loop MUST be inside @triton.jit kernel, NOT in Python forward()
+   - **HYBRID computation strategy** (CRITICAL for performance):
+     * Precompute input-side gates OUTSIDE kernel: `gates_x = (T*B, In) @ W_ih` (ONE large GEMM)
+     * INSIDE kernel: only recurrent-side: `for t: gates_h = h @ W_hh` (T small GEMMs)
+   - CORRECT (FAST - use this):
+     ```python
+     # Python forward():
+     gates_x_all = x.reshape(T*B, In) @ W_ih + b_ih  # ONE large GEMM
+     gates_x_all = gates_x_all.view(T, B, 3*H)
+     gru_persistent_kernel[grid](gates_x_all, h0, W_hh, ...)  # Launch ONCE
+
+     @triton.jit
+     def gru_persistent_kernel(gates_x_ptr, h_ptr, W_hh_ptr, ...):
+         for t in range(T):  # Inside kernel
+             gates_x_t = tl.load(gates_x_ptr + t*...)  # Precomputed
+             gates_h = h @ W_hh  # Only recurrent GEMM
+             h = (1-z)*n + z*h   # Fuse and update
+     ```
+
+5. **Output format**:
+   - Imports: `import torch, torch.nn as nn, triton, triton.language as tl`
+   - `@triton.jit` kernel(s)
+   - Wrapper function(s)
+   - `class ModelNew(nn.Module)` — REQUIRED
+   - NO testing code, NO `if __name__ == "__main__"`
+
+---
+
+Generate the optimized kernel now. Output ONLY the complete Python code.

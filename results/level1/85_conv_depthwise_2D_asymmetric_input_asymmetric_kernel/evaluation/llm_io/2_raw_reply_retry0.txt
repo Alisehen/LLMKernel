@@ -1,0 +1,554 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK': 64}, num_warps=2),
+        triton.Config({'BLOCK': 128}, num_warps=4),
+        triton.Config({'BLOCK': 256}, num_warps=8),
+    ],
+    key=['H_int', 'W_int'],
+)
+@triton.jit
+def depthwise_conv2d_interior_kernel(
+    x_ptr,          # *[N, C, H, W]
+    w_ptr,          # *[C, 1, K_H, K_W]
+    b_ptr,          # *[C] (ignored if has_bias=False)
+    y_ptr,          # *[N, C, H_out, W_out]
+    N, C, H, W,
+    H_out, W_out,
+    stride_h, stride_w,
+    padding_h, padding_w,
+    dilation_h, dilation_w,
+    h_out_start, w_out_start,
+    H_int, W_int,
+    has_bias: tl.constexpr,
+    K_H: tl.constexpr,
+    K_W: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """
+    Interior depthwise conv kernel.
+    2D grid:
+      - pid_nc in [0, N*C)  : batch/channel parallelism (flattened)
+      - pid_hw in [0, ceil(H_int*W_int/BLOCK)) : spatial parallelism
+    No padding checks (all taps guaranteed in-bounds).
+    """
+    pid_nc = tl.program_id(axis=0)
+    pid_hw = tl.program_id(axis=1)
+
+    # Flattened (n, c) index: nc = n*C + c
+    c_idx = pid_nc % C
+
+    # Offsets within the interior H_int x W_int region
+    hw_block_start = pid_hw * BLOCK
+    offs_hw = hw_block_start + tl.arange(0, BLOCK)
+    HW_int = H_int * W_int
+    mask = offs_hw < HW_int
+
+    # Decode (h_int_idx, w_int_idx) from flattened interior index
+    h_int_idx = offs_hw // W_int
+    w_int_idx = offs_hw % W_int
+
+    # Global output coordinates
+    h_out = h_int_idx + h_out_start
+    w_out = w_int_idx + w_out_start
+
+    # Base offsets for this (n, c) plane
+    in_plane_offset = pid_nc * H * W
+    out_plane_offset = pid_nc * H_out * W_out
+
+    # Top-left input coordinate for this output position
+    h_in_origin = h_out * stride_h - padding_h
+    w_in_origin = w_out * stride_w - padding_w
+
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+
+    for kh in tl.static_range(0, K_H):
+        h_in = h_in_origin + kh * dilation_h
+
+        for kw in tl.static_range(0, K_W):
+            w_in = w_in_origin + kw * dilation_w
+
+            # Interior region guarantees in-bounds
+            in_offsets = in_plane_offset + h_in * W + w_in
+            x_val = tl.load(x_ptr + in_offsets, mask=mask, other=0.0).to(tl.float32)
+
+            # Weight is scalar per (c, kh, kw)
+            w_offsets = c_idx * (K_H * K_W) + kh * K_W + kw
+            w_val = tl.load(w_ptr + w_offsets).to(tl.float32)
+
+            acc += x_val * w_val
+
+    if has_bias:
+        b_val = tl.load(b_ptr + c_idx).to(tl.float32)
+        acc += b_val
+
+    out_offsets = out_plane_offset + h_out * W_out + w_out
+    tl.store(y_ptr + out_offsets, acc, mask=mask)
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK': 64}, num_warps=2),
+        triton.Config({'BLOCK': 128}, num_warps=4),
+        triton.Config({'BLOCK': 256}, num_warps=8),
+    ],
+    key=['H_range', 'W_range'],
+)
+@triton.jit
+def depthwise_conv2d_boundary_kernel(
+    x_ptr,          # *[N, C, H, W]
+    w_ptr,          # *[C, 1, K_H, K_W]
+    b_ptr,          # *[C] (ignored if has_bias=False)
+    y_ptr,          # *[N, C, H_out, W_out]
+    N, C, H, W,
+    H_out, W_out,
+    stride_h, stride_w,
+    padding_h, padding_w,
+    dilation_h, dilation_w,
+    h_out_start, w_out_start,
+    H_range, W_range,
+    has_bias: tl.constexpr,
+    K_H: tl.constexpr,
+    K_W: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """
+    Boundary depthwise conv kernel with padding / bounds checks.
+    2D grid:
+      - pid_nc in [0, N*C)  : batch/channel parallelism (flattened)
+      - pid_hw in [0, ceil(H_range*W_range/BLOCK)) : spatial parallelism
+    """
+    pid_nc = tl.program_id(axis=0)
+    pid_hw = tl.program_id(axis=1)
+
+    # Flattened (n, c) index
+    c_idx = pid_nc % C
+
+    # Offsets within the H_range x W_range window
+    hw_block_start = pid_hw * BLOCK
+    offs_hw = hw_block_start + tl.arange(0, BLOCK)
+    HW_range = H_range * W_range
+    mask = offs_hw < HW_range
+
+    # Decode (h_rng_idx, w_rng_idx) from flattened window index
+    h_rng_idx = offs_hw // W_range
+    w_rng_idx = offs_hw % W_range
+
+    # Global output coordinates
+    h_out = h_out_start + h_rng_idx
+    w_out = w_out_start + w_rng_idx
+
+    # Base offsets for this (n, c) plane
+    in_plane_offset = pid_nc * H * W
+    out_plane_offset = pid_nc * H_out * W_out
+
+    # Top-left input coordinate for this output position
+    h_in_origin = h_out * stride_h - padding_h
+    w_in_origin = w_out * stride_w - padding_w
+
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+
+    for kh in tl.static_range(0, K_H):
+        h_in = h_in_origin + kh * dilation_h
+        h_in_clamped = tl.maximum(0, tl.minimum(h_in, H - 1))
+
+        for kw in tl.static_range(0, K_W):
+            w_in = w_in_origin + kw * dilation_w
+            w_in_clamped = tl.maximum(0, tl.minimum(w_in, W - 1))
+
+            in_bounds = (
+                (h_in >= 0)
+                & (h_in < H)
+                & (w_in >= 0)
+                & (w_in < W)
+                & mask
+            )
+
+            in_offsets = in_plane_offset + h_in_clamped * W + w_in_clamped
+            x_val = tl.load(x_ptr + in_offsets, mask=in_bounds, other=0.0).to(tl.float32)
+
+            # Weight is scalar per (c, kh, kw)
+            w_offsets = c_idx * (K_H * K_W) + kh * K_W + kw
+            w_val = tl.load(w_ptr + w_offsets).to(tl.float32)
+
+            acc += x_val * w_val
+
+    if has_bias:
+        b_val = tl.load(b_ptr + c_idx).to(tl.float32)
+        acc += b_val
+
+    out_offsets = out_plane_offset + h_out * W_out + w_out
+    tl.store(y_ptr + out_offsets, acc, mask=mask)
+
+
+def _compute_output_dims(H, W, K_H, K_W, stride_h, stride_w, padding_h, padding_w, dilation_h, dilation_w):
+    H_out = (H + 2 * padding_h - dilation_h * (K_H - 1) - 1) // stride_h + 1
+    W_out = (W + 2 * padding_w - dilation_w * (K_W - 1) - 1) // stride_w + 1
+    return H_out, W_out
+
+
+def _compute_interior_ranges(
+    H, W,
+    H_out, W_out,
+    K_H, K_W,
+    stride_h, stride_w,
+    padding_h, padding_w,
+    dilation_h, dilation_w,
+):
+    """
+    Compute interior output ranges [h_out_start, h_out_end) and [w_out_start, w_out_end)
+    where every kernel tap lies strictly inside the input tensor.
+    """
+    if stride_h <= 0:
+        raise ValueError("stride_h must be positive")
+
+    # h_out * stride_h - padding_h >= 0  -> h_out >= ceil(padding_h / stride_h)
+    h_start = (padding_h + stride_h - 1) // stride_h
+
+    # h_out * stride_h - padding_h + (K_H-1)*dilation_h < H
+    A_h = H + padding_h - dilation_h * (K_H - 1)
+    if A_h <= 0:
+        h_end_candidate = 0
+    else:
+        h_end_candidate = (A_h + stride_h - 1) // stride_h
+    h_end = min(H_out, h_end_candidate)
+    h_start = max(0, h_start)
+
+    if stride_w <= 0:
+        raise ValueError("stride_w must be positive")
+
+    w_start = (padding_w + stride_w - 1) // stride_w
+
+    A_w = W + padding_w - dilation_w * (K_W - 1)
+    if A_w <= 0:
+        w_end_candidate = 0
+    else:
+        w_end_candidate = (A_w + stride_w - 1) // stride_w
+    w_end = min(W_out, w_end_candidate)
+    w_start = max(0, w_start)
+
+    return h_start, h_end, w_start, w_end
+
+
+def depthwise_conv2d_triton(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    stride_h: int,
+    stride_w: int,
+    padding_h: int,
+    padding_w: int,
+    dilation_h: int,
+    dilation_w: int,
+) -> torch.Tensor:
+    """
+    Depthwise 2D convolution (groups == in_channels) implemented with Triton.
+    Uses a fast interior kernel (no padding checks) and a boundary kernel
+    for halo regions. Grid is 2D: parallel over (N*C) and spatial HW.
+    """
+    assert x.is_cuda and weight.is_cuda, "Inputs must be CUDA tensors"
+    assert x.is_contiguous(), "Input must be contiguous NCHW"
+    assert weight.is_contiguous(), "Weight must be contiguous"
+
+    N, C, H, W = x.shape
+    C_w, one, K_H, K_W = weight.shape
+    assert one == 1, "Weight shape for depthwise must be [C, 1, K_H, K_W]"
+    assert C_w == C, "Weight C dimension must match input channels"
+
+    H_out, W_out = _compute_output_dims(
+        H, W, K_H, K_W,
+        stride_h, stride_w,
+        padding_h, padding_w,
+        dilation_h, dilation_w,
+    )
+
+    y = torch.empty((N, C, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    has_bias = bias is not None
+    # Dummy pointer if no bias (never read when has_bias == False)
+    b_tensor = bias if bias is not None else weight
+
+    # Compute interior ranges where all taps are in-bounds
+    h_start, h_end, w_start, w_end = _compute_interior_ranges(
+        H, W,
+        H_out, W_out,
+        K_H, K_W,
+        stride_h, stride_w,
+        padding_h, padding_w,
+        dilation_h, dilation_w,
+    )
+
+    H_int = max(0, h_end - h_start)
+    W_int = max(0, w_end - w_start)
+
+    # Case 1: no interior region -> just run boundary kernel over full output
+    if H_int == 0 or W_int == 0:
+        H_range = H_out
+        W_range = W_out
+        HW_range = H_range * W_range
+        total_elems = N * C * HW_range
+        if total_elems > 0 and HW_range > 0:
+            grid = lambda meta: (N * C, triton.cdiv(HW_range, meta['BLOCK']))
+            depthwise_conv2d_boundary_kernel[grid](
+                x,
+                weight,
+                b_tensor,
+                y,
+                N,
+                C,
+                H,
+                W,
+                H_out,
+                W_out,
+                stride_h,
+                stride_w,
+                padding_h,
+                padding_w,
+                dilation_h,
+                dilation_w,
+                0,        # h_out_start
+                0,        # w_out_start
+                H_range,
+                W_range,
+                has_bias=has_bias,
+                K_H=K_H,
+                K_W=K_W,
+            )
+        return y
+
+    # Case 2: run fast interior kernel over interior region
+    HW_int = H_int * W_int
+    total_int_elems = N * C * HW_int
+    if total_int_elems > 0 and HW_int > 0:
+        grid_int = lambda meta: (N * C, triton.cdiv(HW_int, meta['BLOCK']))
+        depthwise_conv2d_interior_kernel[grid_int](
+            x,
+            weight,
+            b_tensor,
+            y,
+            N,
+            C,
+            H,
+            W,
+            H_out,
+            W_out,
+            stride_h,
+            stride_w,
+            padding_h,
+            padding_w,
+            dilation_h,
+            dilation_w,
+            h_start,
+            w_start,
+            H_int,
+            W_int,
+            has_bias=has_bias,
+            K_H=K_H,
+            K_W=K_W,
+        )
+
+    # Boundary regions: top, bottom, left, right (excluding corners in left/right)
+
+    # Top band: h in [0, h_start)
+    if h_start > 0:
+        H_range = h_start
+        W_range = W_out
+        HW_range = H_range * W_range
+        total_top = N * C * HW_range
+        if total_top > 0 and HW_range > 0:
+            grid_top = lambda meta: (N * C, triton.cdiv(HW_range, meta['BLOCK']))
+            depthwise_conv2d_boundary_kernel[grid_top](
+                x,
+                weight,
+                b_tensor,
+                y,
+                N,
+                C,
+                H,
+                W,
+                H_out,
+                W_out,
+                stride_h,
+                stride_w,
+                padding_h,
+                padding_w,
+                dilation_h,
+                dilation_w,
+                0,          # h_out_start
+                0,          # w_out_start
+                H_range,
+                W_range,
+                has_bias=has_bias,
+                K_H=K_H,
+                K_W=K_W,
+            )
+
+    # Bottom band: h in [h_end, H_out)
+    if h_end < H_out:
+        H_range = H_out - h_end
+        W_range = W_out
+        HW_range = H_range * W_range
+        total_bot = N * C * HW_range
+        if total_bot > 0 and HW_range > 0:
+            grid_bot = lambda meta: (N * C, triton.cdiv(HW_range, meta['BLOCK']))
+            depthwise_conv2d_boundary_kernel[grid_bot](
+                x,
+                weight,
+                b_tensor,
+                y,
+                N,
+                C,
+                H,
+                W,
+                H_out,
+                W_out,
+                stride_h,
+                stride_w,
+                padding_h,
+                padding_w,
+                dilation_h,
+                dilation_w,
+                h_end,      # h_out_start
+                0,          # w_out_start
+                H_range,
+                W_range,
+                has_bias=has_bias,
+                K_H=K_H,
+                K_W=K_W,
+            )
+
+    # Left band within interior rows: h in [h_start, h_end), w in [0, w_start)
+    if w_start > 0 and H_int > 0:
+        H_range = H_int
+        W_range = w_start
+        HW_range = H_range * W_range
+        total_left = N * C * HW_range
+        if total_left > 0 and HW_range > 0:
+            grid_left = lambda meta: (N * C, triton.cdiv(HW_range, meta['BLOCK']))
+            depthwise_conv2d_boundary_kernel[grid_left](
+                x,
+                weight,
+                b_tensor,
+                y,
+                N,
+                C,
+                H,
+                W,
+                H_out,
+                W_out,
+                stride_h,
+                stride_w,
+                padding_h,
+                padding_w,
+                dilation_h,
+                dilation_w,
+                h_start,    # h_out_start
+                0,          # w_out_start
+                H_range,
+                W_range,
+                has_bias=has_bias,
+                K_H=K_H,
+                K_W=K_W,
+            )
+
+    # Right band within interior rows: h in [h_start, h_end), w in [w_end, W_out)
+    if w_end < W_out and H_int > 0:
+        H_range = H_int
+        W_range = W_out - w_end
+        HW_range = H_range * W_range
+        total_right = N * C * HW_range
+        if total_right > 0 and HW_range > 0:
+            grid_right = lambda meta: (N * C, triton.cdiv(HW_range, meta['BLOCK']))
+            depthwise_conv2d_boundary_kernel[grid_right](
+                x,
+                weight,
+                b_tensor,
+                y,
+                N,
+                C,
+                H,
+                W,
+                H_out,
+                W_out,
+                stride_h,
+                stride_w,
+                padding_h,
+                padding_w,
+                dilation_h,
+                dilation_w,
+                h_start,    # h_out_start
+                w_end,      # w_out_start
+                H_range,
+                W_range,
+                has_bias=has_bias,
+                K_H=K_H,
+                K_W=K_W,
+            )
+
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Depthwise 2D convolution implemented with Triton, parameter-compatible
+    with nn.Conv2d (for depthwise case). Uses a fast interior kernel and
+    a boundary kernel, with 2D grid parallelism over (N*C) and spatial HW.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size_h: int,
+        kernel_size_w: int,
+        stride_h: int = 1,
+        stride_w: int = 1,
+        padding_h: int = 0,
+        padding_w: int = 0,
+        dilation_h: int = 1,
+        dilation_w: int = 1,
+        groups: int = 1,
+        bias: bool = False,
+    ):
+        super().__init__()
+        # Depthwise: out_channels == in_channels, groups == in_channels
+        assert groups == in_channels, "This implementation assumes depthwise convolution (groups == in_channels)"
+        self.conv2d = nn.Conv2d(
+            in_channels,
+            in_channels,
+            (kernel_size_h, kernel_size_w),
+            stride=(stride_h, stride_w),
+            padding=(padding_h, padding_w),
+            dilation=(dilation_h, dilation_w),
+            groups=in_channels,
+            bias=bias,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        assert x.dim() == 4, "Expected input of shape [N, C, H, W]"
+        x = x.contiguous()
+        w = self.conv2d.weight
+        b = self.conv2d.bias
+
+        stride_h, stride_w = self.conv2d.stride
+        padding_h, padding_w = self.conv2d.padding
+        dilation_h, dilation_w = self.conv2d.dilation
+
+        return depthwise_conv2d_triton(
+            x,
+            w,
+            b,
+            stride_h=stride_h,
+            stride_w=stride_w,
+            padding_h=padding_h,
+            padding_w=padding_w,
+            dilation_h=dilation_h,
+            dilation_w=dilation_w,
+        )
+```
