@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The Triton model is ~50% slower than the PyTorch baseline, and a significant part of the overhead comes from avoidable data layout conversions around the GEMM.",
+  "bottleneck": "Each fused_linear call performs weight.t().contiguous() to create a [K, N] matrix from the nn.Linear-style [N, K] weight, incurring large extra memory copies and allocations on the critical path for every forward. This layout conversion is purely algorithmic overhead on top of an already less-optimized GEMM vs cuBLAS.",
+  "optimisation method": "Apply a memory-layout-aware algorithm: remove runtime weight transposition by modifying the Triton kernel to directly consume weights in standard [N, K] layout and compute x @ W^T via adjusted strides, or by storing the weights pre-transposed once at initialization.",
+  "modification_plan": "Change linear_bias_relu_kernel so that B is interpreted as [N, K] (same as nn.Linear.weight) and adjust b_ptrs/strides to effectively read W^T without forming an explicit transpose; equivalently, define fc*_weight at model creation time in the [K, N] layout and never call .t().contiguous() inside fused_linear. This removes the per-call transpose+contiguous allocations and large memory moves, letting the kernel operate directly on the original parameters and thus reducing both latency and memory bandwidth pressure.",
+  "expected_speedup": "15-25% on the classifier path, translating to roughly 5-15% end-to-end, depending on how much time the model spends in the fully-connected layers vs convolutions."
+}

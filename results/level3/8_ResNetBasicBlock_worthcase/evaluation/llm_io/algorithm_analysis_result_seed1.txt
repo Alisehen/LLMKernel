@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The block is dominated by repeated global-memory reads/writes across many small kernels (conv, BN, add, ReLU), so fusing them can substantially cut memory traffic and launch overhead.",
+  "bottleneck": "Each feature map is written to and read from global memory multiple times: conv2 -> BN2 -> residual add -> ReLU, plus an extra path for downsample (conv+BN). This makes the block heavily memory-bound and penalized by kernel-launch overhead despite a reasonably optimized conv kernel.",
+  "optimisation method": "Use operator fusion: fold BatchNorm into the corresponding convolutions (conv1, conv2, and downsample conv) and fuse the final conv2d + residual add + ReLU into a single Triton kernel so that the kernel directly computes ReLU(Conv2(x) + Downsample(x)).",
+  "modification plan": "Precompute fused weights/biases by folding BN parameters into conv weights and (optionally) cache them so that at runtime BN disappears as a separate op. Then, write a fused Triton kernel that takes the conv2 input and the identity tensor, performs the conv2 accumulation, adds the (possibly downsampled) identity in-register, applies the final ReLU, and stores the result once to global memory. Replace the current sequence `conv2 -> bn2 -> (downsample conv+bn) -> add_relu` with a single call to this fused kernel, keeping conv1 as-is or also fusing its BN if desired.",
+  "expected_speedup": "20-40%"
+}

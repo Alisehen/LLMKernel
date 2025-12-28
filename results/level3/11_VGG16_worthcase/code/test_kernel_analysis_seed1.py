@@ -1,0 +1,270 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        # High throughput for tall-batch / moderate N
+        triton.Config(
+            {
+                "BLOCK_M": 128,
+                "BLOCK_N": 64,
+                "BLOCK_K": 32,
+            },
+            num_warps=4,   # good balance: more regs/warp, solid occupancy
+            num_stages=2,  # multi-input fusion: keep stages modest
+        ),
+        # High throughput for wide N
+        triton.Config(
+            {
+                "BLOCK_M": 64,
+                "BLOCK_N": 128,
+                "BLOCK_K": 32,
+            },
+            num_warps=4,
+            num_stages=2,
+        ),
+        # Compute-heavy config: deeper K blocking, more warps
+        triton.Config(
+            {
+                "BLOCK_M": 64,
+                "BLOCK_N": 64,
+                "BLOCK_K": 64,
+            },
+            num_warps=8,   # more warps when register pressure allows
+            num_stages=3,  # better latency hiding on large K
+        ),
+        # Conservative baseline (always tested)
+        triton.Config(
+            {
+                "BLOCK_M": 64,
+                "BLOCK_N": 64,
+                "BLOCK_K": 32,
+            },
+            num_warps=4,
+            num_stages=2,
+        ),
+    ],
+    key=["M", "N", "K"],
+)
+@triton.jit
+def linear_bias_relu_kernel(
+    a_ptr,  # [M, K]
+    b_ptr,  # [K, N] logical (weight[n, k] => b_ptr[n, k])
+    bias_ptr,  # [N]
+    c_ptr,  # [M, N]
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    ACT_RELU: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # -------------------------------------------------------------------------
+    # Program IDs for 2D tiling over [M, N]
+    # -------------------------------------------------------------------------
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Codegen hints to improve vectorization / coalescing
+    tl.multiple_of(offs_m, BLOCK_M)
+    tl.multiple_of(offs_n, BLOCK_N)
+    tl.multiple_of(offs_k, BLOCK_K)
+    tl.max_contiguous(offs_m, BLOCK_M)
+    tl.max_contiguous(offs_n, BLOCK_N)
+
+    # Output mask
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+    out_mask = mask_m[:, None] & mask_n[None, :]
+
+    # Base pointers for first K-block of A and B
+    a_ptrs = a_ptr + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
+
+    # Accumulator in FP32 (stays in registers)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # -------------------------------------------------------------------------
+    # K loop - main matmul
+    # -------------------------------------------------------------------------
+    # Streaming over K, no intermediate stores.
+    for k_start in range(0, K, BLOCK_K):
+        k_remaining = K - k_start
+        mask_k = offs_k < k_remaining
+
+        a = tl.load(
+            a_ptrs,
+            mask=mask_m[:, None] & mask_k[None, :],
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptrs,
+            mask=mask_k[:, None] & mask_n[None, :],
+            other=0.0,
+        )
+
+        # tf32 tensor cores on 4090
+        acc += tl.dot(a, b, allow_tf32=True)
+
+        # advance along K
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # -------------------------------------------------------------------------
+    # Fused bias add + optional ReLU (no extra global stores)
+    # -------------------------------------------------------------------------
+    bias = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0)  # [BLOCK_N]
+    acc += bias[None, :]  # broadcast over M
+
+    if ACT_RELU:
+        acc = tl.maximum(acc, 0.0)
+
+    # -------------------------------------------------------------------------
+    # Single global store of final result
+    # -------------------------------------------------------------------------
+    c_ptrs = c_ptr + (offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn)
+    tl.store(c_ptrs, acc, mask=out_mask)
+
+
+def fused_linear(x: torch.Tensor,
+                 weight: torch.Tensor,
+                 bias: torch.Tensor,
+                 activation: str = "none") -> torch.Tensor:
+    """
+    Fused Linear(+Bias[+ReLU]) using an optimized Triton GEMM kernel.
+
+    Computes: out = x @ weight.T + bias
+
+    x:      [M, K]
+    weight: [N, K]  (same layout as nn.Linear.weight)
+    bias:   [N]
+    activation: "none" or "relu"
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+    assert x.dtype == weight.dtype == bias.dtype == torch.float32
+
+    M, K = x.shape
+    N, Kw = weight.shape
+    assert Kw == K, "Weight in_features must match input features"
+
+    out = torch.empty((M, N), device=x.device, dtype=x.dtype)
+
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta["BLOCK_M"]),
+            triton.cdiv(N, meta["BLOCK_N"]),
+        )
+
+    ACT_RELU = activation == "relu"
+
+    linear_bias_relu_kernel[grid](
+        x, weight, bias, out,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        weight.stride(1), weight.stride(0),
+        out.stride(0), out.stride(1),
+        ACT_RELU,
+    )
+
+    return out
+
+
+class ModelNew(nn.Module):
+    def __init__(self, num_classes=1000):
+        """
+        Triton-accelerated VGG16:
+        - Conv feature extractor (standard PyTorch)
+        - Classifier (three Linear layers) via high-performance Triton GEMMs
+        """
+        super(ModelNew, self).__init__()
+
+        # Feature extractor: VGG16-style
+        self.features = nn.Sequential(
+            # Block 1
+            nn.Conv2d(3, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+
+            # Block 2
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 128, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+
+            # Block 3
+            nn.Conv2d(128, 256, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 256, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 256, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+
+            # Block 4
+            nn.Conv2d(256, 512, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 512, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 512, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+
+            # Block 5
+            nn.Conv2d(512, 512, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 512, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 512, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+        )
+
+        # Classifier
+        in_features = 512 * 7 * 7
+        hidden = 4096
+
+        self.fc1_weight = nn.Parameter(torch.randn(hidden, in_features, dtype=torch.float32))
+        self.fc1_bias = nn.Parameter(torch.randn(hidden, dtype=torch.float32))
+
+        self.fc2_weight = nn.Parameter(torch.randn(hidden, hidden, dtype=torch.float32))
+        self.fc2_bias = nn.Parameter(torch.randn(hidden, dtype=torch.float32))
+
+        self.fc3_weight = nn.Parameter(torch.randn(num_classes, hidden, dtype=torch.float32))
+        self.fc3_bias = nn.Parameter(torch.randn(num_classes, dtype=torch.float32))
+
+    def forward(self, x):
+        """
+        Forward pass:
+        - Convolutional backbone via PyTorch
+        - Classifier via Triton fused Linear(+Bias[+ReLU]) kernels
+
+        Returns: [batch_size, num_classes]
+        """
+        x = self.features(x)
+        x = torch.flatten(x, 1)  # [B, 512*7*7]
+
+        # Ensure activations are fp32 on CUDA for Triton
+        if not x.is_cuda:
+            x = x.cuda()
+        x = x.to(torch.float32)
+
+        assert self.fc1_weight.is_cuda and self.fc1_bias.is_cuda
+        assert self.fc2_weight.is_cuda and self.fc2_bias.is_cuda
+        assert self.fc3_weight.is_cuda and self.fc3_bias.is_cuda
+
+        x = fused_linear(x, self.fc1_weight, self.fc1_bias, activation="relu")
+        x = fused_linear(x, self.fc2_weight, self.fc2_bias, activation="relu")
+        x = fused_linear(x, self.fc3_weight, self.fc3_bias, activation="none")
+        return x

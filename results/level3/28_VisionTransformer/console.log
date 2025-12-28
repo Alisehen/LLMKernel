@@ -1,0 +1,119 @@
+[Seed] Generating seed kernel...
+[Seed 1/2] Generating...
+[92mFinish reason: stop[0m
+Usage: In=2259, Out=7226, Total=9485
+[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 644, in compare_and_bench
+    raise ValueError(
+ValueError: Outputs are not close (atol=1, rtol=1). max_abs_err=nan, mean_abs_err=nan
+
+[seed_0] failed. See metrics.message for details.
+[seed_0] metrics saved to: /home/hyc/LLMKernel/run/20251228_085521_batch_range26to32_openai_deepseek/28_VisionTransformer/evaluation/eval_0017.json
+[Seed 1] Failed, attempting repair...
+[92mFinish reason: stop[0m
+Usage: In=2487, Out=7528, Total=10015
+[seed_0_repair_1] score=0.9894 (baseline=3.8764ms)
+[seed_0_repair_1] metrics saved to: /home/hyc/LLMKernel/run/20251228_085521_batch_range26to32_openai_deepseek/28_VisionTransformer/evaluation/eval_0018.json
+[Seed 1 Repair] Score: 0.9894 ✓
+[Seed 1] Final score: 0.9894 ✓
+[Seed 2/2] Generating...
+[92mFinish reason: stop[0m
+Usage: In=2259, Out=6629, Total=8888
+[seed_1] score=0.9603 (baseline=3.9778ms)
+[seed_1] metrics saved to: /home/hyc/LLMKernel/run/20251228_085521_batch_range26to32_openai_deepseek/28_VisionTransformer/evaluation/eval_0019.json
+[Seed 2] Final score: 0.9603 ✓
+
+================================================================================
+[Hybrid Strategy] Analyzing all seeds for algorithmic optimization...
+[Hybrid Strategy] - 2 seed(s) with score < 1.0 (rescue)
+================================================================================
+
+[Hybrid] Seed 1: score=0.9894 < 1.0
+[Hybrid] Attempting algorithm analysis rescue...
+[Hybrid] Requesting LLM analysis for seed 1...
+[92mFinish reason: stop[0m
+Usage: In=4497, Out=766, Total=5263
+[Hybrid] Worth optimizing: yes
+[Hybrid] Reason: Most compute and memory traffic is still in the PyTorch nn.TransformerEncoder, while Triton only accelerates relatively small linear layers (patch embedding + MLP head).
+[Hybrid] Analysis complete for seed 1, generating optimized kernel...
+[Hybrid] Bottleneck: The nn.TransformerEncoder runs self-attention and MLP as multiple unfused PyTorc...
+[Hybrid] Optimization: Replace nn.TransformerEncoder with a custom Transformer block that uses a fused,...
+[Hybrid] Expected speedup: 30-40%
+[92mFinish reason: stop[0m
+Usage: In=4832, Out=9678, Total=14510
+[algorithm_optimized_seed0] score=1.8211 (baseline=3.9778ms)
+[algorithm_optimized_seed0] metrics saved to: /home/hyc/LLMKernel/run/20251228_085521_batch_range26to32_openai_deepseek/28_VisionTransformer/evaluation/eval_0020.json
+[Hybrid] ✓ Rescue successful: 0.9894 → 1.8211
+
+[Hybrid] Seed 2: score=0.9603 < 1.0
+[Hybrid] Attempting algorithm analysis rescue...
+[Hybrid] Requesting LLM analysis for seed 2...
+[92mFinish reason: stop[0m
+Usage: In=3195, Out=1755, Total=4950
+[Hybrid] Worth optimizing: yes
+[Hybrid] Reason: The current optimization focuses on the linear kernel, but a larger inefficiency comes from explicitly materializing patches via unfold before the linear, which can be replaced by a more efficient algorithm.
+[Hybrid] Analysis complete for seed 2, generating optimized kernel...
+[Hybrid] Bottleneck: Patch embedding is implemented as img.unfold(...).reshape(..., patch_dim) follow...
+[Hybrid] Optimization: Replace the unfold + patch_to_embedding Linear (or triton_linear) with a single ...
+[Hybrid] Expected speedup: 20-30%
+[92mFinish reason: stop[0m
+Usage: In=3600, Out=11861, Total=15461
+[algorithm_optimized_seed1] score=1.0003 (baseline=3.9778ms)
+[algorithm_optimized_seed1] metrics saved to: /home/hyc/LLMKernel/run/20251228_085521_batch_range26to32_openai_deepseek/28_VisionTransformer/evaluation/eval_0021.json
+[Hybrid] ✓ Rescue successful: 0.9603 → 1.0003
+
+================================================================================
+[Hybrid] Candidate Selection
+================================================================================
+[Hybrid] Total candidates: 4
+  [1] seed 1: 0.9894
+  [2] seed 2: 0.9603
+  [3] algo-optimized (from seed 1): 1.8211
+  [4] algo-optimized (from seed 2): 1.0003
+
+[Hybrid] ★ Selected best candidate: score=1.8211
+
+[Optimization] Starting 3-stage optimization...
+
+================================================================================
+[Stage 1/3] grid_and_parallel
+Description: Optimize grid layout and parallel work distribution across SMs.
+Current candidates: 1, best score: 1.8211
+================================================================================
+[Stage 1] Profiling best candidate...
+[Stage 1] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=4103, Out=7897, Total=12000
+[stage1_grid_and_parallel] score=1.5288 (baseline=3.9778ms)
+[stage1_grid_and_parallel] metrics saved to: /home/hyc/LLMKernel/run/20251228_085521_batch_range26to32_openai_deepseek/28_VisionTransformer/evaluation/eval_0022.json
+  Optimized kernel score: 1.5288 ✓
+[Stage 1] Current: 1.5288 (global best: 1.8211)
+
+================================================================================
+[Stage 2/3] block_tiling
+Description: Tune BLOCK_M/N/K sizes for optimal register/memory balance.
+Current candidates: 1, best score: 1.8211
+================================================================================
+[Stage 2] Profiling best candidate...
+[Stage 2] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=4747, Out=5852, Total=10599
+[stage2_block_tiling] score=1.4654 (baseline=3.9778ms)
+[stage2_block_tiling] metrics saved to: /home/hyc/LLMKernel/run/20251228_085521_batch_range26to32_openai_deepseek/28_VisionTransformer/evaluation/eval_0023.json
+  Optimized kernel score: 1.4654 ✓
+[Stage 2] Current: 1.4654 (global best: 1.8211)
+
+================================================================================
+[Stage 3/3] memory_and_tuning
+Description: Optimize memory access patterns and fine-tune num_stages/num_warps.
+Current candidates: 1, best score: 1.8211
+================================================================================
+[Stage 3] Profiling best candidate...
+[Stage 3] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=4853, Out=8900, Total=13753
+[stage3_memory_and_tuning] score=1.4813 (baseline=3.9778ms)
+[stage3_memory_and_tuning] metrics saved to: /home/hyc/LLMKernel/run/20251228_085521_batch_range26to32_openai_deepseek/28_VisionTransformer/evaluation/eval_0024.json
+  Optimized kernel score: 1.4813 ✓
+[Stage 3] Current: 1.4813 (global best: 1.8211)
+[28_VisionTransformer.py] Figure saved to: /home/hyc/LLMKernel/run/20251228_085521_batch_range26to32_openai_deepseek/28_VisionTransformer/figures/28_VisionTransformer_score.png

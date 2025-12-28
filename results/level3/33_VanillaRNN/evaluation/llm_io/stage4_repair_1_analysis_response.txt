@@ -1,5 +1,0 @@
-{
-  "critical_issue": "The custom tanh uses (exp(2x) - 1) / (exp(2x) + 1), which overflows to inf/inf for large x and produces NaNs.",
-  "why_it_matters": "NaNs from this unstable tanh propagate into the fused kernel outputs, so the comparison against PyTorch’s stable nn.Tanh returns max_abs_err=nan and mean_abs_err=nan.",
-  "minimal_fix_hint": "Replace the manual tanh formula with a numerically stable variant, e.g., tl.tanh(acc) or an equivalent stable implementation."
-}

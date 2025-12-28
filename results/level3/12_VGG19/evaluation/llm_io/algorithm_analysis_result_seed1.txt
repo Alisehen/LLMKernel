@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The current Triton classifier does an expensive weight transpose on every forward pass, adding large O(K·N) memory traffic that can be removed by changing the weight layout.",
+  "bottleneck": "Each fused_linear / fused_linear_relu call performs `weight.t().contiguous()` at runtime, transposing large [N, K] matrices (e.g., 4096×25088) three times per forward. For these sizes, the transpose plus extra allocation can dominate the FC compute and negate any benefit from the custom GEMM.",
+  "optimisation method": "Change the classifier to store weights directly in the GEMM-friendly [K, N] layout (or maintain a pre-transposed copy) and update the Triton kernel interface accordingly so that no per-forward transpose or extra contiguous() is needed.",
+  "modification plan": "Redefine the FC parameters as `weight_T` with shape [in_features, out_features] (i.e., [K, N]) so the Triton kernels can consume them directly as `b` without calling `weight.t().contiguous()`. Adjust the model’s forward to pass these pre-transposed weights into `fused_linear(_relu)` and update any loading/initialization logic to either initialize in [K, N] layout or transpose once at init/load-time. This removes three large transposes and allocations per inference, substantially reducing memory traffic and kernel overhead for the classifier.",
+  "expected_speedup": "20-30% end-to-end (and much larger, ~2-3x, on just the FC/classifier portion)"
+}

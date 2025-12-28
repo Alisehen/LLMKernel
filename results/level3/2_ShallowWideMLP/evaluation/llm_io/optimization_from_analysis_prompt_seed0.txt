@@ -1,0 +1,293 @@
+You are optimizing a Triton kernel based on algorithmic analysis.
+
+# PyTorch Reference (Target Behavior)
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class Model(nn.Module):
+    def __init__(self, input_size, hidden_layer_sizes, output_size):
+        """
+        :param input_size: The number of input features
+        :param hidden_layer_sizes: A list of ints containing the sizes of each hidden layer
+        :param output_size: The number of output features
+        """
+        super(Model, self).__init__()
+        
+        layers = []
+        current_input_size = input_size
+        
+        for hidden_size in hidden_layer_sizes:
+            layers.append(nn.Linear(current_input_size, hidden_size))
+            layers.append(nn.ReLU())
+            current_input_size = hidden_size
+        
+        layers.append(nn.Linear(current_input_size, output_size))
+        
+        self.network = nn.Sequential(*layers)
+    
+    def forward(self, x):
+        """
+        :param x: The input tensor, shape (batch_size, input_size)
+        :return: The output tensor, shape (batch_size, output_size)
+        """
+        return self.network(x)
+
+# Test code
+batch_size = 128
+input_size = 16384
+hidden_layer_sizes = [32768, 32768]
+output_size = 16384
+
+def get_inputs():
+    return [torch.rand(batch_size, input_size)]
+
+def get_init_inputs():
+    return [input_size, hidden_layer_sizes, output_size]
+```
+
+**CRITICAL**: Study the PyTorch code carefully to understand:
+- What does `forward()` return? (full output sequence vs final hidden state only)
+- What is the computational pattern?
+- What are the input/output shapes?
+
+Your optimized kernel MUST match this exact behavior.
+
+---
+
+# Analysis Results
+
+**Bottleneck**: Each hidden layer performs an independent matmul+bias+ReLU, writing its full output (e.g., 128×32768) to global memory and then reading it back for the next layer, plus incurring three separate kernel launches; this redundant activation traffic and launch overhead dominate once the GEMM itself is reasonably optimized.
+
+**Optimization Strategy**: Fuse all linear+bias+ReLU layers into a single persistent Triton kernel that loops over layers inside the kernel, keeps the current activation tile in registers/shared memory, and only writes the final output to global memory, thus eliminating intermediate activation writes/reads and reducing kernel launches from three to one.
+
+**Implementation Plan**: Refactor `ModelNew.forward` to call a single `triton_fused_mlp` kernel instead of `triton_linear` per layer, passing arrays of weight/bias pointers and per-layer sizes. Inside the fused kernel, tile over (M, feature) as now, but add an outer loop over layers: for each layer, run the K-loop matmul using the current activation tile as A, add bias and apply ReLU (except last), and keep the result tile in registers/shared memory for the next layer instead of storing to global. After the final layer, store only the last layer's output tile to `c_ptr`, handling variable `K`/`N` per layer via metadata and masks.
+
+**Expected Speedup**: 15-25%
+
+---
+
+# Current Kernel (needs optimization)
+
+```python
+import math
+import torch, torch.nn as nn, triton, triton.language as tl
+
+
+@triton.jit
+def linear_bias_kernel(
+    a_ptr, b_ptr, bias_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    ADD_RELU: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    # Program ids for 2D tiling of output matrix C[M, N]
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    # Row/col indices for this program's tile
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Pointers to the first K-tile of A and B
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    # Accumulator in fp32 for better numerical stability
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Loop over K dimension
+    k_remaining = K
+    while k_remaining > 0:
+        # Mask K for this tile
+        k_mask = offs_k[None, :] < k_remaining
+
+        # Load A and B tiles (masked for M, N, and K)
+        a = tl.load(
+            a_ptrs,
+            mask=(offs_m[:, None] < M) & k_mask,
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptrs,
+            mask=(offs_n[None, :] < N) & (offs_k[:, None] < k_remaining),
+            other=0.0,
+        )
+
+        # Fused matmul tile
+        acc += tl.dot(a, b, allow_tf32=True)
+
+        # Advance pointers
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+        k_remaining -= BLOCK_K
+
+    # Add bias: shape (N,)
+    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc += bias[None, :]
+
+    # Optional ReLU
+    if ADD_RELU:
+        acc = tl.maximum(acc, 0.0)
+
+    # Write back, cast to original dtype of C
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    out = acc.to(tl.float32)
+    tl.store(
+        c_ptrs,
+        out,
+        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+    )
+
+
+def triton_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, add_relu: bool):
+    """
+    x:      (M, K)
+    weight: (N, K)  (nn.Linear's weight.t() contiguous)
+    bias:   (N,)
+    returns: (M, N)
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda, "Inputs must be CUDA tensors"
+    assert x.shape[1] == weight.shape[1], "Incompatible shapes"
+    assert weight.shape[0] == bias.shape[0], "Weight/bias size mismatch"
+
+    M, K = x.shape
+    N = weight.shape[0]
+
+    # Ensure contiguous for expected strides
+    a = x.contiguous()
+    b = weight.contiguous()
+    c = torch.empty((M, N), device=x.device, dtype=x.dtype)
+
+    grid = lambda META: (
+        max(1, triton.cdiv(M, META["BLOCK_M"])),
+        max(1, triton.cdiv(N, META["BLOCK_N"])),
+    )
+
+    linear_bias_kernel[grid](
+        a, b, bias, c,
+        M, N, K,
+        a.stride(0), a.stride(1),
+        b.stride(1), b.stride(0),  # b is (N, K) so K-major for kernel: stride_bk, stride_bn
+        c.stride(0), c.stride(1),
+        ADD_RELU=add_relu,
+        BLOCK_M=64,
+        BLOCK_N=128,
+        BLOCK_K=32,
+        num_warps=4,
+        num_stages=2,
+    )
+    return c
+
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_layer_sizes, output_size):
+        """
+        :param input_size: The number of input features
+        :param hidden_layer_sizes: A list of ints containing the sizes of each hidden layer
+        :param output_size: The number of output features
+        """
+        super(ModelNew, self).__init__()
+
+        layer_sizes = [input_size] + list(hidden_layer_sizes) + [output_size]
+        self.weights = nn.ParameterList()
+        self.biases = nn.ParameterList()
+
+        for in_features, out_features in zip(layer_sizes[:-1], layer_sizes[1:]):
+            w = nn.Parameter(torch.empty(out_features, in_features))
+            b = nn.Parameter(torch.empty(out_features))
+            self.weights.append(w)
+            self.biases.append(b)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        # Mimic nn.Linear initialization as closely as possible
+        for w, b in zip(self.weights, self.biases):
+            in_features = w.shape[1]
+            nn.init.kaiming_uniform_(w, a=math.sqrt(5))
+            if b is not None:
+                fan_in = in_features
+                bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+                nn.init.uniform_(b, -bound, bound)
+
+    def forward(self, x):
+        """
+        :param x: The input tensor, shape (batch_size, input_size)
+        :return: The output tensor, shape (batch_size, output_size)
+        """
+        # Move input to same device/dtype as parameters if needed
+        if self.weights:
+            param = self.weights[0]
+            if x.device != param.device:
+                x = x.to(param.device)
+            if x.dtype != param.dtype:
+                x = x.to(param.dtype)
+
+        x = x.contiguous()
+
+        num_layers = len(self.weights)
+        for i in range(num_layers):
+            w = self.weights[i]          # (out_features, in_features)
+            b = self.biases[i]           # (out_features,)
+            # Kernel expects weight as (N, K) with K = in_features
+            w_t = w                      # shape (out_features, in_features)
+            # Use Triton kernel: all but last layer have ReLU
+            add_relu = i < (num_layers - 1)
+            x = triton_linear(x, w_t, b, add_relu=add_relu)
+        return x
+```
+
+---
+
+# Your Task
+
+Implement the optimization strategy above. Focus on the specific bottleneck identified.
+
+## Key Requirements
+
+1. **Preserve correctness**: Maintain the same input/output behavior
+2. **Apply the optimization**: Follow the implementation plan exactly
+3. **Use valid Triton syntax**:
+   - Every kernel MUST have `@triton.jit` decorator
+   - Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+   - BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+   - No `continue`, `break`, `return` inside kernels (use masking)
+   - Prefer `tl.dot(a, b, allow_tf32=True)` for matmul operations
+
+4. **CRITICAL for RNN/GRU/LSTM Persistent Kernels**:
+   - Time loop MUST be inside @triton.jit kernel, NOT in Python forward()
+   - **HYBRID computation strategy** (CRITICAL for performance):
+     * Precompute input-side gates OUTSIDE kernel: `gates_x = (T*B, In) @ W_ih` (ONE large GEMM)
+     * INSIDE kernel: only recurrent-side: `for t: gates_h = h @ W_hh` (T small GEMMs)
+   - CORRECT (FAST - use this):
+     ```python
+     # Python forward():
+     gates_x_all = x.reshape(T*B, In) @ W_ih + b_ih  # ONE large GEMM
+     gates_x_all = gates_x_all.view(T, B, 3*H)
+     gru_persistent_kernel[grid](gates_x_all, h0, W_hh, ...)  # Launch ONCE
+
+     @triton.jit
+     def gru_persistent_kernel(gates_x_ptr, h_ptr, W_hh_ptr, ...):
+         for t in range(T):  # Inside kernel
+             gates_x_t = tl.load(gates_x_ptr + t*...)  # Precomputed
+             gates_h = h @ W_hh  # Only recurrent GEMM
+             h = (1-z)*n + z*h   # Fuse and update
+     ```
+
+5. **Output format**:
+   - Imports: `import torch, torch.nn as nn, triton, triton.language as tl`
+   - `@triton.jit` kernel(s)
+   - Wrapper function(s)
+   - `class ModelNew(nn.Module)` — REQUIRED
+   - NO testing code, NO `if __name__ == "__main__"`
+
+---
+
+Generate the optimized kernel now. Output ONLY the complete Python code.

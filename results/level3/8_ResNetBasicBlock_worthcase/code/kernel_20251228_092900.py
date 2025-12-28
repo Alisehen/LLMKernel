@@ -1,0 +1,527 @@
+# Optimized Triton implementation of ModelNew with high-performance kernels on RTX 4090
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+def fold_conv_bn_2d(conv: nn.Conv2d, bn: nn.BatchNorm2d):
+    """
+    Fold BatchNorm2d into Conv2d for inference:
+      y = BN(conv(x)) == conv_fused(x)
+
+    This uses BN's running_mean / running_var (eval-mode behavior).
+    """
+    W = conv.weight
+    if conv.bias is not None:
+        b = conv.bias
+    else:
+        b = torch.zeros(W.shape[0], device=W.device, dtype=W.dtype)
+
+    running_mean = bn.running_mean
+    running_var = bn.running_var
+    eps = bn.eps
+
+    if bn.weight is not None:
+        gamma = bn.weight
+    else:
+        gamma = torch.ones_like(running_mean, device=running_mean.device, dtype=running_mean.dtype)
+    if bn.bias is not None:
+        beta = bn.bias
+    else:
+        beta = torch.zeros_like(running_mean, device=running_mean.device, dtype=running_mean.dtype)
+
+    inv_std = torch.rsqrt(running_var + eps)  # 1 / sqrt(var + eps)
+
+    # Fuse: W_fused[o] = W[o] * (gamma[o] * inv_std[o])
+    scale = (gamma * inv_std).reshape(-1, 1, 1, 1)
+    W_fused = W * scale
+
+    # b_fused[o] = beta[o] + (b[o] - mean[o]) * inv_std[o] * gamma[o]
+    b_fused = beta + (b - running_mean) * inv_std * gamma
+
+    return W_fused, b_fused
+
+
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32},
+            num_warps=4,
+            num_stages=3,
+        ),
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 32},
+            num_warps=8,
+            num_stages=3,
+        ),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32},
+            num_warps=8,
+            num_stages=3,
+        ),
+    ],
+    key=["C_out", "C_in", "H_out", "W_out"],
+)
+@triton.jit
+def conv2d_nchw_kernel(
+    x_ptr, w_ptr, b_ptr, y_ptr,
+    N, C_in, H_in, W_in,
+    C_out, H_out, W_out,
+    KH, KW,
+    stride_h_conv, stride_w_conv,
+    pad_h, pad_w,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_wo, stride_wi, stride_wk, stride_wl,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    BLOCK_M: tl.constexpr,  # tile over M = N * H_out * W_out
+    BLOCK_N: tl.constexpr,  # tile over output channels C_out
+    BLOCK_K: tl.constexpr,  # tile over reduction K = C_in * KH * KW
+):
+    # 2D grid over (M, C_out) = (N * H_out * W_out, C_out)
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    M = N * H_out * W_out
+    K = C_in * KH * KW
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_m = offs_m < M
+    mask_n = offs_n < C_out
+    mask_mn = mask_m[:, None] & mask_n[None, :]
+
+    # Decode offs_m into (n, oh, ow)
+    hw_out = H_out * W_out
+    n_idx = offs_m // hw_out
+    hw_idx = offs_m % hw_out
+    oh = hw_idx // W_out
+    ow = hw_idx % W_out
+
+    # Base output pointer for this tile: same offsets used by all fused ops
+    y_base = (
+        n_idx[:, None] * stride_yn +
+        oh[:, None] * stride_yh +
+        ow[:, None] * stride_yw
+    )
+    y_ptrs = y_ptr + y_base + offs_n[None, :] * stride_yc
+
+    # Accumulator (float32 for precision)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Precompute bases for input and weights that depend only on (n, oh, ow) or output channel
+    x_n_base = x_ptr + n_idx[:, None] * stride_xn
+    w_o_base = w_ptr + offs_n[None, :] * stride_wo
+
+    # K-loop over C_in * KH * KW
+    for k_start in range(0, K, BLOCK_K):
+        offs_k = k_start + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < K
+
+        ci = offs_k // (KH * KW)
+        rem = offs_k % (KH * KW)
+        kh = rem // KW
+        kw = rem % KW
+
+        # Compute input spatial indices for this K-tile
+        ih = oh[:, None] * stride_h_conv + kh[None, :] - pad_h
+        iw = ow[:, None] * stride_w_conv + kw[None, :] - pad_w
+
+        # In-bounds mask for input
+        mask_in = (
+            mask_m[:, None] & mask_k[None, :] &
+            (ci[None, :] < C_in) &
+            (ih >= 0) & (ih < H_in) &
+            (iw >= 0) & (iw < W_in)
+        )
+
+        # Input pointers: same (n, oh, ow) offsets, plus channel + kernel offsets
+        x_ptrs = (
+            x_n_base +
+            ih * stride_xh +
+            iw * stride_xw +
+            ci[None, :] * stride_xc
+        )
+        x = tl.load(x_ptrs, mask=mask_in, other=0.0)
+
+        # Weight pointers: reuse output-channel base and add (ci, kh, kw)
+        w_ptrs = (
+            w_o_base +
+            ci[:, None] * stride_wi +
+            kh[:, None] * stride_wk +
+            kw[:, None] * stride_wl
+        )
+        mask_w = mask_k[:, None] & mask_n[None, :]
+        w = tl.load(w_ptrs, mask=mask_w, other=0.0)
+
+        acc += tl.dot(x, w, allow_tf32=True)
+
+    # Per-channel bias (broadcast over M)
+    bias = tl.load(b_ptr + offs_n, mask=mask_n, other=0.0)
+    acc += bias[None, :]
+
+    # Store result
+    tl.store(y_ptrs, acc, mask=mask_mn)
+
+
+def triton_conv2d_nchw(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor,
+                       stride=1, padding=0) -> torch.Tensor:
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+    assert x.dtype == weight.dtype == bias.dtype
+
+    N, C_in, H_in, W_in = x.shape
+    C_out, C_in_w, KH, KW = weight.shape
+    assert C_in_w == C_in
+    assert bias.shape[0] == C_out
+
+    if isinstance(stride, int):
+        stride_h_conv = stride
+        stride_w_conv = stride
+    else:
+        stride_h_conv, stride_w_conv = stride
+
+    if isinstance(padding, int):
+        pad_h = padding
+        pad_w = padding
+    else:
+        pad_h, pad_w = padding
+
+    H_out = (H_in + 2 * pad_h - KH) // stride_h_conv + 1
+    W_out = (W_in + 2 * pad_w - KW) // stride_w_conv + 1
+
+    y = torch.empty((N, C_out, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    stride_xn, stride_xc, stride_xh, stride_xw = x.stride()
+    stride_wo, stride_wi, stride_wk, stride_wl = weight.stride()
+    stride_yn, stride_yc, stride_yh, stride_yw = y.stride()
+
+    M = N * H_out * W_out
+
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta["BLOCK_M"]),
+            triton.cdiv(C_out, meta["BLOCK_N"]),
+        )
+
+    conv2d_nchw_kernel[grid](
+        x, weight, bias, y,
+        N, C_in, H_in, W_in,
+        C_out, H_out, W_out,
+        KH, KW,
+        stride_h_conv, stride_w_conv,
+        pad_h, pad_w,
+        stride_xn, stride_xc, stride_xh, stride_xw,
+        stride_wo, stride_wi, stride_wk, stride_wl,
+        stride_yn, stride_yc, stride_yh, stride_yw,
+    )
+    return y
+
+
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K2": 32, "BLOCK_KDS": 32},
+            num_warps=4,
+            num_stages=3,
+        ),
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K2": 32, "BLOCK_KDS": 32},
+            num_warps=8,
+            num_stages=3,
+        ),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K2": 32, "BLOCK_KDS": 32},
+            num_warps=8,
+            num_stages=3,
+        ),
+    ],
+    key=["C_mid", "C_in", "H1", "W1"],
+)
+@triton.jit
+def fused_conv2_downsample_relu_kernel(
+    act_ptr, x_ptr,
+    w2_ptr, b2_ptr,
+    wds_ptr, bds_ptr,
+    y_ptr,
+    N, C_mid, C_in,
+    H0, W0,  # spatial size of x (residual input)
+    H1, W1,  # spatial size of act (conv2 input) and output
+    stride_ds,
+    stride_an, stride_ac, stride_ah, stride_aw,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_w2o, stride_w2i, stride_w2k, stride_w2l,
+    stride_wdso, stride_wdsi, stride_wdsk, stride_wdsl,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K2: tl.constexpr,
+    BLOCK_KDS: tl.constexpr,
+):
+    # 2D grid over output: M = N * H1 * W1, N-dim = output channels
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    M = N * H1 * W1
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    mask_m = offs_m < M
+    mask_n = offs_n < C_mid  # C_out == C_mid in this residual block
+    mask_mn = mask_m[:, None] & mask_n[None, :]
+
+    # Decode offs_m into (n, oh, ow)
+    hw1 = H1 * W1
+    n_idx = offs_m // hw1
+    hw_idx = offs_m % hw1
+    oh = hw_idx // W1
+    ow = hw_idx % W1
+
+    # Output pointers: shared offsets for all fused ops
+    y_base = (
+        n_idx[:, None] * stride_yn +
+        oh[:, None] * stride_yh +
+        ow[:, None] * stride_yw
+    )
+    y_ptrs = y_ptr + y_base + offs_n[None, :] * stride_yc
+
+    # Accumulator
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # ---- conv2 3x3 (on act_ptr) ----
+    # Precompute bases that depend only on (n, oh, ow) or output channel
+    act_out_base = (
+        act_ptr +
+        n_idx[:, None] * stride_an +
+        oh[:, None] * stride_ah +
+        ow[:, None] * stride_aw
+    )
+    w2_out_base = w2_ptr + offs_n[None, :] * stride_w2o
+
+    K2 = C_mid * 3 * 3
+    for k_start in range(0, K2, BLOCK_K2):
+        offs_k2 = k_start + tl.arange(0, BLOCK_K2)
+        mask_k2 = offs_k2 < K2
+
+        ci2 = offs_k2 // (3 * 3)
+        rem2 = offs_k2 % (3 * 3)
+        kh2 = rem2 // 3
+        kw2 = rem2 % 3
+
+        # Spatial positions in act for this kernel element
+        ih2 = oh[:, None] + kh2[None, :] - 1  # pad=1, stride=1
+        iw2 = ow[:, None] + kw2[None, :] - 1
+
+        mask_in2 = (
+            mask_m[:, None] & mask_k2[None, :] &
+            (ci2[None, :] < C_mid) &
+            (ih2 >= 0) & (ih2 < H1) &
+            (iw2 >= 0) & (iw2 < W1)
+        )
+
+        # Input activations for conv2
+        act_ptrs = (
+            act_out_base +
+            ci2[None, :] * stride_ac +
+            (kh2[None, :] - 1) * stride_ah +
+            (kw2[None, :] - 1) * stride_aw
+        )
+        act = tl.load(act_ptrs, mask=mask_in2, other=0.0)
+
+        # Conv2 weights
+        w2_ptrs = (
+            w2_out_base +
+            ci2[:, None] * stride_w2i +
+            kh2[:, None] * stride_w2k +
+            kw2[:, None] * stride_w2l
+        )
+        mask_w2 = mask_k2[:, None] & mask_n[None, :]
+        w2 = tl.load(w2_ptrs, mask=mask_w2, other=0.0)
+
+        acc += tl.dot(act, w2, allow_tf32=True)
+
+    # ---- downsample 1x1 conv (on x_ptr) ----
+    # Output (oh, ow) maps to input (h0, w0) with stride_ds
+    h0 = oh * stride_ds
+    w0 = ow * stride_ds
+
+    # Precompute spatial-valid mask once (shared across all KDS tiles)
+    valid_ds_spatial = (
+        (h0 >= 0) & (h0 < H0) &
+        (w0 >= 0) & (w0 < W0)
+    )
+
+    x_out_base = (
+        x_ptr +
+        n_idx[:, None] * stride_xn +
+        h0[:, None] * stride_xh +
+        w0[:, None] * stride_xw
+    )
+    wds_out_base = wds_ptr + offs_n[None, :] * stride_wdso
+
+    Kds = C_in  # 1x1: reduction only over input channels
+    for kds_start in range(0, Kds, BLOCK_KDS):
+        offs_kds = kds_start + tl.arange(0, BLOCK_KDS)
+        mask_kds = offs_kds < Kds
+        ci_ds = offs_kds
+
+        mask_in_ds = (
+            mask_m[:, None] &
+            valid_ds_spatial[:, None] &
+            mask_kds[None, :]
+        )
+
+        # Residual input
+        x_ptrs = x_out_base + ci_ds[None, :] * stride_xc
+        x = tl.load(x_ptrs, mask=mask_in_ds, other=0.0)
+
+        # Downsample 1x1 weights
+        wds_ptrs = wds_out_base + ci_ds[:, None] * stride_wdsi
+        mask_wds = mask_kds[:, None] & mask_n[None, :]
+        wds = tl.load(wds_ptrs, mask=mask_wds, other=0.0)
+
+        acc += tl.dot(x, wds, allow_tf32=True)
+
+    # ---- fused bias add (conv2 + downsample) and ReLU ----
+    bias2 = tl.load(b2_ptr + offs_n, mask=mask_n, other=0.0)
+    bias_ds = tl.load(bds_ptr + offs_n, mask=mask_n, other=0.0)
+    bias_total = bias2 + bias_ds
+    acc += bias_total[None, :]
+
+    # Final ReLU
+    acc = tl.maximum(acc, 0.0)
+
+    # Store output
+    tl.store(y_ptrs, acc, mask=mask_mn)
+
+
+def fused_conv2_downsample_relu(
+    act: torch.Tensor,
+    x: torch.Tensor,
+    w2: torch.Tensor,
+    b2: torch.Tensor,
+    wds: torch.Tensor,
+    bds: torch.Tensor,
+    stride_ds: int,
+) -> torch.Tensor:
+    """
+    Compute fused:
+      out = ReLU( Conv2_BN(act) + Downsample_BN(x) )
+
+    where Conv2_BN and Downsample_BN are represented by fused weights/biases.
+    - act: (N, C_mid, H1, W1)  after conv1+BN1+ReLU
+    - x:   (N, C_in,  H0, W0)  original input to the block
+    """
+    assert act.is_cuda and x.is_cuda
+    assert w2.is_cuda and b2.is_cuda and wds.is_cuda and bds.is_cuda
+    assert act.dtype == x.dtype == w2.dtype == b2.dtype == wds.dtype == bds.dtype
+
+    N, C_mid, H1, W1 = act.shape
+    N2, C_in, H0, W0 = x.shape
+    assert N == N2
+
+    C_out, C_mid_w, KH2, KW2 = w2.shape
+    assert C_mid_w == C_mid and KH2 == 3 and KW2 == 3
+
+    C_out2, C_in_w, KHds, KWds = wds.shape
+    assert C_out2 == C_out and C_in_w == C_in and KHds == 1 and KWds == 1
+
+    stride_an, stride_ac, stride_ah, stride_aw = act.stride()
+    stride_xn, stride_xc, stride_xh, stride_xw = x.stride()
+    stride_w2o, stride_w2i, stride_w2k, stride_w2l = w2.stride()
+    stride_wdso, stride_wdsi, stride_wdsk, stride_wdsl = wds.stride()
+
+    y = torch.empty((N, C_out, H1, W1), device=act.device, dtype=act.dtype)
+    stride_yn, stride_yc, stride_yh, stride_yw = y.stride()
+
+    M = N * H1 * W1
+
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta["BLOCK_M"]),
+            triton.cdiv(C_out, meta["BLOCK_N"]),
+        )
+
+    fused_conv2_downsample_relu_kernel[grid](
+        act, x,
+        w2, b2,
+        wds, bds,
+        y,
+        N, C_mid, C_in,
+        H0, W0,
+        H1, W1,
+        stride_ds,
+        stride_an, stride_ac, stride_ah, stride_aw,
+        stride_xn, stride_xc, stride_xh, stride_xw,
+        stride_w2o, stride_w2i, stride_w2k, stride_w2l,
+        stride_wdso, stride_wdsi, stride_wdsk, stride_wdsl,
+        stride_yn, stride_yc, stride_yh, stride_yw,
+    )
+    return y
+
+
+class ModelNew(nn.Module):
+    expansion = 1
+
+    def __init__(self, in_channels, out_channels, stride=1):
+        super(ModelNew, self).__init__()
+        self.conv1 = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=3,
+            stride=stride,
+            padding=1,
+            bias=False,
+        )
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(
+            out_channels,
+            out_channels,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            bias=False,
+        )
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.downsample = nn.Sequential(
+            nn.Conv2d(
+                in_channels,
+                out_channels * self.expansion,
+                kernel_size=1,
+                stride=stride,
+                bias=False,
+            ),
+            nn.BatchNorm2d(out_channels * self.expansion),
+        )
+        self.stride = stride
+
+    def forward(self, x):
+        # Fold BN into convs on-the-fly (using running stats) so that
+        # runtime has only conv + pointwise ops.
+        conv1_w, conv1_b = fold_conv_bn_2d(self.conv1, self.bn1)
+        conv2_w, conv2_b = fold_conv_bn_2d(self.conv2, self.bn2)
+        ds_conv, ds_bn = self.downsample[0], self.downsample[1]
+        ds_w, ds_b = fold_conv_bn_2d(ds_conv, ds_bn)
+
+        # conv1 + BN1 fused via folded weights, then ReLU
+        out = triton_conv2d_nchw(
+            x,
+            conv1_w,
+            conv1_b,
+            stride=self.conv1.stride,
+            padding=self.conv1.padding,
+        )
+        out = self.relu(out)
+
+        # Fused conv2 (with BN2) + downsample (with BN) + residual add + ReLU
+        out = fused_conv2_downsample_relu(
+            out,
+            x,
+            conv2_w,
+            conv2_b,
+            ds_w,
+            ds_b,
+            stride_ds=self.stride,
+        )
+        return out

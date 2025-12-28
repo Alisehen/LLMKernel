@@ -1,0 +1,392 @@
+You are optimizing a Triton kernel based on algorithmic analysis.
+
+# PyTorch Reference (Target Behavior)
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class Model(nn.Module):
+    expansion = 1
+
+    def __init__(self, in_channels, out_channels, stride=1):
+        """
+        :param in_channels: Number of input channels
+        :param out_channels: Number of output channels
+        :param stride: Stride for the first convolutional layer
+        :param downsample: Downsample layer for the shortcut connection
+        """
+        super(Model, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.downsample = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels * self.expansion, kernel_size=1, stride=stride, bias=False),
+            nn.BatchNorm2d(out_channels * self.expansion),
+        )
+        self.stride = stride
+
+    def forward(self, x):
+        """
+        :param x: Input tensor, shape (batch_size, in_channels, height, width)
+        :return: Output tensor, shape (batch_size, out_channels, height, width)
+        """
+        identity = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        if self.downsample is not None:
+            identity = self.downsample(x)
+
+        out += identity
+        out = self.relu(out)
+
+        return out
+    
+# Test code
+in_channels = 3
+out_channels = 64
+stride = 1
+batch_size = 10
+num_classes = 1000
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, 224, 224)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, stride]
+```
+
+**CRITICAL**: Study the PyTorch code carefully to understand:
+- What does `forward()` return? (full output sequence vs final hidden state only)
+- What is the computational pattern?
+- What are the input/output shapes?
+
+Your optimized kernel MUST match this exact behavior.
+
+---
+
+# Analysis Results
+
+**Bottleneck**: Each feature map is written to and read from global memory multiple times: conv2 -> BN2 -> residual add -> ReLU, plus an extra path for downsample (conv+BN). This makes the block heavily memory-bound and penalized by kernel-launch overhead despite a reasonably optimized conv kernel.
+
+**Optimization Strategy**: Use operator fusion: fold BatchNorm into the corresponding convolutions (conv1, conv2, and downsample conv) and fuse the final conv2d + residual add + ReLU into a single Triton kernel so that the kernel directly computes ReLU(Conv2(x) + Downsample(x)).
+
+**Implementation Plan**: Precompute fused weights/biases by folding BN parameters into conv weights and (optionally) cache them so that at runtime BN disappears as a separate op. Then, write a fused Triton kernel that takes the conv2 input and the identity tensor, performs the conv2 accumulation, adds the (possibly downsampled) identity in-register, applies the final ReLU, and stores the result once to global memory. Replace the current sequence `conv2 -> bn2 -> (downsample conv+bn) -> add_relu` with a single call to this fused kernel, keeping conv1 as-is or also fusing its BN if desired.
+
+**Expected Speedup**: 20-40%
+
+---
+
+# Current Kernel (needs optimization)
+
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def conv2d_nchw_kernel(
+    x_ptr, w_ptr, y_ptr,
+    N, C_in, H_in, W_in,
+    C_out, H_out, W_out,
+    KH, KW,
+    stride_h_conv, stride_w_conv,
+    pad_h, pad_w,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_wo, stride_wi, stride_wk, stride_wl,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    BLOCK_M: tl.constexpr,  # tile over output M dimension: N * H_out * W_out
+    BLOCK_N: tl.constexpr,  # tile over output channels (C_out)
+    BLOCK_K: tl.constexpr,  # tile over reduction dimension K = C_in * KH * KW
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    M = N * H_out * W_out
+    K = C_in * KH * KW
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    mask_m = offs_m < M
+    mask_n = offs_n < C_out
+
+    hw = H_out * W_out
+    n_idx = offs_m // hw
+    hw_idx = offs_m % hw
+    oh = hw_idx // W_out
+    ow = hw_idx % W_out
+
+    y_ptrs = y_ptr + (
+        n_idx[:, None] * stride_yn +
+        offs_n[None, :] * stride_yc +
+        oh[:, None] * stride_yh +
+        ow[:, None] * stride_yw
+    )
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k_start in range(0, K, BLOCK_K):
+        offs_k = k_start + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < K
+
+        ci = offs_k // (KH * KW)
+        rem = offs_k % (KH * KW)
+        kh = rem // KW
+        kw = rem % KW
+
+        ih = oh[:, None] * stride_h_conv + kh[None, :] - pad_h
+        iw = ow[:, None] * stride_w_conv + kw[None, :] - pad_w
+
+        mask_in = (
+            mask_m[:, None] & mask_k[None, :] &
+            (ci[None, :] < C_in) &
+            (ih >= 0) & (ih < H_in) &
+            (iw >= 0) & (iw < W_in)
+        )
+
+        x_ptrs = x_ptr + (
+            n_idx[:, None] * stride_xn +
+            ci[None, :] * stride_xc +
+            ih * stride_xh +
+            iw * stride_xw
+        )
+        x = tl.load(x_ptrs, mask=mask_in, other=0.0)
+
+        w_ptrs = w_ptr + (
+            offs_n[None, :] * stride_wo +
+            ci[:, None] * stride_wi +
+            kh[:, None] * stride_wk +
+            kw[:, None] * stride_wl
+        )
+        mask_w = (
+            mask_k[:, None] & mask_n[None, :] &
+            (ci[:, None] < C_in)
+        )
+        w = tl.load(w_ptrs, mask=mask_w, other=0.0)
+
+        acc += tl.dot(x, w, allow_tf32=True)
+
+    tl.store(
+        y_ptrs,
+        acc,
+        mask=mask_m[:, None] & mask_n[None, :],
+    )
+
+
+def triton_conv2d_nchw(x: torch.Tensor, weight: torch.Tensor, stride=1, padding=0):
+    assert x.is_cuda and weight.is_cuda, "Triton conv2d expects CUDA tensors"
+    assert x.dtype == weight.dtype, "Input and weight must have same dtype"
+
+    N, C_in, H_in, W_in = x.shape
+    C_out, C_in_w, KH, KW = weight.shape
+    assert C_in_w == C_in, "Incompatible input / weight channels"
+
+    if isinstance(stride, int):
+        stride_h_conv = stride
+        stride_w_conv = stride
+    else:
+        stride_h_conv, stride_w_conv = stride
+
+    if isinstance(padding, int):
+        pad_h = padding
+        pad_w = padding
+    else:
+        pad_h, pad_w = padding
+
+    H_out = (H_in + 2 * pad_h - KH) // stride_h_conv + 1
+    W_out = (W_in + 2 * pad_w - KW) // stride_w_conv + 1
+
+    y = torch.empty((N, C_out, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    stride_xn, stride_xc, stride_xh, stride_xw = x.stride()
+    stride_wo, stride_wi, stride_wk, stride_wl = weight.stride()
+    stride_yn, stride_yc, stride_yh, stride_yw = y.stride()
+
+    BLOCK_M = 64
+    BLOCK_N = 64
+    BLOCK_K = 32
+
+    M = N * H_out * W_out
+
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_M"]),
+        triton.cdiv(C_out, META["BLOCK_N"]),
+    )
+
+    conv2d_nchw_kernel[grid](
+        x, weight, y,
+        N, C_in, H_in, W_in,
+        C_out, H_out, W_out,
+        KH, KW,
+        stride_h_conv, stride_w_conv,
+        pad_h, pad_w,
+        stride_xn, stride_xc, stride_xh, stride_xw,
+        stride_wo, stride_wi, stride_wk, stride_wl,
+        stride_yn, stride_yc, stride_yh, stride_yw,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+    )
+    return y
+
+
+@triton.jit
+def add_relu_kernel(
+    a_ptr, b_ptr, c_ptr,
+    N,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < N
+
+    a = tl.load(a_ptr + offs, mask=mask, other=0.0)
+    b = tl.load(b_ptr + offs, mask=mask, other=0.0)
+    out = a + b
+    out = tl.maximum(out, 0.0)
+
+    tl.store(c_ptr + offs, out, mask=mask)
+
+
+def add_relu(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    assert a.is_cuda and b.is_cuda, "add_relu expects CUDA tensors"
+    assert a.shape == b.shape, "Inputs must have the same shape"
+    assert a.dtype == b.dtype, "Inputs must have the same dtype"
+
+    N = a.numel()
+    c = torch.empty_like(a)
+
+    BLOCK = 256
+    grid = lambda META: (triton.cdiv(N, META["BLOCK"]),)
+
+    add_relu_kernel[grid](
+        a.reshape(-1),
+        b.reshape(-1),
+        c.reshape(-1),
+        N,
+        BLOCK=BLOCK,
+    )
+    return c
+
+
+class ModelNew(nn.Module):
+    expansion = 1
+
+    def __init__(self, in_channels, out_channels, stride=1):
+        super(ModelNew, self).__init__()
+        self.conv1 = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=3,
+            stride=stride,
+            padding=1,
+            bias=False,
+        )
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(
+            out_channels,
+            out_channels,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            bias=False,
+        )
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.downsample = nn.Sequential(
+            nn.Conv2d(
+                in_channels,
+                out_channels * self.expansion,
+                kernel_size=1,
+                stride=stride,
+                bias=False,
+            ),
+            nn.BatchNorm2d(out_channels * self.expansion),
+        )
+        self.stride = stride
+
+    def _triton_conv(self, x: torch.Tensor, conv: nn.Conv2d) -> torch.Tensor:
+        return triton_conv2d_nchw(
+            x,
+            conv.weight,
+            stride=conv.stride,
+            padding=conv.padding,
+        )
+
+    def forward(self, x):
+        identity = x
+
+        out = self._triton_conv(x, self.conv1)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self._triton_conv(out, self.conv2)
+        out = self.bn2(out)
+
+        if self.downsample is not None:
+            ds_conv = self.downsample[0]
+            ds_bn = self.downsample[1]
+            identity = self._triton_conv(x, ds_conv)
+            identity = ds_bn(identity)
+
+        out = add_relu(out, identity)
+        return out
+```
+
+---
+
+# Your Task
+
+Implement the optimization strategy above. Focus on the specific bottleneck identified.
+
+## Key Requirements
+
+1. **Preserve correctness**: Maintain the same input/output behavior
+2. **Apply the optimization**: Follow the implementation plan exactly
+3. **Use valid Triton syntax**:
+   - Every kernel MUST have `@triton.jit` decorator
+   - Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+   - BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+   - No `continue`, `break`, `return` inside kernels (use masking)
+   - Prefer `tl.dot(a, b, allow_tf32=True)` for matmul operations
+
+4. **CRITICAL for RNN/GRU/LSTM Persistent Kernels**:
+   - Time loop MUST be inside @triton.jit kernel, NOT in Python forward()
+   - **HYBRID computation strategy** (CRITICAL for performance):
+     * Precompute input-side gates OUTSIDE kernel: `gates_x = (T*B, In) @ W_ih` (ONE large GEMM)
+     * INSIDE kernel: only recurrent-side: `for t: gates_h = h @ W_hh` (T small GEMMs)
+   - CORRECT (FAST - use this):
+     ```python
+     # Python forward():
+     gates_x_all = x.reshape(T*B, In) @ W_ih + b_ih  # ONE large GEMM
+     gates_x_all = gates_x_all.view(T, B, 3*H)
+     gru_persistent_kernel[grid](gates_x_all, h0, W_hh, ...)  # Launch ONCE
+
+     @triton.jit
+     def gru_persistent_kernel(gates_x_ptr, h_ptr, W_hh_ptr, ...):
+         for t in range(T):  # Inside kernel
+             gates_x_t = tl.load(gates_x_ptr + t*...)  # Precomputed
+             gates_h = h @ W_hh  # Only recurrent GEMM
+             h = (1-z)*n + z*h   # Fuse and update
+     ```
+
+5. **Output format**:
+   - Imports: `import torch, torch.nn as nn, triton, triton.language as tl`
+   - `@triton.jit` kernel(s)
+   - Wrapper function(s)
+   - `class ModelNew(nn.Module)` — REQUIRED
+   - NO testing code, NO `if __name__ == "__main__"`
+
+---
+
+Generate the optimized kernel now. Output ONLY the complete Python code.

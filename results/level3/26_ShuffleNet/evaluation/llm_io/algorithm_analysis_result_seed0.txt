@@ -1,0 +1,10 @@
+```json
+{
+  "worth_optimizing": "yes",
+  "reason": "Most of the extra cost vs PyTorch comes from running many separate Triton kernels per ShuffleNet unit and bouncing all activations through global memory between them.",
+  "bottleneck": "Each unit executes 4–5 custom kernels (1x1 group conv, depthwise 3x3, channel shuffle, 1x1 group conv, shortcut conv) plus separate BatchNorm and ReLU kernels, so intermediate feature maps are repeatedly written to and read from DRAM with small arithmetic intensity and high launch overhead.",
+  "optimisation method": "Fuse the hot per-unit operator chains into a small number of composite kernels, e.g. implement a fused `1x1_group_conv + BN + ReLU` kernel (and similarly `depthwise_3x3 + BN`, `1x1_group_conv + BN + ReLU`, and optionally residual add) so that intermediate tensors stay in registers/shared memory instead of round-tripping to global memory.",
+  "modification plan": "Start with the first path in `ShuffleNetUnitNew`: extend the existing `conv1x1_group_kernel` to (1) accept BN parameters (gamma, beta, running_mean, running_var, eps) and apply the affine normalization to the accumulator before storing, and (2) optionally apply ReLU in-kernel. Replace the current sequence `conv1x1_group_triton -> bn1 -> ReLU` by a single fused Triton call, then repeat the pattern for `conv2+bn2` and `conv3+bn3+ReLU` (and for the shortcut conv+BN). This reduces the number of global reads/writes for each feature map from 3–4 to 1 per stage and cuts kernel launches, which should recover and likely surpass the PyTorch baseline.",
+  "expected_speedup": "30-40% vs current Triton implementation (bringing it to ~1.0–1.1x of the PyTorch baseline for this model)."
+}
+```

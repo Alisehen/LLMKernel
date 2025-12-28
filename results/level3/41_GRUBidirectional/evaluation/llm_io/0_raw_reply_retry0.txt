@@ -1,5 +1,6 @@
 ```python
-# <complete ModelNew code with optimized Triton kernels>
+# complete ModelNew code with optimized Triton kernels
+
 import torch
 import torch.nn as nn
 import triton
@@ -7,25 +8,21 @@ import triton.language as tl
 
 
 @triton.jit
-def linear_bias_kernel(
-    a_ptr,  # (M, K)
-    b_ptr,  # (K, N)
-    bias_ptr,  # (N,)
-    c_ptr,  # (M, N)
+def linear_kernel(
+    a_ptr, b_ptr, bias_ptr, c_ptr,
     M, N, K,
     stride_am, stride_ak,
     stride_bk, stride_bn,
     stride_cm, stride_cn,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
     """
-    Compute C = A @ B + bias
-    A: (M, K)
-    B: (K, N)
-    bias: (N,)
-    C: (M, N)
+    Compute C = A @ B (+ bias) where:
+      A: [M, K]
+      B: [K, N]
+      bias: [N]
+      C: [M, N]
     """
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -40,219 +37,245 @@ def linear_bias_kernel(
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
     for k in range(0, K, BLOCK_K):
-        k_mask = offs_k[None, :] < (K - k)
-        a = tl.load(
-            a_ptrs,
-            mask=(offs_m[:, None] < M) & k_mask,
-            other=0.0,
-        )
-        b = tl.load(
-            b_ptrs,
-            mask=k_mask.T & (offs_n[None, :] < N),
-            other=0.0,
-        )
+        k_remaining = K - k
+        a_mask = (offs_m[:, None] < M) & (offs_k[None, :] < k_remaining)
+        b_mask = (offs_k[:, None] < k_remaining) & (offs_n[None, :] < N)
+
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
         acc += tl.dot(a, b, allow_tf32=True)
+
         a_ptrs += BLOCK_K * stride_ak
         b_ptrs += BLOCK_K * stride_bk
 
-    # Add bias
-    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
-    acc += bias[None, :]
+    if HAS_BIAS:
+        bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+        acc += bias[None, :]
 
     c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
-    tl.store(
-        c_ptrs,
-        acc,
-        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
-    )
+    mask_c = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+
+    tl.store(c_ptrs, acc, mask=mask_c)
 
 
-def linear_triton(x: torch.Tensor, weight_t: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+def triton_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor = None, out: torch.Tensor = None):
     """
-    Compute y = x @ weight + bias using Triton.
-    x: (M, K)
-    weight_t: (K, N)  -- transposed weight
-    bias: (N,)
-    Returns y: (M, N)
+    High-performance linear layer using Triton:
+      y = x @ weight + bias
+    where:
+      x:      [M, K]
+      weight: [K, N]
+      bias:   [N]
+      out:    [M, N] (optional preallocated)
     """
-    assert x.is_cuda and weight_t.is_cuda and bias.is_cuda, "Inputs must be CUDA tensors"
-    assert x.dtype == weight_t.dtype == bias.dtype, "Dtypes must match"
-
+    assert x.dim() == 2, "x must be 2D (M, K)"
+    assert weight.dim() == 2, "weight must be 2D (K, N)"
     M, K = x.shape
-    K_w, N = weight_t.shape
-    assert K_w == K, "Incompatible shapes for matmul"
+    Kw, N = weight.shape
+    assert Kw == K, f"Incompatible shapes: x: ({M}, {K}), weight: ({Kw}, {N})"
 
-    y = torch.empty((M, N), device=x.device, dtype=x.dtype)
-
-    stride_am, stride_ak = x.stride()
-    stride_bk, stride_bn = weight_t.stride()
-    stride_cm, stride_cn = y.stride()
-
-    BLOCK_M = 64
-    BLOCK_N = 64
-    BLOCK_K = 32
-
-    grid = (
-        triton.cdiv(M, BLOCK_M),
-        triton.cdiv(N, BLOCK_N),
-    )
-
-    linear_bias_kernel[grid](
-        x, weight_t, bias, y,
-        M, N, K,
-        stride_am, stride_ak,
-        stride_bk, stride_bn,
-        stride_cm, stride_cn,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_K=BLOCK_K,
-    )
-    return y
-
-
-def gru_layer_triton(
-    x: torch.Tensor,          # (seq_len, batch, input_size_or_2H)
-    h0: torch.Tensor,         # (batch, hidden_size)
-    w_ih_t: torch.Tensor,     # (input_size_or_2H, 3*hidden_size)  transposed
-    b_ih: torch.Tensor,       # (3*hidden_size,)
-    w_hh_t: torch.Tensor,     # (hidden_size, 3*hidden_size)       transposed
-    b_hh: torch.Tensor,       # (3*hidden_size,)
-    reverse: bool,
-) -> (torch.Tensor, torch.Tensor):
-    """
-    Single GRU layer for one direction, using Triton for linear ops.
-
-    Returns:
-        output: (seq_len, batch, hidden_size)
-        h_n: (batch, hidden_size)  final hidden state
-    """
-    seq_len, batch_size, _ = x.shape
-    hidden_size = h0.shape[1]
-    device = x.device
-    dtype = x.dtype
-
-    output = torch.empty((seq_len, batch_size, hidden_size), device=device, dtype=dtype)
-    h_t = h0
-
-    if reverse:
-        time_range = range(seq_len - 1, -1, -1)
+    if out is None:
+        out = torch.empty((M, N), device=x.device, dtype=x.dtype)
     else:
-        time_range = range(seq_len)
+        assert out.shape == (M, N), "out must have shape (M, N)"
 
-    for t in time_range:
-        x_t = x[t]  # (batch, input_size_or_2H)
+    has_bias = bias is not None
+    if has_bias:
+        assert bias.shape[0] == N, "bias must have shape (N,)"
 
-        gates_x = linear_triton(x_t, w_ih_t, b_ih)   # (batch, 3H)
-        gates_h = linear_triton(h_t, w_hh_t, b_hh)   # (batch, 3H)
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_M"]),
+        triton.cdiv(N, META["BLOCK_N"]),
+    )
 
-        i_r, i_z, i_n = gates_x.chunk(3, dim=1)
-        h_r, h_z, h_n = gates_h.chunk(3, dim=1)
-
-        r = torch.sigmoid(i_r + h_r)
-        z = torch.sigmoid(i_z + h_z)
-        n = torch.tanh(i_n + r * h_n)
-
-        h_t = (1.0 - z) * n + z * h_t
-        output[t] = h_t
-
-    return output, h_t
-
-
-def gru_triton_forward(
-    x: torch.Tensor,
-    h0: torch.Tensor,
-    gru_module: nn.GRU,
-) -> (torch.Tensor, torch.Tensor):
-    """
-    Multi-layer (possibly bidirectional) GRU forward using Triton for linear parts.
-    x: (seq_len, batch, input_size) if not batch_first
-       or (batch, seq_len, input_size) if batch_first
-    h0: (num_layers * num_directions, batch, hidden_size)
-    """
-    batch_first = getattr(gru_module, "batch_first", False)
-    if batch_first:
-        # (batch, seq, feat) -> (seq, batch, feat)
-        x = x.transpose(0, 1)
-
-    seq_len, batch_size, _ = x.shape
-    num_layers = gru_module.num_layers
-    hidden_size = gru_module.hidden_size
-    num_directions = 2 if gru_module.bidirectional else 1
-    use_bias = gru_module.bias
-
-    assert h0.shape[0] == num_layers * num_directions
-    assert h0.shape[1] == batch_size
-    assert h0.shape[2] == hidden_size
-
-    current_input = x
-    h_n_list = []
-
-    for layer in range(num_layers):
-        layer_outputs = []
-
-        for direction in range(num_directions):
-            suffix = "" if direction == 0 else "_reverse"
-            reverse = direction == 1
-
-            w_ih = getattr(gru_module, f"weight_ih_l{layer}{suffix}")
-            w_hh = getattr(gru_module, f"weight_hh_l{layer}{suffix}")
-
-            if use_bias:
-                b_ih = getattr(gru_module, f"bias_ih_l{layer}{suffix}")
-                b_hh = getattr(gru_module, f"bias_hh_l{layer}{suffix}")
-            else:
-                b_ih = torch.zeros(
-                    3 * hidden_size, device=current_input.device, dtype=current_input.dtype
-                )
-                b_hh = torch.zeros(
-                    3 * hidden_size, device=current_input.device, dtype=current_input.dtype
-                )
-
-            # Transpose weights once per forward pass for Triton kernel
-            w_ih_t = w_ih.transpose(0, 1).contiguous()   # (input_size, 3H)
-            w_hh_t = w_hh.transpose(0, 1).contiguous()   # (H, 3H)
-
-            h0_ld = h0[layer * num_directions + direction]  # (batch, H)
-
-            out_dir, h_n_dir = gru_layer_triton(
-                current_input, h0_ld, w_ih_t, b_ih, w_hh_t, b_hh, reverse
-            )
-            layer_outputs.append(out_dir)
-            h_n_list.append(h_n_dir.unsqueeze(0))
-
-        if num_directions == 1:
-            current_input = layer_outputs[0]
-        else:
-            # Concatenate forward and backward along feature dimension
-            current_input = torch.cat(layer_outputs, dim=2)
-
-    output = current_input
-    h_n = torch.cat(h_n_list, dim=0)  # (num_layers * num_directions, batch, H)
-
-    if batch_first:
-        output = output.transpose(0, 1)  # back to (batch, seq, feat)
-
-    return output, h_n
+    linear_kernel[grid](
+        x, weight, bias if has_bias else x, out,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        weight.stride(0), weight.stride(1),
+        out.stride(0), out.stride(1),
+        HAS_BIAS=has_bias,
+        BLOCK_M=64, BLOCK_N=64, BLOCK_K=32,
+        num_warps=4, num_stages=2,
+    )
+    return out
 
 
 class ModelNew(nn.Module):
     def __init__(self, input_size, hidden_size, num_layers=3, bias=True, batch_first=False):
         """
-        Matches the original Model interface but uses Triton-accelerated GRU computations.
+        Custom multi-layer bidirectional GRU implemented with Triton-accelerated
+        linear layers for maximal performance.
+
+        Parameters mirror the original Model's GRU.
         """
         super(ModelNew, self).__init__()
-        self.gru = nn.GRU(
-            input_size=input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            bias=bias,
-            batch_first=batch_first,
-            dropout=0.0,
-            bidirectional=True,
-        )
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.bias = bias
+        self.batch_first = batch_first
+        self.num_directions = 2  # bidirectional=True
+
+        # Parameters are stored in (in_features, 3 * hidden_size) format so that
+        # matmul can be done as x @ W efficiently (no transpose needed).
+        self.weight_ih_f = nn.ParameterList()
+        self.weight_hh_f = nn.ParameterList()
+        self.weight_ih_b = nn.ParameterList()
+        self.weight_hh_b = nn.ParameterList()
+
+        if self.bias:
+            self.bias_ih_f = nn.ParameterList()
+            self.bias_hh_f = nn.ParameterList()
+            self.bias_ih_b = nn.ParameterList()
+            self.bias_hh_b = nn.ParameterList()
+        else:
+            self.bias_ih_f = None
+            self.bias_hh_f = None
+            self.bias_ih_b = None
+            self.bias_hh_b = None
+
+        for layer in range(num_layers):
+            if layer == 0:
+                layer_input_size = input_size
+            else:
+                layer_input_size = hidden_size * self.num_directions
+
+            # Forward direction weights
+            w_ih_f = nn.Parameter(torch.empty(layer_input_size, 3 * hidden_size))
+            w_hh_f = nn.Parameter(torch.empty(hidden_size, 3 * hidden_size))
+            # Backward direction weights
+            w_ih_b = nn.Parameter(torch.empty(layer_input_size, 3 * hidden_size))
+            w_hh_b = nn.Parameter(torch.empty(hidden_size, 3 * hidden_size))
+
+            # Initialize weights similar to common RNN practice
+            nn.init.xavier_uniform_(w_ih_f)
+            nn.init.xavier_uniform_(w_ih_b)
+            nn.init.orthogonal_(w_hh_f)
+            nn.init.orthogonal_(w_hh_b)
+
+            self.weight_ih_f.append(w_ih_f)
+            self.weight_hh_f.append(w_hh_f)
+            self.weight_ih_b.append(w_ih_b)
+            self.weight_hh_b.append(w_hh_b)
+
+            if self.bias:
+                b_ih_f = nn.Parameter(torch.zeros(3 * hidden_size))
+                b_hh_f = nn.Parameter(torch.zeros(3 * hidden_size))
+                b_ih_b = nn.Parameter(torch.zeros(3 * hidden_size))
+                b_hh_b = nn.Parameter(torch.zeros(3 * hidden_size))
+
+                self.bias_ih_f.append(b_ih_f)
+                self.bias_hh_f.append(b_hh_f)
+                self.bias_ih_b.append(b_ih_b)
+                self.bias_hh_b.append(b_hh_b)
 
     def forward(self, x, h0):
-        output, _ = gru_triton_forward(x, h0, self.gru)
-        # Original Model returns only `output`
+        """
+        x:  (seq_len, batch_size, input_size) if batch_first == False
+             or (batch_size, seq_len, input_size) if batch_first == True
+        h0: (num_layers * num_directions, batch_size, hidden_size)
+        Returns:
+          output: same as nn.GRU's output (we return only output, like original Model)
+        """
+        # Reorder dimensions to (seq_len, batch, feature) if necessary
+        if self.batch_first:
+            x = x.transpose(0, 1)  # (batch, seq, feat) -> (seq, batch, feat)
+
+        seq_len, batch_size, _ = x.shape
+
+        # If h0 is None, initialize to zeros
+        if h0 is None:
+            h0 = x.new_zeros(self.num_layers * self.num_directions, batch_size, self.hidden_size)
+
+        output = x
+        final_h_states = []
+
+        for layer in range(self.num_layers):
+            layer_input_size = output.size(2)
+
+            # Flatten sequence to one big matrix for input linear (GI) computations
+            # Shape: (seq_len * batch_size, layer_input_size)
+            inp2d = output.reshape(seq_len * batch_size, layer_input_size)
+
+            # Forward direction parameters
+            w_ih_f = self.weight_ih_f[layer]
+            w_hh_f = self.weight_hh_f[layer]
+            b_ih_f = self.bias_ih_f[layer] if self.bias else None
+            b_hh_f = self.bias_hh_f[layer] if self.bias else None
+
+            # Backward direction parameters
+            w_ih_b = self.weight_ih_b[layer]
+            w_hh_b = self.weight_hh_b[layer]
+            b_ih_b = self.bias_ih_b[layer] if self.bias else None
+            b_hh_b = self.bias_hh_b[layer] if self.bias else None
+
+            # Precompute input-side linear transforms for all timesteps and both directions
+            gi_f_flat = triton_linear(inp2d, w_ih_f, b_ih_f)  # (S*B, 3H)
+            gi_b_flat = triton_linear(inp2d, w_ih_b, b_ih_b)  # (S*B, 3H)
+
+            gi_f = gi_f_flat.reshape(seq_len, batch_size, 3 * self.hidden_size)
+            gi_b = gi_b_flat.reshape(seq_len, batch_size, 3 * self.hidden_size)
+
+            # Buffers for outputs
+            out_f = output.new_empty(seq_len, batch_size, self.hidden_size)
+            out_b = output.new_empty(seq_len, batch_size, self.hidden_size)
+
+            # Initial hidden states for this layer (forward and backward)
+            h_f = h0[layer * self.num_directions + 0]
+            h_b = h0[layer * self.num_directions + 1]
+
+            # Recurrent GEMM output buffers (reused every timestep)
+            gh_f_buf = output.new_empty(batch_size, 3 * self.hidden_size)
+            gh_b_buf = output.new_empty(batch_size, 3 * self.hidden_size)
+
+            # ---- Forward direction ----
+            for t in range(seq_len):
+                gi_t = gi_f[t]  # (B, 3H)
+
+                # gh = h_f @ W_hh_f + b_hh_f
+                gh_t = triton_linear(h_f, w_hh_f, b_hh_f, out=gh_f_buf)
+
+                gi_r, gi_z, gi_n = gi_t.chunk(3, dim=1)
+                gh_r, gh_z, gh_n = gh_t.chunk(3, dim=1)
+
+                r = torch.sigmoid(gi_r + gh_r)
+                z = torch.sigmoid(gi_z + gh_z)
+                n = torch.tanh(gi_n + r * gh_n)
+                h_f = n + z * (h_f - n)
+
+                out_f[t] = h_f
+
+            final_h_states.append(h_f)
+
+            # ---- Backward direction ----
+            for t_inv in range(seq_len):
+                t = seq_len - 1 - t_inv
+                gi_t = gi_b[t]  # (B, 3H) corresponding to x_t in reverse order
+
+                gh_t = triton_linear(h_b, w_hh_b, b_hh_b, out=gh_b_buf)
+
+                gi_r, gi_z, gi_n = gi_t.chunk(3, dim=1)
+                gh_r, gh_z, gh_n = gh_t.chunk(3, dim=1)
+
+                r = torch.sigmoid(gi_r + gh_r)
+                z = torch.sigmoid(gi_z + gh_z)
+                n = torch.tanh(gi_n + r * gh_n)
+                h_b = n + z * (h_b - n)
+
+                out_b[t] = h_b
+
+            final_h_states.append(h_b)
+
+            # Concatenate forward and backward outputs for this layer
+            output = torch.cat([out_f, out_b], dim=2)  # (seq_len, batch, 2 * hidden)
+
+        h_n = torch.stack(final_h_states, dim=0)  # (num_layers * num_directions, batch, hidden)
+
+        if self.batch_first:
+            output = output.transpose(0, 1)  # back to (batch, seq, feature)
+
+        # Match original Model: return only output (not h_n)
         return output
 ```

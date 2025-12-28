@@ -1,0 +1,209 @@
+[Seed] Generating seed kernel...
+[Seed 1/2] Generating...
+[92mFinish reason: stop[0m
+Usage: In=1760, Out=5576, Total=7336
+[seed_0] score=0.9043 (baseline=12.3898ms)
+[seed_0] metrics saved to: /home/hyc/LLMKernel/run/20251228_085408_batch_range2to9_openai_deepseek/2_ShallowWideMLP/evaluation/eval_0000.json
+[Seed 1] Final score: 0.9043 ✓
+[Seed 2/2] Generating...
+[92mFinish reason: stop[0m
+Usage: In=1760, Out=5615, Total=7375
+[seed_1] score=0.1711 (baseline=12.3898ms)
+[seed_1] metrics saved to: /home/hyc/LLMKernel/run/20251228_085408_batch_range2to9_openai_deepseek/2_ShallowWideMLP/evaluation/eval_0001.json
+[Seed 2] Final score: 0.1711 ✓
+
+================================================================================
+[Hybrid Strategy] Analyzing all seeds for algorithmic optimization...
+[Hybrid Strategy] - 2 seed(s) with score < 1.0 (rescue)
+================================================================================
+
+[Hybrid] Seed 1: score=0.9043 < 1.0
+[Hybrid] Attempting algorithm analysis rescue...
+[Hybrid] Requesting LLM analysis for seed 1...
+[92mFinish reason: stop[0m
+Usage: In=2500, Out=1903, Total=4403
+[Hybrid] Worth optimizing: yes
+[Hybrid] Reason: The current implementation launches one large matmul kernel per layer and writes/reads huge intermediate activations to/from global memory, which is expensive and still slower than the cuBLAS-based PyTorch baseline.
+[Hybrid] Analysis complete for seed 1, generating optimized kernel...
+[Hybrid] Bottleneck: Each hidden layer performs an independent matmul+bias+ReLU, writing its full out...
+[Hybrid] Optimization: Fuse all linear+bias+ReLU layers into a single persistent Triton kernel that loo...
+[Hybrid] Expected speedup: 15-25%
+[92mFinish reason: stop[0m
+Usage: In=2841, Out=13914, Total=16755
+[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 555, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251228_085408_batch_range2to9_openai_deepseek/2_ShallowWideMLP/code/kernel_20251228_085830.py", line 349, in forward
+    fused_mlp3_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 419, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 733, in run
+    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 861, in _do_compile
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 300, in compile
+    module = src.make_ir(target, options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 80, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 38:7:
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # -----------------------------------------
+    # Layer 0
+    # -----------------------------------------
+    N = N0
+    K = K0
+    mask_n = offs_n < N
+    if tl.any(mask_n):
+       ^
+AttributeError("module 'triton.language' has no attribute 'any'")
+
+[algorithm_optimized_seed0] failed. See metrics.message for details.
+[algorithm_optimized_seed0] metrics saved to: /home/hyc/LLMKernel/run/20251228_085408_batch_range2to9_openai_deepseek/2_ShallowWideMLP/evaluation/eval_0002.json
+[Hybrid] Algorithm-optimized kernel failed, attempting repair...
+[92mFinish reason: stop[0m
+Usage: In=4501, Out=6979, Total=11480
+[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 644, in compare_and_bench
+    raise ValueError(
+ValueError: Outputs are not close (atol=1, rtol=1). max_abs_err=nan, mean_abs_err=nan
+
+[algorithm_optimized_seed0_repair1] failed. See metrics.message for details.
+[algorithm_optimized_seed0_repair1] metrics saved to: /home/hyc/LLMKernel/run/20251228_085408_batch_range2to9_openai_deepseek/2_ShallowWideMLP/evaluation/eval_0003.json
+[Hybrid] ✗ Rescue failed, keeping original seed
+
+[Hybrid] Seed 2: score=0.1711 < 1.0
+[Hybrid] Attempting algorithm analysis rescue...
+[Hybrid] Requesting LLM analysis for seed 2...
+[92mFinish reason: stop[0m
+Usage: In=3190, Out=1654, Total=4844
+[Hybrid] Worth optimizing: yes
+[Hybrid] Reason: Each forward pass performs massive `weight.t().contiguous()` transposes on very large matrices, wasting bandwidth and dominating runtime.
+[Hybrid] Analysis complete for seed 2, generating optimized kernel...
+[Hybrid] Bottleneck: The kernel interface assumes weights as [N, K], so every call does `b_mat = weig...
+[Hybrid] Optimization: Memory layout optimization: store and maintain weights directly in the [K, N] la...
+[Hybrid] Expected speedup: 2-4x vs the current Triton implementation (large reduction in runtime just from eliminating the repeated high-volume transposes), bringing it significantly closer to or below the PyTorch baseline.
+[92mFinish reason: stop[0m
+Usage: In=3503, Out=6217, Total=9720
+[algorithm_optimized_seed1] score=1.3316 (baseline=12.3898ms)
+[algorithm_optimized_seed1] metrics saved to: /home/hyc/LLMKernel/run/20251228_085408_batch_range2to9_openai_deepseek/2_ShallowWideMLP/evaluation/eval_0004.json
+[Hybrid] ✓ Rescue successful: 0.1711 → 1.3316
+
+================================================================================
+[Hybrid] Candidate Selection
+================================================================================
+[Hybrid] Total candidates: 3
+  [1] seed 1: 0.9043
+  [2] seed 2: 0.1711
+  [3] algo-optimized (from seed 1): 1.3316
+
+[Hybrid] ★ Selected best candidate: score=1.3316
+
+[Optimization] Starting 3-stage optimization...
+
+================================================================================
+[Stage 1/3] grid_and_parallel
+Description: Optimize grid layout and parallel work distribution across SMs.
+Current candidates: 1, best score: 1.3316
+================================================================================
+[Stage 1] Profiling best candidate...
+[Stage 1] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=2987, Out=5734, Total=8721
+[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 555, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251228_085408_batch_range2to9_openai_deepseek/2_ShallowWideMLP/code/kernel_20251228_090221.py", line 229, in forward
+    x = fused_linear_bias_relu(x, w, b)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251228_085408_batch_range2to9_openai_deepseek/2_ShallowWideMLP/code/kernel_20251228_090221.py", line 132, in fused_linear_bias_relu
+    linear_bias_kernel[_linear_bias_grid](  # grid is 2D over [M, N]
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 419, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 238, in run
+    benchmark()
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 227, in benchmark
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 227, in <dictcomp>
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 162, in _bench
+    return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/testing.py", line 149, in do_bench
+    fn()
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 148, in kernel_call
+    self.fn.run(
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 748, in run
+    grid = grid(bound_args)
+           ^^^^^^^^^^^^^^^^
+TypeError: _linear_bias_grid() missing 3 required positional arguments: 'M', 'N', and 'K'
+
+[stage1_grid_and_parallel] failed. See metrics.message for details.
+[stage1_grid_and_parallel] metrics saved to: /home/hyc/LLMKernel/run/20251228_085408_batch_range2to9_openai_deepseek/2_ShallowWideMLP/evaluation/eval_0005.json
+  Optimization failed, attempting repair...
+[92mFinish reason: stop[0m
+Usage: In=3278, Out=5044, Total=8322
+[stage1_grid_and_parallel_repair] score=1.2996 (baseline=12.3898ms)
+[stage1_grid_and_parallel_repair] metrics saved to: /home/hyc/LLMKernel/run/20251228_085408_batch_range2to9_openai_deepseek/2_ShallowWideMLP/evaluation/eval_0006.json
+  Optimized kernel score: 1.2996 ✓
+[Stage 1] Current: 1.2996 (global best: 1.3316)
+
+================================================================================
+[Stage 2/3] block_tiling
+Description: Tune BLOCK_M/N/K sizes for optimal register/memory balance.
+Current candidates: 1, best score: 1.3316
+================================================================================
+[Stage 2] Profiling best candidate...
+[Stage 2] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=2706, Out=6136, Total=8842
+[stage2_block_tiling] score=1.0289 (baseline=12.3898ms)
+[stage2_block_tiling] metrics saved to: /home/hyc/LLMKernel/run/20251228_085408_batch_range2to9_openai_deepseek/2_ShallowWideMLP/evaluation/eval_0007.json
+  Optimized kernel score: 1.0289 ✓
+[Stage 2] Current: 1.0289 (global best: 1.3316)
+
+================================================================================
+[Stage 3/3] memory_and_tuning
+Description: Optimize memory access patterns and fine-tune num_stages/num_warps.
+Current candidates: 1, best score: 1.3316
+================================================================================
+[Stage 3] Profiling best candidate...
+[Stage 3] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=3081, Out=4977, Total=8058
+[stage3_memory_and_tuning] score=1.0317 (baseline=12.3898ms)
+[stage3_memory_and_tuning] metrics saved to: /home/hyc/LLMKernel/run/20251228_085408_batch_range2to9_openai_deepseek/2_ShallowWideMLP/evaluation/eval_0008.json
+  Optimized kernel score: 1.0317 ✓
+[Stage 3] Current: 1.0317 (global best: 1.3316)
+[2_ShallowWideMLP.py] Figure saved to: /home/hyc/LLMKernel/run/20251228_085408_batch_range2to9_openai_deepseek/2_ShallowWideMLP/figures/2_ShallowWideMLP_score.png

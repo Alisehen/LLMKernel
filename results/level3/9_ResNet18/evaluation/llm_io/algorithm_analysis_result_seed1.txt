@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The Triton version is ~13% slower than the PyTorch baseline and performs multiple full-tensor read/write cycles per BasicBlock that can be algorithmically removed.",
+  "bottleneck": "Within each BasicBlock, the two conv–BN–ReLU stages and the residual add/ReLU are executed as separate kernels, forcing the intermediate feature map (conv1 output) to be fully written to and re-read from global memory and incurring multiple kernel launches. This creates a memory‑bandwidth and launch‑overhead bottleneck compared to what can be achieved with more aggressive fusion.",
+  "optimisation method": "Fuse the entire BasicBlock (conv1+BN+ReLU, conv2+BN, optional downsample conv+BN, residual add, and final ReLU) into a single Triton kernel so that the intermediate activations stay in registers/shared memory and the output is written to global memory only once.",
+  "modification plan": "Introduce a new Triton kernel that takes as inputs x, conv1/conv2 (and optional downsample) weights, all BN parameters, and produces the final block output in one pass: tile over (N, H_out, W_out, C_out), compute conv1 → BN1 → ReLU in registers, immediately feed that into conv2 → BN2, in parallel compute the downsample path for the identity if needed, then perform the residual addition and final ReLU before a single global store. Replace BasicBlockTriton.forward to call this fused BasicBlock kernel instead of chaining triton_conv2d_bn_relu (twice) plus a separate residual add/ReLU, thereby eliminating the intermediate feature map tensor and reducing kernel launches.",
+  "expected_speedup": "20-30%"
+}

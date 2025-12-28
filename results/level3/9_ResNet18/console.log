@@ -1,0 +1,108 @@
+[Seed] Generating seed kernel...
+[Seed 1/2] Generating...
+[92mFinish reason: stop[0m
+Usage: In=2428, Out=8483, Total=10911
+[seed_0] score=0.8522 (baseline=2.1193ms)
+[seed_0] metrics saved to: /home/hyc/LLMKernel/run/20251228_085408_batch_range2to9_openai_deepseek/9_ResNet18/evaluation/eval_0030.json
+[Seed 1] Final score: 0.8522 ✓
+[Seed 2/2] Generating...
+[92mFinish reason: stop[0m
+Usage: In=2428, Out=15016, Total=17444
+[seed_1] score=0.8817 (baseline=2.1193ms)
+[seed_1] metrics saved to: /home/hyc/LLMKernel/run/20251228_085408_batch_range2to9_openai_deepseek/9_ResNet18/evaluation/eval_0031.json
+[Seed 2] Final score: 0.8817 ✓
+
+================================================================================
+[Hybrid Strategy] Analyzing all seeds for algorithmic optimization...
+[Hybrid Strategy] - 2 seed(s) with score < 1.0 (rescue)
+================================================================================
+
+[Hybrid] Seed 1: score=0.8522 < 1.0
+[Hybrid] Attempting algorithm analysis rescue...
+[Hybrid] Requesting LLM analysis for seed 1...
+[92mFinish reason: stop[0m
+Usage: In=4359, Out=1182, Total=5541
+[Hybrid] Worth optimizing: yes
+[Hybrid] Reason: A large fraction of runtime is spent in Conv + BatchNorm + ReLU sequences, where BatchNorm induces extra kernels and memory traffic that can be eliminated at inference.
+[Hybrid] Analysis complete for seed 1, generating optimized kernel...
+[Hybrid] Bottleneck: The current Triton work optimizes relatively cheap ops (residual add+ReLU, globa...
+[Hybrid] Optimization: At inference, fold each BatchNorm2d into its preceding Conv2d (reparameterizing ...
+[Hybrid] Expected speedup: 20-30%
+[92mFinish reason: stop[0m
+Usage: In=4726, Out=7027, Total=11753
+[algorithm_optimized_seed0] score=2.0729 (baseline=2.1193ms)
+[algorithm_optimized_seed0] metrics saved to: /home/hyc/LLMKernel/run/20251228_085408_batch_range2to9_openai_deepseek/9_ResNet18/evaluation/eval_0032.json
+[Hybrid] ✓ Rescue successful: 0.8522 → 2.0729
+
+[Hybrid] Seed 2: score=0.8817 < 1.0
+[Hybrid] Attempting algorithm analysis rescue...
+[Hybrid] Requesting LLM analysis for seed 2...
+[92mFinish reason: stop[0m
+Usage: In=6336, Out=1002, Total=7338
+[Hybrid] Worth optimizing: yes
+[Hybrid] Reason: The Triton version is ~13% slower than the PyTorch baseline and performs multiple full-tensor read/write cycles per BasicBlock that can be algorithmically removed.
+[Hybrid] Analysis complete for seed 2, generating optimized kernel...
+[Hybrid] Bottleneck: Within each BasicBlock, the two conv–BN–ReLU stages and the residual add/ReLU ar...
+[Hybrid] Optimization: Fuse the entire BasicBlock (conv1+BN+ReLU, conv2+BN, optional downsample conv+BN...
+[Hybrid] Expected speedup: 20-30%
+[92mFinish reason: stop[0m
+Usage: In=6698, Out=24839, Total=31537
+[algorithm_optimized_seed1] score=0.0401 (baseline=2.1193ms)
+[algorithm_optimized_seed1] metrics saved to: /home/hyc/LLMKernel/run/20251228_085408_batch_range2to9_openai_deepseek/9_ResNet18/evaluation/eval_0033.json
+[Hybrid] ✓ Rescue successful: 0.8817 → 0.0401
+
+================================================================================
+[Hybrid] Candidate Selection
+================================================================================
+[Hybrid] Total candidates: 4
+  [1] seed 1: 0.8522
+  [2] seed 2: 0.8817
+  [3] algo-optimized (from seed 1): 2.0729
+  [4] algo-optimized (from seed 2): 0.0401
+
+[Hybrid] ★ Selected best candidate: score=2.0729
+
+[Optimization] Starting 3-stage optimization...
+
+================================================================================
+[Stage 1/3] grid_and_parallel
+Description: Optimize grid layout and parallel work distribution across SMs.
+Current candidates: 1, best score: 2.0729
+================================================================================
+[Stage 1] Profiling best candidate...
+[Stage 1] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=4320, Out=8065, Total=12385
+[stage1_grid_and_parallel] score=1.9752 (baseline=2.1193ms)
+[stage1_grid_and_parallel] metrics saved to: /home/hyc/LLMKernel/run/20251228_085408_batch_range2to9_openai_deepseek/9_ResNet18/evaluation/eval_0034.json
+  Optimized kernel score: 1.9752 ✓
+[Stage 1] Current: 1.9752 (global best: 2.0729)
+
+================================================================================
+[Stage 2/3] block_tiling
+Description: Tune BLOCK_M/N/K sizes for optimal register/memory balance.
+Current candidates: 1, best score: 2.0729
+================================================================================
+[Stage 2] Profiling best candidate...
+[Stage 2] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=4821, Out=6816, Total=11637
+[stage2_block_tiling] score=1.8875 (baseline=2.1193ms)
+[stage2_block_tiling] metrics saved to: /home/hyc/LLMKernel/run/20251228_085408_batch_range2to9_openai_deepseek/9_ResNet18/evaluation/eval_0035.json
+  Optimized kernel score: 1.8875 ✓
+[Stage 2] Current: 1.8875 (global best: 2.0729)
+
+================================================================================
+[Stage 3/3] memory_and_tuning
+Description: Optimize memory access patterns and fine-tune num_stages/num_warps.
+Current candidates: 1, best score: 2.0729
+================================================================================
+[Stage 3] Profiling best candidate...
+[Stage 3] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=5257, Out=8291, Total=13548
+[stage3_memory_and_tuning] score=1.9339 (baseline=2.1193ms)
+[stage3_memory_and_tuning] metrics saved to: /home/hyc/LLMKernel/run/20251228_085408_batch_range2to9_openai_deepseek/9_ResNet18/evaluation/eval_0036.json
+  Optimized kernel score: 1.9339 ✓
+[Stage 3] Current: 1.9339 (global best: 2.0729)
+[9_ResNet18.py] Figure saved to: /home/hyc/LLMKernel/run/20251228_085408_batch_range2to9_openai_deepseek/9_ResNet18/figures/9_ResNet18_score.png

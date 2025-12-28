@@ -1,0 +1,10 @@
+```json
+{
+  "worth_optimizing": "yes",
+  "reason": "Each forward pass performs massive `weight.t().contiguous()` transposes on very large matrices, wasting bandwidth and dominating runtime.",
+  "bottleneck": "The kernel interface assumes weights as [N, K], so every call does `b_mat = weight.t().contiguous()` to get [K, N]; for these layer sizes this rewrites ~8.6 GB of data per forward, which is far more expensive than the matmul itself.",
+  "optimisation method": "Memory layout optimization: store and maintain weights directly in the [K, N] layout expected by the Triton matmul (i.e., initialize parameters as [in_features, out_features]) so no transpose/contiguous is needed in forward.",
+  "modification plan": "Change `ModelNew` to allocate `w` as shape `(in_features, out_features)` and treat this as the canonical parameter layout; update the Triton launch code to pass `weight` directly (no `.t().contiguous()`), adjusting `stride_bk` and `stride_bn` accordingly. Ensure bias remains `[N]` and that only the epilogue (bias+ReLU) uses it, so the rest of the kernel logic remains unchanged except for using the new weight strides.",
+  "expected_speedup": "2-4x vs the current Triton implementation (large reduction in runtime just from eliminating the repeated high-volume transposes), bringing it significantly closer to or below the PyTorch baseline."
+}
+```

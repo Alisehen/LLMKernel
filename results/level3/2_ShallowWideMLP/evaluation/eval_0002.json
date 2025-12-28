@@ -1,54 +1,6 @@
 {
-  "timestamp": "2025-12-15T15:28:00",
-  "reference_file": "KernelBench/level3/2_ShallowWideMLP.py",
-  "candidate_file": "/home/hyc/LLMKernel/run/20251215_151559_batch_range2to16_deepseek_deepseek/2_ShallowWideMLP/code/kernel_20251215_152730.py",
-  "tolerance": 0.1,
-  "max_abs_err": 1.3709068298339844e-06,
-  "mean_abs_err": 9.22789240576094e-08,
-  "ref_latency_ms": {
-    "avg": 12.389747047424317,
-    "min": 12.385087966918945,
-    "max": 12.398591995239258,
-    "all": [
-      12.398591995239258,
-      12.385279655456543,
-      12.390399932861328,
-      12.385087966918945,
-      12.389375686645508
-    ]
-  },
-  "test_latency_ms": {
-    "avg": 76.03340301513671,
-    "min": 76.02073669433594,
-    "max": 76.06681823730469,
-    "all": [
-      76.06681823730469,
-      76.03302764892578,
-      76.02073669433594,
-      76.02381134033203,
-      76.02262115478516
-    ]
-  },
-  "num_runs": 5,
-  "model_init_args": [
-    16384,
-    [
-      32768,
-      32768
-    ],
-    16384
-  ],
-  "model_init_kwargs": {},
-  "seed": 100,
-  "align_stats": {
-    "copied_same_shape": 0,
-    "unique_shape_copied": 4,
-    "mapped_shape": 0,
-    "skipped": 2,
-    "pair_aligner": 0,
-    "pair_key": "Model->ModelNew"
-  },
-  "runnable": true,
-  "phase": "seed_repair",
-  "score": 0.16295136816325015
+  "runnable": false,
+  "phase": "algorithm_optimized_seed0",
+  "error_type": "RuntimeError",
+  "message": "Traceback (most recent call last):\n  File \"/home/hyc/LLMKernel/utils/compile_and_run.py\", line 555, in compare_and_bench\n    test_out, _ = _run_once(test_model, inp, dev)\n                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/LLMKernel/utils/compile_and_run.py\", line 132, in _run_once\n    out = model(*inp)\n          ^^^^^^^^^^^\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py\", line 1775, in _wrapped_call_impl\n    return self._call_impl(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py\", line 1786, in _call_impl\n    return forward_call(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/LLMKernel/run/20251228_085408_batch_range2to9_openai_deepseek/2_ShallowWideMLP/code/kernel_20251228_085830.py\", line 349, in forward\n    fused_mlp3_kernel[grid](\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py\", line 419, in <lambda>\n    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)\n                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py\", line 733, in run\n    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py\", line 861, in _do_compile\n    kernel = self.compile(src, target=target, options=options.__dict__)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py\", line 300, in compile\n    module = src.make_ir(target, options, codegen_fns, module_map, context)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py\", line 80, in make_ir\n    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\ntriton.compiler.errors.CompilationError: at 38:7:\n\n    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)\n    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)\n    offs_k = tl.arange(0, BLOCK_K)\n\n    # -----------------------------------------\n    # Layer 0\n    # -----------------------------------------\n    N = N0\n    K = K0\n    mask_n = offs_n < N\n    if tl.any(mask_n):\n       ^\nAttributeError(\"module 'triton.language' has no attribute 'any'\")\n"
 }

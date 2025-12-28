@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The custom Triton path is slower than the PyTorch baseline, and a large portion of the overhead comes from avoidable full-tensor permutations around every 1x1 convolution.",
+  "bottleneck": "Each 1x1 convolution calls conv1x1_triton, which permutes NCHW→NHWC, makes the GEMM, then permutes back NHWC→NCHW. With 2×MBConv×7 + final conv, this results in dozens of full-tensor memory moves that are purely layout overhead and not present in the cuDNN baseline.",
+  "optimisation method": "Adopt a channels-last (NHWC) activation layout end-to-end inside ModelNew and implement both conv1x1_triton and depthwise_conv3x3_triton directly in NHWC, eliminating the per-layer permute/contiguous overhead.",
+  "modification plan": "Change ModelNew and MBConvNew to keep tensors in NHWC internally (or at least between all Triton ops), converting NCHW→NHWC only once at the model entry and back once at the exit. Rewrite conv1x1_triton to treat x as [N,H,W,C] and flatten (N*H*W, C) without permute, and adjust depthwise_conv3x3_triton indexing to operate on NHWC strides (with C as the fast dimension) so it consumes and produces NHWC. Ensure BatchNorm and ReLU are either performed in NHWC (using channels_last in PyTorch or a fused Triton kernel) or folded into the preceding conv for inference, so no additional layout conversions are introduced.",
+  "expected_speedup": "20-30%"
+}

@@ -1,34 +1,12 @@
 You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
 
-# Target GPU
-GPU Name: 4090
-Architecture: Ada Lovelace
-• Compute Capability: 8.9
-• Number of SMs: 128
-• Memory Bandwidth: 1008 GB/s
-• TF32 Tensor Core TFLOPS: 82.6 with dense
-• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
-• FP16 Tensor Core TFLOPS: 165.2 with dense
-• Maximum number of registers per thread: 255
-• Maximum threads per block: 1024
-• Maximum threads per SM: 1536
-• Warp size: 32
-• Maximum concurrent warps per SM: 48
-• Shared memory capacity per SM: 100 KB
-• Maximum shared memory per thread block: 99 KB
-• L2 cache (global, all SM shared): 72 MB
+# Target GPU: 4090
 
-[OPTIMIZATION STAGE]f
+[OPTIMIZATION STAGE]
 
 ## Current Optimization Stage
 
 Focus: Grid layout & indexing for FUSED operations.
-
-⚠️ FUSION EXCLUSIONS (do NOT apply fusion rules to these):
-- Reduction ops (sum, mean, softmax along axis)
-- Atomic operations
-- Irregular/data-dependent access patterns
-- Cross-block dependencies
 
 Key Principle:
 - All fused ops share the SAME grid AND the SAME (offsets, mask) tuple
@@ -50,208 +28,298 @@ Verification:
 
 [CURRENT CODE]
 ```python
+import math
 import torch
 import torch.nn as nn
 import triton
 import triton.language as tl
 
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=3, num_warps=4),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=3, num_warps=4),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=4, num_warps=2),
-        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=3, num_warps=2),
-    ],
-    key=['M', 'N', 'K']
-)
+
 @triton.jit
-def fused_linear_relu_kernel(
+def linear_bias_relu_kernel(
     a_ptr, b_ptr, bias_ptr, c_ptr,
     M, N, K,
     stride_am, stride_ak,
     stride_bk, stride_bn,
     stride_cm, stride_cn,
-    ACTIVATION: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    ALLOW_TF32: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
 ):
+    # Program IDs for 2D tiling over M and N dimensions
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
-    
+
+    # Tile indices
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, BLOCK_K)
-    
-    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
-    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
-    
+
+    # Pointers to the first tiles of A and B
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak  # [BLOCK_M, BLOCK_K]
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn  # [BLOCK_K, BLOCK_N]
+
+    # Accumulator in FP32 for better numerical stability
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    
+
+    # Loop over K dimension
     for k in range(0, K, BLOCK_K):
-        k_remaining = K - k
-        a_mask = (offs_m[:, None] < M) & (offs_k[None, :] < k_remaining)
-        b_mask = (offs_k[:, None] < k_remaining) & (offs_n[None, :] < N)
-        
+        k_mask = (k + offs_k) < K
+
+        a_mask = (offs_m[:, None] < M) & k_mask[None, :]
+        b_mask = k_mask[:, None] & (offs_n[None, :] < N)
+
         a = tl.load(a_ptrs, mask=a_mask, other=0.0)
         b = tl.load(b_ptrs, mask=b_mask, other=0.0)
-        
-        acc += tl.dot(a, b, allow_tf32=ALLOW_TF32)
-        
+
+        acc += tl.dot(a, b, allow_tf32=True)
+
         a_ptrs += BLOCK_K * stride_ak
         b_ptrs += BLOCK_K * stride_bk
-    
-    if bias_ptr is not None:
-        bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
-        acc += bias[None, :]
-    
-    if ACTIVATION == 1:  # ReLU
-        acc = tl.maximum(acc, 0.0)
-    
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
-    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-    tl.store(c_ptrs, acc, mask=c_mask)
 
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=3, num_warps=4),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=3, num_warps=4),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=4, num_warps=2),
-        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=3, num_warps=2),
-    ],
-    key=['M', 'N', 'K']
-)
+    # Add bias
+    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc += bias[None, :]
+
+    # ReLU activation
+    acc = tl.maximum(acc, 0.0)
+
+    # Store result (acc is already fp32)
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, acc, mask=mask)
+
+
 @triton.jit
-def linear_kernel(
+def linear_bias_kernel(
     a_ptr, b_ptr, bias_ptr, c_ptr,
     M, N, K,
     stride_am, stride_ak,
     stride_bk, stride_bn,
     stride_cm, stride_cn,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    ALLOW_TF32: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
 ):
+    # Program IDs for 2D tiling over M and N dimensions
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
-    
+
+    # Tile indices
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, BLOCK_K)
-    
-    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
-    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
-    
+
+    # Pointers to the first tiles of A and B
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak  # [BLOCK_M, BLOCK_K]
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn  # [BLOCK_K, BLOCK_N]
+
+    # Accumulator in FP32
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    
+
+    # Loop over K dimension
     for k in range(0, K, BLOCK_K):
-        k_remaining = K - k
-        a_mask = (offs_m[:, None] < M) & (offs_k[None, :] < k_remaining)
-        b_mask = (offs_k[:, None] < k_remaining) & (offs_n[None, :] < N)
-        
+        k_mask = (k + offs_k) < K
+
+        a_mask = (offs_m[:, None] < M) & k_mask[None, :]
+        b_mask = k_mask[:, None] & (offs_n[None, :] < N)
+
         a = tl.load(a_ptrs, mask=a_mask, other=0.0)
         b = tl.load(b_ptrs, mask=b_mask, other=0.0)
-        
-        acc += tl.dot(a, b, allow_tf32=ALLOW_TF32)
-        
+
+        acc += tl.dot(a, b, allow_tf32=True)
+
         a_ptrs += BLOCK_K * stride_ak
         b_ptrs += BLOCK_K * stride_bk
-    
-    if bias_ptr is not None:
-        bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
-        acc += bias[None, :]
-    
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
-    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-    tl.store(c_ptrs, acc, mask=c_mask)
 
-def fused_linear_activation(x, weight, bias=None, activation='none'):
-    M, K = x.shape
-    N = weight.shape[0]
-    
+    # Add bias
+    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc += bias[None, :]
+
+    # Store result
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, acc, mask=mask)
+
+
+def fused_linear_bias_relu(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    Fused Linear + Bias + ReLU using Triton.
+
+    x:      [M, K]
+    weight: [K, N]  (stored as [in_features, out_features])
+    bias:   [N]
+    returns: [M, N] with bias + ReLU applied
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda, "Inputs must be on CUDA device"
+
+    # Work in FP32 for numerical stability
+    if x.dtype != torch.float32:
+        x = x.float()
+    if weight.dtype != torch.float32:
+        weight = weight.float()
+    if bias.dtype != torch.float32:
+        bias = bias.float()
+
     x = x.contiguous()
-    weight_t = weight.t().contiguous()
-    
-    c = torch.empty((M, N), device=x.device, dtype=x.dtype)
-    
-    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']), triton.cdiv(N, META['BLOCK_N']))
-    
-    if activation == 'relu':
-        fused_linear_relu_kernel[grid](
-            x, weight_t, bias, c,
-            M, N, K,
-            x.stride(0), x.stride(1),
-            weight_t.stride(0), weight_t.stride(1),
-            c.stride(0), c.stride(1),
-            ACTIVATION=1,
-            ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32
+    weight = weight.contiguous()
+
+    M, K = x.shape
+    K_w, N = weight.shape
+    assert K_w == K, f"Incompatible shapes: x [{M}, {K}], weight [{K_w}, {N}]"
+
+    out = torch.empty((M, N), device=x.device, dtype=torch.float32)
+
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta["BLOCK_M"]),
+            triton.cdiv(N, meta["BLOCK_N"]),
         )
-    else:
-        linear_kernel[grid](
-            x, weight_t, bias, c,
-            M, N, K,
-            x.stride(0), x.stride(1),
-            weight_t.stride(0), weight_t.stride(1),
-            c.stride(0), c.stride(1),
-            ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32
+
+    linear_bias_relu_kernel[grid](
+        x, weight, bias, out,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        weight.stride(0), weight.stride(1),
+        out.stride(0), out.stride(1),
+        BLOCK_M=128,
+        BLOCK_N=128,
+        BLOCK_K=32,
+        num_warps=4,
+        num_stages=3,
+    )
+    return out
+
+
+def fused_linear_bias(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    Fused Linear + Bias using Triton.
+
+    x:      [M, K]
+    weight: [K, N]  (stored as [in_features, out_features])
+    bias:   [N]
+    returns: [M, N] with bias applied
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda, "Inputs must be on CUDA device"
+
+    if x.dtype != torch.float32:
+        x = x.float()
+    if weight.dtype != torch.float32:
+        weight = weight.float()
+    if bias.dtype != torch.float32:
+        bias = bias.float()
+
+    x = x.contiguous()
+    weight = weight.contiguous()
+
+    M, K = x.shape
+    K_w, N = weight.shape
+    assert K_w == K, f"Incompatible shapes: x [{M}, {K}], weight [{K_w}, {N}]"
+
+    out = torch.empty((M, N), device=x.device, dtype=torch.float32)
+
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta["BLOCK_M"]),
+            triton.cdiv(N, meta["BLOCK_N"]),
         )
-    
-    return c
+
+    linear_bias_kernel[grid](
+        x, weight, bias, out,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        weight.stride(0), weight.stride(1),
+        out.stride(0), out.stride(1),
+        BLOCK_M=128,
+        BLOCK_N=128,
+        BLOCK_K=32,
+        num_warps=4,
+        num_stages=3,
+    )
+    return out
+
 
 class ModelNew(nn.Module):
     def __init__(self, input_size, hidden_layer_sizes, output_size):
+        """
+        Triton-accelerated version of the original MLP.
+        Uses fused Linear+Bias+ReLU kernels for hidden layers
+        and fused Linear+Bias for the output layer.
+
+        IMPORTANT: We store weights in [in_features, out_features] layout
+        to match the Triton matmul expectation directly (no transpose in forward).
+        """
         super(ModelNew, self).__init__()
-        
-        self.layers = nn.ModuleList()
-        current_input_size = input_size
-        
-        for hidden_size in hidden_layer_sizes:
-            self.layers.append(nn.Linear(current_input_size, hidden_size))
-            current_input_size = hidden_size
-        
-        self.output_layer = nn.Linear(current_input_size, output_size)
-    
-    def forward(self, x):
-        for layer in self.layers:
-            x = fused_linear_activation(x, layer.weight, layer.bias, activation='relu')
-        
-        x = fused_linear_activation(x, self.output_layer.weight, self.output_layer.bias, activation='none')
-        
+
+        layer_sizes = [input_size] + list(hidden_layer_sizes) + [output_size]
+        self.num_layers = len(layer_sizes) - 1
+        self.num_hidden = len(hidden_layer_sizes)
+
+        self.weights = nn.ParameterList()
+        self.biases = nn.ParameterList()
+
+        # Initialize similar to nn.Linear defaults (Kaiming uniform).
+        # We generate a temporary [out, in] weight, initialize it with
+        # nn.init.kaiming_uniform_, then store its transpose [in, out]
+        # as the actual parameter to keep identical statistics.
+        for in_features, out_features in zip(layer_sizes[:-1], layer_sizes[1:]):
+            # temp tensor in PyTorch's nn.Linear layout [out, in]
+            w_oi = torch.empty(out_features, in_features)
+            nn.init.kaiming_uniform_(w_oi, a=math.sqrt(5))
+            # store as [in, out] for Triton
+            w = nn.Parameter(w_oi.t().contiguous())
+
+            fan_in = in_features
+            bound = 1 / math.sqrt(fan_in)
+            b = nn.Parameter(torch.empty(out_features))
+            nn.init.uniform_(b, -bound, bound)
+
+            self.weights.append(w)
+            self.biases.append(b)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: [batch_size, input_size]
+        returns: [batch_size, output_size]
+        """
+        assert x.is_cuda, "Input must be on CUDA device"
+        if x.dtype != torch.float32:
+            x = x.float()
+
+        for i in range(self.num_layers):
+            w = self.weights[i]   # [in_features, out_features]
+            b = self.biases[i]    # [out_features]
+            if i < self.num_hidden:
+                x = fused_linear_bias_relu(x, w, b)
+            else:
+                x = fused_linear_bias(x, w, b)
         return x
 ```
 
 [NCU PROFILING METRICS]
-{
-  "fused_linear_relu_kernel": {
-    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 66.5,
-    "launch__grid_size": 1024,
-    "sm__warps_active.avg.pct_of_peak_sustained_active": 8.33,
-    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 64.96,
-    "lts__t_sector_hit_rate.pct": 79.7
-  },
-  "linear_kernel": {
-    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 74.72,
-    "launch__grid_size": 256,
-    "sm__warps_active.avg.pct_of_peak_sustained_active": 16.65,
-    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 74.81,
-    "lts__t_sector_hit_rate.pct": 66.45
-  }
-}
+No NCU metrics available
 
 **Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
 
-TRITON API CONSTRAINTS (CRITICAL):
-- Triton has NO: tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+## CRITICAL — Code MUST compile and run:
+1. EVERY kernel function MUST have `@triton.jit` decorator
+2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+3. BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+4. `tl.program_id(axis)` only supports axis = 0, 1, 2
+5. No `continue`, `break`, `return` inside loops — use masking
+6. No tensor indexing with loop vars: `x[:, i]` is INVALID
+7. mask shape MUST match data shape in tl.load/tl.store
 
-OUTPUT RULES (STRICT):
-1. Follow this exact order:
-   1. Imports: torch, torch.nn, triton, triton.language as tl
-   2. @triton.jit decorated kernel function(s)
-   3. Wrapper function(s) for grid calculation and kernel launch
-   4. class ModelNew(nn.Module) that calls your kernels
-2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+## Missing Triton Functions (implement manually):
+- tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+## OUTPUT FORMAT (STRICT):
+1. Imports: torch, torch.nn, triton, triton.language as tl
+2. @triton.jit decorated kernel function(s)
+3. Wrapper function(s) for grid calculation and kernel launch
+4. class ModelNew(nn.Module) that calls your kernels
+
+Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
 
 ```python
 # <optimized Triton code>

@@ -1,0 +1,243 @@
+# <complete ModelNew code with optimized Triton kernels>
+import torch, torch.nn as nn, triton, triton.language as tl
+
+
+@triton.jit
+def conv_im2col_matmul_kernel(
+    x_ptr, w_ptr, out_ptr,
+    N, C_in, H_in, W_in,
+    C_out,
+    H_out, W_out,
+    KH, KW,
+    stride_h, stride_w,
+    pad_h, pad_w,
+    M, K_dim,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_wk, stride_wn,
+    stride_om, stride_on,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    # Program IDs
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    # Offsets in output matrix (M x C_out)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Decode M dimension -> (n, ho, wo)
+    hw_out = H_out * W_out
+    n_idx = offs_m // hw_out
+    rem_m = offs_m - n_idx * hw_out
+    ho_idx = rem_m // W_out
+    wo_idx = rem_m - ho_idx * W_out
+
+    # Initialize accumulator
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Loop over K dimension (C_in * KH * KW)
+    for k in range(0, K_dim, BLOCK_K):
+        k_idx = k + offs_k  # [BLOCK_K]
+        k_mask = k_idx < K_dim
+
+        # Decode K dimension -> (c_in, kh, kw)
+        kk = KH * KW
+        c_idx = k_idx // kk
+        rem_k = k_idx - c_idx * kk
+        kh_idx = rem_k // KW
+        kw_idx = rem_k - kh_idx * KW
+
+        # Compute input spatial indices
+        h_in = ho_idx[:, None] * stride_h + kh_idx[None, :] - pad_h
+        w_in = wo_idx[:, None] * stride_w + kw_idx[None, :] - pad_w
+
+        # Bounds check for input
+        in_bounds = (
+            (h_in >= 0) & (h_in < H_in) &
+            (w_in >= 0) & (w_in < W_in)
+        )
+
+        # Full mask for A loads
+        mask_a = (
+            (offs_m[:, None] < M) &
+            k_mask[None, :] &
+            in_bounds
+        )
+
+        # Pointers for A (im2col of input)
+        a_ptrs = (
+            x_ptr
+            + n_idx[:, None] * stride_xn
+            + c_idx[None, :] * stride_xc
+            + h_in * stride_xh
+            + w_in * stride_xw
+        )
+        a = tl.load(a_ptrs, mask=mask_a, other=0.0)
+
+        # Pointers for B (weights matrix K_dim x C_out)
+        b_ptrs = (
+            w_ptr
+            + k_idx[:, None] * stride_wk
+            + offs_n[None, :] * stride_wn
+        )
+        mask_b = k_mask[:, None] & (offs_n[None, :] < C_out)
+        b = tl.load(b_ptrs, mask=mask_b, other=0.0)
+
+        # Accumulate
+        acc += tl.dot(a, b, allow_tf32=True)
+
+    # Store result to output matrix (M x C_out)
+    out_ptrs = out_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
+    mask_out = (offs_m[:, None] < M) & (offs_n[None, :] < C_out)
+    tl.store(out_ptrs, acc, mask=mask_out)
+
+
+def triton_conv2d_nchw(x, weight, stride=1, padding=0):
+    """
+    NCHW convolution using Triton via implicit im2col + matmul.
+
+    Args:
+        x:       (N, C_in, H_in, W_in) CUDA tensor
+        weight:  (C_out, C_in, KH, KW) CUDA tensor, bias-free
+        stride:  int or (int, int)
+        padding: int or (int, int)
+
+    Returns:
+        y: (N, C_out, H_out, W_out)
+    """
+    assert x.is_cuda and weight.is_cuda, "Inputs must be CUDA tensors"
+    x = x.contiguous()
+    weight = weight.contiguous()
+
+    if isinstance(stride, (tuple, list)):
+        stride_h, stride_w = int(stride[0]), int(stride[1])
+    else:
+        stride_h = stride_w = int(stride)
+
+    if isinstance(padding, (tuple, list)):
+        pad_h, pad_w = int(padding[0]), int(padding[1])
+    else:
+        pad_h = pad_w = int(padding)
+
+    N, C_in, H_in, W_in = x.shape
+    C_out, C_in_w, KH, KW = weight.shape
+    assert C_in_w == C_in, "Input/output channel mismatch"
+
+    H_out = (H_in + 2 * pad_h - KH) // stride_h + 1
+    W_out = (W_in + 2 * pad_w - KW) // stride_w + 1
+
+    M = N * H_out * W_out
+    K_dim = C_in * KH * KW
+
+    # Weight as matrix (K_dim, C_out)
+    w_mat = weight.view(C_out, -1).t().contiguous()  # (K_dim, C_out)
+
+    # Output as matrix (M, C_out)
+    out_mat = torch.empty((M, C_out), device=x.device, dtype=x.dtype)
+
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta["BLOCK_M"]),
+            triton.cdiv(C_out, meta["BLOCK_N"]),
+        )
+
+    conv_im2col_matmul_kernel[grid](
+        x, w_mat, out_mat,
+        N, C_in, H_in, W_in,
+        C_out,
+        H_out, W_out,
+        KH, KW,
+        stride_h, stride_w,
+        pad_h, pad_w,
+        M, K_dim,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        w_mat.stride(0), w_mat.stride(1),
+        out_mat.stride(0), out_mat.stride(1),
+        BLOCK_M=64, BLOCK_N=64, BLOCK_K=32,
+        num_warps=4,
+        num_stages=2,
+    )
+
+    # Reshape back to NCHW
+    out = out_mat.view(N, H_out, W_out, C_out).permute(0, 3, 1, 2).contiguous()
+    return out
+
+
+class ModelNew(nn.Module):
+    expansion = 1
+
+    def __init__(self, in_channels, out_channels, stride=1):
+        """
+        Optimized version of the given residual block using Triton conv kernels.
+        """
+        super(ModelNew, self).__init__()
+        self.conv1 = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=3,
+            stride=stride,
+            padding=1,
+            bias=False,
+        )
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(
+            out_channels,
+            out_channels,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            bias=False,
+        )
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.downsample = nn.Sequential(
+            nn.Conv2d(
+                in_channels,
+                out_channels * self.expansion,
+                kernel_size=1,
+                stride=stride,
+                bias=False,
+            ),
+            nn.BatchNorm2d(out_channels * self.expansion),
+        )
+        self.stride = stride
+
+    def forward(self, x):
+        identity = x
+
+        # Main path: conv1 -> bn1 -> relu
+        out = triton_conv2d_nchw(
+            x,
+            self.conv1.weight,
+            stride=self.conv1.stride,
+            padding=self.conv1.padding,
+        )
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        # Main path: conv2 -> bn2
+        out = triton_conv2d_nchw(
+            out,
+            self.conv2.weight,
+            stride=self.conv2.stride,
+            padding=self.conv2.padding,
+        )
+        out = self.bn2(out)
+
+        # Downsample (shortcut) path
+        if self.downsample is not None:
+            ds_conv = self.downsample[0]
+            ds_bn = self.downsample[1]
+            identity = triton_conv2d_nchw(
+                x,
+                ds_conv.weight,
+                stride=ds_conv.stride,
+                padding=ds_conv.padding,
+            )
+            identity = ds_bn(identity)
+
+        out = out + identity
+        out = self.relu(out)
+
+        return out

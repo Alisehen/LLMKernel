@@ -1,34 +1,12 @@
 You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
 
-# Target GPU
-GPU Name: 4090
-Architecture: Ada Lovelace
-• Compute Capability: 8.9
-• Number of SMs: 128
-• Memory Bandwidth: 1008 GB/s
-• TF32 Tensor Core TFLOPS: 82.6 with dense
-• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
-• FP16 Tensor Core TFLOPS: 165.2 with dense
-• Maximum number of registers per thread: 255
-• Maximum threads per block: 1024
-• Maximum threads per SM: 1536
-• Warp size: 32
-• Maximum concurrent warps per SM: 48
-• Shared memory capacity per SM: 100 KB
-• Maximum shared memory per thread block: 99 KB
-• L2 cache (global, all SM shared): 72 MB
+# Target GPU: 4090
 
-[OPTIMIZATION STAGE]f
+[OPTIMIZATION STAGE]
 
 ## Current Optimization Stage
 
 Focus: Grid layout & indexing for FUSED operations.
-
-⚠️ FUSION EXCLUSIONS (do NOT apply fusion rules to these):
-- Reduction ops (sum, mean, softmax along axis)
-- Atomic operations
-- Irregular/data-dependent access patterns
-- Cross-block dependencies
 
 Key Principle:
 - All fused ops share the SAME grid AND the SAME (offsets, mask) tuple
@@ -57,207 +35,398 @@ import triton
 import triton.language as tl
 
 
+# ---------------------------------------------------------
+# Triton math helpers (tanh/sigmoid/gelu/silu/mish/softmax)
+# ---------------------------------------------------------
+
+
+def _tl_sigmoid(x):
+    return 1.0 / (1.0 + tl.exp(-x))
+
+
+def _tl_tanh(x):
+    # 2*sigmoid(2x) - 1
+    return 2.0 * _tl_sigmoid(2.0 * x) - 1.0
+
+
+def _tl_gelu(x):
+    # Approximate GELU (Hendrycks & Gimpel)
+    c = 0.7978845608028654  # sqrt(2/pi)
+    k = 0.044715
+    return 0.5 * x * (1.0 + _tl_tanh(c * (x + k * x * x * x)))
+
+
+def _tl_silu(x):
+    return x * _tl_sigmoid(x)
+
+
+def _tl_softmax(x, axis=0):
+    x_max = tl.max(x, axis=axis)
+    x_exp = tl.exp(x - x_max)
+    x_sum = tl.sum(x_exp, axis=axis)
+    return x_exp / x_sum
+
+
+def _tl_mish(x):
+    softplus = tl.log(1.0 + tl.exp(x))
+    return x * _tl_tanh(softplus)
+
+
+tl.sigmoid = _tl_sigmoid
+tl.tanh = _tl_tanh
+tl.gelu = _tl_gelu
+tl.silu = _tl_silu
+tl.softmax = _tl_softmax
+tl.mish = _tl_mish
+
+
 # -----------------------------
-# Triton kernel: softmax over last dimension
+# Triton Softmax over width (dim = -1) in-place on NCHW
 # -----------------------------
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_N': 128}, num_warps=4),
-        triton.Config({'BLOCK_N': 256}, num_warps=8),
-    ],
-    key=['N'],
-)
+
 @triton.jit
-def softmax_lastdim_kernel(
-    x_ptr, y_ptr,
-    M, N,
-    stride_xm, stride_xn,
-    stride_ym, stride_yn,
+def softmax_width_inplace_kernel(
+    x_ptr,
+    M,  # number of rows = N * C * H
+    N,  # width dimension (W)
+    stride_xm,
     BLOCK_N: tl.constexpr,
 ):
     """
-    Computes softmax along the last dimension for a 2D tensor of shape (M, N).
-    Each program instance handles one row (length N).
+    In-place softmax along the last dimension (width) for a tensor
+    logically viewed as [M, N], with contiguous rows of length N.
 
-    x_ptr, y_ptr: pointers to input/output
-    M: number of rows
-    N: number of columns (softmax dimension)
-    stride_*: row/col strides
+    x_ptr: pointer to float32 array with shape [M, N] (row-major)
     """
-    m = tl.program_id(0)
-    # Base pointers for this row
-    x_row_ptr = x_ptr + m * stride_xm
-    y_row_ptr = y_ptr + m * stride_ym
+    pid_m = tl.program_id(0)
+    offs_n = tl.arange(0, BLOCK_N)
 
-    # Offsets within a block along N
-    offs = tl.arange(0, BLOCK_N)
+    row_mask = pid_m < M
+    base = pid_m * stride_xm
 
-    # -------------------------
-    # Pass 1: compute row-wise max for numerical stability
-    # -------------------------
-    # First block initializes the maximum
-    mask = offs < N
-    x = tl.load(x_row_ptr + offs * stride_xn, mask=mask, other=-float('inf'))
-    row_max = tl.max(x, axis=0)
-
-    # Remaining blocks update the maximum
-    for start_n in range(BLOCK_N, N, BLOCK_N):
-        offs_block = start_n + offs
-        mask = offs_block < N
-        x = tl.load(x_row_ptr + offs_block * stride_xn, mask=mask, other=-float('inf'))
+    # 1) Compute row-wise max for numerical stability
+    max_val = -float("inf")
+    for start_n in range(0, N, BLOCK_N):
+        idx = start_n + offs_n
+        mask = row_mask & (idx < N)
+        x = tl.load(x_ptr + base + idx, mask=mask, other=-float("inf"))
         curr_max = tl.max(x, axis=0)
-        row_max = tl.maximum(row_max, curr_max)
+        max_val = tl.maximum(max_val, curr_max)
 
-    # -------------------------
-    # Pass 2: compute exp(x - max) and row-wise sum(exp)
-    #         Store exp(...) temporarily in y_ptr
-    # -------------------------
-    # First block initializes the sum
-    offs = tl.arange(0, BLOCK_N)
-    mask = offs < N
-    x = tl.load(x_row_ptr + offs * stride_xn, mask=mask, other=-float('inf'))
-    exp_x = tl.exp(x - row_max)
-    row_sum = tl.sum(exp_x, axis=0)
-    tl.store(y_row_ptr + offs * stride_yn, exp_x, mask=mask)
+    # 2) Compute sum(exp(x - max))
+    sum_exp = 0.0
+    for start_n in range(0, N, BLOCK_N):
+        idx = start_n + offs_n
+        mask = row_mask & (idx < N)
+        x = tl.load(x_ptr + base + idx, mask=mask, other=-float("inf"))
+        x = x - max_val
+        exp_x = tl.exp(x)
+        sum_exp = sum_exp + tl.sum(exp_x, axis=0)
 
-    # Remaining blocks accumulate the sum
-    for start_n in range(BLOCK_N, N, BLOCK_N):
-        offs_block = start_n + offs
-        mask = offs_block < N
-        x = tl.load(x_row_ptr + offs_block * stride_xn, mask=mask, other=-float('inf'))
-        exp_x = tl.exp(x - row_max)
-        row_sum = row_sum + tl.sum(exp_x, axis=0)
-        tl.store(y_row_ptr + offs_block * stride_yn, exp_x, mask=mask)
+    inv_sum = 1.0 / sum_exp
 
-    # -------------------------
-    # Pass 3: normalize stored exp values by row_sum
-    # -------------------------
-    offs = tl.arange(0, BLOCK_N)
-    # First block
-    mask = offs < N
-    exp_x = tl.load(y_row_ptr + offs * stride_yn, mask=mask, other=0.0)
-    softmax_x = exp_x / row_sum
-    tl.store(y_row_ptr + offs * stride_yn, softmax_x, mask=mask)
-
-    # Remaining blocks
-    for start_n in range(BLOCK_N, N, BLOCK_N):
-        offs_block = start_n + offs
-        mask = offs_block < N
-        exp_x = tl.load(y_row_ptr + offs_block * stride_yn, mask=mask, other=0.0)
-        softmax_x = exp_x / row_sum
-        tl.store(y_row_ptr + offs_block * stride_yn, softmax_x, mask=mask)
+    # 3) Normalize and write back in-place
+    for start_n in range(0, N, BLOCK_N):
+        idx = start_n + offs_n
+        mask = row_mask & (idx < N)
+        x = tl.load(x_ptr + base + idx, mask=mask, other=-float("inf"))
+        x = x - max_val
+        exp_x = tl.exp(x) * inv_sum
+        tl.store(x_ptr + base + idx, exp_x, mask=mask)
 
 
-def triton_softmax_lastdim(x: torch.Tensor) -> torch.Tensor:
+def triton_softmax_width_inplace(x: torch.Tensor) -> torch.Tensor:
     """
-    Softmax over the last dimension of x using Triton.
-    x: (..., W)
-    Returns tensor with same shape and dtype as x.
+    In-place softmax along width (dim = -1) for NCHW tensors.
+
+    Equivalent to:
+        x = F.softmax(x, dim=-1)
+    but implemented with a fused Triton kernel and no extra allocations.
+
+    Assumes:
+        - x is CUDA
+        - x is float32
+        - x is contiguous NCHW
     """
+    assert x.is_cuda, "triton_softmax_width_inplace requires a CUDA tensor"
+    assert x.dtype == torch.float32, "triton_softmax_width_inplace supports float32 only"
+    assert x.dim() == 4, "Expected NCHW 4D tensor"
+
     if x.numel() == 0:
         return x
 
-    orig_dtype = x.dtype
-    x_f = x.float().contiguous()  # compute in float32 for numerical stability
+    x = x.contiguous()
+    N, C, H, W = x.shape
 
-    last_dim = x_f.shape[-1]
-    x_2d = x_f.view(-1, last_dim)
-    M, N = x_2d.shape
+    # Flatten logical view to [M, W] without creating a new tensor
+    M = N * C * H
+    stride_xm = W  # row stride in elements for contiguous NCHW
 
-    y_2d = torch.empty_like(x_2d)
+    def grid(meta):
+        # One program per row
+        return (max(1, M),)
 
-    grid = lambda META: (M,)
+    softmax_width_inplace_kernel[grid](
+        x,
+        M,
+        W,
+        stride_xm,
+        BLOCK_N=256,  # power-of-2
+    )
+    return x
 
-    softmax_lastdim_kernel[grid](
-        x_2d, y_2d,
-        M, N,
-        x_2d.stride(0), x_2d.stride(1),
-        y_2d.stride(0), y_2d.stride(1),
+
+# -----------------------------
+# Triton MaxPool2d (k=2, s=2)
+# -----------------------------
+
+@triton.jit
+def maxpool2x2_kernel(
+    x_ptr, y_ptr,
+    N, C, H, W,
+    H_out, W_out,
+    total_out,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < total_out
+
+    idx = offs
+
+    wo = idx % W_out
+    tmp = idx // W_out
+    ho = tmp % H_out
+    tmp = tmp // H_out
+    c = tmp % C
+    n = tmp // C
+
+    hi = ho * 2
+    wi = wo * 2
+
+    base = ((n * C + c) * H + hi) * W + wi
+
+    idx00 = base
+    idx01 = base + 1
+    idx10 = base + W
+    idx11 = base + W + 1
+
+    x00 = tl.load(x_ptr + idx00, mask=mask, other=-float("inf"))
+    x01 = tl.load(x_ptr + idx01, mask=mask & (wi + 1 < W), other=-float("inf"))
+    x10 = tl.load(x_ptr + idx10, mask=mask & (hi + 1 < H), other=-float("inf"))
+    x11 = tl.load(
+        x_ptr + idx11,
+        mask=mask & (wi + 1 < W) & (hi + 1 < H),
+        other=-float("inf"),
     )
 
-    y = y_2d.view_as(x_f)
-    if orig_dtype != torch.float32:
-        y = y.to(orig_dtype)
+    m1 = tl.maximum(x00, x01)
+    m2 = tl.maximum(x10, x11)
+    m = tl.maximum(m1, m2)
+
+    tl.store(y_ptr + offs, m, mask=mask)
+
+
+def triton_maxpool2x2(x: torch.Tensor) -> torch.Tensor:
+    """
+    MaxPool2d with kernel_size=2, stride=2, no padding.
+    Equivalent to nn.MaxPool2d(2, 2) for NCHW tensors.
+    """
+    assert x.is_cuda, "triton_maxpool2x2 requires a CUDA tensor"
+    assert x.dim() == 4, "Expected NCHW input"
+    x = x.contiguous()
+    N, C, H, W = x.shape
+
+    if N == 0 or C == 0 or H == 0 or W == 0:
+        return x.new_empty((N, C, H // 2, W // 2))
+
+    assert H % 2 == 0 and W % 2 == 0, "H and W must be even for k=2, s=2"
+
+    H_out = H // 2
+    W_out = W // 2
+    y = torch.empty((N, C, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    total_out = N * C * H_out * W_out
+
+    def grid(meta):
+        return (max(1, triton.cdiv(total_out, meta["BLOCK"])),)
+
+    maxpool2x2_kernel[grid](
+        x, y,
+        N, C, H, W,
+        H_out, W_out,
+        total_out,
+        BLOCK=256,
+    )
     return y
 
 
 # -----------------------------
-# Network components
+# Conv+BatchNorm2d folding (eval-time fusion)
 # -----------------------------
-class DoubleConv(nn.Module):
+
+
+def fuse_conv_bn_eval(conv: nn.Conv2d, bn: nn.BatchNorm2d) -> nn.Conv2d:
     """
-    Two consecutive Conv2d + BatchNorm2d + Softmax(dim=-1),
-    with Softmax implemented via a Triton kernel.
+    Fuse Conv2d + BatchNorm2d into a single Conv2d for inference.
+
+    The resulting conv produces the same output as conv -> bn
+    when bn is in eval mode (using running_mean/var).
     """
+    assert isinstance(conv, nn.Conv2d)
+    assert isinstance(bn, nn.BatchNorm2d)
+
+    # Create a new conv with bias
+    fused_conv = nn.Conv2d(
+        conv.in_channels,
+        conv.out_channels,
+        conv.kernel_size,
+        stride=conv.stride,
+        padding=conv.padding,
+        dilation=conv.dilation,
+        groups=conv.groups,
+        bias=True,
+        padding_mode=conv.padding_mode,
+    ).to(conv.weight.device, conv.weight.dtype)
+
+    # Prepare parameters
+    w_conv = conv.weight.clone().view(conv.out_channels, -1)
+    if conv.bias is not None:
+        b_conv = conv.bias.clone()
+    else:
+        b_conv = torch.zeros(conv.out_channels, device=w_conv.device, dtype=w_conv.dtype)
+
+    gamma = bn.weight
+    beta = bn.bias
+    mean = bn.running_mean
+    var = bn.running_var
+    eps = bn.eps
+
+    inv_std = 1.0 / torch.sqrt(var + eps)
+
+    # w_fused[c, :] = w_conv[c, :] * (gamma[c] * inv_std[c])
+    scale = (gamma * inv_std).reshape(-1, 1)
+    w_fused = w_conv * scale
+    # b_fused[c] = beta[c] + gamma[c] * (b_conv[c] - mean[c]) * inv_std[c]
+    b_fused = beta + (b_conv - mean) * gamma * inv_std
+
+    fused_conv.weight.data.copy_(w_fused.view_as(conv.weight))
+    fused_conv.bias.data.copy_(b_fused)
+    fused_conv.requires_grad_(False)
+    return fused_conv
+
+
+# -----------------------------
+# Network definitions
+# -----------------------------
+
+
+class DoubleConvNew(nn.Module):
+    """
+    DoubleConv block with:
+        Conv2d -> BatchNorm2d -> Softmax(dim=-1) ->
+        Conv2d -> BatchNorm2d -> Softmax(dim=-1)
+
+    Optimizations:
+      * In eval mode, BatchNorm2d layers are folded into the preceding Conv2d
+        (Conv+BN fusion), eliminating BN from the forward path.
+      * Softmax over width is implemented by a Triton in-place kernel
+        without extra allocations or reshaping.
+    """
+
     def __init__(self, in_channels, out_channels):
         super().__init__()
+        # Original Conv + BN modules (used for training / for parameter storage)
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
         self.bn1 = nn.BatchNorm2d(out_channels)
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
         self.bn2 = nn.BatchNorm2d(out_channels)
 
-    def forward(self, x):
-        # First conv block
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = triton_softmax_lastdim(x)  # softmax over width (last dim)
+        # Fused versions used only in eval mode
+        self._fused = False
+        self.fused_conv1: nn.Conv2d | None = None
+        self.fused_conv2: nn.Conv2d | None = None
 
-        # Second conv block
-        x = self.conv2(x)
-        x = self.bn2(x)
-        x = triton_softmax_lastdim(x)  # softmax over width (last dim)
+    def _maybe_fuse_eval(self):
+        # Lazily fuse Conv+BN the first time we run in eval mode
+        if self._fused:
+            return
+        # Ensure BN uses running stats at fusion time
+        self.bn1.eval()
+        self.bn2.eval()
+        self.fused_conv1 = fuse_conv_bn_eval(self.conv1, self.bn1)
+        self.fused_conv2 = fuse_conv_bn_eval(self.conv2, self.bn2)
+        self._fused = True
+
+    def forward(self, x):
+        if self.training:
+            # Training path: keep full Conv+BN for correctness
+            x = self.conv1(x)
+            x = self.bn1(x)
+            x = triton_softmax_width_inplace(x)
+            x = self.conv2(x)
+            x = self.bn2(x)
+            x = triton_softmax_width_inplace(x)
+        else:
+            # Inference path: use fused Conv (Conv+BN folded) + Triton softmax
+            self._maybe_fuse_eval()
+            x = self.fused_conv1(x)
+            x = triton_softmax_width_inplace(x)
+            x = self.fused_conv2(x)
+            x = triton_softmax_width_inplace(x)
         return x
 
 
 class ModelNew(nn.Module):
+    """
+    U-Net-like architecture with:
+      * Conv+BN folded in DoubleConv blocks during eval
+      * Triton-optimized softmax over width
+      * Triton-optimized MaxPool2d with k=2, s=2
+    """
+
     def __init__(self, in_channels, out_channels, features):
-        """
-        U-Net-like model with Triton-accelerated Softmax in DoubleConv blocks.
-        :param in_channels: Number of input channels
-        :param out_channels: Number of output channels
-        :param features: Number of base features (doubled in each encoder layer)
-        """
         super(ModelNew, self).__init__()
-        self.encoder1 = DoubleConv(in_channels, features)
-        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
-        self.encoder2 = DoubleConv(features, features * 2)
-        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
-        self.encoder3 = DoubleConv(features * 2, features * 4)
-        self.pool3 = nn.MaxPool2d(kernel_size=2, stride=2)
-        self.encoder4 = DoubleConv(features * 4, features * 8)
-        self.pool4 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.encoder1 = DoubleConvNew(in_channels, features)
+        self.encoder2 = DoubleConvNew(features, features * 2)
+        self.encoder3 = DoubleConvNew(features * 2, features * 4)
+        self.encoder4 = DoubleConvNew(features * 4, features * 8)
 
-        self.bottleneck = DoubleConv(features * 8, features * 16)
+        self.bottleneck = DoubleConvNew(features * 8, features * 16)
 
-        self.upconv4 = nn.ConvTranspose2d(features * 16, features * 8, kernel_size=2, stride=2)
-        self.decoder4 = DoubleConv(features * 16, features * 8)
+        self.upconv4 = nn.ConvTranspose2d(
+            features * 16, features * 8, kernel_size=2, stride=2
+        )
+        self.decoder4 = DoubleConvNew(features * 16, features * 8)
 
-        self.upconv3 = nn.ConvTranspose2d(features * 8, features * 4, kernel_size=2, stride=2)
-        self.decoder3 = DoubleConv(features * 8, features * 4)
+        self.upconv3 = nn.ConvTranspose2d(
+            features * 8, features * 4, kernel_size=2, stride=2
+        )
+        self.decoder3 = DoubleConvNew(features * 8, features * 4)
 
-        self.upconv2 = nn.ConvTranspose2d(features * 4, features * 2, kernel_size=2, stride=2)
-        self.decoder2 = DoubleConv(features * 4, features * 2)
+        self.upconv2 = nn.ConvTranspose2d(
+            features * 4, features * 2, kernel_size=2, stride=2
+        )
+        # Correct in_channels after concatenation: features*2 (enc2) + features*2 (upconv2)
+        self.decoder2 = DoubleConvNew(features * 4, features * 2)
 
-        self.upconv1 = nn.ConvTranspose2d(features * 2, features, kernel_size=2, stride=2)
-        self.decoder1 = DoubleConv(features * 2, features)
+        self.upconv1 = nn.ConvTranspose2d(
+            features * 2, features, kernel_size=2, stride=2
+        )
+        self.decoder1 = DoubleConvNew(features * 2, features)
 
         self.final_conv = nn.Conv2d(features, out_channels, kernel_size=1)
 
     def forward(self, x):
-        """
-        :param x: Input tensor, shape (batch_size, in_channels, height, width)
-        :return: Output tensor, shape (batch_size, out_channels, height, width)
-        """
-        # Encoder
+        # Encoder with Triton MaxPool2d
         enc1 = self.encoder1(x)
-        enc2 = self.encoder2(self.pool1(enc1))
-        enc3 = self.encoder3(self.pool2(enc2))
-        enc4 = self.encoder4(self.pool3(enc3))
+        enc2 = self.encoder2(triton_maxpool2x2(enc1))
+        enc3 = self.encoder3(triton_maxpool2x2(enc2))
+        enc4 = self.encoder4(triton_maxpool2x2(enc3))
 
-        # Bottleneck
-        bottleneck = self.bottleneck(self.pool4(enc4))
+        bottleneck = self.bottleneck(triton_maxpool2x2(enc4))
 
-        # Decoder
+        # Decoder path
         dec4 = self.upconv4(bottleneck)
         dec4 = torch.cat((dec4, enc4), dim=1)
         dec4 = self.decoder4(dec4)
@@ -278,20 +447,29 @@ class ModelNew(nn.Module):
 ```
 
 [NCU PROFILING METRICS]
-No NCU metrics available (skipped for network-level model)
+No NCU metrics available
 
 **Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
 
-TRITON API CONSTRAINTS (CRITICAL):
-- Triton has NO: tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+## CRITICAL — Code MUST compile and run:
+1. EVERY kernel function MUST have `@triton.jit` decorator
+2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+3. BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+4. `tl.program_id(axis)` only supports axis = 0, 1, 2
+5. No `continue`, `break`, `return` inside loops — use masking
+6. No tensor indexing with loop vars: `x[:, i]` is INVALID
+7. mask shape MUST match data shape in tl.load/tl.store
 
-OUTPUT RULES (STRICT):
-1. Follow this exact order:
-   1. Imports: torch, torch.nn, triton, triton.language as tl
-   2. @triton.jit decorated kernel function(s)
-   3. Wrapper function(s) for grid calculation and kernel launch
-   4. class ModelNew(nn.Module) that calls your kernels
-2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+## Missing Triton Functions (implement manually):
+- tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+## OUTPUT FORMAT (STRICT):
+1. Imports: torch, torch.nn, triton, triton.language as tl
+2. @triton.jit decorated kernel function(s)
+3. Wrapper function(s) for grid calculation and kernel launch
+4. class ModelNew(nn.Module) that calls your kernels
+
+Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
 
 ```python
 # <optimized Triton code>

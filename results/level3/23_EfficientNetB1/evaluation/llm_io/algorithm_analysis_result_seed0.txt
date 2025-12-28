@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The Triton path is significantly slower than the PyTorch baseline and spends a lot of time on redundant memory traffic and kernel launches between tightly coupled ops (conv → BN → ReLU6).",
+  "bottleneck": "Each MBConv stage is decomposed into separate kernels for 1x1 GEMM, depthwise 3x3, BatchNorm, and ReLU6, forcing intermediate tensors to be written to and read from global memory multiple times and incurring many small kernel launches. The 1x1 conv implementation also adds layout convert/permute overhead around every GEMM.",
+  "optimisation method": "Operator fusion: fuse each (1x1 conv → BN → ReLU6) and (depthwise 3x3 → BN → ReLU6) sequence into a single Triton kernel that performs convolution, per-channel affine (BN in inference form), and activation in-register before a single global store.",
+  "modification plan": "First, switch BatchNorm to inference form inside the fused kernels (precompute γ, β from BN parameters and running stats so BN reduces to y = γ * x + β) and integrate this affine transform plus ReLU6 into the epilogue of the existing 1x1 and depthwise Triton kernels. Then, update MBConvBlockNew.forward to call the fused kernels directly (removing separate expand_bn/depthwise_bn calls and intervening ReLU6 ops) so that each expand and depthwise stage is a single kernel launch with only one read/write of feature maps. Finally, ensure the fused kernels operate on the native NCHW layout to avoid extra permute/reshape passes where possible, or at least keep data in the GEMM-friendly layout across fused steps within the block.",
+  "expected_speedup": "30-40%"
+}

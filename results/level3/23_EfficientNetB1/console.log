@@ -1,0 +1,155 @@
+[Seed] Generating seed kernel...
+[Seed 1/2] Generating...
+[92mFinish reason: stop[0m
+Usage: In=2336, Out=13270, Total=15606
+[seed_0] score=0.5641 (baseline=2.3026ms)
+[seed_0] metrics saved to: /home/hyc/LLMKernel/run/20251228_085453_batch_range11to24_openai_deepseek/23_EfficientNetB1/evaluation/eval_0025.json
+[Seed 1] Final score: 0.5641 ✓
+[Seed 2/2] Generating...
+[92mFinish reason: stop[0m
+Usage: In=2336, Out=15208, Total=17544
+[seed_1] score=0.9052 (baseline=2.3026ms)
+[seed_1] metrics saved to: /home/hyc/LLMKernel/run/20251228_085453_batch_range11to24_openai_deepseek/23_EfficientNetB1/evaluation/eval_0026.json
+[Seed 2] Final score: 0.9052 ✓
+
+================================================================================
+[Hybrid Strategy] Analyzing all seeds for algorithmic optimization...
+[Hybrid Strategy] - 2 seed(s) with score < 1.0 (rescue)
+================================================================================
+
+[Hybrid] Seed 1: score=0.5641 < 1.0
+[Hybrid] Attempting algorithm analysis rescue...
+[Hybrid] Requesting LLM analysis for seed 1...
+[92mFinish reason: stop[0m
+Usage: In=6024, Out=771, Total=6795
+[Hybrid] Worth optimizing: yes
+[Hybrid] Reason: The Triton path is significantly slower than the PyTorch baseline and spends a lot of time on redundant memory traffic and kernel launches between tightly coupled ops (conv → BN → ReLU6).
+[Hybrid] Analysis complete for seed 1, generating optimized kernel...
+[Hybrid] Bottleneck: Each MBConv stage is decomposed into separate kernels for 1x1 GEMM, depthwise 3x...
+[Hybrid] Optimization: Operator fusion: fuse each (1x1 conv → BN → ReLU6) and (depthwise 3x3 → BN → ReL...
+[Hybrid] Expected speedup: 30-40%
+[92mFinish reason: stop[0m
+Usage: In=6392, Out=12228, Total=18620
+[algorithm_optimized_seed0] score=0.9005 (baseline=2.3026ms)
+[algorithm_optimized_seed0] metrics saved to: /home/hyc/LLMKernel/run/20251228_085453_batch_range11to24_openai_deepseek/23_EfficientNetB1/evaluation/eval_0027.json
+[Hybrid] ✓ Rescue successful: 0.5641 → 0.9005
+
+[Hybrid] Seed 2: score=0.9052 < 1.0
+[Hybrid] Attempting algorithm analysis rescue...
+[Hybrid] Requesting LLM analysis for seed 2...
+[92mFinish reason: stop[0m
+Usage: In=5319, Out=1213, Total=6532
+[Hybrid] Worth optimizing: yes
+[Hybrid] Reason: The custom Triton path is slower than the PyTorch baseline, and a large portion of the overhead comes from avoidable full-tensor permutations around every 1x1 convolution.
+[Hybrid] Analysis complete for seed 2, generating optimized kernel...
+[Hybrid] Bottleneck: Each 1x1 convolution calls conv1x1_triton, which permutes NCHW→NHWC, makes the G...
+[Hybrid] Optimization: Adopt a channels-last (NHWC) activation layout end-to-end inside ModelNew and im...
+[Hybrid] Expected speedup: 20-30%
+[92mFinish reason: stop[0m
+Usage: In=5667, Out=14031, Total=19698
+[algorithm_optimized_seed1] score=1.0007 (baseline=2.3026ms)
+[algorithm_optimized_seed1] metrics saved to: /home/hyc/LLMKernel/run/20251228_085453_batch_range11to24_openai_deepseek/23_EfficientNetB1/evaluation/eval_0028.json
+[Hybrid] ✓ Rescue successful: 0.9052 → 1.0007
+
+================================================================================
+[Hybrid] Candidate Selection
+================================================================================
+[Hybrid] Total candidates: 4
+  [1] seed 1: 0.5641
+  [2] seed 2: 0.9052
+  [3] algo-optimized (from seed 1): 0.9005
+  [4] algo-optimized (from seed 2): 1.0007
+
+[Hybrid] ★ Selected best candidate: score=1.0007
+
+[Optimization] Starting 3-stage optimization...
+
+================================================================================
+[Stage 1/3] grid_and_parallel
+Description: Optimize grid layout and parallel work distribution across SMs.
+Current candidates: 1, best score: 1.0007
+================================================================================
+[Stage 1] Profiling best candidate...
+[Stage 1] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=5492, Out=11745, Total=17237
+[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 555, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251228_085453_batch_range11to24_openai_deepseek/23_EfficientNetB1/code/kernel_20251228_093009.py", line 578, in forward
+    x = self.mbconv1(x)
+        ^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251228_085453_batch_range11to24_openai_deepseek/23_EfficientNetB1/code/kernel_20251228_093009.py", line 500, in forward
+    x = conv1x1_triton(x, self.expand_weight)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251228_085453_batch_range11to24_openai_deepseek/23_EfficientNetB1/code/kernel_20251228_093009.py", line 408, in conv1x1_triton
+    conv1x1_nhwc_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 419, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 238, in run
+    benchmark()
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 227, in benchmark
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 227, in <dictcomp>
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 137, in _bench
+    raise ValueError(f"Conflicting meta-parameters: {', '.join(conflicts)}."
+ValueError: Conflicting meta-parameters: BLOCK_K, BLOCK_N, BLOCK_M. Make sure that you don't re-define auto-tuned symbols.
+
+[stage1_grid_and_parallel] failed. See metrics.message for details.
+[stage1_grid_and_parallel] metrics saved to: /home/hyc/LLMKernel/run/20251228_085453_batch_range11to24_openai_deepseek/23_EfficientNetB1/evaluation/eval_0029.json
+  Optimization failed, attempting repair...
+[92mFinish reason: stop[0m
+Usage: In=6840, Out=7389, Total=14229
+[stage1_grid_and_parallel_repair] score=1.0829 (baseline=2.3026ms)
+[stage1_grid_and_parallel_repair] metrics saved to: /home/hyc/LLMKernel/run/20251228_085453_batch_range11to24_openai_deepseek/23_EfficientNetB1/evaluation/eval_0030.json
+  Optimized kernel score: 1.0829 ✓
+[Stage 1] ★ New best score: 1.0829
+
+================================================================================
+[Stage 2/3] block_tiling
+Description: Tune BLOCK_M/N/K sizes for optimal register/memory balance.
+Current candidates: 1, best score: 1.0829
+================================================================================
+[Stage 2] Profiling best candidate...
+[Stage 2] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=5953, Out=8068, Total=14021
+[stage2_block_tiling] score=1.0595 (baseline=2.3026ms)
+[stage2_block_tiling] metrics saved to: /home/hyc/LLMKernel/run/20251228_085453_batch_range11to24_openai_deepseek/23_EfficientNetB1/evaluation/eval_0031.json
+  Optimized kernel score: 1.0595 ✓
+[Stage 2] Current: 1.0595 (global best: 1.0829)
+
+================================================================================
+[Stage 3/3] memory_and_tuning
+Description: Optimize memory access patterns and fine-tune num_stages/num_warps.
+Current candidates: 1, best score: 1.0829
+================================================================================
+[Stage 3] Profiling best candidate...
+[Stage 3] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=6154, Out=8849, Total=15003
+[stage3_memory_and_tuning] score=1.0726 (baseline=2.3026ms)
+[stage3_memory_and_tuning] metrics saved to: /home/hyc/LLMKernel/run/20251228_085453_batch_range11to24_openai_deepseek/23_EfficientNetB1/evaluation/eval_0032.json
+  Optimized kernel score: 1.0726 ✓
+[Stage 3] Current: 1.0726 (global best: 1.0829)
+[23_EfficientNetB1.py] Figure saved to: /home/hyc/LLMKernel/run/20251228_085453_batch_range11to24_openai_deepseek/23_EfficientNetB1/figures/23_EfficientNetB1_score.png

@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "Most compute and memory traffic is still in the PyTorch nn.TransformerEncoder, while Triton only accelerates relatively small linear layers (patch embedding + MLP head).",
+  "bottleneck": "The nn.TransformerEncoder runs self-attention and MLP as multiple unfused PyTorch kernels (separate QKV projections, matmuls, softmax, dropout, residuals, layer norms), causing high memory bandwidth usage and kernel launch overhead relative to the small sequence length (~197) and depth (6).",
+  "optimisation method": "Replace nn.TransformerEncoder with a custom Transformer block that uses a fused, FlashAttention-style Triton kernel (or PyTorch's scaled_dot_product_attention with flash backend) for multi-head attention, combined with Triton-fused linear+activation kernels for the MLP, thereby reducing intermediate reads/writes and kernel launches.",
+  "modification plan": "Implement a custom ViT encoder layer: (1) a Triton or SDPA-based attention module that computes Q/K/V, attention scores, softmax, and value aggregation in a single or few kernels (blockwise softmax, no explicit attention matrix materialization); (2) an MLP sub-block using the existing triton_linear_gelu for the first projection and triton_linear for the second, with residual and layer norm fused where feasible. Replace the nn.TransformerEncoder stack with a Python loop over these custom layers, keeping tensor shapes and interfaces compatible with the current model. This will concentrate the bulk of transformer compute into a handful of high-throughput, memory-efficient kernels.",
+  "expected_speedup": "30-40%"
+}

@@ -1,17 +1,17 @@
 # Kernel Benchmark Summary
 | 算子 | best_score | 状态 |
 | 1 | 1.26 | ✅ |
-| 2_Standard_matrix_multiplication | 1.04 | ✅ |
+| 2_Standard_matrix_multiplication | 1.3316 | ✅ |
 | 3_Batched_matrix_multiplication | 1.66 | ✅ |
 | 4_Matrix_vector_multiplication | 2.2 | ✅ |
 | 5_Matrix_scalar_multiplication | 1.01 | ✅ |
 | 6_Matmul_with_large_K_dimension | 1.26 | ✅ |
 | 7_Matmul_with_small_K_dimension | 0.9650 | ✅ |
-| 8_Matmul_with_irregular_shapes | 1.04 | ✅ |
-| 9_Tall_skinny_matrix_multiplication | 1.09 | ✅ |
+| 8_Matmul_with_irregular_shapes | 2.416 | ✅ |
+| 9_Tall_skinny_matrix_multiplication | 2.0729 | ✅ |
 | 10_3D_tensor_matrix_multiplication | 0.89 | ✅ |
-| 11 | 0.7896 | ✅ |
-| 12_Matmul_with_diagonal_matrices | 1.01 | ✅ |
+| 11 | 1.0682 | ✅ |
+| 12_Matmul_with_diagonal_matrices | 1.0255 | ✅ |
 | 13_Matmul_for_symmetric_matrices | 2.12 | ✅ |
 | 14_Matmul_for_upper_triangular_matrices | 1.1871 | ✅ |
 | 15_Matmul_for_lower_triangular_matrices | 1.05 | ✅ |
@@ -22,12 +22,12 @@
 | 20_LeakyReLU | 1.01 | ✅ |
 | 21_Sigmoid | 1.25 | ✅ |
 | 22_Tanh | 0.835 | ✅ |
-| 23_Softmax | 1.05 | ✅ |
+| 23_Softmax | 1.0829 | ✅ |
 | 24_LogSoftmax | 1.05 | ✅ |
 | 25_Swish | 1.3452 | ✅ |
-| 26_GELU | 1.01 | ✅ |
+| 26_GELU | 1.2724 | ✅ |
 | 27_SELU | 1.08 | ✅ |
-| 28_HardSigmoid | 1.01 | ✅ |
+| 28_HardSigmoid | 1.8211 | ✅ |
 | 29_Softplus | 1.14 | ✅ |
 | 30_Softsign | 1.216 | ✅ |
 | 31 | 3.539 | ✅ |
@@ -44,7 +44,7 @@
 | 42_Max_Pooling_2D | 1.8228 | ✅ |
 | 43_Max_Pooling_3D | 1.85 | ✅ |
 | 44 | 1.61 | ✅ |
-| 45_Average_Pooling_2D | 1.08 | ✅ |
+| 45_Average_Pooling_2D | 1.1591 | ✅ |
 | 46_Average_Pooling_3D | 1.41 | ✅ |
 | 47_Sum_reduction_over_a_dimension | 1.01 | ✅ |
 | 48_Mean_reduction_over_a_dimension | 1.17 | ✅ |

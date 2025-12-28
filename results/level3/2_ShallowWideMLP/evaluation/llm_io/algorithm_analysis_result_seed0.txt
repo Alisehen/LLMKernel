@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The current implementation launches one large matmul kernel per layer and writes/reads huge intermediate activations to/from global memory, which is expensive and still slower than the cuBLAS-based PyTorch baseline.",
+  "bottleneck": "Each hidden layer performs an independent matmul+bias+ReLU, writing its full output (e.g., 128×32768) to global memory and then reading it back for the next layer, plus incurring three separate kernel launches; this redundant activation traffic and launch overhead dominate once the GEMM itself is reasonably optimized.",
+  "optimisation method": "Fuse all linear+bias+ReLU layers into a single persistent Triton kernel that loops over layers inside the kernel, keeps the current activation tile in registers/shared memory, and only writes the final output to global memory, thus eliminating intermediate activation writes/reads and reducing kernel launches from three to one.",
+  "modification plan": "Refactor `ModelNew.forward` to call a single `triton_fused_mlp` kernel instead of `triton_linear` per layer, passing arrays of weight/bias pointers and per-layer sizes. Inside the fused kernel, tile over (M, feature) as now, but add an outer loop over layers: for each layer, run the K-loop matmul using the current activation tile as A, add bias and apply ReLU (except last), and keep the result tile in registers/shared memory for the next layer instead of storing to global. After the final layer, store only the last layer's output tile to `c_ptr`, handling variable `K`/`N` per layer via metadata and masks.",
+  "expected_speedup": "15-25%"
+}

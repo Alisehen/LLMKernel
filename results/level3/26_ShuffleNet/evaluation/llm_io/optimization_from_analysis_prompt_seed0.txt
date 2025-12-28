@@ -1,0 +1,833 @@
+You are optimizing a Triton kernel based on algorithmic analysis.
+
+# PyTorch Reference (Target Behavior)
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class ShuffleNetUnit(nn.Module):
+    def __init__(self, in_channels, out_channels, groups=3):
+        """
+        ShuffleNet unit implementation.
+
+        :param in_channels: Number of input channels.
+        :param out_channels: Number of output channels.
+        :param groups: Number of groups for group convolution.
+        """
+        super(ShuffleNetUnit, self).__init__()
+        
+        # Ensure the output channels are divisible by groups
+        assert out_channels % 4 == 0
+        mid_channels = out_channels // 4
+        
+        # First 1x1 group convolution
+        self.conv1 = nn.Conv2d(in_channels, mid_channels, kernel_size=1, stride=1, padding=0, groups=groups, bias=False)
+        self.bn1 = nn.BatchNorm2d(mid_channels)
+        
+        # Depthwise 3x3 convolution
+        self.conv2 = nn.Conv2d(mid_channels, mid_channels, kernel_size=3, stride=1, padding=1, groups=mid_channels, bias=False)
+        self.bn2 = nn.BatchNorm2d(mid_channels)
+        
+        # Second 1x1 group convolution
+        self.conv3 = nn.Conv2d(mid_channels, out_channels, kernel_size=1, stride=1, padding=0, groups=groups, bias=False)
+        self.bn3 = nn.BatchNorm2d(out_channels)
+        
+        # Shuffle operation
+        self.shuffle = ChannelShuffle(groups)
+        
+        # Shortcut connection if input and output channels are the same
+        if in_channels == out_channels:
+            self.shortcut = nn.Sequential()
+        else:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0, bias=False),
+                nn.BatchNorm2d(out_channels)
+            )
+    
+    def forward(self, x):
+        """
+        Forward pass for ShuffleNet unit.
+
+        :param x: Input tensor, shape (batch_size, in_channels, height, width)
+        :return: Output tensor, shape (batch_size, out_channels, height, width)
+        """
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out = self.shuffle(out)
+        out = F.relu(self.bn3(self.conv3(out)))
+        
+        out += self.shortcut(x)
+        return out
+
+class ChannelShuffle(nn.Module):
+    def __init__(self, groups):
+        """
+        Channel shuffle operation.
+
+        :param groups: Number of groups for shuffling.
+        """
+        super(ChannelShuffle, self).__init__()
+        self.groups = groups
+    
+    def forward(self, x):
+        """
+        Forward pass for channel shuffle.
+
+        :param x: Input tensor, shape (batch_size, channels, height, width)
+        :return: Output tensor, shape (batch_size, channels, height, width)
+        """
+        batch_size, channels, height, width = x.size()
+        channels_per_group = channels // self.groups
+        
+        # Reshape
+        x = x.view(batch_size, self.groups, channels_per_group, height, width)
+        
+        # Transpose
+        x = x.transpose(1, 2).contiguous()
+        
+        # Flatten
+        x = x.view(batch_size, -1, height, width)
+        
+        return x
+
+class Model(nn.Module):
+    def __init__(self, num_classes=1000, groups=3, stages_repeats=[3, 7, 3], stages_out_channels=[24, 240, 480, 960]):
+        """
+        ShuffleNet architecture.
+
+        :param num_classes: Number of output classes.
+        :param groups: Number of groups for group convolution.
+        :param stages_repeats: List of ints specifying the number of repeats for each stage.
+        :param stages_out_channels: List of ints specifying the output channels for each stage.
+        """
+        super(Model, self).__init__()
+        
+        self.conv1 = nn.Conv2d(3, stages_out_channels[0], kernel_size=3, stride=2, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(stages_out_channels[0])
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        
+        self.stage2 = self._make_stage(stages_out_channels[0], stages_out_channels[1], stages_repeats[0], groups)
+        self.stage3 = self._make_stage(stages_out_channels[1], stages_out_channels[2], stages_repeats[1], groups)
+        self.stage4 = self._make_stage(stages_out_channels[2], stages_out_channels[3], stages_repeats[2], groups)
+        
+        self.conv5 = nn.Conv2d(stages_out_channels[3], 1024, kernel_size=1, stride=1, padding=0, bias=False)
+        self.bn5 = nn.BatchNorm2d(1024)
+        
+        self.fc = nn.Linear(1024, num_classes)
+    
+    def _make_stage(self, in_channels, out_channels, repeats, groups):
+        """
+        Helper function to create a stage of ShuffleNet units.
+
+        :param in_channels: Number of input channels.
+        :param out_channels: Number of output channels.
+        :param repeats: Number of ShuffleNet units in the stage.
+        :param groups: Number of groups for group convolution.
+        :return: nn.Sequential containing the stage.
+        """
+        layers = []
+        layers.append(ShuffleNetUnit(in_channels, out_channels, groups))
+        for _ in range(1, repeats):
+            layers.append(ShuffleNetUnit(out_channels, out_channels, groups))
+        return nn.Sequential(*layers)
+    
+    def forward(self, x):
+        """
+        Forward pass for ShuffleNet.
+
+        :param x: Input tensor, shape (batch_size, 3, height, width)
+        :return: Output tensor, shape (batch_size, num_classes)
+        """
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = self.maxpool(x)
+        
+        x = self.stage2(x)
+        x = self.stage3(x)
+        x = self.stage4(x)
+        
+        x = F.relu(self.bn5(self.conv5(x)))
+        x = F.adaptive_avg_pool2d(x, (1, 1))
+        x = x.view(x.size(0), -1)
+        x = self.fc(x)
+        
+        return x
+
+# Test code
+batch_size = 10
+input_channels = 3
+height = 224
+width = 224
+num_classes = 1000
+
+def get_inputs():
+    return [torch.rand(batch_size, input_channels, height, width)]
+
+def get_init_inputs():
+    return [num_classes]
+```
+
+**CRITICAL**: Study the PyTorch code carefully to understand:
+- What does `forward()` return? (full output sequence vs final hidden state only)
+- What is the computational pattern?
+- What are the input/output shapes?
+
+Your optimized kernel MUST match this exact behavior.
+
+---
+
+# Analysis Results
+
+**Bottleneck**: Each unit executes 4–5 custom kernels (1x1 group conv, depthwise 3x3, channel shuffle, 1x1 group conv, shortcut conv) plus separate BatchNorm and ReLU kernels, so intermediate feature maps are repeatedly written to and read from DRAM with small arithmetic intensity and high launch overhead.
+
+**Optimization Strategy**: Fuse the hot per-unit operator chains into a small number of composite kernels, e.g. implement a fused `1x1_group_conv + BN + ReLU` kernel (and similarly `depthwise_3x3 + BN`, `1x1_group_conv + BN + ReLU`, and optionally residual add) so that intermediate tensors stay in registers/shared memory instead of round-tripping to global memory.
+
+**Implementation Plan**: Start with the first path in `ShuffleNetUnitNew`: extend the existing `conv1x1_group_kernel` to (1) accept BN parameters (gamma, beta, running_mean, running_var, eps) and apply the affine normalization to the accumulator before storing, and (2) optionally apply ReLU in-kernel. Replace the current sequence `conv1x1_group_triton -> bn1 -> ReLU` by a single fused Triton call, then repeat the pattern for `conv2+bn2` and `conv3+bn3+ReLU` (and for the shortcut conv+BN). This reduces the number of global reads/writes for each feature map from 3–4 to 1 per stage and cuts kernel launches, which should recover and likely surpass the PyTorch baseline.
+
+**Expected Speedup**: 30-40% vs current Triton implementation (bringing it to ~1.0–1.1x of the PyTorch baseline for this model).
+
+---
+
+# Current Kernel (needs optimization)
+
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+import torch.nn.functional as F
+
+
+# -----------------------
+# Triton 1x1 Group Conv
+# -----------------------
+@triton.jit
+def conv1x1_group_kernel(
+    x_ptr, w_ptr, y_ptr,
+    B, H, W,
+    C_in, C_out,
+    groups,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_wo, stride_wi,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    BLOCK_M: tl.constexpr,  # tiles over B*H*W
+    BLOCK_N: tl.constexpr,  # tiles over C_out_per_group
+    BLOCK_K: tl.constexpr,  # tiles over C_in_per_group
+):
+    pid_m = tl.program_id(0)  # along M = B*H*W
+    pid_n = tl.program_id(1)  # along N_per_group
+    pid_g = tl.program_id(2)  # group index
+
+    M = B * H * W
+    K_per_g = C_in // groups
+    N_per_g = C_out // groups
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # [BLOCK_M]
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # [BLOCK_N]
+    offs_k = tl.arange(0, BLOCK_K)                    # [BLOCK_K]
+
+    m_mask = offs_m < M
+    n_mask = offs_n < N_per_g
+
+    # Map m -> (b, h, w)
+    HW = H * W
+    b_idx = offs_m // HW
+    rem_hw = offs_m - b_idx * HW
+    h_idx = rem_hw // W
+    w_idx = rem_hw - h_idx * W
+
+    # Group offsets
+    c_base = pid_g * K_per_g
+    oc_base = pid_g * N_per_g
+
+    # Broadcasted indices
+    b_broad = b_idx[:, None]
+    h_broad = h_idx[:, None]
+    w_broad = w_idx[:, None]
+    oc_idx = oc_base + offs_n[None, :]  # [1, BLOCK_N]
+
+    # Initialize accumulator
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # K-loop over C_in_per_group
+    k = 0
+    while k < K_per_g:
+        k_offsets = k + offs_k  # [BLOCK_K]
+        k_mask = k_offsets < K_per_g
+
+        c_idx = c_base + k_offsets  # [BLOCK_K]
+
+        # A: X[n, c, h, w]
+        c_broad = c_idx[None, :]  # [1, BLOCK_K]
+        a_ptrs = (
+            x_ptr
+            + b_broad * stride_xn
+            + c_broad * stride_xc
+            + h_broad * stride_xh
+            + w_broad * stride_xw
+        )
+        a_mask = m_mask[:, None] & k_mask[None, :]
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+
+        # B: W[oc, ic]
+        ic_broad = c_idx[:, None]  # [BLOCK_K, 1]
+        b_ptrs = (
+            w_ptr
+            + oc_idx * stride_wo
+            + ic_broad * stride_wi
+        )
+        b_mask = k_mask[:, None] & n_mask[None, :]
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+        acc += tl.dot(a, b, allow_tf32=True)
+        k += BLOCK_K
+
+    # Store Y[n, oc, h, w]
+    y_ptrs = (
+        y_ptr
+        + b_broad * stride_yn
+        + oc_idx * stride_yc
+        + h_broad * stride_yh
+        + w_broad * stride_yw
+    )
+    y_mask = m_mask[:, None] & n_mask[None, :]
+    tl.store(y_ptrs, acc, mask=y_mask)
+
+
+def conv1x1_group_triton(x: torch.Tensor, weight: torch.Tensor, groups: int) -> torch.Tensor:
+    """
+    x: (B, C_in, H, W), contiguous NCHW
+    weight: (C_out, C_in/groups, 1, 1) as in Conv2d
+    groups: number of groups
+    """
+    assert x.is_cuda and weight.is_cuda
+    B, C_in, H, W = x.shape
+    C_out = weight.shape[0]
+    x_ = x.contiguous()
+    w_ = weight.contiguous()
+
+    y = torch.empty((B, C_out, H, W), device=x.device, dtype=x.dtype)
+
+    grid = lambda META: (
+        triton.cdiv(B * H * W, META['BLOCK_M']),
+        triton.cdiv(C_out // groups, META['BLOCK_N']),
+        groups,
+    )
+
+    conv1x1_group_kernel[grid](
+        x_, w_, y,
+        B, H, W,
+        C_in, C_out,
+        groups,
+        x_.stride(0), x_.stride(1), x_.stride(2), x_.stride(3),
+        w_.stride(0), w_.stride(1),
+        y.stride(0), y.stride(1), y.stride(2), y.stride(3),
+        BLOCK_M=64, BLOCK_N=64, BLOCK_K=32,
+    )
+    return y
+
+
+# -----------------------
+# Triton Depthwise 3x3 Conv (stride=1, padding=1)
+# -----------------------
+@triton.jit
+def depthwise_conv3x3_kernel(
+    x_ptr, w_ptr, y_ptr,
+    B, C, H, W,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_wc, stride_wkh, stride_wkw,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    BLOCK_NC: tl.constexpr,  # tiles over B*C
+    BLOCK_HW: tl.constexpr,  # tiles over H*W
+):
+    pid_nc = tl.program_id(0)
+    pid_hw = tl.program_id(1)
+
+    NC = B * C
+    HW = H * W
+
+    offs_nc = pid_nc * BLOCK_NC + tl.arange(0, BLOCK_NC)
+    offs_hw = pid_hw * BLOCK_HW + tl.arange(0, BLOCK_HW)
+
+    nc_mask = offs_nc < NC
+    hw_mask = offs_hw < HW
+
+    # Map nc -> (n, c)
+    n_idx = offs_nc // C
+    c_idx = offs_nc - n_idx * C
+
+    # Map hw -> (h, w)
+    h_idx = offs_hw // W
+    w_idx = offs_hw - h_idx * W
+
+    n_broad = n_idx[:, None]
+    c_broad = c_idx[:, None]
+    h_broad = h_idx[None, :]
+    w_broad = w_idx[None, :]
+
+    base_mask = nc_mask[:, None] & hw_mask[None, :]
+
+    acc = tl.zeros((BLOCK_NC, BLOCK_HW), dtype=tl.float32)
+
+    for ky in range(3):
+        for kx in range(3):
+            dh = ky - 1
+            dw = kx - 1
+
+            hi = h_broad + dh
+            wi = w_broad + dw
+
+            in_bounds = (hi >= 0) & (hi < H) & (wi >= 0) & (wi < W)
+            mask = base_mask & in_bounds
+
+            in_ptrs = (
+                x_ptr
+                + n_broad * stride_xn
+                + c_broad * stride_xc
+                + hi * stride_xh
+                + wi * stride_xw
+            )
+            x_val = tl.load(in_ptrs, mask=mask, other=0.0)
+
+            # weight: (C, 1, 3, 3)
+            w_ptrs = (
+                w_ptr
+                + c_idx * stride_wc
+                + ky * stride_wkh
+                + kx * stride_wkw
+            )
+            w_val = tl.load(w_ptrs, mask=nc_mask, other=0.0)  # [BLOCK_NC]
+            w_val_2d = w_val[:, None]
+
+            acc += x_val * w_val_2d
+
+    out_ptrs = (
+        y_ptr
+        + n_broad * stride_yn
+        + c_broad * stride_yc
+        + h_broad * stride_yh
+        + w_broad * stride_yw
+    )
+    tl.store(out_ptrs, acc, mask=base_mask)
+
+
+def depthwise_conv3x3_triton(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """
+    x: (B, C, H, W)
+    weight: (C, 1, 3, 3) depthwise (groups=C)
+    stride=1, padding=1, bias=False
+    """
+    assert x.is_cuda and weight.is_cuda
+    B, C, H, W = x.shape
+    x_ = x.contiguous()
+    w_ = weight.contiguous()
+
+    y = torch.empty_like(x_)
+
+    grid = lambda META: (
+        triton.cdiv(B * C, META['BLOCK_NC']),
+        triton.cdiv(H * W, META['BLOCK_HW']),
+    )
+
+    depthwise_conv3x3_kernel[grid](
+        x_, w_, y,
+        B, C, H, W,
+        x_.stride(0), x_.stride(1), x_.stride(2), x_.stride(3),
+        w_.stride(0), w_.stride(2), w_.stride(3),
+        y.stride(0), y.stride(1), y.stride(2), y.stride(3),
+        BLOCK_NC=32, BLOCK_HW=64,
+    )
+    return y
+
+
+# -----------------------
+# Triton Channel Shuffle
+# -----------------------
+@triton.jit
+def channel_shuffle_kernel(
+    x_ptr, y_ptr,
+    B, C, H, W, groups,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    BLOCK_E: tl.constexpr,  # tiles over C*H*W per batch
+):
+    pid_b = tl.program_id(0)
+    pid_e = tl.program_id(1)
+
+    E = C * H * W
+    offs_e = pid_e * BLOCK_E + tl.arange(0, BLOCK_E)
+    mask = offs_e < E
+
+    HW = H * W
+    channels_per_group = C // groups
+
+    c_idx = offs_e // HW
+    rem = offs_e - c_idx * HW
+    h_idx = rem // W
+    w_idx = rem - h_idx * W
+
+    g_idx = c_idx // channels_per_group
+    cpg_idx = c_idx - g_idx * channels_per_group
+    c_new = cpg_idx * groups + g_idx
+
+    in_ptrs = (
+        x_ptr
+        + pid_b * stride_xn
+        + c_idx * stride_xc
+        + h_idx * stride_xh
+        + w_idx * stride_xw
+    )
+    out_ptrs = (
+        y_ptr
+        + pid_b * stride_yn
+        + c_new * stride_yc
+        + h_idx * stride_yh
+        + w_idx * stride_yw
+    )
+
+    val = tl.load(in_ptrs, mask=mask, other=0.0)
+    tl.store(out_ptrs, val, mask=mask)
+
+
+def channel_shuffle_triton(x: torch.Tensor, groups: int) -> torch.Tensor:
+    """
+    x: (B, C, H, W)
+    groups: number of groups
+    """
+    assert x.is_cuda
+    B, C, H, W = x.shape
+    x_ = x.contiguous()
+    y = torch.empty_like(x_)
+
+    grid = lambda META: (
+        B,
+        triton.cdiv(C * H * W, META['BLOCK_E']),
+    )
+
+    channel_shuffle_kernel[grid](
+        x_, y,
+        B, C, H, W, groups,
+        x_.stride(0), x_.stride(1), x_.stride(2), x_.stride(3),
+        y.stride(0), y.stride(1), y.stride(2), y.stride(3),
+        BLOCK_E=256,
+    )
+    return y
+
+
+# -----------------------
+# Triton Linear (GEMM + bias)
+# -----------------------
+@triton.jit
+def linear_kernel(
+    a_ptr, b_ptr, bias_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # rows (M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # cols (N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    m_mask = offs_m < M
+    n_mask = offs_n < N
+
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    k = 0
+    while k < K:
+        k_rem = K - k
+        k_mask = offs_k < k_rem
+
+        a = tl.load(a_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
+        b = tl.load(b_ptrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0)
+
+        acc += tl.dot(a, b, allow_tf32=True)
+
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+        k += BLOCK_K
+
+    # Add bias
+    bias = tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0)
+    acc += bias[None, :]
+
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    tl.store(c_ptrs, acc, mask=m_mask[:, None] & n_mask[None, :])
+
+
+def linear_triton(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    x: (M, K)
+    weight: (N, K)  (same as nn.Linear out_features x in_features)
+    bias: (N,)
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+    M, K = x.shape
+    N = weight.shape[0]
+
+    a = x.contiguous()
+    # Use weight^T as (K, N)
+    b = weight.t().contiguous()
+
+    c = torch.empty((M, N), device=x.device, dtype=x.dtype)
+
+    grid = lambda META: (
+        triton.cdiv(M, META['BLOCK_M']),
+        triton.cdiv(N, META['BLOCK_N']),
+    )
+
+    linear_kernel[grid](
+        a, b, bias, c,
+        M, N, K,
+        a.stride(0), a.stride(1),
+        b.stride(0), b.stride(1),
+        c.stride(0), c.stride(1),
+        BLOCK_M=128, BLOCK_N=128, BLOCK_K=32,
+    )
+    return c
+
+
+# -----------------------
+# High-performance ShuffleNet
+# -----------------------
+class ChannelShuffleNew(nn.Module):
+    def __init__(self, groups: int):
+        super(ChannelShuffleNew, self).__init__()
+        self.groups = groups
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return channel_shuffle_triton(x, self.groups)
+
+
+class ShuffleNetUnitNew(nn.Module):
+    def __init__(self, in_channels, out_channels, groups=3):
+        super(ShuffleNetUnitNew, self).__init__()
+
+        assert out_channels % 4 == 0
+        mid_channels = out_channels // 4
+
+        # First 1x1 group conv
+        self.conv1 = nn.Conv2d(
+            in_channels,
+            mid_channels,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+            groups=groups,
+            bias=False,
+        )
+        self.bn1 = nn.BatchNorm2d(mid_channels)
+
+        # Depthwise 3x3 conv (groups = mid_channels)
+        self.conv2 = nn.Conv2d(
+            mid_channels,
+            mid_channels,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            groups=mid_channels,
+            bias=False,
+        )
+        self.bn2 = nn.BatchNorm2d(mid_channels)
+
+        # Second 1x1 group conv
+        self.conv3 = nn.Conv2d(
+            mid_channels,
+            out_channels,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+            groups=groups,
+            bias=False,
+        )
+        self.bn3 = nn.BatchNorm2d(out_channels)
+
+        self.shuffle = ChannelShuffleNew(groups)
+
+        if in_channels == out_channels:
+            self.use_shortcut_conv = False
+            self.shortcut_conv = None
+            self.shortcut_bn = None
+        else:
+            self.use_shortcut_conv = True
+            self.shortcut_conv = nn.Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size=1,
+                stride=1,
+                padding=0,
+                bias=False,
+            )
+            self.shortcut_bn = nn.BatchNorm2d(out_channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Main path
+        out = conv1x1_group_triton(x, self.conv1.weight, groups=self.conv1.groups)
+        out = self.bn1(out)
+        out = F.relu(out, inplace=False)
+
+        out = depthwise_conv3x3_triton(out, self.conv2.weight)
+        out = self.bn2(out)
+
+        out = self.shuffle(out)
+
+        out = conv1x1_group_triton(out, self.conv3.weight, groups=self.conv3.groups)
+        out = self.bn3(out)
+        out = F.relu(out, inplace=False)
+
+        # Shortcut
+        if self.use_shortcut_conv:
+            shortcut = conv1x1_group_triton(
+                x, self.shortcut_conv.weight, groups=self.shortcut_conv.groups
+            )
+            shortcut = self.shortcut_bn(shortcut)
+        else:
+            shortcut = x
+
+        out = out + shortcut
+        return out
+
+
+class ModelNew(nn.Module):
+    def __init__(
+        self,
+        num_classes=1000,
+        groups=3,
+        stages_repeats=[3, 7, 3],
+        stages_out_channels=[24, 240, 480, 960],
+    ):
+        super(ModelNew, self).__init__()
+
+        # Stem conv (3x3, stride=2) – keep PyTorch conv as is
+        self.conv1 = nn.Conv2d(
+            3,
+            stages_out_channels[0],
+            kernel_size=3,
+            stride=2,
+            padding=1,
+            bias=False,
+        )
+        self.bn1 = nn.BatchNorm2d(stages_out_channels[0])
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+
+        self.stage2 = self._make_stage(
+            stages_out_channels[0],
+            stages_out_channels[1],
+            stages_repeats[0],
+            groups,
+        )
+        self.stage3 = self._make_stage(
+            stages_out_channels[1],
+            stages_out_channels[2],
+            stages_repeats[1],
+            groups,
+        )
+        self.stage4 = self._make_stage(
+            stages_out_channels[2],
+            stages_out_channels[3],
+            stages_repeats[2],
+            groups,
+        )
+
+        # Final 1x1 conv -> 1024 channels (use Triton 1x1 conv)
+        self.conv5 = nn.Conv2d(
+            stages_out_channels[3],
+            1024,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+            bias=False,
+        )
+        self.bn5 = nn.BatchNorm2d(1024)
+
+        self.fc = nn.Linear(1024, num_classes)
+
+    def _make_stage(self, in_channels, out_channels, repeats, groups):
+        layers = []
+        layers.append(ShuffleNetUnitNew(in_channels, out_channels, groups))
+        for _ in range(1, repeats):
+            layers.append(ShuffleNetUnitNew(out_channels, out_channels, groups))
+        return nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Stem
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = F.relu(x, inplace=False)
+        x = self.maxpool(x)
+
+        # Stages
+        x = self.stage2(x)
+        x = self.stage3(x)
+        x = self.stage4(x)
+
+        # Final 1x1 conv (Triton)
+        x = conv1x1_group_triton(x, self.conv5.weight, groups=self.conv5.groups)
+        x = self.bn5(x)
+        x = F.relu(x, inplace=False)
+
+        # Global pooling and FC (Triton)
+        x = F.adaptive_avg_pool2d(x, (1, 1))
+        x = x.view(x.size(0), -1)
+        x = linear_triton(x, self.fc.weight, self.fc.bias)
+        return x
+```
+
+---
+
+# Your Task
+
+Implement the optimization strategy above. Focus on the specific bottleneck identified.
+
+## Key Requirements
+
+1. **Preserve correctness**: Maintain the same input/output behavior
+2. **Apply the optimization**: Follow the implementation plan exactly
+3. **Use valid Triton syntax**:
+   - Every kernel MUST have `@triton.jit` decorator
+   - Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+   - BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+   - No `continue`, `break`, `return` inside kernels (use masking)
+   - Prefer `tl.dot(a, b, allow_tf32=True)` for matmul operations
+
+4. **CRITICAL for RNN/GRU/LSTM Persistent Kernels**:
+   - Time loop MUST be inside @triton.jit kernel, NOT in Python forward()
+   - **HYBRID computation strategy** (CRITICAL for performance):
+     * Precompute input-side gates OUTSIDE kernel: `gates_x = (T*B, In) @ W_ih` (ONE large GEMM)
+     * INSIDE kernel: only recurrent-side: `for t: gates_h = h @ W_hh` (T small GEMMs)
+   - CORRECT (FAST - use this):
+     ```python
+     # Python forward():
+     gates_x_all = x.reshape(T*B, In) @ W_ih + b_ih  # ONE large GEMM
+     gates_x_all = gates_x_all.view(T, B, 3*H)
+     gru_persistent_kernel[grid](gates_x_all, h0, W_hh, ...)  # Launch ONCE
+
+     @triton.jit
+     def gru_persistent_kernel(gates_x_ptr, h_ptr, W_hh_ptr, ...):
+         for t in range(T):  # Inside kernel
+             gates_x_t = tl.load(gates_x_ptr + t*...)  # Precomputed
+             gates_h = h @ W_hh  # Only recurrent GEMM
+             h = (1-z)*n + z*h   # Fuse and update
+     ```
+
+5. **Output format**:
+   - Imports: `import torch, torch.nn as nn, triton, triton.language as tl`
+   - `@triton.jit` kernel(s)
+   - Wrapper function(s)
+   - `class ModelNew(nn.Module)` — REQUIRED
+   - NO testing code, NO `if __name__ == "__main__"`
+
+---
+
+Generate the optimized kernel now. Output ONLY the complete Python code.

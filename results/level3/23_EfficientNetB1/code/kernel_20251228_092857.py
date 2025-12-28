@@ -1,0 +1,513 @@
+import torch, torch.nn as nn, triton, triton.language as tl
+import torch.nn.functional as F
+
+
+# ----------------------------
+# Triton GEMM w/ optional bias
+# ----------------------------
+
+@triton.jit
+def matmul_bias_kernel(
+    a_ptr, b_ptr, bias_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    HAS_BIAS: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k in range(0, K, BLOCK_K):
+        k_offsets = k + offs_k
+        mask_k_a = k_offsets[None, :] < K          # (1, BLOCK_K)
+        mask_k_b = k_offsets[:, None] < K          # (BLOCK_K, 1)
+
+        a = tl.load(
+            a_ptrs,
+            mask=(offs_m[:, None] < M) & mask_k_a,
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptrs,
+            mask=mask_k_b & (offs_n[None, :] < N),
+            other=0.0,
+        )
+        acc += tl.dot(a, b, allow_tf32=True)
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    if HAS_BIAS:
+        bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+        acc += bias[None, :]
+
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    tl.store(
+        c_ptrs,
+        acc,
+        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+    )
+
+
+def triton_matmul(a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor = None) -> torch.Tensor:
+    """
+    High-performance GEMM: C = A @ B (+ bias), using Triton.
+
+    A: [M, K], B: [K, N], bias: [N]
+    """
+    assert a.is_cuda and b.is_cuda, "Inputs must be CUDA tensors"
+    assert a.dtype == torch.float32 and b.dtype == torch.float32, "Only float32 supported"
+    M, K = a.shape
+    Kb, N = b.shape
+    assert K == Kb, "Incompatible shapes for matmul"
+
+    a = a.contiguous()
+    b = b.contiguous()
+
+    c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+    has_bias = bias is not None
+    if has_bias:
+        bias = bias.contiguous()
+
+    BLOCK_M = 64
+    BLOCK_N = 64
+    BLOCK_K = 32
+
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_M"]),
+        triton.cdiv(N, META["BLOCK_N"]),
+    )
+
+    matmul_bias_kernel[grid](
+        a, b, bias if has_bias else a, c,
+        M, N, K,
+        a.stride(0), a.stride(1),
+        b.stride(0), b.stride(1),
+        c.stride(0), c.stride(1),
+        HAS_BIAS=has_bias,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+    )
+    return c
+
+
+# ----------------------------
+# Depthwise 3x3 Conv (NHWC, stride 1/2, padding 1)
+# ----------------------------
+
+@triton.jit
+def depthwise_conv3x3_nhwc_kernel(
+    x_ptr, w_ptr, y_ptr,
+    N, H, W, C,
+    H_out, W_out,
+    stride_hw, pad_hw,
+    stride_xn, stride_xh, stride_xw, stride_xc,
+    stride_yn, stride_yh, stride_yw, stride_yc,
+    stride_wo, stride_wi, stride_wh, stride_ww,
+    BLOCK_HW: tl.constexpr,
+):
+    # program_id over (n, c) and spatial locations
+    pid_nc = tl.program_id(0)
+    pid_hw = tl.program_id(1)
+
+    nc = pid_nc
+    n = nc // C
+    c = nc % C
+
+    offs_hw = pid_hw * BLOCK_HW + tl.arange(0, BLOCK_HW)
+    total_hw = H_out * W_out
+    mask_hw = offs_hw < total_hw
+
+    h_out = offs_hw // W_out
+    w_out = offs_hw % W_out
+
+    in_h0 = h_out * stride_hw - pad_hw
+    in_w0 = w_out * stride_hw - pad_hw
+
+    base_x = x_ptr + n * stride_xn + c * stride_xc
+    base_y = y_ptr + n * stride_yn + c * stride_yc
+    base_w = w_ptr + c * stride_wo  # [C, 1, 3, 3]
+
+    acc = tl.zeros((BLOCK_HW,), dtype=tl.float32)
+
+    for kh in range(3):
+        in_h = in_h0 + kh
+        valid_h = (in_h >= 0) & (in_h < H)
+        for kw in range(3):
+            in_w = in_w0 + kw
+            valid_w = (in_w >= 0) & (in_w < W)
+            mask = mask_hw & valid_h & valid_w
+
+            x_ptrs = base_x + in_h * stride_xh + in_w * stride_xw
+            x_vals = tl.load(x_ptrs, mask=mask, other=0.0)
+
+            w_val = tl.load(base_w + kh * stride_wh + kw * stride_ww)
+            acc += x_vals * w_val
+
+    y_ptrs = base_y + h_out * stride_yh + w_out * stride_yw
+    tl.store(y_ptrs, acc, mask=mask_hw)
+
+
+def depthwise_conv3x3_triton(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    stride: int = 1,
+    padding: int = 1,
+) -> torch.Tensor:
+    """
+    Depthwise 3x3 convolution (groups = C), assuming NHWC (channels_last) layout
+    in memory but logical shape [N, C, H, W].
+
+    x: [N, C, H, W] (channels_last contiguous)
+    weight: [C, 1, 3, 3]
+    """
+    assert x.is_cuda and weight.is_cuda, "Inputs must be CUDA tensors"
+    assert x.dtype == torch.float32 and weight.dtype == torch.float32, "Only float32 supported"
+    assert x.is_contiguous(memory_format=torch.channels_last), "x must be channels_last contiguous"
+
+    N, C, H, W = x.shape
+    Cout, Cin_per_group, Kh, Kw = weight.shape
+    assert Kh == 3 and Kw == 3
+    assert Cin_per_group == 1
+    assert Cout == C, "Depthwise conv requires Cout == Cin"
+    assert padding == 1, "This kernel assumes padding=1"
+    assert stride in (1, 2), "This kernel supports stride 1 or 2"
+
+    H_out = (H + 2 * padding - Kh) // stride + 1
+    W_out = (W + 2 * padding - Kw) // stride + 1
+
+    # Allocate output in channels_last format
+    y = torch.empty(
+        (N, C, H_out, W_out),
+        device=x.device,
+        dtype=x.dtype,
+        memory_format=torch.channels_last,
+    )
+
+    BLOCK_HW = 128
+
+    grid = lambda META: (
+        N * C,
+        triton.cdiv(H_out * W_out, META["BLOCK_HW"]),
+    )
+
+    depthwise_conv3x3_nhwc_kernel[grid](
+        x, weight, y,
+        N, H, W, C,
+        H_out, W_out,
+        stride, padding,
+        # NHWC strides derived from channels_last tensor [N, C, H, W]
+        x.stride(0), x.stride(2), x.stride(3), x.stride(1),
+        y.stride(0), y.stride(2), y.stride(3), y.stride(1),
+        weight.stride(0), weight.stride(1), weight.stride(2), weight.stride(3),
+        BLOCK_HW=BLOCK_HW,
+    )
+    return y
+
+
+# ----------------------------
+# 1x1 Conv in NHWC via GEMM-like kernel
+# ----------------------------
+
+@triton.jit
+def conv1x1_nhwc_kernel(
+    x_ptr, w_ptr, y_ptr,
+    N, H, W, C_in, C_out,
+    stride_xn, stride_xh, stride_xw, stride_xc,
+    stride_yn, stride_yh, stride_yw, stride_yc,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """
+    x: [N, H, W, C_in] in memory (passed as channels_last tensor)
+    w: [C_out, C_in] contiguous
+    y: [N, H, W, C_out] in memory
+    """
+    pid_m = tl.program_id(0)  # over N*H*W
+    pid_n = tl.program_id(1)  # over C_out
+
+    M = N * H * W
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    mask_m = offs_m < M
+    mask_n = offs_n < C_out
+
+    # Decode flat index m -> (n, h, w)
+    n = offs_m // (H * W)
+    hw = offs_m % (H * W)
+    h = hw // W
+    w = hw % W
+
+    base_x = x_ptr + n * stride_xn + h * stride_xh + w * stride_xw
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k in range(0, C_in, BLOCK_K):
+        offs_k = k + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < C_in
+
+        # Load input tile: [BLOCK_M, BLOCK_K]
+        x_ptrs = base_x[:, None] + offs_k[None, :] * stride_xc
+        x_vals = tl.load(
+            x_ptrs,
+            mask=mask_m[:, None] & mask_k[None, :],
+            other=0.0,
+        )
+
+        # Load weight tile: reinterpret w as [K, N] = [C_in, C_out]
+        # w layout is [C_out, C_in] contiguous -> strides: (C_in, 1)
+        # So for [K, N] view: stride_bk = 1, stride_bn = C_in
+        w_ptrs = w_ptr + offs_k[:, None] * 1 + offs_n[None, :] * C_in
+        w_vals = tl.load(
+            w_ptrs,
+            mask=mask_k[:, None] & mask_n[None, :],
+            other=0.0,
+        )
+
+        acc += tl.dot(x_vals, w_vals, allow_tf32=True)
+
+    base_y = y_ptr + n * stride_yn + h * stride_yh + w * stride_yw
+    y_ptrs = base_y[:, None] + offs_n[None, :] * stride_yc
+    tl.store(
+        y_ptrs,
+        acc,
+        mask=mask_m[:, None] & mask_n[None, :],
+    )
+
+
+def conv1x1_triton(x: torch.Tensor, weight_2d: torch.Tensor) -> torch.Tensor:
+    """
+    1x1 convolution (no bias, no groups) using a GEMM-like Triton kernel.
+
+    Assumes x is channels_last contiguous, logical shape [N, C_in, H, W].
+
+    x: [N, C_in, H, W] (channels_last)
+    weight_2d: [C_out, C_in]
+    """
+    assert x.is_cuda and weight_2d.is_cuda, "Inputs must be CUDA tensors"
+    assert x.dtype == torch.float32 and weight_2d.dtype == torch.float32, "Only float32 supported"
+    assert x.is_contiguous(memory_format=torch.channels_last), "x must be channels_last contiguous"
+
+    N, C_in, H, W = x.shape
+    C_out, C_in_w = weight_2d.shape
+    assert C_in == C_in_w, "Input channels mismatch"
+
+    # Output tensor in channels_last format
+    y = torch.empty(
+        (N, C_out, H, W),
+        device=x.device,
+        dtype=x.dtype,
+        memory_format=torch.channels_last,
+    )
+
+    BLOCK_M = 64
+    BLOCK_N = 64
+    BLOCK_K = 32
+
+    M = N * H * W
+
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_M"]),
+        triton.cdiv(C_out, META["BLOCK_N"]),
+    )
+
+    conv1x1_nhwc_kernel[grid](
+        x, weight_2d, y,
+        N, H, W, C_in, C_out,
+        # NHWC strides from channels_last tensor [N, C, H, W]
+        x.stride(0), x.stride(2), x.stride(3), x.stride(1),
+        y.stride(0), y.stride(2), y.stride(3), y.stride(1),
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+    )
+    return y
+
+
+# ----------------------------
+# Linear via GEMM
+# ----------------------------
+
+def linear_triton(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    Fully-connected layer using GEMM.
+
+    x: [B, in_features]
+    weight: [out_features, in_features]
+    bias: [out_features]
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda, "Inputs must be CUDA tensors"
+    assert x.dtype == torch.float32 and weight.dtype == torch.float32 and bias.dtype == torch.float32
+
+    B, K = x.shape
+    out_features, in_features = weight.shape
+    assert K == in_features, "Input features mismatch"
+    assert bias.shape[0] == out_features
+
+    a = x.contiguous()                          # [B, K]
+    b = weight.t().contiguous()                 # [K, out_features]
+    y = triton_matmul(a, b, bias=bias)
+    return y
+
+
+# ----------------------------
+# MBConv Block (Triton convs, NHWC layout)
+# ----------------------------
+
+class MBConvNew(nn.Module):
+    def __init__(self, in_channels, out_channels, stride, expand_ratio):
+        """
+        MBConv block:
+          1x1 pointwise conv (expand)
+          BN + ReLU6
+          3x3 depthwise conv (stride = stride)
+          BN + ReLU6
+          1x1 pointwise conv (project)
+          BN
+
+        Internal activations are kept in channels_last (NHWC) memory layout.
+        """
+        super().__init__()
+        hidden_dim = round(in_channels * expand_ratio)
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.hidden_dim = hidden_dim
+        self.stride = stride
+
+        # 1x1 expand conv weight: [hidden_dim, in_channels]
+        self.expand_weight = nn.Parameter(torch.empty(hidden_dim, in_channels))
+        # Depthwise 3x3 conv weight: [hidden_dim, 1, 3, 3]
+        self.depthwise_weight = nn.Parameter(torch.empty(hidden_dim, 1, 3, 3))
+        # 1x1 project conv weight: [out_channels, hidden_dim]
+        self.project_weight = nn.Parameter(torch.empty(out_channels, hidden_dim))
+
+        # BatchNorm layers (operate on [N, C, H, W] but support channels_last layout)
+        self.bn1 = nn.BatchNorm2d(hidden_dim)
+        self.bn2 = nn.BatchNorm2d(hidden_dim)
+        self.bn3 = nn.BatchNorm2d(out_channels)
+
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        nn.init.kaiming_normal_(self.expand_weight, mode="fan_out", nonlinearity="relu")
+        nn.init.kaiming_normal_(self.depthwise_weight, mode="fan_out", nonlinearity="relu")
+        nn.init.kaiming_normal_(self.project_weight, mode="fan_out", nonlinearity="linear")
+
+        nn.init.ones_(self.bn1.weight)
+        nn.init.zeros_(self.bn1.bias)
+        nn.init.ones_(self.bn2.weight)
+        nn.init.zeros_(self.bn2.bias)
+        nn.init.ones_(self.bn3.weight)
+        nn.init.zeros_(self.bn3.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x is expected to be channels_last throughout
+        assert x.is_contiguous(memory_format=torch.channels_last), "MBConvNew expects channels_last activations"
+
+        # 1x1 expand conv
+        x = conv1x1_triton(x, self.expand_weight)
+        x = self.bn1(x)
+        x = F.relu6(x)
+
+        # Depthwise 3x3 conv
+        x = depthwise_conv3x3_triton(x, self.depthwise_weight, stride=self.stride, padding=1)
+        x = self.bn2(x)
+        x = F.relu6(x)
+
+        # 1x1 project conv
+        x = conv1x1_triton(x, self.project_weight)
+        x = self.bn3(x)
+        return x
+
+
+# ----------------------------
+# EfficientNetB1-like Model (Triton-optimized, NHWC activations)
+# ----------------------------
+
+class ModelNew(nn.Module):
+    def __init__(self, num_classes=1000):
+        super(ModelNew, self).__init__()
+
+        # Initial convolutional layer (PyTorch, but we feed channels_last tensors)
+        self.conv1 = nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(32)
+
+        # MBConv blocks using Triton convs (channels_last activations)
+        self.mbconv1 = MBConvNew(32, 16, 1, 1)
+        self.mbconv2 = MBConvNew(16, 24, 2, 6)
+        self.mbconv3 = MBConvNew(24, 40, 2, 6)
+        self.mbconv4 = MBConvNew(40, 80, 2, 6)
+        self.mbconv5 = MBConvNew(80, 112, 1, 6)
+        self.mbconv6 = MBConvNew(112, 192, 2, 6)
+        self.mbconv7 = MBConvNew(192, 320, 1, 6)
+
+        # Final 1x1 convolution implemented via Triton GEMM-like kernel
+        # weight: [1280, 320] corresponds to Conv2d(320, 1280, kernel=1)
+        self.conv2_weight = nn.Parameter(torch.empty(1280, 320))
+        self.bn2 = nn.BatchNorm2d(1280)
+
+        # Fully connected layer via Triton GEMM
+        self.fc_weight = nn.Parameter(torch.empty(num_classes, 1280))
+        self.fc_bias = nn.Parameter(torch.empty(num_classes))
+
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        # Conv1
+        nn.init.kaiming_normal_(self.conv1.weight, mode="fan_out", nonlinearity="relu")
+        nn.init.ones_(self.bn1.weight)
+        nn.init.zeros_(self.bn1.bias)
+
+        # Conv2-equivalent weight
+        nn.init.kaiming_normal_(self.conv2_weight, mode="fan_out", nonlinearity="relu")
+        nn.init.ones_(self.bn2.weight)
+        nn.init.zeros_(self.bn2.bias)
+
+        # FC
+        nn.init.kaiming_normal_(self.fc_weight, mode="fan_out", nonlinearity="linear")
+        fan_in = self.fc_weight.shape[1]
+        bound = 1.0 / fan_in ** 0.5
+        nn.init.uniform_(self.fc_bias, -bound, bound)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: [batch_size, 3, 240, 240], standard NCHW input.
+
+        Internally, activations are kept in channels_last (NHWC) memory layout
+        to avoid per-layer NCHW<->NHWC permutations for Triton kernels.
+        """
+        # Convert input once to channels_last
+        x = x.to(memory_format=torch.channels_last)
+
+        # Initial conv + BN + ReLU (PyTorch handles channels_last)
+        x = F.relu(self.bn1(self.conv1(x)))
+
+        # MBConv blocks (all expect channels_last)
+        x = self.mbconv1(x)
+        x = self.mbconv2(x)
+        x = self.mbconv3(x)
+        x = self.mbconv4(x)
+        x = self.mbconv5(x)
+        x = self.mbconv6(x)
+        x = self.mbconv7(x)
+
+        # Final 1x1 conv via Triton + BN + ReLU
+        x = conv1x1_triton(x, self.conv2_weight)
+        x = self.bn2(x)
+        x = F.relu(x)
+
+        # Global average pooling (supports channels_last)
+        x = F.adaptive_avg_pool2d(x, (1, 1))
+        x = torch.flatten(x, 1)
+
+        # Fully connected via Triton
+        x = linear_triton(x, self.fc_weight, self.fc_bias)
+        return x

@@ -1,0 +1,288 @@
+You are a GPU kernel optimization architect. Analyze the kernel and identify **ONE high-level algorithmic optimization**.
+
+# PyTorch Reference
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class Model(nn.Module):
+    def __init__(self, input_size, hidden_layer_sizes, output_size):
+        """
+        :param input_size: The number of input features
+        :param hidden_layer_sizes: A list of ints containing the sizes of each hidden layer
+        :param output_size: The number of output features
+        """
+        super(Model, self).__init__()
+        
+        layers = []
+        current_input_size = input_size
+        
+        for hidden_size in hidden_layer_sizes:
+            layers.append(nn.Linear(current_input_size, hidden_size))
+            layers.append(nn.ReLU())
+            current_input_size = hidden_size
+        
+        layers.append(nn.Linear(current_input_size, output_size))
+        
+        self.network = nn.Sequential(*layers)
+    
+    def forward(self, x):
+        """
+        :param x: The input tensor, shape (batch_size, input_size)
+        :return: The output tensor, shape (batch_size, output_size)
+        """
+        return self.network(x)
+
+# Test code
+batch_size = 128
+input_size = 16384
+hidden_layer_sizes = [32768, 32768]
+output_size = 16384
+
+def get_inputs():
+    return [torch.rand(batch_size, input_size)]
+
+def get_init_inputs():
+    return [input_size, hidden_layer_sizes, output_size]
+```
+
+# Current Triton Kernel
+```python
+import math
+import torch, torch.nn as nn, triton, triton.language as tl
+
+
+@triton.jit
+def linear_bias_kernel(
+    a_ptr, b_ptr, bias_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    ADD_RELU: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    # Program ids for 2D tiling of output matrix C[M, N]
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    # Row/col indices for this program's tile
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Pointers to the first K-tile of A and B
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    # Accumulator in fp32 for better numerical stability
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Loop over K dimension
+    k_remaining = K
+    while k_remaining > 0:
+        # Mask K for this tile
+        k_mask = offs_k[None, :] < k_remaining
+
+        # Load A and B tiles (masked for M, N, and K)
+        a = tl.load(
+            a_ptrs,
+            mask=(offs_m[:, None] < M) & k_mask,
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptrs,
+            mask=(offs_n[None, :] < N) & (offs_k[:, None] < k_remaining),
+            other=0.0,
+        )
+
+        # Fused matmul tile
+        acc += tl.dot(a, b, allow_tf32=True)
+
+        # Advance pointers
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+        k_remaining -= BLOCK_K
+
+    # Add bias: shape (N,)
+    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc += bias[None, :]
+
+    # Optional ReLU
+    if ADD_RELU:
+        acc = tl.maximum(acc, 0.0)
+
+    # Write back, cast to original dtype of C
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    out = acc.to(tl.float32)
+    tl.store(
+        c_ptrs,
+        out,
+        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+    )
+
+
+def triton_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, add_relu: bool):
+    """
+    x:      (M, K)
+    weight: (N, K)  (nn.Linear's weight.t() contiguous)
+    bias:   (N,)
+    returns: (M, N)
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda, "Inputs must be CUDA tensors"
+    assert x.shape[1] == weight.shape[1], "Incompatible shapes"
+    assert weight.shape[0] == bias.shape[0], "Weight/bias size mismatch"
+
+    M, K = x.shape
+    N = weight.shape[0]
+
+    # Ensure contiguous for expected strides
+    a = x.contiguous()
+    b = weight.contiguous()
+    c = torch.empty((M, N), device=x.device, dtype=x.dtype)
+
+    grid = lambda META: (
+        max(1, triton.cdiv(M, META["BLOCK_M"])),
+        max(1, triton.cdiv(N, META["BLOCK_N"])),
+    )
+
+    linear_bias_kernel[grid](
+        a, b, bias, c,
+        M, N, K,
+        a.stride(0), a.stride(1),
+        b.stride(1), b.stride(0),  # b is (N, K) so K-major for kernel: stride_bk, stride_bn
+        c.stride(0), c.stride(1),
+        ADD_RELU=add_relu,
+        BLOCK_M=64,
+        BLOCK_N=128,
+        BLOCK_K=32,
+        num_warps=4,
+        num_stages=2,
+    )
+    return c
+
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_layer_sizes, output_size):
+        """
+        :param input_size: The number of input features
+        :param hidden_layer_sizes: A list of ints containing the sizes of each hidden layer
+        :param output_size: The number of output features
+        """
+        super(ModelNew, self).__init__()
+
+        layer_sizes = [input_size] + list(hidden_layer_sizes) + [output_size]
+        self.weights = nn.ParameterList()
+        self.biases = nn.ParameterList()
+
+        for in_features, out_features in zip(layer_sizes[:-1], layer_sizes[1:]):
+            w = nn.Parameter(torch.empty(out_features, in_features))
+            b = nn.Parameter(torch.empty(out_features))
+            self.weights.append(w)
+            self.biases.append(b)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        # Mimic nn.Linear initialization as closely as possible
+        for w, b in zip(self.weights, self.biases):
+            in_features = w.shape[1]
+            nn.init.kaiming_uniform_(w, a=math.sqrt(5))
+            if b is not None:
+                fan_in = in_features
+                bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+                nn.init.uniform_(b, -bound, bound)
+
+    def forward(self, x):
+        """
+        :param x: The input tensor, shape (batch_size, input_size)
+        :return: The output tensor, shape (batch_size, output_size)
+        """
+        # Move input to same device/dtype as parameters if needed
+        if self.weights:
+            param = self.weights[0]
+            if x.device != param.device:
+                x = x.to(param.device)
+            if x.dtype != param.dtype:
+                x = x.to(param.dtype)
+
+        x = x.contiguous()
+
+        num_layers = len(self.weights)
+        for i in range(num_layers):
+            w = self.weights[i]          # (out_features, in_features)
+            b = self.biases[i]           # (out_features,)
+            # Kernel expects weight as (N, K) with K = in_features
+            w_t = w                      # shape (out_features, in_features)
+            # Use Triton kernel: all but last layer have ReLU
+            add_relu = i < (num_layers - 1)
+            x = triton_linear(x, w_t, b, add_relu=add_relu)
+        return x
+```
+
+# Performance
+- **PyTorch baseline**: 12.39 ms
+- **Current Triton**: 13.70 ms
+- **Current speedup**: 0.90x (-10.6% vs baseline)
+
+
+---
+
+## Analysis Steps
+
+1. **Code Analysis**: Count kernels, identify operations, check for inefficiencies
+2. **Performance Diagnosis**: Use metrics/latency to identify bottleneck type
+3. **Root Cause**: Combine code + performance to find the core issue
+
+## Optimization Categories (pick ONE if worth optimizing):
+
+### 1. Operator Fusion
+Fuse consecutive ops into fewer kernels to reduce memory traffic and launch overhead.
+
+### 2. Algorithm Replacement
+Replace naive algorithm with optimized variant.
+- For Attention: Flash Attention, online softmax
+- For Convolution: Winograd, im2col
+- **For RNN/GRU/LSTM**: Persistent kernel with HYBRID computation
+  - **CRITICAL**: Use hybrid approach for best performance:
+    * Precompute input-side gates ONCE (outside kernel): `gates_x = (T*B, In) @ W_ih`
+    * Persistent kernel (inside): only recurrent-side: `for t: gates_h = h @ W_hh`
+  - Time loop `for t in range(T)` must be inside kernel, NOT in Python
+  - Launch kernel once per layer, not once per timestep
+  - Expected speedup: 10-100x (vs per-timestep launches)
+
+### 3. Kernel Launch Reduction
+Combine multiple small kernels to reduce overhead.
+- **For RNN/GRU/LSTM**: See "Algorithm Replacement" above for persistent kernel approach
+
+### 4. Memory Layout Optimization
+Use in-place operations, buffer reuse, or better layouts.
+
+## Should We Optimize?
+
+Before proposing optimization, determine if it's worthwhile:
+- **Not worth optimizing** if:
+  - Code is already near-optimal (expected speedup < 10%)
+  - Bottleneck cannot be addressed (hardware limited, already optimal algorithm)
+  - Optimization would add significant complexity with minimal gain
+
+- **Worth optimizing** if:
+  - Clear algorithmic inefficiency exists (multiple kernels, suboptimal algorithm)
+  - Expected speedup >= 20%
+  - Concrete optimization path available
+
+## Output (JSON)
+
+```json
+{
+  "worth_optimizing": "yes/no",
+  "reason": "<Why worth or not worth optimizing, 1 sentence>",
+  "bottleneck": "<Root cause in 1-2 sentences, empty if not worth optimizing>",
+  "optimisation method": "<Specific optimization in 1-2 sentences, empty if not worth optimizing>",
+  "modification plan": "<Implementation steps in 2-3 sentences, empty if not worth optimizing>",
+  "expected_speedup": "<e.g., '30-40%', empty if not worth optimizing>"
+}
+```
+
+Return JSON only.

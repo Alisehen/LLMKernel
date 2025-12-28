@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "A large fraction of runtime is spent in Conv + BatchNorm + ReLU sequences, where BatchNorm induces extra kernels and memory traffic that can be eliminated at inference.",
+  "bottleneck": "The current Triton work optimizes relatively cheap ops (residual add+ReLU, global avgpool, final linear), while the dominant cost remains the many Conv2d + BatchNorm2d + ReLU blocks. Each BatchNorm2d is a separate kernel with full-tensor reads/writes, adding significant bandwidth and launch overhead on top of already highly optimized cuDNN convolutions.",
+  "optimisation method": "At inference, fold each BatchNorm2d into its preceding Conv2d (reparameterizing Conv weights and adding a bias term) and remove the BatchNorm op so that the hot path becomes Conv(with fused BN) + ReLU (and your fused residual add+ReLU). This is effectively an operator fusion / algorithm replacement that eliminates all BN kernels and reduces memory traffic.",
+  "modification plan": "Introduce an inference-only graph rewrite (or a pre-export step) that, for every Conv2d->BatchNorm2d pair, computes new Conv parameters: W' = W * (gamma / sqrt(var + eps)) and b' = beta + (b - mean) * (gamma / sqrt(var + eps)), enabling bias on the Conv and deleting the BatchNorm module. Update BasicBlock/ModelNew so that in eval() they use the folded Conv modules (no BN) while keeping the original modules for training. Keep using cuDNN’s Conv (optionally with fused activation) and your Triton residual add+ReLU; you no longer launch separate BN kernels on any block.",
+  "expected_speedup": "20-30%"
+}

@@ -910,9 +910,9 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
     # Level3 tasks have high variance, benefit from multiple seeds
     if args.model == MODEL_SINGLE:
         # Level1: single operation, seed quality very stable
-        num_seeds_actual = 1
-        if num_seeds > 1:
-            print(f"[Seed] Level1 task detected, using 1 seed instead of {num_seeds} (seed quality is stable)")
+        num_seeds_actual = num_seeds
+        # if num_seeds > 1:
+        #     print(f"[Seed] Level1 task detected, using 1 seed instead of {num_seeds} (seed quality is stable)")
     elif args.model == MODEL_FUSION:
         # Level2: fused operations, seed quality fairly stable
         num_seeds_actual = num_seeds

@@ -1,6 +1,4 @@
 ```python
-# <complete ModelNew code with optimized Triton kernels>
-
 import math
 import torch
 import torch.nn as nn
@@ -8,247 +6,262 @@ import triton
 import triton.language as tl
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=8),
-    ],
-    key=['M', 'N', 'K'],
-)
 @triton.jit
-def linear_bias_tanh_kernel(
-    a_ptr,      # (M, K)
-    b_ptr,      # (K, N)
-    bias_ptr,   # (N,)
-    c_ptr,      # (M, N)
-    M, N, K,
-    stride_am, stride_ak,
-    stride_bk, stride_bn,
-    stride_cm, stride_cn,
+def fused_i2h_tanh_kernel(
+    x_ptr, h_ptr, w_ptr, bias_ptr, out_ptr,
+    M, K1, K2, N,
+    stride_xm, stride_xk,
+    stride_hm, stride_hk,
+    stride_wn, stride_wk,
+    stride_om, stride_on,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    """
+    Compute: out = tanh( x @ W_x^T + h @ W_h^T + bias )
+    where W = [W_x | W_h] along input-dimension.
+    Shapes (PyTorch convention):
+      x      : [M, K1]
+      h      : [M, K2]
+      W      : [N, K1 + K2]
+      bias   : [N]
+      out    : [M, N]
+    """
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_k = tl.arange(0, BLOCK_K)
 
-    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
-    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+    # Accumulator in fp32
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # -----------------------
+    # Contribution from x @ W_x^T (first K1 columns of W)
+    # -----------------------
+    for k1 in range(0, K1, BLOCK_K):
+        offs_k1 = k1 + tl.arange(0, BLOCK_K)
+
+        x_ptrs = x_ptr + offs_m[:, None] * stride_xm + offs_k1[None, :] * stride_xk
+        w_ptrs = w_ptr + offs_n[None, :] * stride_wn + offs_k1[:, None] * stride_wk
+
+        mask_x = (offs_m[:, None] < M) & (offs_k1[None, :] < K1)
+        mask_w = (offs_k1[:, None] < K1) & (offs_n[None, :] < N)
+
+        a = tl.load(x_ptrs, mask=mask_x, other=0.0)
+        b = tl.load(w_ptrs, mask=mask_w, other=0.0)
+
+        acc += tl.dot(a, b, allow_tf32=True)
+
+    # -----------------------
+    # Contribution from h @ W_h^T (last K2 columns of W)
+    # -----------------------
+    w_h_base = w_ptr + K1 * stride_wk
+
+    for k2 in range(0, K2, BLOCK_K):
+        offs_k2 = k2 + tl.arange(0, BLOCK_K)
+
+        h_ptrs = h_ptr + offs_m[:, None] * stride_hm + offs_k2[None, :] * stride_hk
+        w2_ptrs = w_h_base + offs_n[None, :] * stride_wn + offs_k2[:, None] * stride_wk
+
+        mask_h = (offs_m[:, None] < M) & (offs_k2[None, :] < K2)
+        mask_w2 = (offs_k2[:, None] < K2) & (offs_n[None, :] < N)
+
+        a2 = tl.load(h_ptrs, mask=mask_h, other=0.0)
+        b2 = tl.load(w2_ptrs, mask=mask_w2, other=0.0)
+
+        acc += tl.dot(a2, b2, allow_tf32=True)
+
+    # Add bias
+    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc = acc + bias[None, :]
+
+    # Tanh activation (manual implementation)
+    # tanh(x) = (exp(2x) - 1) / (exp(2x) + 1)
+    u = 2.0 * acc
+    e = tl.exp(u)
+    out_val = (e - 1.0) / (e + 1.0)
+
+    out_ptrs = out_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
+    mask_out = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(out_ptrs, out_val, mask=mask_out)
+
+
+@triton.jit
+def fused_linear_kernel(
+    x_ptr, w_ptr, bias_ptr, out_ptr,
+    M, N, K,
+    stride_xm, stride_xk,
+    stride_wn, stride_wk,
+    stride_om, stride_on,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """
+    Compute: out = x @ W^T + bias
+    Shapes (PyTorch convention):
+      x    : [M, K]
+      W    : [N, K]
+      bias : [N]
+      out  : [M, N]
+    """
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
     for k in range(0, K, BLOCK_K):
-        k_remaining = K - k
+        offs_k = k + tl.arange(0, BLOCK_K)
 
-        a_mask = (offs_m[:, None] < M) & (offs_k[None, :] < k_remaining)
-        b_mask = (offs_k[:, None] < k_remaining) & (offs_n[None, :] < N)
+        x_ptrs = x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk
+        w_ptrs = w_ptr + offs_n[None, :] * stride_wn + offs_k[:, None] * stride_wk
 
-        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
-        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+        mask_x = (offs_m[:, None] < M) & (offs_k[None, :] < K)
+        mask_w = (offs_k[:, None] < K) & (offs_n[None, :] < N)
 
-        a_f32 = a.to(tl.float32)
-        b_f32 = b.to(tl.float32)
+        a = tl.load(x_ptrs, mask=mask_x, other=0.0)
+        b = tl.load(w_ptrs, mask=mask_w, other=0.0)
 
-        acc += tl.dot(a_f32, b_f32, allow_tf32=True)
+        acc += tl.dot(a, b, allow_tf32=True)
 
-        a_ptrs += BLOCK_K * stride_ak
-        b_ptrs += BLOCK_K * stride_bk
-
-    # Add bias
     bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
-    acc += bias[None, :]
+    acc = acc + bias[None, :]
 
-    # tanh activation: tanh(x) = (e^{2x} - 1) / (e^{2x} + 1)
-    two = 2.0
-    z = acc * two
-    exp2z = tl.exp(z)
-    tanh_out = (exp2z - 1.0) / (exp2z + 1.0)
-
-    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
-    out_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-    tl.store(c_ptrs, tanh_out, mask=out_mask)
+    out_ptrs = out_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
+    mask_out = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(out_ptrs, acc, mask=mask_out)
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=8),
-    ],
-    key=['M', 'N', 'K'],
-)
-@triton.jit
-def linear_bias_kernel(
-    a_ptr,      # (M, K)
-    b_ptr,      # (K, N)
-    bias_ptr,   # (N,)
-    c_ptr,      # (M, N)
-    M, N, K,
-    stride_am, stride_ak,
-    stride_bk, stride_bn,
-    stride_cm, stride_cn,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_k = tl.arange(0, BLOCK_K)
-
-    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
-    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
-
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-
-    for k in range(0, K, BLOCK_K):
-        k_remaining = K - k
-
-        a_mask = (offs_m[:, None] < M) & (offs_k[None, :] < k_remaining)
-        b_mask = (offs_k[:, None] < k_remaining) & (offs_n[None, :] < N)
-
-        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
-        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
-
-        a_f32 = a.to(tl.float32)
-        b_f32 = b.to(tl.float32)
-
-        acc += tl.dot(a_f32, b_f32, allow_tf32=True)
-
-        a_ptrs += BLOCK_K * stride_ak
-        b_ptrs += BLOCK_K * stride_bk
-
-    # Add bias
-    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
-    acc += bias[None, :]
-
-    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
-    out_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-    tl.store(c_ptrs, acc, mask=out_mask)
-
-
-def fused_linear_tanh(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+def fused_i2h_tanh(x: torch.Tensor,
+                   h: torch.Tensor,
+                   weight: torch.Tensor,
+                   bias: torch.Tensor) -> torch.Tensor:
     """
-    x:      (M, K)
-    weight: (N, K)  - PyTorch Linear weight (out_features, in_features)
-    bias:   (N,)
-    returns (M, N)
+    x      : [batch, input_size]
+    h      : [batch, hidden_size]
+    weight : [hidden_size, input_size + hidden_size]
+    bias   : [hidden_size]
     """
-    assert x.is_cuda and weight.is_cuda and bias.is_cuda
-    assert x.dtype == weight.dtype == bias.dtype
+    assert x.is_cuda and h.is_cuda and weight.is_cuda and bias.is_cuda
+    M, K1 = x.shape
+    Mh, K2 = h.shape
+    assert Mh == M, "x and h must have same batch size"
+    N, K_total = weight.shape
+    assert K_total == K1 + K2, "weight second dim must equal input_size + hidden_size"
+    assert bias.shape[0] == N
 
-    x_contig = x.contiguous()
-    w = weight.contiguous()          # (N, K)
-    w_t = w.t().contiguous()         # (K, N)
-
-    M, K = x_contig.shape
-    N = w.shape[0]
-
-    out = torch.empty((M, N), device=x.device, dtype=torch.float32)
+    out = torch.empty((M, N), device=x.device, dtype=x.dtype)
 
     grid = lambda META: (
         triton.cdiv(M, META['BLOCK_M']),
         triton.cdiv(N, META['BLOCK_N']),
     )
 
-    linear_bias_tanh_kernel[grid](
-        x_contig, w_t, bias, out,
-        M, N, K,
-        x_contig.stride(0), x_contig.stride(1),
-        w_t.stride(0), w_t.stride(1),
+    fused_i2h_tanh_kernel[grid](
+        x, h, weight, bias, out,
+        M, K1, K2, N,
+        x.stride(0), x.stride(1),
+        h.stride(0), h.stride(1),
+        weight.stride(0), weight.stride(1),
         out.stride(0), out.stride(1),
+        BLOCK_M=64, BLOCK_N=128, BLOCK_K=32,
+        num_warps=4,
+        num_stages=2,
     )
-    # Match PyTorch nn.Linear + Tanh dtype (same as input)
-    if out.dtype != x.dtype:
-        out = out.to(x.dtype)
     return out
 
 
-def fused_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+def fused_linear(x: torch.Tensor,
+                 weight: torch.Tensor,
+                 bias: torch.Tensor) -> torch.Tensor:
     """
-    x:      (M, K)
-    weight: (N, K)  - PyTorch Linear weight (out_features, in_features)
-    bias:   (N,)
-    returns (M, N)
+    x      : [batch, in_features]
+    weight : [out_features, in_features]
+    bias   : [out_features]
     """
     assert x.is_cuda and weight.is_cuda and bias.is_cuda
-    assert x.dtype == weight.dtype == bias.dtype
+    M, K = x.shape
+    N, K_w = weight.shape
+    assert K == K_w
+    assert bias.shape[0] == N
 
-    x_contig = x.contiguous()
-    w = weight.contiguous()
-    w_t = w.t().contiguous()
-
-    M, K = x_contig.shape
-    N = w.shape[0]
-
-    out = torch.empty((M, N), device=x.device, dtype=torch.float32)
+    out = torch.empty((M, N), device=x.device, dtype=x.dtype)
 
     grid = lambda META: (
         triton.cdiv(M, META['BLOCK_M']),
         triton.cdiv(N, META['BLOCK_N']),
     )
 
-    linear_bias_kernel[grid](
-        x_contig, w_t, bias, out,
+    fused_linear_kernel[grid](
+        x, weight, bias, out,
         M, N, K,
-        x_contig.stride(0), x_contig.stride(1),
-        w_t.stride(0), w_t.stride(1),
+        x.stride(0), x.stride(1),
+        weight.stride(0), weight.stride(1),
         out.stride(0), out.stride(1),
+        BLOCK_M=64, BLOCK_N=128, BLOCK_K=32,
+        num_warps=4,
+        num_stages=2,
     )
-    if out.dtype != x.dtype:
-        out = out.to(x.dtype)
     return out
 
 
 class ModelNew(nn.Module):
     def __init__(self, input_size: int, hidden_size: int, output_size: int):
         """
-        Vanilla RNN with Triton-fused Linear + Tanh and Linear layers.
-        Semantics match the original Model.
+        Triton-optimized Vanilla RNN cell:
+          hidden_t = tanh( [x_t, h_{t-1}] @ W_ih^T + b_ih )
+          y_t      = hidden_t @ W_ho^T + b_ho
         """
         super(ModelNew, self).__init__()
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.output_size = output_size
 
-        # Keep nn.Linear modules so state_dict is compatible with the original Model
-        self.i2h = nn.Linear(input_size + hidden_size, hidden_size)
-        self.h2o = nn.Linear(hidden_size, output_size)
-        self.tanh = nn.Tanh()  # kept for structural compatibility (not used directly)
+        # NOTE: uses global batch_size from the original definition
+        global batch_size
+        self.hidden = torch.randn((batch_size, hidden_size))
 
-        # Lazy-initialized hidden state buffer
-        self.register_buffer("hidden", None, persistent=False)
+        # Parameters replacing nn.Linear layers
+        self.i2h_weight = nn.Parameter(torch.empty(hidden_size, input_size + hidden_size))
+        self.i2h_bias = nn.Parameter(torch.empty(hidden_size))
+        self.h2o_weight = nn.Parameter(torch.empty(output_size, hidden_size))
+        self.h2o_bias = nn.Parameter(torch.empty(output_size))
 
-    def forward(self, x: torch.Tensor, initial_hidden: torch.Tensor = None) -> torch.Tensor:
+        # Initialize like nn.Linear
+        for w, b in ((self.i2h_weight, self.i2h_bias),
+                     (self.h2o_weight, self.h2o_bias)):
+            nn.init.kaiming_uniform_(w, a=math.sqrt(5))
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(w)
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            nn.init.uniform_(b, -bound, bound)
+
+    def forward(self, x: torch.Tensor, initial_hidden=None) -> torch.Tensor:
         """
-        x:              (batch_size, input_size)
-        initial_hidden: (batch_size, hidden_size) or None
-        returns:        (batch_size, output_size)
+        x: [batch_size, input_size]
+        initial_hidden: [batch_size, hidden_size] or None
+        Returns:
+          output: [batch_size, output_size]
         """
-        assert x.dim() == 2
-        batch_size = x.shape[0]
-
         if initial_hidden is not None:
-            hidden = initial_hidden
-        else:
-            if (self.hidden is None) or (self.hidden.shape[0] != batch_size):
-                self.hidden = torch.zeros(batch_size, self.hidden_size, device=x.device, dtype=x.dtype)
-            hidden = self.hidden
+            self.hidden.copy_(initial_hidden)
 
-        hidden = hidden.to(device=x.device, dtype=x.dtype)
+        # Ensure hidden is on the same device as x, as in original model
+        self.hidden = self.hidden.to(x.device)
 
-        # Concatenate input and previous hidden state
-        combined = torch.cat((x, hidden), dim=1)
+        # Hidden state update via fused Triton kernel
+        self.hidden = fused_i2h_tanh(
+            x,
+            self.hidden,
+            self.i2h_weight,
+            self.i2h_bias,
+        )
 
-        # Fused input-to-hidden linear + bias + tanh
-        new_hidden = fused_linear_tanh(combined, self.i2h.weight, self.i2h.bias)
-
-        # Fused hidden-to-output linear + bias
-        output = fused_linear(new_hidden, self.h2o.weight, self.h2o.bias)
-
-        # Update internal hidden buffer (detach to avoid graph retention)
-        self.hidden = new_hidden.detach()
-
+        # Output projection via fused Triton linear kernel
+        output = fused_linear(
+            self.hidden,
+            self.h2o_weight,
+            self.h2o_bias,
+        )
         return output
 ```

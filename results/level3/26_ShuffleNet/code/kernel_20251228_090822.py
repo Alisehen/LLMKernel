@@ -1,0 +1,976 @@
+# Optimized Triton kernels for ShuffleNet-style model on RTX 4090
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+# ------------------------------------------------------------
+# 1x1 Group Conv (baseline, unfused) - kept for completeness
+# ------------------------------------------------------------
+@triton.jit
+def conv1x1_group_kernel(
+    x_ptr, w_ptr, y_ptr,
+    B, H, W,
+    C_in, C_out,
+    groups,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_wo, stride_wi,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    BLOCK_M: tl.constexpr,  # tiles over B*H*W
+    BLOCK_N: tl.constexpr,  # tiles over C_out_per_group
+    BLOCK_K: tl.constexpr,  # tiles over C_in_per_group
+):
+    pid_m = tl.program_id(0)  # along M = B*H*W
+    pid_n = tl.program_id(1)  # along N_per_group
+    pid_g = tl.program_id(2)  # group index
+
+    M = B * H * W
+    K_per_g = C_in // groups
+    N_per_g = C_out // groups
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # [BM]
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # [BN]
+    offs_k = tl.arange(0, BLOCK_K)                    # [BK]
+
+    m_mask = offs_m < M
+    n_mask = offs_n < N_per_g
+    mn_mask = m_mask[:, None] & n_mask[None, :]
+
+    HW = H * W
+    b_idx = offs_m // HW
+    rem_hw = offs_m - b_idx * HW
+    h_idx = rem_hw // W
+    w_idx = rem_hw - h_idx * W
+
+    # Group offsets
+    c_base = pid_g * K_per_g
+    oc_base = pid_g * N_per_g
+
+    b_broad = b_idx[:, None]   # [BM,1]
+    h_broad = h_idx[:, None]   # [BM,1]
+    w_broad = w_idx[:, None]   # [BM,1]
+    oc_idx_1d = oc_base + offs_n       # [BN]
+    oc_idx_2d = oc_idx_1d[None, :]     # [1,BN]
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    k = 0
+    while k < K_per_g:
+        k_offsets = k + offs_k            # [BK]
+        k_mask = k_offsets < K_per_g      # [BK]
+
+        c_idx = c_base + k_offsets        # [BK]
+
+        # X[n, c, h, w] -> [BM, BK]
+        c_broad = c_idx[None, :]          # [1,BK]
+        a_ptrs = (
+            x_ptr
+            + b_broad * stride_xn
+            + c_broad * stride_xc
+            + h_broad * stride_xh
+            + w_broad * stride_xw
+        )
+        a_mask = m_mask[:, None] & k_mask[None, :]
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+
+        # W[oc, ic] -> [BK, BN]
+        ic_broad = c_idx[:, None]         # [BK,1]
+        b_ptrs = (
+            w_ptr
+            + oc_idx_2d * stride_wo
+            + ic_broad * stride_wi
+        )
+        b_mask = k_mask[:, None] & n_mask[None, :]
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+        acc += tl.dot(a, b, allow_tf32=True)
+        k += BLOCK_K
+
+    y_ptrs = (
+        y_ptr
+        + b_broad * stride_yn
+        + oc_idx_2d * stride_yc
+        + h_broad * stride_yh
+        + w_broad * stride_yw
+    )
+    tl.store(y_ptrs, acc, mask=mn_mask)
+
+
+def conv1x1_group_triton(x: torch.Tensor, weight: torch.Tensor, groups: int) -> torch.Tensor:
+    """
+    Baseline unfused 1x1 group conv.
+    x: (B, C_in, H, W), contiguous NCHW
+    weight: (C_out, C_in/groups, 1, 1)
+    """
+    assert x.is_cuda and weight.is_cuda
+    B, C_in, H, W = x.shape
+    C_out = weight.shape[0]
+    x_ = x.contiguous()
+    w_ = weight.contiguous()
+
+    y = torch.empty((B, C_out, H, W), device=x.device, dtype=x.dtype)
+
+    grid = lambda META: (
+        triton.cdiv(B * H * W, META['BLOCK_M']),
+        triton.cdiv(C_out // groups, META['BLOCK_N']),
+        groups,
+    )
+
+    conv1x1_group_kernel[grid](
+        x_, w_, y,
+        B, H, W,
+        C_in, C_out,
+        groups,
+        x_.stride(0), x_.stride(1), x_.stride(2), x_.stride(3),
+        w_.stride(0), w_.stride(1),
+        y.stride(0), y.stride(1), y.stride(2), y.stride(3),
+        BLOCK_M=64, BLOCK_N=64, BLOCK_K=32,
+        num_warps=4,
+        num_stages=2,
+    )
+    return y
+
+
+# ------------------------------------------------------------
+# 1x1 Group Conv + BN (pre-fused scale/bias) + optional ReLU
+# Optimized for 4090: only one tl.store (final), multi-input fusion.
+# ------------------------------------------------------------
+
+@triton.autotune(
+    configs=[
+        # Conservative baseline, register-friendly
+        triton.Config(
+            {'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 32},
+            num_warps=4, num_stages=2
+        ),
+        # Rectangular tiles for tall / wide feature maps
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32},
+            num_warps=4, num_stages=2
+        ),
+        triton.Config(
+            {'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_warps=4, num_stages=2
+        ),
+        # Larger symmetric tile with more warps when register pressure allows
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_warps=8, num_stages=2
+        ),
+    ],
+    key=['B', 'H', 'W', 'C_in', 'C_out', 'groups'],
+)
+@triton.jit
+def conv1x1_group_bn_relu_kernel(
+    x_ptr, w_ptr, y_ptr,
+    bn_scale_ptr, bn_bias_ptr,
+    B, H, W,
+    C_in, C_out,
+    groups,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_wo, stride_wi,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    APPLY_RELU: tl.constexpr,
+    BLOCK_M: tl.constexpr,  # tiles over B*H*W
+    BLOCK_N: tl.constexpr,  # tiles over C_out_per_group
+    BLOCK_K: tl.constexpr,  # tiles over C_in_per_group
+):
+    pid_m = tl.program_id(0)  # along M = B*H*W
+    pid_n = tl.program_id(1)  # along N_per_group
+    pid_g = tl.program_id(2)  # group index
+
+    M = B * H * W
+    K_per_g = C_in // groups
+    N_per_g = C_out // groups
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # [BM]
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # [BN]
+    offs_k = tl.arange(0, BLOCK_K)                    # [BK]
+
+    m_mask = offs_m < M
+    n_mask = offs_n < N_per_g
+    mn_mask = m_mask[:, None] & n_mask[None, :]
+
+    HW = H * W
+    b_idx = offs_m // HW
+    rem_hw = offs_m - b_idx * HW
+    h_idx = rem_hw // W
+    w_idx = rem_hw - h_idx * W
+
+    # Group offsets
+    c_base = pid_g * K_per_g
+    oc_base = pid_g * N_per_g
+
+    # Broadcasting indices
+    b_broad = b_idx[:, None]   # [BM,1]
+    h_broad = h_idx[:, None]   # [BM,1]
+    w_broad = w_idx[:, None]   # [BM,1]
+
+    oc_idx_1d = oc_base + offs_n       # [BN]
+    oc_idx_2d = oc_idx_1d[None, :]     # [1,BN]
+
+    # Accumulator in FP32
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # K-loop over C_in_per_group
+    k = 0
+    while k < K_per_g:
+        k_offsets = k + offs_k            # [BK]
+        k_mask = k_offsets < K_per_g      # [BK]
+
+        c_idx = c_base + k_offsets        # [BK]
+
+        # X[n, c, h, w]  -> [BM, BK]
+        c_broad = c_idx[None, :]          # [1,BK]
+        a_ptrs = (
+            x_ptr
+            + b_broad * stride_xn
+            + c_broad * stride_xc
+            + h_broad * stride_xh
+            + w_broad * stride_xw
+        )
+        a_mask = m_mask[:, None] & k_mask[None, :]
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+
+        # W[oc, ic] -> [BK, BN]
+        ic_broad = c_idx[:, None]         # [BK,1]
+        b_ptrs = (
+            w_ptr
+            + oc_idx_2d * stride_wo
+            + ic_broad * stride_wi
+        )
+        b_mask = k_mask[:, None] & n_mask[None, :]
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+        acc += tl.dot(a, b, allow_tf32=True)
+        k += BLOCK_K
+
+    # Fused BN (inference-style): y = x * scale + bias
+    bn_scale = tl.load(bn_scale_ptr + oc_idx_1d, mask=n_mask, other=1.0)  # [BN]
+    bn_bias = tl.load(bn_bias_ptr + oc_idx_1d, mask=n_mask, other=0.0)    # [BN]
+
+    acc = acc * bn_scale[None, :] + bn_bias[None, :]
+
+    # Optional ReLU
+    if APPLY_RELU:
+        acc = tl.maximum(acc, 0.0)
+
+    # Final store: single tl.store per output tensor
+    y_ptrs = (
+        y_ptr
+        + b_broad * stride_yn
+        + oc_idx_2d * stride_yc
+        + h_broad * stride_yh
+        + w_broad * stride_yw
+    )
+    tl.store(y_ptrs, acc, mask=mn_mask)
+
+
+def conv1x1_group_bn_relu_triton(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bn: nn.BatchNorm2d,
+    groups: int,
+    apply_relu: bool,
+) -> torch.Tensor:
+    """
+    Fused 1x1 group conv + BatchNorm (running stats, inference-style) + optional ReLU.
+
+    x:        (B, C_in, H, W)
+    weight:   (C_out, C_in/groups, 1, 1)
+    bn:       nn.BatchNorm2d(C_out)
+    groups:   int
+    apply_relu: bool
+    """
+    assert x.is_cuda and weight.is_cuda
+    assert isinstance(bn, nn.BatchNorm2d)
+    B, C_in, H, W = x.shape
+    C_out = weight.shape[0]
+    assert C_out == bn.num_features
+
+    x_ = x.contiguous()
+    w_ = weight.contiguous()
+
+    # Pre-fuse BN scale and bias on device
+    running_mean = bn.running_mean.detach()
+    running_var = bn.running_var.detach()
+    gamma = bn.weight.detach()
+    beta = bn.bias.detach()
+
+    invstd = (running_var + bn.eps).rsqrt()
+    bn_scale = (gamma * invstd).contiguous()
+    bn_bias = (beta - running_mean * bn_scale).contiguous()
+
+    y = torch.empty((B, C_out, H, W), device=x.device, dtype=x.dtype)
+
+    grid = lambda META: (
+        triton.cdiv(B * H * W, META['BLOCK_M']),
+        triton.cdiv(C_out // groups, META['BLOCK_N']),
+        groups,
+    )
+
+    conv1x1_group_bn_relu_kernel[grid](
+        x_, w_, y,
+        bn_scale, bn_bias,
+        B, H, W,
+        C_in, C_out,
+        groups,
+        x_.stride(0), x_.stride(1), x_.stride(2), x_.stride(3),
+        w_.stride(0), w_.stride(1),
+        y.stride(0), y.stride(1), y.stride(2), y.stride(3),
+        APPLY_RELU=apply_relu,
+    )
+    return y
+
+
+# ------------------------------------------------------------
+# Depthwise 3x3 Conv (stride=1, padding=1) - baseline
+# ------------------------------------------------------------
+@triton.jit
+def depthwise_conv3x3_kernel(
+    x_ptr, w_ptr, y_ptr,
+    B, C, H, W,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_wc, stride_wkh, stride_wkw,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    BLOCK_NC: tl.constexpr,  # tiles over B*C
+    BLOCK_HW: tl.constexpr,  # tiles over H*W
+):
+    pid_nc = tl.program_id(0)
+    pid_hw = tl.program_id(1)
+
+    NC = B * C
+    HW = H * W
+
+    offs_nc = pid_nc * BLOCK_NC + tl.arange(0, BLOCK_NC)  # [BNc]
+    offs_hw = pid_hw * BLOCK_HW + tl.arange(0, BLOCK_HW)  # [BHw]
+
+    nc_mask = offs_nc < NC
+    hw_mask = offs_hw < HW
+    base_mask = nc_mask[:, None] & hw_mask[None, :]
+
+    # Map nc -> (n, c)
+    n_idx = offs_nc // C
+    c_idx = offs_nc - n_idx * C
+
+    # Map hw -> (h, w)
+    h_idx = offs_hw // W
+    w_idx = offs_hw - h_idx * W
+
+    n_broad = n_idx[:, None]        # [BNc,1]
+    c_broad = c_idx[:, None]        # [BNc,1]
+    h_broad = h_idx[None, :]        # [1,BHw]
+    w_broad = w_idx[None, :]        # [1,BHw]
+
+    acc = tl.zeros((BLOCK_NC, BLOCK_HW), dtype=tl.float32)
+
+    # 3x3 depthwise convolution, stride=1, padding=1
+    for ky in range(3):
+        for kx in range(3):
+            dh = ky - 1
+            dw = kx - 1
+
+            hi = h_broad + dh
+            wi = w_broad + dw
+
+            in_bounds = (hi >= 0) & (hi < H) & (wi >= 0) & (wi < W)
+            mask = base_mask & in_bounds
+
+            in_ptrs = (
+                x_ptr
+                + n_broad * stride_xn
+                + c_broad * stride_xc
+                + hi * stride_xh
+                + wi * stride_xw
+            )
+            x_val = tl.load(in_ptrs, mask=mask, other=0.0)
+
+            # weight: (C, 1, 3, 3)
+            w_ptrs = (
+                w_ptr
+                + c_idx * stride_wc
+                + ky * stride_wkh
+                + kx * stride_wkw
+            )
+            w_val = tl.load(w_ptrs, mask=nc_mask, other=0.0)  # [BNc]
+
+            acc += x_val * w_val[:, None]
+
+    out_ptrs = (
+        y_ptr
+        + n_broad * stride_yn
+        + c_broad * stride_yc
+        + h_broad * stride_yh
+        + w_broad * stride_yw
+    )
+    tl.store(out_ptrs, acc, mask=base_mask)
+
+
+def depthwise_conv3x3_triton(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """
+    Baseline unfused depthwise 3x3 conv.
+    x: (B, C, H, W)
+    weight: (C, 1, 3, 3)
+    """
+    assert x.is_cuda and weight.is_cuda
+    B, C, H, W = x.shape
+    x_ = x.contiguous()
+    w_ = weight.contiguous()
+
+    y = torch.empty_like(x_)
+
+    grid = lambda META: (
+        triton.cdiv(B * C, META['BLOCK_NC']),
+        triton.cdiv(H * W, META['BLOCK_HW']),
+    )
+
+    depthwise_conv3x3_kernel[grid](
+        x_, w_, y,
+        B, C, H, W,
+        x_.stride(0), x_.stride(1), x_.stride(2), x_.stride(3),
+        w_.stride(0), w_.stride(2), w_.stride(3),
+        y.stride(0), y.stride(1), y.stride(2), y.stride(3),
+        BLOCK_NC=32, BLOCK_HW=64,
+        num_warps=4,
+        num_stages=2,
+    )
+    return y
+
+
+# ------------------------------------------------------------
+# Depthwise 3x3 Conv + BN (pre-fused scale/bias) + optional ReLU
+# Multi-input fusion, tuned for 4090 with num_warps in {4,8}, num_stages=2.
+# ------------------------------------------------------------
+
+@triton.autotune(
+    configs=[
+        # Conservative baseline
+        triton.Config({'BLOCK_NC': 32, 'BLOCK_HW': 32},  num_warps=4, num_stages=2),
+        # Balanced tiles
+        triton.Config({'BLOCK_NC': 64, 'BLOCK_HW': 32},  num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_NC': 32, 'BLOCK_HW': 64},  num_warps=4, num_stages=2),
+        # Larger tile for big feature maps
+        triton.Config({'BLOCK_NC': 64, 'BLOCK_HW': 64},  num_warps=8, num_stages=2),
+    ],
+    key=['B', 'C', 'H', 'W'],
+)
+@triton.jit
+def depthwise_conv3x3_bn_kernel(
+    x_ptr, w_ptr, y_ptr,
+    bn_scale_ptr, bn_bias_ptr,
+    B, C, H, W,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_wc, stride_wkh, stride_wkw,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    APPLY_RELU: tl.constexpr,
+    BLOCK_NC: tl.constexpr,  # tiles over B*C
+    BLOCK_HW: tl.constexpr,  # tiles over H*W
+):
+    pid_nc = tl.program_id(0)
+    pid_hw = tl.program_id(1)
+
+    NC = B * C
+    HW = H * W
+
+    offs_nc = pid_nc * BLOCK_NC + tl.arange(0, BLOCK_NC)  # [BNc]
+    offs_hw = pid_hw * BLOCK_HW + tl.arange(0, BLOCK_HW)  # [BHw]
+
+    nc_mask = offs_nc < NC
+    hw_mask = offs_hw < HW
+    base_mask = nc_mask[:, None] & hw_mask[None, :]
+
+    # Map nc -> (n, c)
+    n_idx = offs_nc // C
+    c_idx = offs_nc - n_idx * C
+
+    # Map hw -> (h, w)
+    h_idx = offs_hw // W
+    w_idx = offs_hw - h_idx * W
+
+    n_broad = n_idx[:, None]        # [BNc,1]
+    c_broad = c_idx[:, None]        # [BNc,1]
+    h_broad = h_idx[None, :]        # [1,BHw]
+    w_broad = w_idx[None, :]        # [1,BHw]
+
+    acc = tl.zeros((BLOCK_NC, BLOCK_HW), dtype=tl.float32)
+
+    # 3x3 depthwise convolution, stride=1, padding=1
+    for ky in range(3):
+        for kx in range(3):
+            dh = ky - 1
+            dw = kx - 1
+
+            hi = h_broad + dh
+            wi = w_broad + dw
+
+            in_bounds = (hi >= 0) & (hi < H) & (wi >= 0) & (wi < W)
+            mask = base_mask & in_bounds
+
+            in_ptrs = (
+                x_ptr
+                + n_broad * stride_xn
+                + c_broad * stride_xc
+                + hi * stride_xh
+                + wi * stride_xw
+            )
+            x_val = tl.load(in_ptrs, mask=mask, other=0.0)
+
+            # weight: (C, 1, 3, 3)
+            w_ptrs = (
+                w_ptr
+                + c_idx * stride_wc
+                + ky * stride_wkh
+                + kx * stride_wkw
+            )
+            w_val = tl.load(w_ptrs, mask=nc_mask, other=0.0)  # [BNc]
+
+            acc += x_val * w_val[:, None]
+
+    # BN with pre-fused scale and bias: y = x * scale + bias
+    bn_scale = tl.load(bn_scale_ptr + c_idx, mask=nc_mask, other=1.0)  # [BNc]
+    bn_bias = tl.load(bn_bias_ptr + c_idx, mask=nc_mask, other=0.0)    # [BNc]
+
+    acc = acc * bn_scale[:, None] + bn_bias[:, None]
+
+    if APPLY_RELU:
+        acc = tl.maximum(acc, 0.0)
+
+    out_ptrs = (
+        y_ptr
+        + n_broad * stride_yn
+        + c_broad * stride_yc
+        + h_broad * stride_yh
+        + w_broad * stride_yw
+    )
+    tl.store(out_ptrs, acc, mask=base_mask)
+
+
+def depthwise_conv3x3_bn_triton(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bn: nn.BatchNorm2d,
+    apply_relu: bool,
+) -> torch.Tensor:
+    """
+    Fused depthwise 3x3 conv + BatchNorm (running stats) + optional ReLU.
+
+    x:      (B, C, H, W)
+    weight: (C, 1, 3, 3)
+    bn:     nn.BatchNorm2d(C)
+    """
+    assert x.is_cuda and weight.is_cuda
+    assert isinstance(bn, nn.BatchNorm2d)
+    B, C, H, W = x.shape
+    assert C == weight.shape[0] == bn.num_features
+
+    x_ = x.contiguous()
+    w_ = weight.contiguous()
+
+    running_mean = bn.running_mean.detach()
+    running_var = bn.running_var.detach()
+    gamma = bn.weight.detach()
+    beta = bn.bias.detach()
+
+    invstd = (running_var + bn.eps).rsqrt()
+    bn_scale = (gamma * invstd).contiguous()
+    bn_bias = (beta - running_mean * bn_scale).contiguous()
+
+    y = torch.empty_like(x_)
+
+    grid = lambda META: (
+        triton.cdiv(B * C, META['BLOCK_NC']),
+        triton.cdiv(H * W, META['BLOCK_HW']),
+    )
+
+    depthwise_conv3x3_bn_kernel[grid](
+        x_, w_, y,
+        bn_scale, bn_bias,
+        B, C, H, W,
+        x_.stride(0), x_.stride(1), x_.stride(2), x_.stride(3),
+        w_.stride(0), w_.stride(2), w_.stride(3),
+        y.stride(0), y.stride(1), y.stride(2), y.stride(3),
+        APPLY_RELU=apply_relu,
+    )
+    return y
+
+
+# ------------------------------------------------------------
+# Channel Shuffle (elementwise-style)
+# ------------------------------------------------------------
+@triton.jit
+def channel_shuffle_kernel(
+    x_ptr, y_ptr,
+    B, C, H, W, groups,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    BLOCK_E: tl.constexpr,  # tiles over C*H*W per batch
+):
+    pid_b = tl.program_id(0)
+    pid_e = tl.program_id(1)
+
+    E = C * H * W
+    offs_e = pid_e * BLOCK_E + tl.arange(0, BLOCK_E)  # [BE]
+    mask = offs_e < E
+
+    HW = H * W
+    channels_per_group = C // groups
+
+    c_idx = offs_e // HW
+    rem = offs_e - c_idx * HW
+    h_idx = rem // W
+    w_idx = rem - h_idx * W
+
+    g_idx = c_idx // channels_per_group
+    cpg_idx = c_idx - g_idx * channels_per_group
+    c_new = cpg_idx * groups + g_idx
+
+    in_ptrs = (
+        x_ptr
+        + pid_b * stride_xn
+        + c_idx * stride_xc
+        + h_idx * stride_xh
+        + w_idx * stride_xw
+    )
+    out_ptrs = (
+        y_ptr
+        + pid_b * stride_yn
+        + c_new * stride_yc
+        + h_idx * stride_yh
+        + w_idx * stride_yw
+    )
+
+    val = tl.load(in_ptrs, mask=mask, other=0.0)
+    tl.store(out_ptrs, val, mask=mask)
+
+
+def channel_shuffle_triton(x: torch.Tensor, groups: int) -> torch.Tensor:
+    """
+    x: (B, C, H, W)
+    groups: number of groups
+    """
+    assert x.is_cuda
+    B, C, H, W = x.shape
+    x_ = x.contiguous()
+    y = torch.empty_like(x_)
+
+    grid = lambda META: (
+        B,
+        triton.cdiv(C * H * W, META['BLOCK_E']),
+    )
+
+    channel_shuffle_kernel[grid](
+        x_, y,
+        B, C, H, W, groups,
+        x_.stride(0), x_.stride(1), x_.stride(2), x_.stride(3),
+        y.stride(0), y.stride(1), y.stride(2), y.stride(3),
+        BLOCK_E=256,
+        num_warps=4,
+        num_stages=2,
+    )
+    return y
+
+
+# ------------------------------------------------------------
+# Linear (GEMM + bias) - autotuned with register-safe tiles
+# ------------------------------------------------------------
+@triton.autotune(
+    configs=[
+        # Conservative baseline
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_warps=4, num_stages=2),
+        # Rectangular for tall / wide cases
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4, num_stages=2),
+        # Larger tile + deeper pipeline when registers allow
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=8, num_stages=3),
+    ],
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def linear_kernel(
+    a_ptr, b_ptr, bias_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # rows (M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # cols (N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    m_mask = offs_m < M
+    n_mask = offs_n < N
+    mn_mask = m_mask[:, None] & n_mask[None, :]
+
+    # Base pointers for this tile
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    k = 0
+    while k < K:
+        k_rem = K - k
+        k_mask = offs_k < k_rem
+
+        a = tl.load(a_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
+        b = tl.load(b_ptrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0)
+
+        acc += tl.dot(a, b, allow_tf32=True)
+
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+        k += BLOCK_K
+
+    # Add bias (broadcast over rows)
+    bias = tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0)
+    acc += bias[None, :]
+
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    tl.store(c_ptrs, acc, mask=mn_mask)
+
+
+def linear_triton(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    x: (M, K)
+    weight: (N, K)  (same as nn.Linear out_features x in_features)
+    bias: (N,)
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+    M, K = x.shape
+    N = weight.shape[0]
+
+    a = x.contiguous()
+    # Use weight^T as (K, N)
+    b = weight.t().contiguous()
+
+    c = torch.empty((M, N), device=x.device, dtype=x.dtype)
+
+    grid = lambda META: (
+        triton.cdiv(M, META['BLOCK_M']),
+        triton.cdiv(N, META['BLOCK_N']),
+    )
+
+    linear_kernel[grid](
+        a, b, bias, c,
+        M, N, K,
+        a.stride(0), a.stride(1),
+        b.stride(0), b.stride(1),
+        c.stride(0), c.stride(1),
+    )
+    return c
+
+
+# ------------------------------------------------------------
+# High-performance ShuffleNet components
+# ------------------------------------------------------------
+class ChannelShuffleNew(nn.Module):
+    def __init__(self, groups: int):
+        super(ChannelShuffleNew, self).__init__()
+        self.groups = groups
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return channel_shuffle_triton(x, self.groups)
+
+
+class ShuffleNetUnitNew(nn.Module):
+    def __init__(self, in_channels, out_channels, groups=3):
+        super(ShuffleNetUnitNew, self).__init__()
+
+        assert out_channels % 4 == 0
+        mid_channels = out_channels // 4
+
+        # First 1x1 group conv
+        self.conv1 = nn.Conv2d(
+            in_channels,
+            mid_channels,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+            groups=groups,
+            bias=False,
+        )
+        self.bn1 = nn.BatchNorm2d(mid_channels)
+
+        # Depthwise 3x3 conv (groups = mid_channels)
+        self.conv2 = nn.Conv2d(
+            mid_channels,
+            mid_channels,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            groups=mid_channels,
+            bias=False,
+        )
+        self.bn2 = nn.BatchNorm2d(mid_channels)
+
+        # Second 1x1 group conv
+        self.conv3 = nn.Conv2d(
+            mid_channels,
+            out_channels,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+            groups=groups,
+            bias=False,
+        )
+        self.bn3 = nn.BatchNorm2d(out_channels)
+
+        self.shuffle = ChannelShuffleNew(groups)
+
+        if in_channels == out_channels:
+            self.use_shortcut_conv = False
+            self.shortcut_conv = None
+            self.shortcut_bn = None
+        else:
+            self.use_shortcut_conv = True
+            self.shortcut_conv = nn.Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size=1,
+                stride=1,
+                padding=0,
+                bias=False,
+            )
+            self.shortcut_bn = nn.BatchNorm2d(out_channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Main path: conv1 + bn1 + ReLU (fused)
+        out = conv1x1_group_bn_relu_triton(
+            x,
+            self.conv1.weight,
+            self.bn1,
+            groups=self.conv1.groups,
+            apply_relu=True,
+        )
+
+        # Depthwise conv2 + bn2 (no ReLU)
+        out = depthwise_conv3x3_bn_triton(
+            out,
+            self.conv2.weight,
+            self.bn2,
+            apply_relu=False,
+        )
+
+        # Channel shuffle
+        out = self.shuffle(out)
+
+        # conv3 + bn3 + ReLU (fused)
+        out = conv1x1_group_bn_relu_triton(
+            out,
+            self.conv3.weight,
+            self.bn3,
+            groups=self.conv3.groups,
+            apply_relu=True,
+        )
+
+        # Shortcut path
+        if self.use_shortcut_conv:
+            shortcut = conv1x1_group_bn_relu_triton(
+                x,
+                self.shortcut_conv.weight,
+                self.shortcut_bn,
+                groups=self.shortcut_conv.groups,
+                apply_relu=False,
+            )
+        else:
+            shortcut = x
+
+        out = out + shortcut
+        return out
+
+
+class ModelNew(nn.Module):
+    def __init__(
+        self,
+        num_classes=1000,
+        groups=3,
+        stages_repeats=[3, 7, 3],
+        stages_out_channels=[24, 240, 480, 960],
+    ):
+        super(ModelNew, self).__init__()
+
+        # Stem conv (3x3, stride=2) – keep PyTorch conv as is
+        self.conv1 = nn.Conv2d(
+            3,
+            stages_out_channels[0],
+            kernel_size=3,
+            stride=2,
+            padding=1,
+            bias=False,
+        )
+        self.bn1 = nn.BatchNorm2d(stages_out_channels[0])
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+
+        self.stage2 = self._make_stage(
+            stages_out_channels[0],
+            stages_out_channels[1],
+            stages_repeats[0],
+            groups,
+        )
+        self.stage3 = self._make_stage(
+            stages_out_channels[1],
+            stages_out_channels[2],
+            stages_repeats[1],
+            groups,
+        )
+        self.stage4 = self._make_stage(
+            stages_out_channels[2],
+            stages_out_channels[3],
+            stages_repeats[2],
+            groups,
+        )
+
+        # Final 1x1 conv -> 1024 channels (use fused Triton 1x1 conv)
+        self.conv5 = nn.Conv2d(
+            stages_out_channels[3],
+            1024,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+            bias=False,
+        )
+        self.bn5 = nn.BatchNorm2d(1024)
+
+        self.fc = nn.Linear(1024, num_classes)
+
+    def _make_stage(self, in_channels, out_channels, repeats, groups):
+        layers = []
+        layers.append(ShuffleNetUnitNew(in_channels, out_channels, groups))
+        for _ in range(1, repeats):
+            layers.append(ShuffleNetUnitNew(out_channels, out_channels, groups))
+        return nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Stem (PyTorch conv + BN + ReLU)
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = torch.relu(x)
+
+        x = self.maxpool(x)
+
+        # Stages (Triton fused units)
+        x = self.stage2(x)
+        x = self.stage3(x)
+        x = self.stage4(x)
+
+        # Final 1x1 conv + BN + ReLU (fused Triton)
+        x = conv1x1_group_bn_relu_triton(
+            x,
+            self.conv5.weight,
+            self.bn5,
+            groups=self.conv5.groups,
+            apply_relu=True,
+        )
+
+        # Global pooling and FC (Triton)
+        x = torch.nn.functional.adaptive_avg_pool2d(x, (1, 1))
+        x = x.view(x.size(0), -1)
+        x = linear_triton(x, self.fc.weight, self.fc.bias)
+        return x

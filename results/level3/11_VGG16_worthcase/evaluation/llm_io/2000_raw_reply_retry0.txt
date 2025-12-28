@@ -1,0 +1,663 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+# -----------------------------
+# Triton kernels
+# -----------------------------
+
+@triton.jit
+def winograd_f2k3_conv3x3_bias_relu_kernel(
+    x_ptr,            # float32* : [N, Cin, H, W]
+    w_ptr,            # float32* : [Cout, Cin, 4, 4] (Winograd-transformed)
+    bias_ptr,         # float32* : [Cout]
+    y_ptr,            # float32* : [N, Cout, H, W]
+    N, Cin, H, W, Cout,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_wn, stride_wc, stride_wh, stride_ww,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    tiles_h, tiles_w,
+    BLOCK_N: tl.constexpr,  # tile in Cout dimension
+):
+    # Each program processes one output Winograd tile (2x2 outputs) for a block of Cout channels
+    pid_tile = tl.program_id(0)
+    pid_co_block = tl.program_id(1)
+
+    # Offsets in output-channel dimension
+    offs_co = pid_co_block * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_co = offs_co < Cout
+
+    # Decode tile index into (n, th, tw)
+    tiles_per_img = tiles_h * tiles_w
+    n = pid_tile // tiles_per_img
+    tile_in_img = pid_tile - n * tiles_per_img
+    th = tile_in_img // tiles_w
+    tw = tile_in_img - th * tiles_w
+
+    # Guard against out-of-range n (should not happen if grid is correct)
+    if_tiles_valid = n < N
+
+    # Top-left of 2x2 output tile
+    h_out0 = th * 2
+    w_out0 = tw * 2
+    h_out1 = h_out0 + 1
+    w_out1 = w_out0 + 1
+
+    # Top-left of 4x4 input patch (with padding=1 accounted)
+    h_patch0 = h_out0 - 1
+    w_patch0 = w_out0 - 1
+
+    # Precompute 4x4 patch coordinates
+    range4 = tl.arange(0, 4)
+    h_idx = h_patch0 + range4[:, None]  # shape (4,1)
+    w_idx = w_patch0 + range4[None, :]  # shape (1,4)
+
+    # Masks for input patch (padding)
+    mask_h = (h_idx >= 0) & (h_idx < H)
+    mask_w = (w_idx >= 0) & (w_idx < W)
+    mask_in = mask_h & mask_w
+
+    # Accumulator in Winograd domain: [BLOCK_N, 4, 4]
+    acc = tl.zeros((BLOCK_N, 4, 4), dtype=tl.float32)
+
+    # Loop over input channels
+    c = 0
+    while c < Cin:
+        if if_tiles_valid:
+            # Load 4x4 input patch for this (n, c, tile)
+            x_base = x_ptr + n * stride_xn + c * stride_xc
+            x_ptrs = x_base + h_idx * stride_xh + w_idx * stride_xw
+            patch = tl.load(x_ptrs, mask=mask_in, other=0.0)  # [4,4]
+
+            # ---- Winograd input transform: D = B^T * d * B ----
+            # Using standard F(2x2,3x3) B matrix:
+            # B^T = [[1, 0, -1, 0],
+            #        [0, 1,  1, 0],
+            #        [0,-1,  1, 0],
+            #        [0, 1,  0,-1]]
+            # Implement as: temp = B^T * d; D = temp * B
+
+            # Rows of d
+            d0 = patch[0, :]
+            d1 = patch[1, :]
+            d2 = patch[2, :]
+            d3 = patch[3, :]
+
+            # temp = B^T * d  (4x4)
+            t0 = d0
+            t1 = d1 + d2
+            t2 = -d1 + d2
+            t3 = d1 - d3
+
+            # D = temp * B
+            # B = [[1, 0, 0, 0],
+            #      [0, 1,-1, 1],
+            #      [-1,1, 1, 0],
+            #      [0, 0, 0,-1]]
+            D0 = t0 - t2          # row 0
+            D1 = t1 + t2          # row 1
+            D2 = -t1 + t2         # row 2
+            D3 = t1 - t3          # row 3
+
+            # Extract scalars D[p,q]
+            D00 = D0[0]; D01 = D0[1]; D02 = D0[2]; D03 = D0[3]
+            D10 = D1[0]; D11 = D1[1]; D12 = D1[2]; D13 = D1[3]
+            D20 = D2[0]; D21 = D2[1]; D22 = D2[2]; D23 = D2[3]
+            D30 = D3[0]; D31 = D3[1]; D32 = D3[2]; D33 = D3[3]
+
+            # ---- Accumulate elementwise products with transformed weights ----
+            # w_ptr layout: [Cout, Cin, 4, 4]
+            # strides: stride_wn, stride_wc, stride_wh, stride_ww
+
+            co = offs_co
+
+            # Row 0
+            w00_ptrs = w_ptr + co * stride_wn + c * stride_wc + 0 * stride_wh + 0 * stride_ww
+            w01_ptrs = w_ptr + co * stride_wn + c * stride_wc + 0 * stride_wh + 1 * stride_ww
+            w02_ptrs = w_ptr + co * stride_wn + c * stride_wc + 0 * stride_wh + 2 * stride_ww
+            w03_ptrs = w_ptr + co * stride_wn + c * stride_wc + 0 * stride_wh + 3 * stride_ww
+
+            w00 = tl.load(w00_ptrs, mask=mask_co & if_tiles_valid, other=0.0)
+            w01 = tl.load(w01_ptrs, mask=mask_co & if_tiles_valid, other=0.0)
+            w02 = tl.load(w02_ptrs, mask=mask_co & if_tiles_valid, other=0.0)
+            w03 = tl.load(w03_ptrs, mask=mask_co & if_tiles_valid, other=0.0)
+
+            acc[:, 0, 0] += w00 * D00
+            acc[:, 0, 1] += w01 * D01
+            acc[:, 0, 2] += w02 * D02
+            acc[:, 0, 3] += w03 * D03
+
+            # Row 1
+            w10_ptrs = w_ptr + co * stride_wn + c * stride_wc + 1 * stride_wh + 0 * stride_ww
+            w11_ptrs = w_ptr + co * stride_wn + c * stride_wc + 1 * stride_wh + 1 * stride_ww
+            w12_ptrs = w_ptr + co * stride_wn + c * stride_wc + 1 * stride_wh + 2 * stride_ww
+            w13_ptrs = w_ptr + co * stride_wn + c * stride_wc + 1 * stride_wh + 3 * stride_ww
+
+            w10 = tl.load(w10_ptrs, mask=mask_co & if_tiles_valid, other=0.0)
+            w11 = tl.load(w11_ptrs, mask=mask_co & if_tiles_valid, other=0.0)
+            w12 = tl.load(w12_ptrs, mask=mask_co & if_tiles_valid, other=0.0)
+            w13 = tl.load(w13_ptrs, mask=mask_co & if_tiles_valid, other=0.0)
+
+            acc[:, 1, 0] += w10 * D10
+            acc[:, 1, 1] += w11 * D11
+            acc[:, 1, 2] += w12 * D12
+            acc[:, 1, 3] += w13 * D13
+
+            # Row 2
+            w20_ptrs = w_ptr + co * stride_wn + c * stride_wc + 2 * stride_wh + 0 * stride_ww
+            w21_ptrs = w_ptr + co * stride_wn + c * stride_wc + 2 * stride_wh + 1 * stride_ww
+            w22_ptrs = w_ptr + co * stride_wn + c * stride_wc + 2 * stride_wh + 2 * stride_ww
+            w23_ptrs = w_ptr + co * stride_wn + c * stride_wc + 2 * stride_wh + 3 * stride_ww
+
+            w20 = tl.load(w20_ptrs, mask=mask_co & if_tiles_valid, other=0.0)
+            w21 = tl.load(w21_ptrs, mask=mask_co & if_tiles_valid, other=0.0)
+            w22 = tl.load(w22_ptrs, mask=mask_co & if_tiles_valid, other=0.0)
+            w23 = tl.load(w23_ptrs, mask=mask_co & if_tiles_valid, other=0.0)
+
+            acc[:, 2, 0] += w20 * D20
+            acc[:, 2, 1] += w21 * D21
+            acc[:, 2, 2] += w22 * D22
+            acc[:, 2, 3] += w23 * D23
+
+            # Row 3
+            w30_ptrs = w_ptr + co * stride_wn + c * stride_wc + 3 * stride_wh + 0 * stride_ww
+            w31_ptrs = w_ptr + co * stride_wn + c * stride_wc + 3 * stride_wh + 1 * stride_ww
+            w32_ptrs = w_ptr + co * stride_wn + c * stride_wc + 3 * stride_wh + 2 * stride_ww
+            w33_ptrs = w_ptr + co * stride_wn + c * stride_wc + 3 * stride_wh + 3 * stride_ww
+
+            w30 = tl.load(w30_ptrs, mask=mask_co & if_tiles_valid, other=0.0)
+            w31 = tl.load(w31_ptrs, mask=mask_co & if_tiles_valid, other=0.0)
+            w32 = tl.load(w32_ptrs, mask=mask_co & if_tiles_valid, other=0.0)
+            w33 = tl.load(w33_ptrs, mask=mask_co & if_tiles_valid, other=0.0)
+
+            acc[:, 3, 0] += w30 * D30
+            acc[:, 3, 1] += w31 * D31
+            acc[:, 3, 2] += w32 * D32
+            acc[:, 3, 3] += w33 * D33
+
+        c += 1
+
+    # ---- Inverse Winograd transform: Y = A^T * M * A ----
+    # A^T = [[1, 1, 1, 0],
+    #        [0, 1,-1,-1]]
+    # Row transform: T = A^T * M  => shape [BLOCK_N, 2, 4]
+    m0 = acc[:, 0, :]  # [BLOCK_N, 4]
+    m1 = acc[:, 1, :]
+    m2 = acc[:, 2, :]
+    m3 = acc[:, 3, :]
+
+    t0 = m0 + m1 + m2       # row 0
+    t1 = m1 - m2 - m3       # row 1
+
+    # Column transform: Y = T * A  => shape [BLOCK_N, 2, 2]
+    y00 = t0[:, 0] + t0[:, 1] + t0[:, 2]
+    y01 = t0[:, 1] - t0[:, 2] - t0[:, 3]
+    y10 = t1[:, 0] + t1[:, 1] + t1[:, 2]
+    y11 = t1[:, 1] - t1[:, 2] - t1[:, 3]
+
+    # Add bias and ReLU
+    bias = tl.load(bias_ptr + offs_co, mask=mask_co, other=0.0)
+    y00 = tl.maximum(y00 + bias, 0.0)
+    y01 = tl.maximum(y01 + bias, 0.0)
+    y10 = tl.maximum(y10 + bias, 0.0)
+    y11 = tl.maximum(y11 + bias, 0.0)
+
+    # ---- Store results to output tensor ----
+    # Masks for valid output positions (handles odd H/W)
+    mask_00 = (h_out0 < H) & (w_out0 < W) & if_tiles_valid
+    mask_01 = (h_out0 < H) & (w_out1 < W) & if_tiles_valid
+    mask_10 = (h_out1 < H) & (w_out0 < W) & if_tiles_valid
+    mask_11 = (h_out1 < H) & (w_out1 < W) & if_tiles_valid
+
+    base_y_n = n * stride_yn
+
+    # (0,0)
+    y00_ptrs = (
+        y_ptr
+        + base_y_n
+        + offs_co * stride_yc
+        + h_out0 * stride_yh
+        + w_out0 * stride_yw
+    )
+    tl.store(y00_ptrs, y00, mask=mask_co & mask_00)
+
+    # (0,1)
+    y01_ptrs = (
+        y_ptr
+        + base_y_n
+        + offs_co * stride_yc
+        + h_out0 * stride_yh
+        + w_out1 * stride_yw
+    )
+    tl.store(y01_ptrs, y01, mask=mask_co & mask_01)
+
+    # (1,0)
+    y10_ptrs = (
+        y_ptr
+        + base_y_n
+        + offs_co * stride_yc
+        + h_out1 * stride_yh
+        + w_out0 * stride_yw
+    )
+    tl.store(y10_ptrs, y10, mask=mask_co & mask_10)
+
+    # (1,1)
+    y11_ptrs = (
+        y_ptr
+        + base_y_n
+        + offs_co * stride_yc
+        + h_out1 * stride_yh
+        + w_out1 * stride_yw
+    )
+    tl.store(y11_ptrs, y11, mask=mask_co & mask_11)
+
+
+@triton.jit
+def gemm_bias_relu_kernel(
+    a_ptr, b_ptr, bias_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    k0 = 0
+    while k0 < K:
+        k = k0 + offs_k
+
+        a_ptrs = (
+            a_ptr
+            + offs_m[:, None] * stride_am
+            + k[None, :] * stride_ak
+        )
+        b_ptrs = (
+            b_ptr
+            + k[:, None] * stride_bk
+            + offs_n[None, :] * stride_bn
+        )
+
+        mask_k = k < K
+        mask_m = offs_m < M
+        mask_n = offs_n < N
+
+        a = tl.load(a_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0)
+        b = tl.load(b_ptrs, mask=mask_k[:, None] & mask_n[None, :], other=0.0)
+
+        acc += tl.dot(a, b, allow_tf32=True)
+        k0 += BLOCK_K
+
+    # Add bias and ReLU
+    mask_n = offs_n < N
+    bias = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0)
+    acc = acc + bias[None, :]
+    acc = tl.maximum(acc, 0.0)
+
+    c_ptrs = (
+        c_ptr
+        + offs_m[:, None] * stride_cm
+        + offs_n[None, :] * stride_cn
+    )
+    tl.store(
+        c_ptrs,
+        acc,
+        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+    )
+
+
+@triton.jit
+def gemm_bias_kernel(
+    a_ptr, b_ptr, bias_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    k0 = 0
+    while k0 < K:
+        k = k0 + offs_k
+
+        a_ptrs = (
+            a_ptr
+            + offs_m[:, None] * stride_am
+            + k[None, :] * stride_ak
+        )
+        b_ptrs = (
+            b_ptr
+            + k[:, None] * stride_bk
+            + offs_n[None, :] * stride_bn
+        )
+
+        mask_k = k < K
+        mask_m = offs_m < M
+        mask_n = offs_n < N
+
+        a = tl.load(a_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0)
+        b = tl.load(b_ptrs, mask=mask_k[:, None] & mask_n[None, :], other=0.0)
+
+        acc += tl.dot(a, b, allow_tf32=True)
+        k0 += BLOCK_K
+
+    # Add bias (no activation)
+    mask_n = offs_n < N
+    bias = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0)
+    acc = acc + bias[None, :]
+
+    c_ptrs = (
+        c_ptr
+        + offs_m[:, None] * stride_cm
+        + offs_n[None, :] * stride_cn
+    )
+    tl.store(
+        c_ptrs,
+        acc,
+        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+    )
+
+
+# -----------------------------
+# Python wrappers / helpers
+# -----------------------------
+
+def _get_winograd_weight(conv: nn.Conv2d) -> torch.Tensor:
+    """
+    Precompute and cache Winograd-transformed weights for a 3x3, stride=1, padding=1 conv.
+    Uses F(2x2,3x3) transform: U = G * g * G^T.
+    """
+    weight = conv.weight
+    assert weight.shape[2:] == (3, 3)
+    device = weight.device
+    dtype = weight.dtype
+
+    need_recompute = (
+        not hasattr(conv, "_winograd_weight")
+        or conv._winograd_weight.device != device
+        or conv._winograd_weight.dtype != dtype
+        or conv._winograd_weight.shape[0] != weight.shape[0]
+        or conv._winograd_weight.shape[1] != weight.shape[1]
+        or getattr(conv, "_winograd_weight_version", None) != weight._version
+    )
+
+    if need_recompute:
+        # Standard F(2x2,3x3) G matrix (Lavin's scaled variant)
+        # G = [[1,   0,   0],
+        #      [1/2, 1/2, 1/2],
+        #      [1/2,-1/2, 1/2],
+        #      [0,   0,   1]]
+        G = torch.tensor(
+            [
+                [1.0, 0.0, 0.0],
+                [0.5, 0.5, 0.5],
+                [0.5, -0.5, 0.5],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=dtype,
+            device=device,
+        )
+        # U[p,q] = sum_{i,j} G[p,i] * g[i,j] * G[q,j]
+        # weight: [Cout, Cin, 3, 3] -> [Cout, Cin, 4, 4]
+        with torch.no_grad():
+            w_winograd = torch.einsum("pi,ocij,qj->ocpq", G, weight, G)
+        conv._winograd_weight = w_winograd.contiguous()
+        conv._winograd_weight_version = int(weight._version)
+    return conv._winograd_weight
+
+
+def conv3x3_bias_relu(x: torch.Tensor, conv: nn.Conv2d) -> torch.Tensor:
+    """
+    Fused 3x3 conv (stride=1, padding=1) + bias + ReLU using
+    Winograd F(2x2,3x3) Triton kernel.
+    x: [N, Cin, H, W], conv.weight: [Cout, Cin, 3, 3]
+    """
+    assert x.is_cuda
+    assert conv.weight.shape[2:] == (3, 3)
+    assert conv.stride == (1, 1)
+    assert conv.padding == (1, 1)
+    assert conv.dilation == (1, 1)
+    assert conv.groups == 1
+    assert conv.bias is not None
+
+    N, Cin, H, W = x.shape
+    Cout = conv.weight.shape[0]
+
+    # Precompute/cached Winograd-transformed weights
+    w_winograd = _get_winograd_weight(conv)
+
+    y = torch.empty((N, Cout, H, W), device=x.device, dtype=x.dtype)
+
+    tiles_h = (H + 1) // 2
+    tiles_w = (W + 1) // 2
+
+    grid = lambda META: (
+        N * tiles_h * tiles_w,
+        triton.cdiv(Cout, META["BLOCK_N"]),
+    )
+
+    winograd_f2k3_conv3x3_bias_relu_kernel[grid](
+        x, w_winograd, conv.bias, y,
+        N, Cin, H, W, Cout,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        w_winograd.stride(0), w_winograd.stride(1),
+        w_winograd.stride(2), w_winograd.stride(3),
+        y.stride(0), y.stride(1), y.stride(2), y.stride(3),
+        tiles_h, tiles_w,
+        BLOCK_N=64,
+        num_warps=4,
+        num_stages=2,
+    )
+    return y
+
+
+def linear_bias_relu(x: torch.Tensor, linear: nn.Linear) -> torch.Tensor:
+    """
+    Fused Linear + bias + ReLU using Triton.
+    x: [M, K], weight: [N, K] (PyTorch layout)
+    """
+    assert x.is_cuda
+    weight = linear.weight
+    bias = linear.bias
+    M, K = x.shape
+    N = weight.shape[0]
+
+    # b_ptr expects [K, N] (input features x output features)
+    b = weight.t().contiguous()
+    out = torch.empty((M, N), device=x.device, dtype=x.dtype)
+
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_M"]),
+        triton.cdiv(N, META["BLOCK_N"]),
+    )
+
+    gemm_bias_relu_kernel[grid](
+        x, b, bias, out,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        b.stride(0), b.stride(1),
+        out.stride(0), out.stride(1),
+        BLOCK_M=128,
+        BLOCK_N=64,
+        BLOCK_K=32,
+        num_warps=4,
+        num_stages=3,
+    )
+    return out
+
+
+def linear_bias(x: torch.Tensor, linear: nn.Linear) -> torch.Tensor:
+    """
+    Fused Linear + bias (no activation) using Triton.
+    x: [M, K], weight: [N, K]
+    """
+    assert x.is_cuda
+    weight = linear.weight
+    bias = linear.bias
+    M, K = x.shape
+    N = weight.shape[0]
+
+    b = weight.t().contiguous()
+    out = torch.empty((M, N), device=x.device, dtype=x.dtype)
+
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_M"]),
+        triton.cdiv(N, META["BLOCK_N"]),
+    )
+
+    gemm_bias_kernel[grid](
+        x, b, bias, out,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        b.stride(0), b.stride(1),
+        out.stride(0), out.stride(1),
+        BLOCK_M=128,
+        BLOCK_N=64,
+        BLOCK_K=32,
+        num_warps=4,
+        num_stages=3,
+    )
+    return out
+
+
+# -----------------------------
+# Optimized VGG16 Model
+# -----------------------------
+
+class ModelNew(nn.Module):
+    def __init__(self, num_classes=1000):
+        """
+        VGG16 with high-performance Triton kernels for:
+          - All 3x3 Conv2d + ReLU layers (Winograd F(2x2,3x3))
+          - All Linear + ReLU layers
+          - Final Linear layer
+        MaxPool and Dropout remain as PyTorch ops.
+        """
+        super(ModelNew, self).__init__()
+
+        # Same architecture as the reference VGG16
+        self.features = nn.Sequential(
+            # Block 1
+            nn.Conv2d(3, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+
+            # Block 2
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 128, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+
+            # Block 3
+            nn.Conv2d(128, 256, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 256, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 256, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+
+            # Block 4
+            nn.Conv2d(256, 512, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 512, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 512, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+
+            # Block 5
+            nn.Conv2d(512, 512, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 512, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 512, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+        )
+
+        self.classifier = nn.Sequential(
+            nn.Linear(512 * 7 * 7, 4096),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.0),
+            nn.Linear(4096, 4096),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.0),
+            nn.Linear(4096, num_classes),
+        )
+
+    def forward(self, x):
+        """
+        Forward pass using Triton kernels for Conv+ReLU and Linear(+ReLU).
+        x: [batch_size, 3, 224, 224]
+        Returns: [batch_size, num_classes]
+        """
+        # ---- Features (manual unrolling for fusion) ----
+        # Block 1
+        x = conv3x3_bias_relu(x, self.features[0])   # Conv 1_1 + ReLU
+        x = conv3x3_bias_relu(x, self.features[2])   # Conv 1_2 + ReLU
+        x = self.features[4](x)                      # MaxPool
+
+        # Block 2
+        x = conv3x3_bias_relu(x, self.features[5])   # Conv 2_1 + ReLU
+        x = conv3x3_bias_relu(x, self.features[7])   # Conv 2_2 + ReLU
+        x = self.features[9](x)                      # MaxPool
+
+        # Block 3
+        x = conv3x3_bias_relu(x, self.features[10])  # Conv 3_1 + ReLU
+        x = conv3x3_bias_relu(x, self.features[12])  # Conv 3_2 + ReLU
+        x = conv3x3_bias_relu(x, self.features[14])  # Conv 3_3 + ReLU
+        x = self.features[16](x)                     # MaxPool
+
+        # Block 4
+        x = conv3x3_bias_relu(x, self.features[17])  # Conv 4_1 + ReLU
+        x = conv3x3_bias_relu(x, self.features[19])  # Conv 4_2 + ReLU
+        x = conv3x3_bias_relu(x, self.features[21])  # Conv 4_3 + ReLU
+        x = self.features[23](x)                     # MaxPool
+
+        # Block 5
+        x = conv3x3_bias_relu(x, self.features[24])  # Conv 5_1 + ReLU
+        x = conv3x3_bias_relu(x, self.features[26])  # Conv 5_2 + ReLU
+        x = conv3x3_bias_relu(x, self.features[28])  # Conv 5_3 + ReLU
+        x = self.features[30](x)                     # MaxPool
+
+        # ---- Classifier ----
+        x = torch.flatten(x, 1)                      # [B, 512*7*7]
+
+        # Linear 1 + ReLU
+        x = linear_bias_relu(x, self.classifier[0])
+        x = self.classifier[2](x)                    # Dropout p=0
+
+        # Linear 2 + ReLU
+        x = linear_bias_relu(x, self.classifier[3])
+        x = self.classifier[5](x)                    # Dropout p=0
+
+        # Final Linear (no activation)
+        x = linear_bias(x, self.classifier[6])
+        return x
+```

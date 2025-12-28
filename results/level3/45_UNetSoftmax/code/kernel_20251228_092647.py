@@ -1,0 +1,207 @@
+import torch, torch.nn as nn, triton, triton.language as tl
+
+# ============================
+# Triton kernels and wrappers
+# ============================
+
+@triton.jit
+def softmax_lastdim_kernel(
+    inp_ptr, out_ptr,
+    ROWS, COLS,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Compute softmax over the last dimension (length = COLS) for ROWS rows.
+    inp_ptr, out_ptr: flattened [ROWS, COLS] (row-major, contiguous).
+    """
+
+    row_id = tl.program_id(0)
+    row_mask = row_id < ROWS
+    safe_row = tl.where(row_mask, row_id, 0)
+    row_start = safe_row * COLS
+
+    offs = tl.arange(0, BLOCK_SIZE)
+
+    # Pass 1: compute row-wise max for numerical stability
+    row_max = tl.full((), -1.0e30, tl.float32)
+    for col_start in range(0, COLS, BLOCK_SIZE):
+        idx = col_start + offs
+        mask = (idx < COLS) & row_mask
+        x = tl.load(inp_ptr + row_start + idx, mask=mask, other=-1.0e30)
+        current_max = tl.max(x, axis=0)
+        row_max = tl.maximum(row_max, current_max)
+
+    # Pass 2: compute exp(x - max) and row-wise sum, store numerators to out
+    row_sum = tl.full((), 0.0, tl.float32)
+    for col_start in range(0, COLS, BLOCK_SIZE):
+        idx = col_start + offs
+        mask = (idx < COLS) & row_mask
+        x = tl.load(inp_ptr + row_start + idx, mask=mask, other=-1.0e30)
+        x = x - row_max
+        num = tl.exp(x)
+        tl.store(out_ptr + row_start + idx, num, mask=mask)
+        row_sum = row_sum + tl.sum(num, axis=0)
+
+    # Pass 3: normalize
+    inv_sum = 1.0 / row_sum
+    for col_start in range(0, COLS, BLOCK_SIZE):
+        idx = col_start + offs
+        mask = (idx < COLS) & row_mask
+        num = tl.load(out_ptr + row_start + idx, mask=mask, other=0.0)
+        out = num * inv_sum
+        tl.store(out_ptr + row_start + idx, out, mask=mask)
+
+
+def triton_softmax_lastdim(x: torch.Tensor) -> torch.Tensor:
+    """
+    Softmax over last dimension (dim=-1) using Triton kernel.
+    Works for N-D tensors; only last dimension is reduced.
+    """
+    assert x.is_cuda, "Triton softmax requires CUDA tensor"
+    x_contig = x.contiguous()
+    orig_dtype = x_contig.dtype
+    if orig_dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise TypeError(f"Unsupported dtype {orig_dtype} for Triton softmax")
+
+    # Compute in fp32 for numerical stability
+    if x_contig.dtype != torch.float32:
+        x_ = x_contig.to(torch.float32)
+    else:
+        x_ = x_contig
+
+    *leading, last = x_.shape
+    rows = 1
+    for d in leading:
+        rows *= d
+    cols = last
+
+    inp_flat = x_.view(rows, cols)
+    out_flat = torch.empty_like(inp_flat)
+
+    BLOCK_SIZE = 128  # power of 2, good balance for width up to 512
+    grid = lambda META: (triton.cdiv(rows, 1),)
+    softmax_lastdim_kernel[grid](
+        inp_flat, out_flat,
+        rows, cols,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+
+    out = out_flat.view_as(x_)
+    if orig_dtype != torch.float32:
+        out = out.to(orig_dtype)
+    return out
+
+
+class TritonSoftmaxLastDim(nn.Module):
+    """
+    Drop-in replacement for nn.Softmax(dim=-1) using the Triton kernel.
+    """
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_softmax_lastdim(x)
+
+
+# ============================
+# U-Net building blocks (Triton-accelerated softmax)
+# ============================
+
+class DoubleConvNew(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        # Keep high-performance PyTorch convolutions and batchnorm;
+        # replace softmax with Triton implementation.
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.softmax1 = TritonSoftmaxLastDim()
+
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.softmax2 = TritonSoftmaxLastDim()
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.softmax1(x)
+        x = self.conv2(x)
+        x = self.bn2(x)
+        x = self.softmax2(x)
+        return x
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, features):
+        """
+        :param in_channels: Number of input channels
+        :param out_channels: Number of output channels
+        :param features: Number of base features (will be doubled in each layer)
+        """
+        super(ModelNew, self).__init__()
+        self.encoder1 = DoubleConvNew(in_channels, features)
+        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.encoder2 = DoubleConvNew(features, features * 2)
+        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.encoder3 = DoubleConvNew(features * 2, features * 4)
+        self.pool3 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.encoder4 = DoubleConvNew(features * 4, features * 8)
+        self.pool4 = nn.MaxPool2d(kernel_size=2, stride=2)
+
+        self.bottleneck = DoubleConvNew(features * 8, features * 16)
+
+        self.upconv4 = nn.ConvTranspose2d(features * 16, features * 8, kernel_size=2, stride=2)
+        self.decoder4 = DoubleConvNew(features * 16, features * 8)
+        self.upconv3 = nn.ConvTranspose2d(features * 8, features * 4, kernel_size=2, stride=2)
+        self.decoder3 = DoubleConvNew(features * 8, features * 4)
+        self.upconv2 = nn.ConvTranspose2d(features * 4, features * 2, kernel_size=2, stride=2)
+        self.decoder2 = DoubleConvNew(features * 4, features * 2)
+        self.upconv1 = nn.ConvTranspose2d(features * 2, features, kernel_size=2, stride=2)
+        self.decoder1 = DoubleConvNew(features * 2, features)
+
+        self.final_conv = nn.Conv2d(features, out_channels, kernel_size=1)
+
+    def forward(self, x):
+        """
+        :param x: Input tensor, shape (batch_size, in_channels, height, width)
+        :return: Output tensor, shape (batch_size, out_channels, height, width)
+        """
+        enc1 = self.encoder1(x)
+        enc2 = self.encoder2(self.pool1(enc1))
+        enc3 = self.encoder3(self.pool2(enc2))
+        enc4 = self.encoder4(self.pool3(enc3))
+
+        bottleneck = self.bottleneck(self.pool4(enc4))
+
+        dec4 = self.upconv4(bottleneck)
+        dec4 = torch.cat((dec4, enc4), dim=1)
+        dec4 = self.decoder4(dec4)
+
+        dec3 = self.upconv3(dec4)
+        dec3 = torch.cat((dec3, enc3), dim=1)
+        dec3 = self.decoder3(dec3)
+
+        dec2 = self.upconv2(dec3)
+        dec2 = torch.cat((dec2, enc2), dim=1)
+        dec2 = self.decoder2(dec2)
+
+        dec1 = self.upconv1(dec2)
+        dec1 = torch.cat((dec1, enc1), dim=1)
+        dec1 = self.decoder1(dec1)
+
+        return self.final_conv(dec1)
+
+
+# Example input helpers (can be used by external harness)
+batch_size = 8
+in_channels = 8
+out_channels = 4
+height = 64
+width = 512
+features = 64
+
+def get_inputs():
+    # For Triton, inputs should be moved to CUDA by the caller if needed.
+    return [torch.rand(batch_size, in_channels, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, features]

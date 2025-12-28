@@ -1,0 +1,10 @@
+```json
+{
+  "worth_optimizing": "yes",
+  "reason": "The current Triton softmax is slower than the PyTorch baseline mainly because it makes three full passes over each row and uses an intermediate global buffer, causing excessive global memory traffic.",
+  "bottleneck": "The softmax kernel is memory-bandwidth bound: each element is read multiple times and written twice (intermediate numerators + final output) due to the 3-pass design with a temporary global buffer, which is especially costly given the large last dimension (COLS=512) and many rows.",
+  "optimisation method": "Replace the current 3-pass softmax with a row-persistent, on-chip implementation that keeps one entire row in registers/shared memory and computes softmax in-place (max → exp/sum → normalize) without writing intermediate numerators to global memory, effectively halving global memory traffic per element.",
+  "modification plan": "Change the kernel so that each program instance is responsible for a full row (set BLOCK_SIZE=COLS=512 for this workload) and allocates a local buffer (e.g., `tl.zeros([BLOCK_SIZE], tl.float32)`) for that row. First, load the row once and compute the row-wise max and store the row values in the local buffer; second, reuse the local buffer to compute `exp(x - max)`, accumulate the sum, and then normalize in-place and write out the final results, thus eliminating the separate intermediate global buffer and the third pass. This reduces global reads/writes from ~4N to ~2N per row and should be tuned via `num_warps`/`num_stages` to maintain occupancy.",
+  "expected_speedup": "20-30%"
+}
+```

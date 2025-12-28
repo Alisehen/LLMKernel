@@ -1,0 +1,252 @@
+import math
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def linear_bias_relu_kernel(
+    a_ptr, b_ptr, bias_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # Program IDs for 2D tiling over M and N dimensions
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    # Tile indices
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Pointers to the first tiles of A and B
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    # Accumulator in FP32 for better numerical stability
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Loop over K dimension
+    for k in range(0, K, BLOCK_K):
+        k_mask = (k + offs_k) < K
+
+        a_mask = (offs_m[:, None] < M) & k_mask[None, :]
+        b_mask = k_mask[:, None] & (offs_n[None, :] < N)
+
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+        acc += tl.dot(a, b, allow_tf32=True)
+
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Add bias
+    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc += bias[None, :]
+
+    # ReLU activation
+    acc = tl.maximum(acc, 0.0)
+
+    # Store result (cast back to A's dtype)
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    c = acc.to(tl.float32)  # we keep everything in fp32; wrapper controls external dtype
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, c, mask=mask)
+
+
+@triton.jit
+def linear_bias_kernel(
+    a_ptr, b_ptr, bias_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # Program IDs for 2D tiling over M and N dimensions
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    # Tile indices
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Pointers to the first tiles of A and B
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    # Accumulator in FP32
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Loop over K dimension
+    for k in range(0, K, BLOCK_K):
+        k_mask = (k + offs_k) < K
+
+        a_mask = (offs_m[:, None] < M) & k_mask[None, :]
+        b_mask = k_mask[:, None] & (offs_n[None, :] < N)
+
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+        acc += tl.dot(a, b, allow_tf32=True)
+
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Add bias
+    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc += bias[None, :]
+
+    # Store result
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    c = acc.to(tl.float32)
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, c, mask=mask)
+
+
+def fused_linear_bias_relu(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    x:      [M, K]
+    weight: [N, K] (nn.Linear.weight layout)
+    bias:   [N]
+    returns: [M, N] with bias + ReLU applied
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda, "Inputs must be on CUDA device"
+    # Work in FP32 for maximum numerical stability and performance
+    if x.dtype != torch.float32:
+        x = x.float()
+    if weight.dtype != torch.float32:
+        weight = weight.float()
+    if bias.dtype != torch.float32:
+        bias = bias.float()
+
+    x = x.contiguous()
+    # Transform weight to [K, N] for coalesced access in matmul
+    b_mat = weight.t().contiguous()  # [K, N]
+
+    M, K = x.shape
+    N = weight.shape[0]
+
+    out = torch.empty((M, N), device=x.device, dtype=torch.float32)
+
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta["BLOCK_M"]),
+            triton.cdiv(N, meta["BLOCK_N"]),
+        )
+
+    linear_bias_relu_kernel[grid](
+        x, b_mat, bias, out,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        b_mat.stride(0), b_mat.stride(1),
+        out.stride(0), out.stride(1),
+        BLOCK_M=128,
+        BLOCK_N=128,
+        BLOCK_K=32,
+        num_warps=4,
+        num_stages=3,
+    )
+    return out
+
+
+def fused_linear_bias(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    x:      [M, K]
+    weight: [N, K] (nn.Linear.weight layout)
+    bias:   [N]
+    returns: [M, N] with bias applied
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda, "Inputs must be on CUDA device"
+    if x.dtype != torch.float32:
+        x = x.float()
+    if weight.dtype != torch.float32:
+        weight = weight.float()
+    if bias.dtype != torch.float32:
+        bias = bias.float()
+
+    x = x.contiguous()
+    b_mat = weight.t().contiguous()  # [K, N]
+
+    M, K = x.shape
+    N = weight.shape[0]
+
+    out = torch.empty((M, N), device=x.device, dtype=torch.float32)
+
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta["BLOCK_M"]),
+            triton.cdiv(N, meta["BLOCK_N"]),
+        )
+
+    linear_bias_kernel[grid](
+        x, b_mat, bias, out,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        b_mat.stride(0), b_mat.stride(1),
+        out.stride(0), out.stride(1),
+        BLOCK_M=128,
+        BLOCK_N=128,
+        BLOCK_K=32,
+        num_warps=4,
+        num_stages=3,
+    )
+    return out
+
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_layer_sizes, output_size):
+        """
+        Triton-accelerated version of the original MLP.
+        Uses fused Linear+Bias+ReLU kernels for hidden layers
+        and fused Linear+Bias for the output layer.
+        """
+        super(ModelNew, self).__init__()
+
+        layer_sizes = [input_size] + list(hidden_layer_sizes) + [output_size]
+        self.num_layers = len(layer_sizes) - 1
+        self.num_hidden = len(hidden_layer_sizes)
+
+        self.weights = nn.ParameterList()
+        self.biases = nn.ParameterList()
+
+        # Initialize similar to nn.Linear defaults (Kaiming uniform)
+        for in_features, out_features in zip(layer_sizes[:-1], layer_sizes[1:]):
+            w = nn.Parameter(torch.empty(out_features, in_features))
+            nn.init.kaiming_uniform_(w, a=math.sqrt(5))
+            fan_in = in_features
+            bound = 1 / math.sqrt(fan_in)
+            b = nn.Parameter(torch.empty(out_features))
+            nn.init.uniform_(b, -bound, bound)
+
+            self.weights.append(w)
+            self.biases.append(b)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: [batch_size, input_size]
+        returns: [batch_size, output_size]
+        """
+        # Ensure CUDA & FP32 for Triton kernels
+        assert x.is_cuda, "Input must be on CUDA device"
+        if x.dtype != torch.float32:
+            x = x.float()
+
+        for i in range(self.num_layers):
+            w = self.weights[i]
+            b = self.biases[i]
+            if i < self.num_hidden:
+                x = fused_linear_bias_relu(x, w, b)
+            else:
+                x = fused_linear_bias(x, w, b)
+        return x

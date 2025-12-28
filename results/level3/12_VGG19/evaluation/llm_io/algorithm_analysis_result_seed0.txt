@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The custom 3x3 convolution kernel uses a straightforward direct algorithm and is significantly slower than cuDNN, so an algorithmic improvement on all 3x3 layers can yield a large end‑to‑end gain.",
+  "bottleneck": "All VGG blocks are dominated by 3x3 stride‑1 convolutions implemented as naive direct convolution, performing 9× more MAC operations per output element than necessary for a Winograd formulation and with poor arithmetic intensity relative to peak GPU capability.",
+  "optimisation method": "Replace the direct 3x3 convolution in `conv3x3_bias_relu_kernel` with a Winograd F(2x2,3x3) algorithm (still fused with bias+ReLU), which reduces the number of multiplications per output tile and increases compute reuse, especially beneficial given VGG’s many 3x3 layers.",
+  "modification plan": "Pre-transform all 3x3 filters once per forward (or once at weight update) into Winograd space (e.g., F(2x2,3x3) filter transform) and store them as parameters. Rewrite the Triton conv kernel to operate on 4x4 input tiles: load an input tile, apply the Winograd input transform, perform elementwise multiplications with the pre‑transformed filters, apply the inverse Winograd transform to produce a 2x2 output tile, then add bias and apply ReLU before writing to global memory. Adjust grid/blocking so that each program instance handles one or multiple 2x2 output tiles per output channel block, ensuring coalesced loads/stores and reusing transformed tiles across channels.",
+  "expected_speedup": "30-50%"
+}

@@ -267,7 +267,7 @@ def build_seed_prompt(
         if "conv" in str(arch_path).lower():
             few_base = FEWSHOT_FUSION_BASE.read_text().strip()
             few_new = FEWSHOT_FUSION_NEW_TRITON.read_text().strip()
-            fusion_guidance = FUSION_CONV_GUIDANCE
+            fusion_guidance = ""
         else:
             few_base = FEWSHOT_FUSION_BASE.read_text().strip()
             few_new = FEWSHOT_FUSION_NEW_TRITON.read_text().strip()

@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The current optimization focuses on the linear kernel, but a larger inefficiency comes from explicitly materializing patches via unfold before the linear, which can be replaced by a more efficient algorithm.",
+  "bottleneck": "Patch embedding is implemented as img.unfold(...).reshape(..., patch_dim) followed by a Linear(patch_dim -> dim), which is essentially an im2col + GEMM convolution; this creates a large intermediate [B, num_patches, patch_dim] tensor and extra kernel launches, making the operation memory‑bound and dominating over any micro‑optimizations of the GEMM itself.",
+  "optimisation method": "Replace the unfold + patch_to_embedding Linear (or triton_linear) with a single convolutional patch embedding (Conv2d with kernel_size=patch_size, stride=patch_size, out_channels=dim) or an equivalent fused Triton kernel that directly reads from the NCHW image and applies the patch_to_embedding weights without materializing patches.",
+  "modification plan": "Change the model to use nn.Conv2d(channels, dim, kernel_size=patch_size, stride=patch_size, bias=True) for patch embedding, reshaping its [B, dim, H/p, W/p] output to [B, num_patches, dim] and removing img.unfold + reshape + Linear. If you want to keep Triton, write a fused kernel that computes y[b, p, :] = sum_{c, u, v} img[b, c, h+u, w+v] * W[:, c, u, v] directly from the image layout, using block tiling over patches and output dim; this reuses the same core dot-product structure as linear_bias_kernel but with patch indexing instead of reading from a precomputed patch buffer. Integrate this fused patch-embedding kernel into ModelNew.forward in place of both the unfold and the first triton_linear call.",
+  "expected_speedup": "20-30%"
+}

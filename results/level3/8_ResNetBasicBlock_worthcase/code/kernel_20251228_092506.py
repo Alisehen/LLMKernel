@@ -1,0 +1,412 @@
+# <complete ModelNew code with optimized Triton kernels>
+import torch, torch.nn as nn, triton, triton.language as tl
+
+
+@triton.jit
+def conv_im2col_matmul_kernel(
+    x_ptr, w_ptr, out_ptr,
+    N, C_in, H_in, W_in,
+    C_out,
+    H_out, W_out,
+    KH, KW,
+    stride_h, stride_w,
+    pad_h, pad_w,
+    M, K_dim,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_wk, stride_wn,
+    stride_om, stride_on,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    hw_out = H_out * W_out
+    n_idx = offs_m // hw_out
+    rem_m = offs_m - n_idx * hw_out
+    ho_idx = rem_m // W_out
+    wo_idx = rem_m - ho_idx * W_out
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k in range(0, K_dim, BLOCK_K):
+        k_idx = k + offs_k
+        k_mask = k_idx < K_dim
+
+        kk = KH * KW
+        c_idx = k_idx // kk
+        rem_k = k_idx - c_idx * kk
+        kh_idx = rem_k // KW
+        kw_idx = rem_k - kh_idx * KW
+
+        h_in = ho_idx[:, None] * stride_h + kh_idx[None, :] - pad_h
+        w_in = wo_idx[:, None] * stride_w + kw_idx[None, :] - pad_w
+
+        in_bounds = (
+            (h_in >= 0) & (h_in < H_in) &
+            (w_in >= 0) & (w_in < W_in)
+        )
+
+        mask_a = (
+            (offs_m[:, None] < M) &
+            k_mask[None, :] &
+            in_bounds
+        )
+
+        a_ptrs = (
+            x_ptr
+            + n_idx[:, None] * stride_xn
+            + c_idx[None, :] * stride_xc
+            + h_in * stride_xh
+            + w_in * stride_xw
+        )
+        a = tl.load(a_ptrs, mask=mask_a, other=0.0)
+
+        b_ptrs = (
+            w_ptr
+            + k_idx[:, None] * stride_wk
+            + offs_n[None, :] * stride_wn
+        )
+        mask_b = k_mask[:, None] & (offs_n[None, :] < C_out)
+        b = tl.load(b_ptrs, mask=mask_b, other=0.0)
+
+        acc += tl.dot(a, b, allow_tf32=True)
+
+    out_ptrs = out_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
+    mask_out = (offs_m[:, None] < M) & (offs_n[None, :] < C_out)
+    tl.store(out_ptrs, acc, mask=mask_out)
+
+
+def triton_conv2d_nchw(x, weight, stride=1, padding=0):
+    """
+    Generic Triton conv2d (NCHW) via implicit im2col + matmul.
+    Used as a fallback / reference implementation.
+    """
+    assert x.is_cuda and weight.is_cuda, "Inputs must be CUDA tensors"
+    x = x.contiguous()
+    weight = weight.contiguous()
+
+    if isinstance(stride, (tuple, list)):
+        stride_h, stride_w = int(stride[0]), int(stride[1])
+    else:
+        stride_h = stride_w = int(stride)
+
+    if isinstance(padding, (tuple, list)):
+        pad_h, pad_w = int(padding[0]), int(padding[1])
+    else:
+        pad_h = pad_w = int(padding)
+
+    N, C_in, H_in, W_in = x.shape
+    C_out, C_in_w, KH, KW = weight.shape
+    assert C_in_w == C_in
+
+    H_out = (H_in + 2 * pad_h - KH) // stride_h + 1
+    W_out = (W_in + 2 * pad_w - KW) // stride_w + 1
+
+    M = N * H_out * W_out
+    K_dim = C_in * KH * KW
+
+    w_mat = weight.view(C_out, -1).t().contiguous()  # (K_dim, C_out)
+    out_mat = torch.empty((M, C_out), device=x.device, dtype=torch.float32)
+
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta["BLOCK_M"]),
+            triton.cdiv(C_out, meta["BLOCK_N"]),
+        )
+
+    conv_im2col_matmul_kernel[grid](
+        x, w_mat, out_mat,
+        N, C_in, H_in, W_in,
+        C_out,
+        H_out, W_out,
+        KH, KW,
+        stride_h, stride_w,
+        pad_h, pad_w,
+        M, K_dim,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        w_mat.stride(0), w_mat.stride(1),
+        out_mat.stride(0), out_mat.stride(1),
+        BLOCK_M=64, BLOCK_N=64, BLOCK_K=32,
+        num_warps=4,
+        num_stages=2,
+    )
+
+    out = out_mat.view(N, H_out, W_out, C_out).permute(0, 3, 1, 2).contiguous()
+    if out.dtype != x.dtype:
+        out = out.to(x.dtype)
+    return out
+
+
+@triton.jit
+def conv_im2col_matmul_bn_relu_kernel(
+    x_ptr, w_ptr,
+    y_ptr,
+    bn_weight_ptr, bn_bias_ptr,
+    bn_running_mean_ptr, bn_running_var_ptr,
+    eps,
+    N, C_in, H_in, W_in,
+    C_out,
+    H_out, W_out,
+    KH, KW,
+    stride_h, stride_w,
+    pad_h, pad_w,
+    M, K_dim,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_wk, stride_wn,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    APPLY_RELU: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    hw_out = H_out * W_out
+    n_idx = offs_m // hw_out
+    rem_m = offs_m - n_idx * hw_out
+    ho_idx = rem_m // W_out
+    wo_idx = rem_m - ho_idx * W_out
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k in range(0, K_dim, BLOCK_K):
+        k_idx = k + offs_k
+        k_mask = k_idx < K_dim
+
+        kk = KH * KW
+        c_idx = k_idx // kk
+        rem_k = k_idx - c_idx * kk
+        kh_idx = rem_k // KW
+        kw_idx = rem_k - kh_idx * KW
+
+        h_in = ho_idx[:, None] * stride_h + kh_idx[None, :] - pad_h
+        w_in = wo_idx[:, None] * stride_w + kw_idx[None, :] - pad_w
+
+        in_bounds = (
+            (h_in >= 0) & (h_in < H_in) &
+            (w_in >= 0) & (w_in < W_in)
+        )
+
+        mask_a = (
+            (offs_m[:, None] < M) &
+            k_mask[None, :] &
+            in_bounds
+        )
+
+        a_ptrs = (
+            x_ptr
+            + n_idx[:, None] * stride_xn
+            + c_idx[None, :] * stride_xc
+            + h_in * stride_xh
+            + w_in * stride_xw
+        )
+        a = tl.load(a_ptrs, mask=mask_a, other=0.0)
+
+        b_ptrs = (
+            w_ptr
+            + k_idx[:, None] * stride_wk
+            + offs_n[None, :] * stride_wn
+        )
+        mask_b = k_mask[:, None] & (offs_n[None, :] < C_out)
+        b = tl.load(b_ptrs, mask=mask_b, other=0.0)
+
+        acc += tl.dot(a, b, allow_tf32=True)
+
+    # BatchNorm (eval): y = gamma * (x - mean) / sqrt(var + eps) + beta
+    bn_mask = offs_n < C_out
+    gamma = tl.load(bn_weight_ptr + offs_n, mask=bn_mask, other=0.0)
+    beta = tl.load(bn_bias_ptr + offs_n, mask=bn_mask, other=0.0)
+    mean = tl.load(bn_running_mean_ptr + offs_n, mask=bn_mask, other=0.0)
+    var = tl.load(bn_running_var_ptr + offs_n, mask=bn_mask, other=0.0)
+
+    rvar = tl.rsqrt(var + eps)
+    scale = gamma * rvar          # per-channel
+    bn_bias = beta - mean * scale
+
+    acc = acc * scale[None, :] + bn_bias[None, :]
+
+    if APPLY_RELU:
+        acc = tl.maximum(acc, 0.0)
+
+    out_ptrs = (
+        y_ptr
+        + n_idx[:, None] * stride_yn
+        + offs_n[None, :] * stride_yc
+        + ho_idx[:, None] * stride_yh
+        + wo_idx[:, None] * stride_yw
+    )
+    mask_out = (offs_m[:, None] < M) & (offs_n[None, :] < C_out)
+    tl.store(out_ptrs, acc, mask=mask_out)
+
+
+def fused_conv2d_bn_act(x, conv, bn, apply_relu: bool):
+    """
+    Fused conv2d (bias=False) + BatchNorm2d (eval) + optional ReLU.
+    Uses Triton kernel to keep conv accumulators in registers and apply
+    BN+activation before a single write to global memory.
+    """
+    assert x.is_cuda, "Input must be CUDA tensor"
+    assert isinstance(conv, nn.Conv2d) and conv.bias is None
+    assert isinstance(bn, nn.BatchNorm2d)
+    # Fused path only valid in eval mode where running stats are used
+    assert not bn.training, "Fused BN only supports eval mode"
+    assert bn.track_running_stats, "BatchNorm must track running stats"
+
+    x = x.contiguous()
+    weight = conv.weight.contiguous()
+
+    if isinstance(conv.stride, (tuple, list)):
+        stride_h, stride_w = int(conv.stride[0]), int(conv.stride[1])
+    else:
+        stride_h = stride_w = int(conv.stride)
+
+    if isinstance(conv.padding, (tuple, list)):
+        pad_h, pad_w = int(conv.padding[0]), int(conv.padding[1])
+    else:
+        pad_h = pad_w = int(conv.padding)
+
+    N, C_in, H_in, W_in = x.shape
+    C_out, C_in_w, KH, KW = weight.shape
+    assert C_in_w == C_in
+
+    H_out = (H_in + 2 * pad_h - KH) // stride_h + 1
+    W_out = (W_in + 2 * pad_w - KW) // stride_w + 1
+
+    M = N * H_out * W_out
+    K_dim = C_in * KH * KW
+
+    w_mat = weight.view(C_out, -1).t().contiguous()  # (K_dim, C_out)
+
+    y = torch.empty((N, C_out, H_out, W_out),
+                    device=x.device, dtype=torch.float32)
+
+    bn_weight = bn.weight.contiguous()
+    bn_bias = bn.bias.contiguous()
+    running_mean = bn.running_mean.contiguous()
+    running_var = bn.running_var.contiguous()
+    eps = bn.eps
+
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta["BLOCK_M"]),
+            triton.cdiv(C_out, meta["BLOCK_N"]),
+        )
+
+    conv_im2col_matmul_bn_relu_kernel[grid](
+        x, w_mat,
+        y,
+        bn_weight, bn_bias,
+        running_mean, running_var,
+        eps,
+        N, C_in, H_in, W_in,
+        C_out,
+        H_out, W_out,
+        KH, KW,
+        stride_h, stride_w,
+        pad_h, pad_w,
+        M, K_dim,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        w_mat.stride(0), w_mat.stride(1),
+        y.stride(0), y.stride(1), y.stride(2), y.stride(3),
+        BLOCK_M=64, BLOCK_N=64, BLOCK_K=32,
+        APPLY_RELU=apply_relu,
+        num_warps=4,
+        num_stages=2,
+    )
+
+    if y.dtype != x.dtype:
+        y = y.to(x.dtype)
+    return y
+
+
+class ModelNew(nn.Module):
+    expansion = 1
+
+    def __init__(self, in_channels, out_channels, stride=1):
+        """
+        Optimized residual block using Triton fused conv+BN(+ReLU) kernels
+        on the critical paths in eval mode. Training falls back to PyTorch
+        modules to preserve BatchNorm statistics updates.
+        """
+        super(ModelNew, self).__init__()
+        self.conv1 = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=3,
+            stride=stride,
+            padding=1,
+            bias=False,
+        )
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(
+            out_channels,
+            out_channels,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            bias=False,
+        )
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.downsample = nn.Sequential(
+            nn.Conv2d(
+                in_channels,
+                out_channels * self.expansion,
+                kernel_size=1,
+                stride=stride,
+                bias=False,
+            ),
+            nn.BatchNorm2d(out_channels * self.expansion),
+        )
+        self.stride = stride
+
+    def forward(self, x):
+        identity = x
+
+        if self.training:
+            # Training: use PyTorch modules so BN statistics are updated correctly
+            out = self.conv1(x)
+            out = self.bn1(out)
+            out = self.relu(out)
+
+            out = self.conv2(out)
+            out = self.bn2(out)
+
+            if self.downsample is not None:
+                identity = self.downsample(x)
+        else:
+            # Eval: fuse conv + BN (+ ReLU) in Triton kernels
+            out = fused_conv2d_bn_act(
+                x,
+                self.conv1,
+                self.bn1,
+                apply_relu=True,
+            )
+
+            out = fused_conv2d_bn_act(
+                out,
+                self.conv2,
+                self.bn2,
+                apply_relu=False,
+            )
+
+            if self.downsample is not None:
+                ds_conv = self.downsample[0]
+                ds_bn = self.downsample[1]
+                identity = fused_conv2d_bn_act(
+                    x,
+                    ds_conv,
+                    ds_bn,
+                    apply_relu=False,
+                )
+
+        out = out + identity
+        out = self.relu(out)
+        return out
