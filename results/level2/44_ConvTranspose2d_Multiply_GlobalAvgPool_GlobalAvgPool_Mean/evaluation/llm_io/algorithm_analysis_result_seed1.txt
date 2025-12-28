@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The Triton kernel is ~2.5x slower than the PyTorch/cuDNN baseline and still does full conv-transpose over all output pixels even though the final result is only B×C scalars.",
+  "bottleneck": "The algorithm explicitly iterates over every (ho, wo) output location (and does expensive stride/division-based index math) and only then sums them, so the work is O(B * Cout * H_out * W_out * Cin * K_h * K_w) despite the fact that global average pooling collapses H_out×W_out to 1.",
+  "optimisation method": "Exploit linearity of global average pooling and reorder the computation so that you directly reduce over input spatial positions with precomputed 1D multiplicity factors per (hi, kh) and (wi, kw), instead of materializing/iterating over all output (ho, wo) positions for the transposed convolution.",
+  "modification plan": "Mathematically derive, for the given stride/padding/output_padding, per-dimension multiplicity coefficients mult_h(hi, kh) and mult_w(wi, kw) describing how many times an input pixel at hi (or wi) is seen in the global sum over outputs for a given kernel tap kh (or kw). Implement a two-stage algorithm in Triton: (1) for each (b, ci), perform weighted reductions over H_in and then W_in using mult_h/mult_w to form a compact intermediate U[b, ci, kh, kw]; (2) compute S[b, co] by contracting U with w[ci, co, kh, kw] (a small batched GEMM-like contraction). This replaces the explicit H_out×W_out traversal with O(B * Cin * H_in * W_in + B * Cin * Cout * K_h * K_w) work and removes the per-output integer division/floor logic.",
+  "expected_speedup": "3-5x over the current Triton kernel, with a good chance of matching or surpassing the PyTorch baseline for typical sizes like 128×128."
+}

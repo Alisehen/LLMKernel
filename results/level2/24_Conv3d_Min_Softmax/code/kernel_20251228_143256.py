@@ -1,0 +1,339 @@
+import math
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def conv3d_fwd_kernel(
+    x_ptr, w_ptr, b_ptr, y_ptr,
+    N, C_in, D_in, H_in, W_in,
+    C_out, kD, kH, kW,
+    D_out, H_out, W_out,
+    M, K,
+    stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
+    stride_wk, stride_wn,
+    stride_yn, stride_yc, stride_yd, stride_yh, stride_yw,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    # Program IDs
+    pid_m = tl.program_id(0)  # over M = N*D_out*H_out*W_out
+    pid_n = tl.program_id(1)  # over C_out
+
+    # Offsets for tiles
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    mask_m = offs_m < M
+    mask_n = offs_n < C_out
+
+    # Map flattened output index m -> (n_idx, od, oh, ow)
+    m_tmp = offs_m
+    ow = m_tmp % W_out
+    m_tmp = m_tmp // W_out
+    oh = m_tmp % H_out
+    m_tmp = m_tmp // H_out
+    od = m_tmp % D_out
+    n_idx = m_tmp // D_out
+
+    n_b = n_idx[:, None]
+    od_b = od[:, None]
+    oh_b = oh[:, None]
+    ow_b = ow[:, None]
+
+    # Accumulator in FP32
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Loop over K = C_in * kD * kH * kW
+    for k0 in range(0, K, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+        k_mask = offs_k < K
+
+        kk = offs_k
+        kw = kk % kW
+        kk = kk // kW
+        kh = kk % kH
+        kk = kk // kH
+        kd = kk % kD
+        cin = kk // kD
+
+        kw_b = kw[None, :]
+        kh_b = kh[None, :]
+        kd_b = kd[None, :]
+        cin_b = cin[None, :]
+
+        # Input pointers for implicit im2col
+        in_ptrs = (
+            x_ptr
+            + n_b * stride_xn
+            + cin_b * stride_xc
+            + (od_b + kd_b) * stride_xd
+            + (oh_b + kh_b) * stride_xh
+            + (ow_b + kw_b) * stride_xw
+        )
+
+        a = tl.load(
+            in_ptrs,
+            mask=mask_m[:, None] & k_mask[None, :],
+            other=0.0,
+        )
+
+        # Weight pointers: w_ptr is [K, C_out] with strides (stride_wk, stride_wn)
+        w_ptrs = w_ptr + offs_k[:, None] * stride_wk + offs_n[None, :] * stride_wn
+        b = tl.load(
+            w_ptrs,
+            mask=k_mask[:, None] & mask_n[None, :],
+            other=0.0,
+        )
+
+        # Matmul accumulate
+        acc += tl.dot(a, b, allow_tf32=True)
+
+    # Add bias
+    bias = tl.load(b_ptr + offs_n, mask=mask_n, other=0.0)
+    acc = acc + bias[None, :]
+
+    # Store results back to 5D output tensor
+    y_ptrs = (
+        y_ptr
+        + n_b * stride_yn
+        + offs_n[None, :] * stride_yc
+        + od_b * stride_yd
+        + oh_b * stride_yh
+        + ow_b * stride_yw
+    )
+    tl.store(
+        y_ptrs,
+        acc,
+        mask=mask_m[:, None] & mask_n[None, :],
+    )
+
+
+def triton_conv3d(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor):
+    """
+    x:      [N, C_in, D_in, H_in, W_in]
+    weight: [C_out, C_in, kD, kH, kW]
+    bias:   [C_out]
+    returns: [N, C_out, D_out, H_out, W_out]
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+    assert x.dtype == torch.float32 and weight.dtype == torch.float32 and bias.dtype == torch.float32
+
+    x = x.contiguous()
+    weight = weight.contiguous()
+    bias = bias.contiguous()
+
+    N, C_in, D_in, H_in, W_in = x.shape
+    C_out, C_in_w, kD, kH, kW = weight.shape
+    assert C_in == C_in_w
+
+    D_out = D_in - kD + 1
+    H_out = H_in - kH + 1
+    W_out = W_in - kW + 1
+
+    # Output tensor
+    y = torch.empty((N, C_out, D_out, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    # Reshape weight to [K, C_out] for GEMM-style matmul
+    K = C_in * kD * kH * kW
+    weight_matrix = weight.view(C_out, K).t().contiguous()  # [K, C_out]
+
+    M = N * D_out * H_out * W_out
+
+    BLOCK_M = 64
+    BLOCK_N = 32
+    BLOCK_K = 32
+
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_M"]),
+        triton.cdiv(C_out, META["BLOCK_N"]),
+    )
+
+    conv3d_fwd_kernel[grid](
+        x, weight_matrix, bias, y,
+        N, C_in, D_in, H_in, W_in,
+        C_out, kD, kH, kW,
+        D_out, H_out, W_out,
+        M, K,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
+        weight_matrix.stride(0), weight_matrix.stride(1),
+        y.stride(0), y.stride(1), y.stride(2), y.stride(3), y.stride(4),
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        num_warps=4, num_stages=2,
+    )
+
+    return y
+
+
+@triton.jit
+def reduce_min_kernel(
+    x_ptr, out_ptr,
+    M, R,
+):
+    # Each program reduces one row of length R
+    row_id = tl.program_id(0)
+    row_start = row_id * R
+
+    # Initialize accumulator
+    acc = tl.load(x_ptr + row_start)
+
+    # Sequential reduction over the row
+    for i in range(1, R):
+        val = tl.load(x_ptr + row_start + i)
+        acc = tl.minimum(acc, val)
+
+    tl.store(out_ptr + row_id, acc)
+
+
+def triton_min_dim(x: torch.Tensor, dim: int):
+    """
+    Mimics torch.min(x, dim=dim)[0], for x being 5D or 4D.
+    Dimension `dim` is removed in the output.
+    """
+    assert x.is_cuda and x.dtype == torch.float32
+
+    x = x.contiguous()
+    ndim = x.ndim
+    assert 0 <= dim < ndim
+
+    # Move the reduction dimension to the last axis
+    if dim != ndim - 1:
+        perm = list(range(ndim))
+        reduce_axis = perm.pop(dim)
+        perm.append(reduce_axis)
+        x_perm = x.permute(perm).contiguous()
+    else:
+        x_perm = x
+
+    *rest, R = x_perm.shape
+    M = 1
+    for s in rest:
+        M *= s
+
+    x_2d = x_perm.view(M, R)
+    out_flat = torch.empty((M,), device=x.device, dtype=x.dtype)
+
+    grid = lambda META: (triton.cdiv(M, 1),)
+
+    reduce_min_kernel[grid](
+        x_2d, out_flat,
+        M, R,
+        num_warps=1,
+    )
+
+    out_rest = out_flat.view(*rest)
+    return out_rest
+
+
+@triton.jit
+def softmax_kernel(
+    x_ptr, out_ptr,
+    M, N_COLS,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Row-wise softmax over N_COLS for M rows.
+    """
+    row_id = tl.program_id(0)
+    row_start = row_id * N_COLS
+
+    offs = tl.arange(0, BLOCK_SIZE)
+
+    # Compute max for numerical stability
+    row_max = tl.full((1,), -float("inf"), dtype=tl.float32)
+    for start in range(0, N_COLS, BLOCK_SIZE):
+        idx = start + offs
+        mask = idx < N_COLS
+        x = tl.load(x_ptr + row_start + idx, mask=mask, other=-float("inf"))
+        curr_max = tl.max(x, axis=0)
+        row_max = tl.maximum(row_max, curr_max)
+
+    # Compute denominator: sum(exp(x - row_max))
+    row_sum = tl.zeros((1,), dtype=tl.float32)
+    for start in range(0, N_COLS, BLOCK_SIZE):
+        idx = start + offs
+        mask = idx < N_COLS
+        x = tl.load(x_ptr + row_start + idx, mask=mask, other=-float("inf"))
+        x = x - row_max
+        exp_x = tl.exp(x)
+        row_sum = row_sum + tl.sum(exp_x, axis=0)
+
+    # Write out normalized softmax
+    for start in range(0, N_COLS, BLOCK_SIZE):
+        idx = start + offs
+        mask = idx < N_COLS
+        x = tl.load(x_ptr + row_start + idx, mask=mask, other=-float("inf"))
+        x = x - row_max
+        exp_x = tl.exp(x)
+        out = exp_x / row_sum
+        tl.store(out_ptr + row_start + idx, out, mask=mask)
+
+
+def triton_softmax_channel(x: torch.Tensor):
+    """
+    Softmax along channel dimension (dim=1) for 4D tensors: [N, C, H, W].
+    """
+    assert x.is_cuda and x.dtype == torch.float32
+    x = x.contiguous()
+    assert x.ndim == 4
+
+    N, C, H, W = x.shape
+
+    # Move channels to last dimension for row-wise softmax
+    x_perm = x.permute(0, 2, 3, 1).contiguous()  # [N, H, W, C]
+    M = N * H * W
+    N_COLS = C
+
+    x_2d = x_perm.view(M, N_COLS)
+    out_2d = torch.empty_like(x_2d)
+
+    BLOCK_SIZE = 64
+
+    grid = lambda META: (triton.cdiv(M, 1),)
+
+    softmax_kernel[grid](
+        x_2d, out_2d,
+        M, N_COLS,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=2,
+    )
+
+    out = out_2d.view(N, H, W, C).permute(0, 3, 1, 2).contiguous()
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-accelerated version of the target model:
+    Conv3d -> reduction (min) along a given dim -> softmax along channel dim.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, dim):
+        super(ModelNew, self).__init__()
+        if isinstance(kernel_size, int):
+            kD = kH = kW = kernel_size
+        else:
+            kD, kH, kW = kernel_size
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kD = kD
+        self.kH = kH
+        self.kW = kW
+        self.dim = dim
+
+        self.weight = nn.Parameter(torch.empty(out_channels, in_channels, kD, kH, kW))
+        self.bias = nn.Parameter(torch.empty(out_channels))
+
+        # Initialize like nn.Conv3d
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        fan_in = in_channels * kD * kH * kW
+        bound = 1 / math.sqrt(fan_in)
+        nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x):
+        # Expect x on CUDA, float32
+        y = triton_conv3d(x, self.weight, self.bias)
+        y = triton_min_dim(y, dim=self.dim)
+        y = triton_softmax_channel(y)
+        return y

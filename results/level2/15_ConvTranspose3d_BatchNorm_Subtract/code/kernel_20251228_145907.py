@@ -1,0 +1,161 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def bn3d_reduce_kernel(
+    x_ptr,            # float32* [N, C, D, H, W] contiguous
+    mean_ptr,         # float32* [C]
+    var_ptr,          # float32* [C]
+    N, C, S,          # int32 N, C, S = D*H*W
+    BLOCK_S: tl.constexpr,
+):
+    # One program per channel
+    c = tl.program_id(0)
+
+    # Accumulators in FP32
+    acc_sum = tl.zeros((BLOCK_S,), dtype=tl.float32)
+    acc_sq = tl.zeros((BLOCK_S,), dtype=tl.float32)
+
+    # Loop over batch and spatial positions
+    for n in range(0, N):
+        base = (n * C + c) * S
+        for s_start in range(0, S, BLOCK_S):
+            offs = s_start + tl.arange(0, BLOCK_S)
+            mask = offs < S
+            x = tl.load(x_ptr + base + offs, mask=mask, other=0.0)
+            x = x.to(tl.float32)
+            acc_sum += tl.where(mask, x, 0.0)
+            acc_sq += tl.where(mask, x * x, 0.0)
+
+    # Reduce partial sums to scalars
+    sum_x = tl.sum(acc_sum, axis=0)
+    sum_x2 = tl.sum(acc_sq, axis=0)
+
+    # Number of elements per channel: N * S
+    E = N * S
+    E_f = E.to(tl.float32)
+
+    mean = sum_x / E_f
+    var = sum_x2 / E_f - mean * mean
+
+    tl.store(mean_ptr + c, mean)
+    tl.store(var_ptr + c, var)
+
+
+@triton.jit
+def bn3d_norm_sub_mean_kernel(
+    x_ptr,            # float32* [N, C, D, H, W] contiguous
+    mean_ptr,         # float32* [C]
+    var_ptr,          # float32* [C]
+    weight_ptr,       # float32* [C]
+    bias_ptr,         # float32* [C]
+    out_ptr,          # float32* [N, C, D, H, W] contiguous
+    N, C, S,          # int32 N, C, S = D*H*W
+    eps,              # float32
+    BLOCK_S: tl.constexpr,
+):
+    # One program per (n, c)
+    nc = tl.program_id(0)
+    n = nc // C
+    c = nc - n * C
+
+    mean_c = tl.load(mean_ptr + c)
+    var_c = tl.load(var_ptr + c)
+    gamma = tl.load(weight_ptr + c)
+    beta = tl.load(bias_ptr + c)
+
+    inv_std = 1.0 / tl.sqrt(var_c + eps)
+
+    base = (n * C + c) * S
+
+    # First pass: compute spatial mean after BN for this (n, c)
+    acc_sum = tl.zeros((BLOCK_S,), dtype=tl.float32)
+    for s_start in range(0, S, BLOCK_S):
+        offs = s_start + tl.arange(0, BLOCK_S)
+        mask = offs < S
+        x = tl.load(x_ptr + base + offs, mask=mask, other=0.0)
+        x = x.to(tl.float32)
+        y = ((x - mean_c) * inv_std) * gamma + beta
+        acc_sum += tl.where(mask, y, 0.0)
+
+    sum_y = tl.sum(acc_sum, axis=0)
+    S_f = S.to(tl.float32)
+    mean_spatial = sum_y / S_f
+
+    # Second pass: write normalized output minus spatial mean
+    for s_start in range(0, S, BLOCK_S):
+        offs = s_start + tl.arange(0, BLOCK_S)
+        mask = offs < S
+        x = tl.load(x_ptr + base + offs, mask=mask, other=0.0)
+        x = x.to(tl.float32)
+        y = ((x - mean_c) * inv_std) * gamma + beta
+        y = y - mean_spatial
+        tl.store(out_ptr + base + offs, y, mask=mask)
+
+
+def bn3d_norm_sub_mean(x, weight, bias, eps):
+    """
+    BatchNorm3d (training semantics: per-batch channel-wise mean/var)
+    followed by subtracting per-sample spatial mean, implemented in Triton.
+
+    x: [N, C, D, H, W] contiguous, float32, CUDA
+    weight, bias: [C]
+    """
+    assert x.is_cuda
+    x = x.contiguous()
+    N, C, D, H, W = x.shape
+    S = D * H * W
+
+    # Allocate per-channel statistics
+    mean = torch.empty(C, device=x.device, dtype=torch.float32)
+    var = torch.empty(C, device=x.device, dtype=torch.float32)
+
+    # Kernel 1: compute per-channel mean and variance over N*D*H*W
+    grid_reduce = lambda META: (C,)
+    bn3d_reduce_kernel[grid_reduce](
+        x, mean, var,
+        N, C, S,
+        BLOCK_S=256,
+    )
+
+    # Kernel 2: apply BN and subtract per-sample spatial mean
+    out = torch.empty_like(x, dtype=torch.float32)
+    grid_norm = lambda META: (N * C,)
+    bn3d_norm_sub_mean_kernel[grid_norm](
+        x, mean, var, weight, bias, out,
+        N, C, S, eps,
+        BLOCK_S=256,
+    )
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    ConvTranspose3d + BatchNorm3d (training-style per-batch stats) +
+    subtraction of spatial mean, with BN + mean-sub fused in Triton.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, bias=True):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            bias=bias,
+        )
+        # We keep BatchNorm3d for its learnable parameters (weight, bias) and eps.
+        # Forward uses custom Triton kernels, not nn.BatchNorm3d.forward.
+        self.batch_norm = nn.BatchNorm3d(out_channels)
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        # Use training-mode BatchNorm semantics: per-batch statistics
+        weight = self.batch_norm.weight
+        bias = self.batch_norm.bias
+        eps = self.batch_norm.eps
+        x = bn3d_norm_sub_mean(x, weight, bias, eps)
+        return x

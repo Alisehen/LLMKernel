@@ -1,0 +1,266 @@
+You are a GPU kernel optimization architect. Analyze the kernel and identify **ONE high-level algorithmic optimization**.
+
+# PyTorch Reference
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs a convolution, scales the output, and then applies a minimum operation.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, scale_factor):
+        super(Model, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.scale_factor = scale_factor
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_channels, height, width).
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_channels, height, width).
+        """
+        x = self.conv(x)
+        x = x * self.scale_factor
+        x = torch.min(x, dim=1, keepdim=True)[0]  # Minimum along channel dimension
+        return x
+
+batch_size = 64
+in_channels = 64
+out_channels = 128
+height = width = 256
+kernel_size = 3
+scale_factor = 2.0
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, scale_factor]
+```
+
+# Current Triton Kernel
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def conv_scale_min_kernel(
+    x_ptr, w_ptr, bias_ptr, out_ptr,
+    B, Ci, Hi, Wi, Co, Kh, Kw, Ho, Wo,
+    stride_xb, stride_xc, stride_xh, stride_xw,
+    stride_wco, stride_wci, stride_wkh, stride_wkw,
+    stride_ob, stride_oc, stride_oh, stride_ow,
+    scale,
+    BLOCK_M: tl.constexpr,  # number of (b, y, x) points per program
+    BLOCK_CO: tl.constexpr,  # number of output channels processed per block
+):
+    pid_m = tl.program_id(0)
+
+    # Total number of output spatial points (B * Ho * Wo)
+    N_points = B * Ho * Wo
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offs_m < N_points
+
+    # Decode linear index into (b, y, x)
+    hw = Ho * Wo
+    b = offs_m // hw
+    rem = offs_m % hw
+    y = rem // Wo
+    x = rem % Wo
+
+    # Initialize running minimum (per output spatial location)
+    # Large positive value as initial min
+    min_val = tl.full((BLOCK_M,), 3.4e38, tl.float32)
+
+    # Loop over output channels in tiles of size BLOCK_CO
+    for oc_start in range(0, Co, BLOCK_CO):
+        oc_offsets = oc_start + tl.arange(0, BLOCK_CO)
+        mask_co = oc_offsets < Co
+
+        # Accumulator for this output-channel tile
+        acc = tl.zeros((BLOCK_M, BLOCK_CO), dtype=tl.float32)
+
+        # Convolution: sum over input channels and kernel spatial dims
+        # No padding, stride=1, dilation=1 assumed.
+        for ic in range(0, Ci):
+            for ky in range(0, Kh):
+                for kx in range(0, Kw):
+                    iy = y + ky
+                    ix = x + kx
+                    # Within valid region by construction for standard conv
+                    x_ptrs = (
+                        x_ptr
+                        + b * stride_xb
+                        + ic * stride_xc
+                        + iy * stride_xh
+                        + ix * stride_xw
+                    )
+                    x_vals = tl.load(x_ptrs, mask=mask_m, other=0.0)
+
+                    w_ptrs = (
+                        w_ptr
+                        + oc_offsets * stride_wco
+                        + ic * stride_wci
+                        + ky * stride_wkh
+                        + kx * stride_wkw
+                    )
+                    w_vals = tl.load(w_ptrs, mask=mask_co, other=0.0)
+
+                    acc += x_vals[:, None] * w_vals[None, :]
+
+        # Add bias for this output-channel tile
+        bias_vals = tl.load(bias_ptr + oc_offsets, mask=mask_co, other=0.0)
+        acc += bias_vals[None, :]
+
+        # Scale
+        acc = acc * scale
+
+        # Reduce over output-channel tile (per spatial point)
+        tile_min = tl.min(acc, 1)
+        min_val = tl.minimum(min_val, tile_min)
+
+    # Store result: output shape [B, 1, Ho, Wo]
+    out_ptrs = (
+        out_ptr
+        + b * stride_ob
+        + 0 * stride_oc
+        + y * stride_oh
+        + x * stride_ow
+    )
+    tl.store(out_ptrs, min_val, mask=mask_m)
+
+
+def conv_scale_min_triton(x, weight, bias, scale_factor):
+    """
+    x:       [B, Ci, Hi, Wi]
+    weight:  [Co, Ci, Kh, Kw]
+    bias:    [Co]
+    Returns: [B, 1, Ho, Wo] with Ho/Wo as in PyTorch conv2d (stride=1, padding=0, dilation=1).
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda, "Tensors must be on CUDA"
+    B, Ci, Hi, Wi = x.shape
+    Co, Ci_w, Kh, Kw = weight.shape
+    assert Ci == Ci_w, "In-channel mismatch between input and weight"
+    assert bias.shape[0] == Co, "Bias must match out_channels"
+
+    # Conv2d output spatial size for stride=1, padding=0, dilation=1
+    Ho = Hi - Kh + 1
+    Wo = Wi - Kw + 1
+    assert Ho > 0 and Wo > 0, "Invalid kernel size for given input"
+
+    out = torch.empty((B, 1, Ho, Wo), device=x.device, dtype=x.dtype)
+
+    stride_xb, stride_xc, stride_xh, stride_xw = x.stride()
+    stride_wco, stride_wci, stride_wkh, stride_wkw = weight.stride()
+    stride_ob, stride_oc, stride_oh, stride_ow = out.stride()
+
+    N_points = B * Ho * Wo
+
+    def grid(meta):
+        return (triton.cdiv(N_points, meta["BLOCK_M"]),)
+
+    conv_scale_min_kernel[grid](
+        x, weight, bias, out,
+        B, Ci, Hi, Wi, Co, Kh, Kw, Ho, Wo,
+        stride_xb, stride_xc, stride_xh, stride_xw,
+        stride_wco, stride_wci, stride_wkh, stride_wkw,
+        stride_ob, stride_oc, stride_oh, stride_ow,
+        scale_factor,
+        BLOCK_M=64,
+        BLOCK_CO=32,
+    )
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-accelerated version of:
+        Conv2d -> scale -> min over channel dim (keepdim=True)
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, scale_factor):
+        super(ModelNew, self).__init__()
+        if isinstance(kernel_size, int):
+            kh = kw = kernel_size
+        else:
+            kh, kw = kernel_size
+        self.weight = nn.Parameter(
+            torch.randn(out_channels, in_channels, kh, kw)
+        )
+        self.bias = nn.Parameter(torch.randn(out_channels))
+        self.scale_factor = float(scale_factor)
+
+    def forward(self, x):
+        return conv_scale_min_triton(x, self.weight, self.bias, self.scale_factor)
+```
+
+# Performance
+- **PyTorch baseline**: 23.56 ms
+- **Current Triton**: 157.04 ms
+- **Current speedup**: 0.15x (-566.7% vs baseline)
+
+
+---
+
+## Analysis Steps
+
+1. **Code Analysis**: Count kernels, identify operations, check for inefficiencies
+2. **Performance Diagnosis**: Use metrics/latency to identify bottleneck type
+3. **Root Cause**: Combine code + performance to find the core issue
+
+## Optimization Categories (pick ONE if worth optimizing):
+
+### 1. Operator Fusion
+Fuse consecutive ops into fewer kernels to reduce memory traffic and launch overhead.
+
+### 2. Algorithm Replacement
+Replace naive algorithm with optimized variant.
+- For Attention: Flash Attention, online softmax
+- For Convolution: Winograd, im2col
+- **For RNN/GRU/LSTM**: Persistent kernel with HYBRID computation
+  - **CRITICAL**: Use hybrid approach for best performance:
+    * Precompute input-side gates ONCE (outside kernel): `gates_x = (T*B, In) @ W_ih`
+    * Persistent kernel (inside): only recurrent-side: `for t: gates_h = h @ W_hh`
+  - Time loop `for t in range(T)` must be inside kernel, NOT in Python
+  - Launch kernel once per layer, not once per timestep
+  - Expected speedup: 10-100x (vs per-timestep launches)
+
+### 3. Kernel Launch Reduction
+Combine multiple small kernels to reduce overhead.
+- **For RNN/GRU/LSTM**: See "Algorithm Replacement" above for persistent kernel approach
+
+### 4. Memory Layout Optimization
+Use in-place operations, buffer reuse, or better layouts.
+
+## Should We Optimize?
+
+Before proposing optimization, determine if it's worthwhile:
+- **Not worth optimizing** if:
+  - Code is already near-optimal (expected speedup < 10%)
+  - Bottleneck cannot be addressed (hardware limited, already optimal algorithm)
+  - Optimization would add significant complexity with minimal gain
+
+- **Worth optimizing** if:
+  - Clear algorithmic inefficiency exists (multiple kernels, suboptimal algorithm)
+  - Expected speedup >= 20%
+  - Concrete optimization path available
+
+## Output (JSON)
+
+```json
+{
+  "worth_optimizing": "yes/no",
+  "reason": "<Why worth or not worth optimizing, 1 sentence>",
+  "bottleneck": "<Root cause in 1-2 sentences, empty if not worth optimizing>",
+  "optimisation method": "<Specific optimization in 1-2 sentences, empty if not worth optimizing>",
+  "modification plan": "<Implementation steps in 2-3 sentences, empty if not worth optimizing>",
+  "expected_speedup": "<e.g., '30-40%', empty if not worth optimizing>"
+}
+```
+
+Return JSON only.

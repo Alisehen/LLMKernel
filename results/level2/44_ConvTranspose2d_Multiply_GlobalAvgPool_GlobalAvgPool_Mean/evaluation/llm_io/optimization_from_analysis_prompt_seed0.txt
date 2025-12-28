@@ -1,0 +1,235 @@
+You are optimizing a Triton kernel based on algorithmic analysis.
+
+# PyTorch Reference (Target Behavior)
+
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs a transposed convolution, multiplies by a scalar, applies global average pooling, 
+    another global average pooling
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, multiplier):
+        super(Model, self).__init__()
+        self.conv_transpose = nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, output_padding=output_padding)
+        self.multiplier = multiplier
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = x * self.multiplier
+        x = torch.mean(x, dim=[2, 3], keepdim=True)  # First global average pooling
+        x = torch.mean(x, dim=[2, 3], keepdim=True)  # Second global average pooling
+        return x
+
+batch_size = 16
+in_channels = 64
+out_channels = 128
+height, width = 128, 128
+kernel_size = 3
+stride = 2
+padding = 1
+output_padding = 1
+multiplier = 0.5
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, stride, padding, output_padding, multiplier]
+```
+
+**CRITICAL**: Study the PyTorch code carefully to understand:
+- What does `forward()` return? (full output sequence vs final hidden state only)
+- What is the computational pattern?
+- What are the input/output shapes?
+
+Your optimized kernel MUST match this exact behavior.
+
+---
+
+# Analysis Results
+
+**Bottleneck**: The main cost is writing and then rereading the large (B, C_out, H, W) conv_transpose output tensor from global memory only to immediately reduce it to a single spatial value per channel. This extra memory traffic dominates runtime and limits the benefit of the current pooling fusion.
+
+**Optimization Strategy**: Fuse the transposed convolution, scalar multiplication, and global average pooling into a single Triton kernel that directly accumulates per-(b, out_c) sums while computing the deconvolution, never materializing the full (H, W) feature map in memory.
+
+**Implementation Plan**: Replace the separate cuDNN conv_transpose2d + Triton GAP with a custom Triton kernel that iterates over the input feature map and filters, computes each contribution to the transposed-convolution output, and accumulates it into per-(b, out_c) registers or shared memory; at the end, divide by (H*W) and apply the multiplier before writing a compact (B, C_out, 1, 1) tensor. This effectively performs an on-the-fly reduction over the implicit conv_transpose output, eliminating both the full output buffer and the follow-up read for pooling. Integrate this kernel into ModelNew so that conv_transpose weights are still initialized/maintained by PyTorch but the forward path uses the fused Triton implementation.
+
+**Expected Speedup**: 30-40%
+
+---
+
+# Current Kernel (needs optimization)
+
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def mul_global_avg2d_kernel(
+    x_ptr, y_ptr,
+    B, C, H, W,
+    stride_xb, stride_xc, stride_xh, stride_xw,
+    stride_yb, stride_yc, stride_yh, stride_yw,
+    scale,                      # precomputed = multiplier / (H * W)
+    BLOCK_HW: tl.constexpr,     # tile size over H*W
+):
+    pid = tl.program_id(0)
+    # total number of (b, c) pairs
+    n_bc = B * C
+    bc_mask = pid < n_bc
+
+    # Decode (b, c) from linear pid
+    b = pid // C
+    c = pid - b * C
+
+    hw = H * W
+    offs = tl.arange(0, BLOCK_HW)
+    acc = tl.zeros((), dtype=tl.float32)
+
+    # Reduce over spatial dimension in tiles of BLOCK_HW
+    for hw_start in range(0, hw, BLOCK_HW):
+        idx = hw_start + offs
+        mask_hw = (idx < hw) & bc_mask
+
+        h = idx // W
+        w = idx - h * W
+
+        x_ptrs = (
+            x_ptr
+            + b * stride_xb
+            + c * stride_xc
+            + h * stride_xh
+            + w * stride_xw
+        )
+
+        vals = tl.load(x_ptrs, mask=mask_hw, other=0.0)
+        vals_f32 = vals.to(tl.float32)
+        acc += tl.sum(vals_f32, axis=0)
+
+    # Apply combined scaling: (sum / (H*W)) * multiplier = sum * scale
+    out_val = acc * scale
+
+    # Store to (b, c, 0, 0)
+    y_ptrs = (
+        y_ptr
+        + b * stride_yb
+        + c * stride_yc
+        + 0 * stride_yh
+        + 0 * stride_yw
+    )
+    tl.store(y_ptrs, out_val, mask=bc_mask)
+
+
+def mul_global_avg2d(x: torch.Tensor, multiplier: float) -> torch.Tensor:
+    """
+    Fused operation:
+      y[n, c, 0, 0] = multiplier * mean_{h, w} x[n, c, h, w]
+
+    This replaces:
+      x = x * multiplier
+      x = torch.mean(x, dim=[2, 3], keepdim=True)
+      x = torch.mean(x, dim=[2, 3], keepdim=True)  # no-op after keepdim
+    """
+    assert x.ndim == 4, "Expected NCHW tensor"
+    B, C, H, W = x.shape
+    device = x.device
+    dtype = x.dtype
+
+    y = torch.empty((B, C, 1, 1), device=device, dtype=dtype)
+
+    scale = float(multiplier) / float(H * W)
+
+    grid = lambda META: (triton.cdiv(B * C, 1),)
+
+    mul_global_avg2d_kernel[grid](
+        x, y,
+        B, C, H, W,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        y.stride(0), y.stride(1), y.stride(2), y.stride(3),
+        scale,
+        BLOCK_HW=256,
+        num_warps=4,
+    )
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Model that performs a transposed convolution, multiplies by a scalar,
+    and applies two global average poolings (fused into one in Triton).
+    """
+    def __init__(self, in_channels, out_channels, kernel_size,
+                 stride, padding, output_padding, multiplier):
+        super(ModelNew, self).__init__()
+        # Keep conv_transpose2d as in the original model for correctness & cuDNN speed
+        self.conv_transpose = nn.ConvTranspose2d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            output_padding=output_padding,
+        )
+        self.multiplier = float(multiplier)
+
+    def forward(self, x):
+        # cuDNN-optimized transposed convolution
+        x = self.conv_transpose(x)
+        # Fused multiplier + double global average pooling in Triton
+        x = mul_global_avg2d(x, self.multiplier)
+        return x
+```
+
+---
+
+# Your Task
+
+Implement the optimization strategy above. Focus on the specific bottleneck identified.
+
+## Key Requirements
+
+1. **Preserve correctness**: Maintain the same input/output behavior
+2. **Apply the optimization**: Follow the implementation plan exactly
+3. **Use valid Triton syntax**:
+   - Every kernel MUST have `@triton.jit` decorator
+   - Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+   - BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+   - No `continue`, `break`, `return` inside kernels (use masking)
+   - Prefer `tl.dot(a, b, allow_tf32=True)` for matmul operations
+
+4. **CRITICAL for RNN/GRU/LSTM Persistent Kernels**:
+   - Time loop MUST be inside @triton.jit kernel, NOT in Python forward()
+   - **HYBRID computation strategy** (CRITICAL for performance):
+     * Precompute input-side gates OUTSIDE kernel: `gates_x = (T*B, In) @ W_ih` (ONE large GEMM)
+     * INSIDE kernel: only recurrent-side: `for t: gates_h = h @ W_hh` (T small GEMMs)
+   - CORRECT (FAST - use this):
+     ```python
+     # Python forward():
+     gates_x_all = x.reshape(T*B, In) @ W_ih + b_ih  # ONE large GEMM
+     gates_x_all = gates_x_all.view(T, B, 3*H)
+     gru_persistent_kernel[grid](gates_x_all, h0, W_hh, ...)  # Launch ONCE
+
+     @triton.jit
+     def gru_persistent_kernel(gates_x_ptr, h_ptr, W_hh_ptr, ...):
+         for t in range(T):  # Inside kernel
+             gates_x_t = tl.load(gates_x_ptr + t*...)  # Precomputed
+             gates_h = h @ W_hh  # Only recurrent GEMM
+             h = (1-z)*n + z*h   # Fuse and update
+     ```
+
+5. **Output format**:
+   - Imports: `import torch, torch.nn as nn, triton, triton.language as tl`
+   - `@triton.jit` kernel(s)
+   - Wrapper function(s)
+   - `class ModelNew(nn.Module)` — REQUIRED
+   - NO testing code, NO `if __name__ == "__main__"`
+
+---
+
+Generate the optimized kernel now. Output ONLY the complete Python code.

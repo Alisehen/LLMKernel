@@ -1,22 +1,6 @@
 You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
 
-# Target GPU
-GPU Name: 4090
-Architecture: Ada Lovelace
-• Compute Capability: 8.9
-• Number of SMs: 128
-• Memory Bandwidth: 1008 GB/s
-• TF32 Tensor Core TFLOPS: 82.6 with dense
-• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
-• FP16 Tensor Core TFLOPS: 165.2 with dense
-• Maximum number of registers per thread: 255
-• Maximum threads per block: 1024
-• Maximum threads per SM: 1536
-• Warp size: 32
-• Maximum concurrent warps per SM: 48
-• Shared memory capacity per SM: 100 KB
-• Maximum shared memory per thread block: 99 KB
-• L2 cache (global, all SM shared): 72 MB
+# Target GPU: 4090
 
 [OPTIMIZATION STAGE]
 
@@ -51,241 +35,433 @@ Autotune:
 
 [CURRENT CODE]
 ```python
-# 1. Imports
-import torch
-import torch.nn as nn
-import triton
-import triton.language as tl
+import torch, torch.nn as nn, triton, triton.language as tl
 
 
-# 2. Triton kernel(s)
+# -----------------------------
+# 1) Sum over H,W: [B, C, H, W] -> [B, C]
+# -----------------------------
+@triton.jit
+def sum_hw_kernel(
+    x_ptr, out_ptr,
+    B, C, HW,
+    stride_b, stride_c,
+    BLOCK_HW: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    # One program = one (b, c)
+    b = pid // C
+    c = pid % C
+
+    # Pointer to x[b, c, 0, 0]
+    base_offset = b * stride_b + c * stride_c
+    base_ptr = x_ptr + base_offset
+
+    acc = tl.zeros((), dtype=tl.float32)
+
+    offs = tl.arange(0, BLOCK_HW)
+    for start in range(0, HW, BLOCK_HW):
+        idx = start + offs
+        mask = idx < HW
+        vals = tl.load(base_ptr + idx, mask=mask, other=0.0)
+        acc += tl.sum(vals, axis=0)
+
+    tl.store(out_ptr + pid, acc)
+
+
+def triton_sum_hw(x: torch.Tensor) -> torch.Tensor:
+    """
+    x: [B, C, H, W] (NCHW, contiguous)
+    returns: [B, C] with sum over H,W
+    """
+    x = x.contiguous()
+    B, C, H, W = x.shape
+    HW = H * W
+    out = torch.empty(B * C, device=x.device, dtype=torch.float32)
+
+    stride_b = x.stride(0)
+    stride_c = x.stride(1)
+
+    grid = (B * C,)
+    sum_hw_kernel[grid](
+        x, out,
+        B, C, HW,
+        stride_b, stride_c,
+        BLOCK_HW=256,
+        num_warps=4,
+        num_stages=2,
+    )
+    return out.view(B, C)
+
+
+# -----------------------------
+# 2) GEMM + scale + bias: [M,K] @ [K,N] -> [M,N]
+#    Uses 2D tiled matmul with shared grid/offsets for GEMM & bias.
+# -----------------------------
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_C': 32,  'BLOCK_W': 64}, num_warps=2, num_stages=2),
-        triton.Config({'BLOCK_C': 64,  'BLOCK_W': 32}, num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_C': 64,  'BLOCK_W': 64}, num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_C': 128, 'BLOCK_W': 32}, num_warps=8, num_stages=2),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32},
+            num_warps=4,
+            num_stages=3,
+        ),
+        triton.Config(
+            {"BLOCK_M": 32, "BLOCK_N": 128, "BLOCK_K": 32},
+            num_warps=4,
+            num_stages=3,
+        ),
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 32, "BLOCK_K": 32},
+            num_warps=4,
+            num_stages=3,
+        ),
     ],
-    key=['C', 'H', 'W'],
+    key=["M", "N", "K"],
 )
 @triton.jit
-def gap_bias_kernel(
-    x_ptr,          # *f32, [N, C, H, W]
-    bias_ptr,       # *f32, [C]
-    y_ptr,          # *f32, [N, C]  (global-avg pooled + bias)
-    N, C, H, W,
-    stride_xn, stride_xc, stride_xh, stride_xw,
-    stride_yn, stride_yc,
-    inv_hw,         # f32 = 1.0 / (H * W)
-    BLOCK_C: tl.constexpr,
-    BLOCK_W: tl.constexpr,
+def gemm_mean_bias_kernel(
+    a_ptr,        # [M, K]
+    w_ptr,        # [K, N]
+    bias_ptr,     # [N]
+    out_ptr,      # [M, N]
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    scale,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
 ):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+
+    # Accumulator for C tile
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Loop over K dimension
+    for k_start in range(0, K, BLOCK_K):
+        k_idx = k_start + offs_k
+        k_mask = k_idx < K
+
+        a_ptrs = a_ptr + offs_m[:, None] * stride_am + k_idx[None, :] * stride_ak
+        b_ptrs = w_ptr + k_idx[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+        a = tl.load(
+            a_ptrs,
+            mask=mask_m[:, None] & k_mask[None, :],
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptrs,
+            mask=k_mask[:, None] & mask_n[None, :],
+            other=0.0,
+        )
+
+        acc += tl.dot(a, b, allow_tf32=True)
+
+    # Scale and add bias — all ops share offs_m/offs_n + same mask
+    acc = acc * scale
+    bias = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0)
+    acc += bias[None, :]
+
+    # Store C tile
+    out_ptrs = out_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    tl.store(
+        out_ptrs,
+        acc,
+        mask=mask_m[:, None] & mask_n[None, :],
+    )
+
+
+def triton_gemm_mean_bias(
+    a: torch.Tensor,      # [M, K]
+    w: torch.Tensor,      # [K, N]
+    bias: torch.Tensor,   # [N]
+    scale: float,
+) -> torch.Tensor:
     """
-    Kernel 1:
-      y[n, c] = mean_{h,w} x[n, c, h, w] + bias[c]
-    Fuses: global average pooling over (H, W) + bias add.
-    Grid: (pid_n, pid_c_block) covers output [N, C].
+    Computes:
+        g[m, n] = (a[m, :] @ w[:, n]) * scale + bias[n]
+    using a 2D-tiled GEMM kernel.
     """
-    pid_n = tl.program_id(0)
-    pid_c_block = tl.program_id(1)
+    assert a.ndim == 2 and w.ndim == 2 and bias.ndim == 1
+    M, K = a.shape
+    K_w, N = w.shape
+    assert K_w == K
+    assert bias.shape[0] == N
 
-    if pid_n >= N:
-        return
+    a = a.contiguous()
+    w = w.contiguous()
+    bias = bias.contiguous()
 
-    offs_c = pid_c_block * BLOCK_C + tl.arange(0, BLOCK_C)
-    mask_c = offs_c < C
+    # Use float32 for intermediate g for better numerical stability
+    g = torch.empty((M, N), device=a.device, dtype=torch.float32)
 
-    # Base pointer for (n, c-block)
-    base_nc = x_ptr + pid_n * stride_xn + offs_c[:, None] * stride_xc
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_M"]),
+        triton.cdiv(N, META["BLOCK_N"]),
+    )
 
-    acc = tl.zeros((BLOCK_C,), dtype=tl.float32)
-
-    # Iterate over H and W in tiles along W
-    for h in range(0, H):
-        row_base = base_nc + h * stride_xh
-        w0 = 0
-        while w0 < W:
-            offs_w = w0 + tl.arange(0, BLOCK_W)
-            mask_w = offs_w < W
-            mask = mask_c[:, None] & mask_w[None, :]
-
-            x_ptrs = row_base + offs_w[None, :] * stride_xw
-            x_vals = tl.load(x_ptrs, mask=mask, other=0.0)
-
-            # Reduce over W dimension
-            acc += tl.sum(x_vals, axis=1)
-
-            w0 += BLOCK_W
-
-    # Global average over H*W
-    acc = acc * inv_hw
-
-    # Add bias
-    bias_vals = tl.load(bias_ptr + offs_c, mask=mask_c, other=0.0)
-    acc = acc + bias_vals
-
-    # Store result y[n, c]
-    y_ptrs = y_ptr + pid_n * stride_yn + offs_c * stride_yc
-    tl.store(y_ptrs, acc, mask=mask_c)
+    gemm_mean_bias_kernel[grid](
+        a, w, bias, g,
+        M, N, K,
+        a.stride(0), a.stride(1),
+        w.stride(0), w.stride(1),
+        g.stride(0), g.stride(1),
+        scale,
+    )
+    return g
 
 
+# -----------------------------
+# 3) Row-wise logsumexp * 10: [M, N] -> [M]
+#    Fused logsumexp & scaling share same grid/offsets on M.
+# -----------------------------
 @triton.jit
-def logsumexp_mul_kernel(
-    y_ptr,      # *f32, [N, C]
-    out_ptr,    # *f32, [N, 1]
-    N, C,
-    stride_yn, stride_yc,
-    BLOCK_C: tl.constexpr,
+def logsumexp_10_kernel(
+    g_ptr,      # [M, N]
+    out_ptr,    # [M]
+    M, N,
+    stride_gm, stride_gn,
+    stride_out,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
 ):
+    pid_m = tl.program_id(0)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offs_m < M
+
+    neg_inf = -float("inf")
+    max_row = tl.full((BLOCK_M,), neg_inf, dtype=tl.float32)
+    sum_row = tl.zeros((BLOCK_M,), dtype=tl.float32)
+
+    offs_n = tl.arange(0, BLOCK_N)
+
+    # Streaming log-sum-exp over N
+    for n_start in range(0, N, BLOCK_N):
+        n_idx = n_start + offs_n
+        mask_n = n_idx < N
+
+        g_ptrs = g_ptr + offs_m[:, None] * stride_gm + n_idx[None, :] * stride_gn
+        # Out-of-range in either dim -> -inf so they don't affect max/sum
+        g_tile = tl.load(
+            g_ptrs,
+            mask=mask_m[:, None] & mask_n[None, :],
+            other=neg_inf,
+        )
+
+        tile_max = tl.max(g_tile, axis=1)
+        new_max = tl.maximum(max_row, tile_max)
+
+        shifted = g_tile - new_max[:, None]
+        exp_shifted = tl.exp(shifted)
+        tile_sum = tl.sum(exp_shifted, axis=1)
+
+        has_prev = max_row > neg_inf
+        scale_prev = tl.where(has_prev, tl.exp(max_row - new_max), 0.0)
+
+        sum_row = sum_row * scale_prev + tile_sum
+        max_row = new_max
+
+    log_sum = tl.log(sum_row)
+    result = (log_sum + max_row) * 10.0
+
+    tl.store(out_ptr + offs_m * stride_out, result, mask=mask_m)
+
+
+def triton_logsumexp_10(g: torch.Tensor) -> torch.Tensor:
     """
-    Kernel 2:
-      out[n] = 10 * logsumexp_c ( y[n, c] )
-    Fuses: logsumexp over C + multiply(10.0).
-    Grid: (pid_n,) covers output [N].
+    g: [M, N]
+    returns out[m] = 10 * logsumexp_n(g[m, n])
     """
-    pid_n = tl.program_id(0)
-    if pid_n >= N:
-        return
+    assert g.ndim == 2
+    M, N = g.shape
+    g = g.contiguous()
+    out = torch.empty(M, device=g.device, dtype=torch.float32)
 
-    offs_c = tl.arange(0, BLOCK_C)
+    BLOCK_M = 64
+    BLOCK_N = 128
 
-    # Pass 1: compute max over C for numerical stability
-    max_val = -float('inf')
-    c0 = 0
-    while c0 < C:
-        cur_offs = c0 + offs_c
-        mask = cur_offs < C
-        y_ptrs = y_ptr + pid_n * stride_yn + cur_offs * stride_yc
-        y_vals = tl.load(y_ptrs, mask=mask, other=-float('inf'))
-        block_max = tl.max(y_vals, axis=0)
-        max_val = tl.maximum(max_val, block_max)
-        c0 += BLOCK_C
+    grid = (triton.cdiv(M, BLOCK_M),)
 
-    # Pass 2: compute sum(exp(y - max_val))
-    sum_exp = 0.0
-    c0 = 0
-    while c0 < C:
-        cur_offs = c0 + offs_c
-        mask = cur_offs < C
-        y_ptrs = y_ptr + pid_n * stride_yn + cur_offs * stride_yc
-        y_vals = tl.load(y_ptrs, mask=mask, other=-float('inf'))
-        sum_exp += tl.sum(tl.exp(y_vals - max_val), axis=0)
-        c0 += BLOCK_C
-
-    # Final logsumexp and scale by 10.0
-    logsumexp_val = max_val + tl.log(sum_exp)
-    result = logsumexp_val * 10.0
-
-    tl.store(out_ptr + pid_n, result)
-
-
-# 3. Wrapper function(s)
-
-def fused_post_convtranspose(x: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
-    """
-    Two-kernel fused implementation:
-
-      1) gap_bias_kernel:
-           y[n, c] = mean(x[n, c, :, :]) + bias[c]   -> y: [N, C]
-
-      2) logsumexp_mul_kernel:
-           out[n] = 10 * logsumexp(y[n, :])          -> out: [N, 1]
-    """
-    assert x.is_cuda, "Triton kernels require CUDA tensors"
-    assert bias.is_cuda, "Bias must be on CUDA device"
-    assert x.dim() == 4, "x must be [N, C, H, W]"
-
-    N, C, H, W = x.shape
-    assert bias.numel() == C, "Bias must have C elements"
-
-    # Intermediate [N, C] buffer
-    y = torch.empty((N, C), device=x.device, dtype=x.dtype)
-    out = torch.empty((N, 1), device=x.device, dtype=x.dtype)
-
-    inv_hw = 1.0 / float(H * W)
-
-    # Launch kernel 1: GlobalAvgPool + Bias
-    grid_gap = lambda META: (
-        N,
-        triton.cdiv(C, META['BLOCK_C']),
+    logsumexp_10_kernel[grid](
+        g, out,
+        M, N,
+        g.stride(0), g.stride(1),
+        out.stride(0),
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        num_warps=4,
+        num_stages=2,
     )
-
-    gap_bias_kernel[grid_gap](
-        x, bias, y,
-        N, C, H, W,
-        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
-        y.stride(0), y.stride(1),
-        inv_hw,
-    )
-
-    # Launch kernel 2: LogSumExp over C + *10.0
-    BLOCK_C_LSE = 128
-    grid_lse = (N,)
-
-    logsumexp_mul_kernel[grid_lse](
-        y, out,
-        N, C,
-        y.stride(0), y.stride(1),
-        BLOCK_C=BLOCK_C_LSE,
-    )
-
     return out
 
 
-# 4. ModelNew definition
+# -----------------------------
+# 4) High-level fused function using optimized kernels
+# -----------------------------
+def triton_fused_gemm_mean_bias_logsumexp_10(
+    a: torch.Tensor,          # [B, C_in] = sum over H,W of input
+    weight_sum: torch.Tensor, # [C_in, C_out] = sum over kh,kw of weight
+    conv_bias: torch.Tensor,  # [C_out]
+    bias2: torch.Tensor,      # [C_out, 1, 1]
+    H: int, W: int,
+    kH: int, kW: int,
+) -> torch.Tensor:
+    """
+    Computes:
+        g[b, c_out] = mean_HW(convT(x))[b, c_out] + bias2[c_out]
+        out[b, 0]   = 10 * logsumexp_c_out(g[b, c_out])
 
+    Using the algebraic reduction:
+        mean_HW(convT) = (sum_HW(x) @ weight_sum) / (H_out*W_out) + conv_bias
+
+    Implemented as:
+      1) GEMM + scaling + total bias: [B, C_in] x [C_in, C_out] -> g[B, C_out]
+      2) Row-wise logsumexp(g) * 10 -> out[B]
+    """
+    B, C_in = a.shape
+    C_in_w, C_out = weight_sum.shape
+    assert C_in_w == C_in
+
+    H_out = H + kH - 1
+    W_out = W + kW - 1
+    scale = 1.0 / float(H_out * W_out)
+
+    # Bias after pooling (conv bias) + separate bias parameter
+    bias2_flat = bias2.view(-1)
+    bias_total = conv_bias + bias2_flat  # [C_out]
+
+    a = a.contiguous()
+    w = weight_sum.contiguous()
+    bias_total = bias_total.contiguous()
+
+    # 1) GEMM + scale + bias
+    g = triton_gemm_mean_bias(a, w, bias_total, scale)  # [B, C_out]
+
+    # 2) Row-wise 10 * logsumexp
+    out = triton_logsumexp_10(g)  # [B]
+
+    return out.view(B, 1)
+
+
+# -----------------------------
+# 5) ModelNew using optimized Triton kernels
+# -----------------------------
 class ModelNew(nn.Module):
     """
-    Model that performs a transposed convolution (PyTorch native),
-    followed by optimized Triton kernels for:
-      1) GlobalAvgPool over (H, W) + BiasAdd  -> [N, C]
-      2) LogSumExp over C + Multiply(10.0)    -> [N, 1]
+    Triton-optimized version of the original model.
+
+    Uses algebraic simplification of ConvTranspose2d + global average pooling:
+    Instead of forming the full [B, C_out, H_out, W_out] tensor, it computes
+    the pooled values directly from sums of inputs and kernel weights.
+
+    Internally:
+      - sum over H,W via a streaming reduction kernel
+      - GEMM + scaling + bias via a 2D-tiled Triton matmul
+      - row-wise 10 * logsumexp via a streaming reduction kernel
     """
+
     def __init__(self, in_channels, out_channels, kernel_size, bias_shape):
         super(ModelNew, self).__init__()
-        self.conv_transpose = nn.ConvTranspose2d(
-            in_channels, out_channels, kernel_size
+        if isinstance(kernel_size, int):
+            kH = kW = kernel_size
+        else:
+            kH, kW = kernel_size
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kH = kH
+        self.kW = kW
+
+        # ConvTranspose2d-like parameters: [in_channels, out_channels, kH, kW]
+        self.weight = nn.Parameter(
+            torch.randn(in_channels, out_channels, kH, kW)
         )
+        self.conv_bias = nn.Parameter(torch.randn(out_channels))
+
+        # Additional bias added after global average pooling
         self.bias = nn.Parameter(torch.randn(bias_shape))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.conv_transpose(x)
-        bias_1d = self.bias.view(-1)
-        x = fused_post_convtranspose(x, bias_1d)
-        return x
+        # x: [B, C_in, H, W]
+        B, C_in, H, W = x.shape
+        assert C_in == self.in_channels
+
+        # 1) Sum over spatial dims (H, W)
+        sum_x = triton_sum_hw(x)  # [B, C_in]
+
+        # 2) Sum weights over kernel dims (kh, kw): [C_in, C_out]
+        weight_sum = self.weight.sum(dim=(2, 3))
+
+        # 3) GEMM + scaling + bias + 10*logsumexp
+        out = triton_fused_gemm_mean_bias_logsumexp_10(
+            sum_x,
+            weight_sum,
+            self.conv_bias,
+            self.bias,
+            H, W,
+            self.kH, self.kW,
+        )  # [B, 1]
+
+        return out
 ```
 
 [NCU PROFILING METRICS]
 {
-  "gap_bias_kernel": {
-    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 20.59,
-    "launch__grid_size": 64,
-    "sm__warps_active.avg.pct_of_peak_sustained_active": 4.17,
-    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 42.32,
-    "lts__t_sector_hit_rate.pct": 0.44
+  "sum_hw_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 31.1,
+    "launch__grid_size": 1024,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 66.44,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 96.55,
+    "lts__t_sector_hit_rate.pct": 0.02
   },
-  "logsumexp_mul_kernel": {
-    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 0.49,
-    "launch__grid_size": 16,
-    "sm__warps_active.avg.pct_of_peak_sustained_active": 8.24,
-    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 0.55,
-    "lts__t_sector_hit_rate.pct": 83.8
+  "gemm_mean_bias_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 0.47,
+    "launch__grid_size": 4,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 8.32,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 1.28,
+    "lts__t_sector_hit_rate.pct": 76.44
+  },
+  "logsumexp_10_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 0.14,
+    "launch__grid_size": 1,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 8.28,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 0.93,
+    "lts__t_sector_hit_rate.pct": 89.12
   }
 }
 
 **Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
 
-TRITON API CONSTRAINTS (CRITICAL):
-- Triton has NO: tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+## CRITICAL — Code MUST compile and run:
+1. EVERY kernel function MUST have `@triton.jit` decorator
+2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+3. BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+4. `tl.program_id(axis)` only supports axis = 0, 1, 2
+5. No `continue`, `break`, `return` inside loops — use masking
+6. No tensor indexing with loop vars: `x[:, i]` is INVALID
+7. mask shape MUST match data shape in tl.load/tl.store
 
-OUTPUT RULES (STRICT):
-1. Follow this exact order:
-   1. Imports: torch, torch.nn, triton, triton.language as tl
-   2. @triton.jit decorated kernel function(s)
-   3. Wrapper function(s) for grid calculation and kernel launch
-   4. class ModelNew(nn.Module) that calls your kernels
-2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+## Missing Triton Functions (implement manually):
+- tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+## OUTPUT FORMAT (STRICT):
+1. Imports: torch, torch.nn, triton, triton.language as tl
+2. @triton.jit decorated kernel function(s)
+3. Wrapper function(s) for grid calculation and kernel launch
+4. class ModelNew(nn.Module) that calls your kernels
+
+Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
 
 ```python
 # <optimized Triton code>

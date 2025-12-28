@@ -1,0 +1,308 @@
+Fix the Triton kernel errors. Generate correct code.
+
+## ERROR LOG
+```
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 555, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251228_142926_batch_range13to23_openai_deepseek/18_Matmul_Sum_Max_AvgPool_LogSumExp_LogSumExp/code/kernel_20251228_151655.py", line 173, in forward
+    return fused_linear_and_reductions(x, self.weight, self.bias)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251228_142926_batch_range13to23_openai_deepseek/18_Matmul_Sum_Max_AvgPool_LogSumExp_LogSumExp/code/kernel_20251228_151655.py", line 137, in fused_linear_and_reductions
+    fused_row_gemv_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 419, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 733, in run
+    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 861, in _do_compile
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 300, in compile
+    module = src.make_ir(target, options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 80, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: def fused_row_gemv_kernel(
+    x_ptr,           # (M, K) input
+    w_eff_ptr,       # (K,)   effective weight vector
+    out_ptr,         # (M,)   output (fp32)
+    b_eff,           # scalar bias in fp32
+    M, K,
+    stride_xm, stride_xk,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+):
+    # 2D grid:
+    #   pid_m  -> blocks of rows
+    #   pid_k  -> split-K parallelism
+    pid_m = tl.program_id(0)
+    pid_k = tl.program_id(1)
+
+    # Row offsets (output dimension)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offs_m < M
+
+    # K offsets for tiling
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Accumulator for each row in the block
+    acc = tl.zeros((BLOCK_M,), dtype=tl.float32)
+
+    # Number of tiles along K
+    k_tiles = tl.cdiv(K, BLOCK_K)
+
+    # Each split-K instance processes a strided subset of K-tiles:
+    # tile_idx = pid_k, pid_k + SPLIT_K, ...
+    for tile_idx in range(pid_k, k_tiles, SPLIT_K):
+        k_offsets = tile_idx * BLOCK_K + offs_k
+        k_mask = k_offsets < K
+
+        # Pointers
+        x_ptrs = x_ptr + offs_m[:, None] * stride_xm + k_offsets[None, :] * stride_xk
+        w_ptrs = w_eff_ptr + k_offsets
+
+        # Loads
+        x_tile = tl.load(
+            x_ptrs,
+            mask=mask_m[:, None] & k_mask[None, :],
+            other=0.0,
+        )
+        w_tile = tl.load(
+            w_ptrs,
+            mask=k_mask,
+            other=0.0,
+        )
+
+        # Promote to fp32
+        x_tile = x_tile.to(tl.float32)
+        w_tile = w_tile.to(tl.float32)
+
+        # Per-row dot-product accumulation over this K-tile
+        acc += tl.sum(x_tile * w_tile[None, :], axis=1)
+
+    # Add scalar bias exactly once per row (only split 0 adds it)
+    if SPLIT_K == 1:
+        acc += b_eff
+        tl.store(out_ptr + offs_m, acc, mask=mask_m)
+    else:
+        if pid_k == 0:
+            acc += b_eff
+        tl.atomic_add(out_ptr + offs_m, acc, mask=mask_m)
+
+IncompatibleTypeErrorImpl('invalid operands of type pointer<fp32> and triton.language.float32')
+```
+
+## Broken Code
+```python
+import math
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def fused_row_gemv_kernel(
+    x_ptr,           # (M, K) input
+    w_eff_ptr,       # (K,)   effective weight vector
+    out_ptr,         # (M,)   output (fp32)
+    b_eff,           # scalar bias in fp32
+    M, K,
+    stride_xm, stride_xk,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+):
+    # 2D grid:
+    #   pid_m  -> blocks of rows
+    #   pid_k  -> split-K parallelism
+    pid_m = tl.program_id(0)
+    pid_k = tl.program_id(1)
+
+    # Row offsets (output dimension)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offs_m < M
+
+    # K offsets for tiling
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Accumulator for each row in the block
+    acc = tl.zeros((BLOCK_M,), dtype=tl.float32)
+
+    # Number of tiles along K
+    k_tiles = tl.cdiv(K, BLOCK_K)
+
+    # Each split-K instance processes a strided subset of K-tiles:
+    # tile_idx = pid_k, pid_k + SPLIT_K, ...
+    for tile_idx in range(pid_k, k_tiles, SPLIT_K):
+        k_offsets = tile_idx * BLOCK_K + offs_k
+        k_mask = k_offsets < K
+
+        # Pointers
+        x_ptrs = x_ptr + offs_m[:, None] * stride_xm + k_offsets[None, :] * stride_xk
+        w_ptrs = w_eff_ptr + k_offsets
+
+        # Loads
+        x_tile = tl.load(
+            x_ptrs,
+            mask=mask_m[:, None] & k_mask[None, :],
+            other=0.0,
+        )
+        w_tile = tl.load(
+            w_ptrs,
+            mask=k_mask,
+            other=0.0,
+        )
+
+        # Promote to fp32
+        x_tile = x_tile.to(tl.float32)
+        w_tile = w_tile.to(tl.float32)
+
+        # Per-row dot-product accumulation over this K-tile
+        acc += tl.sum(x_tile * w_tile[None, :], axis=1)
+
+    # Add scalar bias exactly once per row (only split 0 adds it)
+    if SPLIT_K == 1:
+        acc += b_eff
+        tl.store(out_ptr + offs_m, acc, mask=mask_m)
+    else:
+        if pid_k == 0:
+            acc += b_eff
+        tl.atomic_add(out_ptr + offs_m, acc, mask=mask_m)
+
+
+def fused_linear_and_reductions(x, weight, bias):
+    """
+    Compute:
+        y = x @ weight.T + bias   # (M, N)
+        s = torch.sum(y, dim=1, keepdim=True)
+        (followed by a chain of no-op reductions on dim=1 of size 1)
+
+    Using:
+        sum_n (x W^T + b)_mn = x_m · (sum_n W_n·) + sum_n b_n
+
+    So:
+        w_eff = weight.sum(dim=0)  # (K,)
+        b_eff = bias.sum()         # scalar
+        out[m] = x[m] · w_eff + b_eff
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+    M, K = x.shape
+    assert weight.shape[1] == K, "weight shape must be (out_features, in_features)"
+
+    # Precompute effective weight and bias in fp32
+    w_eff = weight.sum(dim=0, dtype=torch.float32).contiguous()  # (K,)
+    b_eff = bias.sum(dtype=torch.float32)
+
+    # Heuristics for tile sizes (power-of-two) tuned for Ada (e.g. RTX 4090)
+    if M < 2048:
+        BLOCK_M = 64
+        num_warps = 4
+    else:
+        BLOCK_M = 128
+        num_warps = 8
+
+    BLOCK_K = 256  # Large K tile for better memory throughput
+
+    # Split-K parallelism to increase grid size when M is small
+    grid_m = triton.cdiv(M, BLOCK_M)
+    k_tiles = (K + BLOCK_K - 1) // BLOCK_K
+    # Hard cap on split-K to avoid excessive atomics
+    max_split_k = max(1, min(8, k_tiles))
+
+    # Aim for at least ~4 CTAs per SM (4090 has 128 SMs)
+    device_index = x.device.index if x.device.index is not None else torch.cuda.current_device()
+    num_sms = torch.cuda.get_device_properties(device_index).multi_processor_count
+    target_ctas = 4 * num_sms
+
+    split_k = 1
+    if grid_m > 0 and max_split_k > 1 and grid_m < target_ctas:
+        needed = (target_ctas + grid_m - 1) // grid_m
+        split_k = min(max_split_k, max(1, needed))
+    split_k = max(1, split_k)
+
+    # Allocate output buffer (zeroed only if we use atomics)
+    if split_k == 1:
+        out_fp32 = torch.empty((M,), device=x.device, dtype=torch.float32)
+    else:
+        out_fp32 = torch.zeros((M,), device=x.device, dtype=torch.float32)
+
+    def grid(meta):
+        return (triton.cdiv(M, meta["BLOCK_M"]), split_k)
+
+    fused_row_gemv_kernel[grid](
+        x,                     # x_ptr
+        w_eff,                 # w_eff_ptr
+        out_fp32,              # out_ptr
+        b_eff,                 # scalar bias
+        M, K,
+        x.stride(0), x.stride(1),
+        BLOCK_M=BLOCK_M,
+        BLOCK_K=BLOCK_K,
+        SPLIT_K=split_k,
+        num_warps=num_warps,
+        num_stages=4,
+    )
+
+    # Match original model's output shape: (M, 1)
+    return out_fp32.to(x.dtype).view(M, 1)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model using a Triton GEMV with split-K parallelism and fused
+    bias addition, algebraically equivalent to the original sequence of
+    linear + reductions.
+    """
+    def __init__(self, in_features, out_features):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias = nn.Parameter(torch.empty(out_features))
+
+        # Match nn.Linear initialization
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+        bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+        nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x):
+        return fused_linear_and_reductions(x, self.weight, self.bias)
+```
+
+## CRITICAL — These cause 60%+ of failures:
+1. EVERY kernel function MUST have `@triton.jit` decorator — MANDATORY
+2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+3. BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+4. `tl.program_id(axis)` only supports axis = 0, 1, 2
+5. No `continue`, `break`, `return` inside loops — use masking
+6. No tensor indexing with loop vars: `x[:, i]` is INVALID
+7. mask shape MUST match data shape in tl.load/tl.store
+
+## Missing Triton Functions (implement manually):
+- tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+## OUTPUT FORMAT (STRICT):
+1. Imports: torch, torch.nn, triton, triton.language as tl (and math if needed)
+2. @triton.jit decorated kernel function(s)
+3. Wrapper function(s) for grid calculation and kernel launch
+4. class ModelNew(nn.Module) — REQUIRED
+
+Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <corrected code>
+```

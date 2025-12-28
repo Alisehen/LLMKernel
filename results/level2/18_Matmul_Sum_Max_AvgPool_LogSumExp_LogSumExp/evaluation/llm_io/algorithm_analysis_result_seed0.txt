@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The kernel is performing a full M×K×N matmul even though the final result is only one scalar per row, so most of the computed data is immediately reduced away.",
+  "bottleneck": "You compute the entire y = x @ W^T + b (shape M×N) tile-by-tile and then sum over N, which is both compute- and memory-heavy, and additionally use atomics to accumulate partial row sums across blocks.",
+  "optimisation method": "Exploit the algebraic identity sum_n (x W^T + b)_mn = x_m · (sum_n W_n·) + sum_n b_n to replace the M×K×N GEMM+row-sum with a single M×K GEMV using an \"effective\" weight vector w_eff = W.sum(dim=0) and scalar b_eff = b.sum().",
+  "modification plan": "Before launching any Triton kernel, compute w_eff = weight.sum(dim=0) (shape K) and b_eff = bias.sum() once (e.g., with PyTorch). Then implement or call a GEMV-style kernel that, for each row m, computes out[m] = dot(x[m, :], w_eff) + b_eff, producing shape (M,1) directly with no N-dimension, no tiling over N, and no atomics. This replaces the current fused_linear_row_sum_kernel entirely with a much simpler and cheaper dot-product-per-row kernel.",
+  "expected_speedup": "2-3x"
+}

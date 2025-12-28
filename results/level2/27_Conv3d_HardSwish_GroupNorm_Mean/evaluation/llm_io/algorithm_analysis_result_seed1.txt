@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The pipeline writes and then rereads a full (B, C, D, H, W) tensor just to compute a spatial mean, which is expensive in memory bandwidth and kernel launches.",
+  "bottleneck": "After HardSwish+GroupNorm, the kernel stores a normalized 5D tensor to global memory, and a second kernel (spatial_mean_kernel) immediately rereads all of it to reduce over spatial dimensions, causing redundant global memory traffic and an extra launch.",
+  "optimisation method": "Fuse the spatial mean pooling into the existing HardSwish+GroupNorm Triton kernel so that, after applying normalization and affine, each program accumulates per-channel spatial sums and directly writes (B, C) outputs, eliminating the intermediate 5D tensor and the separate spatial_mean kernel.",
+  "modification plan": "Extend hardswish_groupnorm_kernel to also track, for each (b, c), the sum of the final normalized+affine values over D×H×W (possibly via an additional reduction pass or by restructuring the mapping from programs to (b, c)). At the end of processing each (b, c), divide by the spatial size and write directly into the (B, C) output tensor instead of storing the full y: (B, C, D, H, W). Remove spatial_mean_kernel and adjust ModelNew.forward to call only this fused kernel after the Conv3D. This reduces one full read/write of the 5D tensor and one kernel launch.",
+  "expected_speedup": "20-30%"
+}

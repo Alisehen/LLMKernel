@@ -1,34 +1,12 @@
 You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
 
-# Target GPU
-GPU Name: 4090
-Architecture: Ada Lovelace
-• Compute Capability: 8.9
-• Number of SMs: 128
-• Memory Bandwidth: 1008 GB/s
-• TF32 Tensor Core TFLOPS: 82.6 with dense
-• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
-• FP16 Tensor Core TFLOPS: 165.2 with dense
-• Maximum number of registers per thread: 255
-• Maximum threads per block: 1024
-• Maximum threads per SM: 1536
-• Warp size: 32
-• Maximum concurrent warps per SM: 48
-• Shared memory capacity per SM: 100 KB
-• Maximum shared memory per thread block: 99 KB
-• L2 cache (global, all SM shared): 72 MB
+# Target GPU: 4090
 
 [OPTIMIZATION STAGE]
 
 ## Current Optimization Stage
 
 Focus: Grid layout & indexing for FUSED operations.
-
-⚠️ FUSION EXCLUSIONS (do NOT apply fusion rules to these):
-- Reduction ops (sum, mean, softmax along axis)
-- Atomic operations
-- Irregular/data-dependent access patterns
-- Cross-block dependencies
 
 Key Principle:
 - All fused ops share the SAME grid AND the SAME (offsets, mask) tuple
@@ -52,250 +30,183 @@ Verification:
 ```python
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
 
 @triton.jit
-def conv2d_scale_kernel(
-    x_ptr, w_ptr, b_ptr, y_ptr,
-    N, C_in, H, W, C_out,
-    KH, KW,
-    H_out, W_out,
+def scale_channel_min_kernel(
+    x_ptr,  # (N, C, H, W)
+    y_ptr,  # (N, 1, H, W)
+    N, C, H, W,
     stride_xn, stride_xc, stride_xh, stride_xw,
-    stride_wn, stride_wc, stride_wkh, stride_wkw,
     stride_yn, stride_yc, stride_yh, stride_yw,
     scale,
-    BLOCK_M: tl.constexpr,  # flattened positions (N * H_out * W_out)
-    BLOCK_N: tl.constexpr,  # output channels
+    BLOCK_M: tl.constexpr,  # number of (n, h, w) elements per program
+    BLOCK_C: tl.constexpr,  # channel tile
 ):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-
-    P = N * H_out * W_out
-    mask_m = offs_m < P
-    mask_n = offs_n < C_out
-
-    HW_out = H_out * W_out
-
-    n_idx = offs_m // HW_out
-    rem = offs_m % HW_out
-    oh_idx = rem // W_out
-    ow_idx = rem % W_out
-
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-
-    # Convolution: no padding, stride=1, dilation=1
-    for ic in range(0, C_in):
-        for kh in range(0, KH):
-            for kw in range(0, KW):
-                ih = oh_idx + kh
-                iw = ow_idx + kw
-
-                x_offsets = (
-                    n_idx * stride_xn
-                    + ic * stride_xc
-                    + ih * stride_xh
-                    + iw * stride_xw
-                )
-                x_ptrs = x_ptr + x_offsets
-                x_vals = tl.load(x_ptrs, mask=mask_m, other=0.0)
-
-                w_offsets = (
-                    offs_n * stride_wn
-                    + ic * stride_wc
-                    + kh * stride_wkh
-                    + kw * stride_wkw
-                )
-                w_ptrs = w_ptr + w_offsets
-                w_vals = tl.load(w_ptrs, mask=mask_n, other=0.0)
-
-                acc += x_vals[:, None] * w_vals[None, :]
-
-    # Add bias and scale
-    bias = tl.load(b_ptr + offs_n, mask=mask_n, other=0.0)
-    acc += bias[None, :]
-    acc = acc * scale
-
-    y_offsets = (
-        n_idx[:, None] * stride_yn
-        + offs_n[None, :] * stride_yc
-        + oh_idx[:, None] * stride_yh
-        + ow_idx[:, None] * stride_yw
-    )
-    y_ptrs = y_ptr + y_offsets
-    mask = mask_m[:, None] & mask_n[None, :]
-    tl.store(y_ptrs, acc, mask=mask)
-
-
-@triton.jit
-def channel_min_kernel(
-    y_ptr, out_ptr,
-    N, C_out, H_out, W_out,
-    stride_yn, stride_yc, stride_yh, stride_yw,
-    stride_on, stride_oc, stride_oh, stride_ow,
-    BLOCK_M: tl.constexpr,  # flattened positions (N * H_out * W_out)
-):
+    # Flattened index over (N * H * W)
     pid = tl.program_id(0)
     offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    M = N * H * W
+    mask_m = offs_m < M
 
-    P = N * H_out * W_out
-    mask_m = offs_m < P
+    # Decode offs_m -> (n, h, w)
+    hw = H * W
+    n_idx = offs_m // hw
+    rem = offs_m % hw
+    h_idx = rem // W
+    w_idx = rem % W
 
-    HW_out = H_out * W_out
-    n_idx = offs_m // HW_out
-    rem = offs_m % HW_out
-    oh_idx = rem // W_out
-    ow_idx = rem % W_out
+    # Decide whether to compute min or max depending on scale sign.
+    # For scale >= 0: min(scale * x) = scale * min(x)
+    # For scale < 0:  min(scale * x) = scale * max(x)
+    is_pos = scale >= 0
 
-    base_offsets = (
-        n_idx * stride_yn
-        + oh_idx * stride_yh
-        + ow_idx * stride_yw
+    # Initialize accumulator
+    pos_inf = 3.402823e38
+    neg_inf = -3.402823e38
+
+    acc = tl.where(is_pos, tl.full((BLOCK_M,), pos_inf, dtype=tl.float32),
+                           tl.full((BLOCK_M,), neg_inf, dtype=tl.float32))
+    other_val = tl.where(is_pos, pos_inf, neg_inf)
+
+    # Loop over channel dimension in BLOCK_C tiles
+    for c_start in range(0, C, BLOCK_C):
+        offs_c = c_start + tl.arange(0, BLOCK_C)
+        mask_c = offs_c < C
+
+        x_ptrs = (
+            x_ptr
+            + n_idx[:, None] * stride_xn
+            + offs_c[None, :] * stride_xc
+            + h_idx[:, None] * stride_xh
+            + w_idx[:, None] * stride_xw
+        )
+        mask = mask_m[:, None] & mask_c[None, :]
+
+        vals = tl.load(x_ptrs, mask=mask, other=other_val)
+
+        if is_pos:
+            tile_red = tl.min(vals, axis=1)
+            acc = tl.minimum(acc, tile_red)
+        else:
+            tile_red = tl.max(vals, axis=1)
+            acc = tl.maximum(acc, tile_red)
+
+    # Apply scale after reduction for correct semantics with negative scale
+    acc = acc * scale
+
+    # Store result at channel 0
+    y_ptrs = (
+        y_ptr
+        + n_idx * stride_yn
+        + 0 * stride_yc
+        + h_idx * stride_yh
+        + w_idx * stride_yw
     )
-
-    # Large positive value as +infinity
-    current_min = tl.full((BLOCK_M,), 1e30, dtype=tl.float32)
-
-    for oc in range(0, C_out):
-        y_ptrs = y_ptr + base_offsets + oc * stride_yc
-        vals = tl.load(y_ptrs, mask=mask_m, other=1e30)
-        current_min = tl.minimum(current_min, vals)
-
-    out_offsets = (
-        n_idx * stride_on
-        + oh_idx * stride_oh
-        + ow_idx * stride_ow
-    )
-    out_ptrs = out_ptr + out_offsets
-    tl.store(out_ptrs, current_min, mask=mask_m)
+    tl.store(y_ptrs, acc, mask=mask_m)
 
 
-def conv2d_scale_triton(x, weight, bias, scale_factor):
-    # x: [N, C_in, H, W]
-    # weight: [C_out, C_in, KH, KW]
-    x = x.contiguous()
-    weight = weight.contiguous()
-    bias = bias.contiguous()
+def scale_min_triton(conv_out: torch.Tensor, scale_factor: float) -> torch.Tensor:
+    """
+    Fused scale + channel-wise min over a Conv2d output.
 
-    N, C_in, H, W = x.shape
-    C_out, C_in_w, KH, KW = weight.shape
-    assert C_in == C_in_w, "Input channels mismatch between x and weight"
+    Args:
+        conv_out: (N, C, H, W) CUDA tensor
+        scale_factor: float scalar
 
-    H_out = H - KH + 1
-    W_out = W - KW + 1
+    Returns:
+        y: (N, 1, H, W) where
+           y[n, 0, h, w] = min_c(conv_out[n, c, h, w] * scale_factor)
+    """
+    assert conv_out.is_cuda, "Triton kernel requires CUDA tensor"
+    conv_out = conv_out.contiguous()
 
-    y = torch.empty((N, C_out, H_out, W_out), device=x.device, dtype=x.dtype)
+    N, C, H, W = conv_out.shape
+    y = torch.empty((N, 1, H, W), device=conv_out.device, dtype=conv_out.dtype)
 
-    stride_xn, stride_xc, stride_xh, stride_xw = x.stride()
-    stride_wn, stride_wc, stride_wkh, stride_wkw = weight.stride()
+    stride_xn, stride_xc, stride_xh, stride_xw = conv_out.stride()
     stride_yn, stride_yc, stride_yh, stride_yw = y.stride()
 
-    P = N * H_out * W_out
+    M = N * H * W
+    BLOCK_M = 128
+    BLOCK_C = 64
 
-    def grid(meta):
-        return (
-            triton.cdiv(P, meta["BLOCK_M"]),
-            triton.cdiv(C_out, meta["BLOCK_N"]),
-        )
+    grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]),)
 
-    conv2d_scale_kernel[grid](
-        x, weight, bias, y,
-        N, C_in, H, W, C_out,
-        KH, KW,
-        H_out, W_out,
+    scale_channel_min_kernel[grid](
+        conv_out,
+        y,
+        N, C, H, W,
         stride_xn, stride_xc, stride_xh, stride_xw,
-        stride_wn, stride_wc, stride_wkh, stride_wkw,
         stride_yn, stride_yc, stride_yh, stride_yw,
-        scale_factor,
-        BLOCK_M=32,
-        BLOCK_N=32,
+        float(scale_factor),
+        BLOCK_M=BLOCK_M,
+        BLOCK_C=BLOCK_C,
+        num_warps=4,
+        num_stages=2,
     )
     return y
 
 
-def conv_scale_min_triton(x, weight, bias, scale_factor):
-    # Conv + scale
-    y = conv2d_scale_triton(x, weight, bias, scale_factor)
-    N, C_out, H_out, W_out = y.shape
-
-    out = torch.empty((N, 1, H_out, W_out), device=y.device, dtype=y.dtype)
-
-    stride_yn, stride_yc, stride_yh, stride_yw = y.stride()
-    stride_on, stride_oc, stride_oh, stride_ow = out.stride()
-
-    P = N * H_out * W_out
-
-    def grid(meta):
-        return (triton.cdiv(P, meta["BLOCK_M"]),)
-
-    channel_min_kernel[grid](
-        y, out,
-        N, C_out, H_out, W_out,
-        stride_yn, stride_yc, stride_yh, stride_yw,
-        stride_on, stride_oc, stride_oh, stride_ow,
-        BLOCK_M=128,
-    )
-    return out
-
-
 class ModelNew(nn.Module):
     """
-    Triton implementation of:
-        y = Conv2d(x)
-        y = y * scale_factor
-        y = min(y, dim=1, keepdim=True)
+    Optimized model:
+    - Uses cuDNN (torch.nn.Conv2d) for convolution
+    - Uses a Triton kernel to fuse scaling and channel-wise minimum:
+        y[n, 0, h, w] = min_c( conv(x)[n, c, h, w] * scale_factor )
     """
     def __init__(self, in_channels, out_channels, kernel_size, scale_factor):
         super(ModelNew, self).__init__()
-        if isinstance(kernel_size, int):
-            kh = kw = kernel_size
-        else:
-            kh, kw = kernel_size
-        self.weight = nn.Parameter(
-            torch.randn(out_channels, in_channels, kh, kw)
-        )
-        self.bias = nn.Parameter(torch.randn(out_channels))
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
         self.scale_factor = float(scale_factor)
 
     def forward(self, x):
-        # Expect x: [N, C_in, H, W] on CUDA
-        return conv_scale_min_triton(x, self.weight, self.bias, self.scale_factor)
+        # First do convolution using cuDNN-optimized Conv2d
+        x = self.conv(x)
+
+        # If on CUDA, use Triton to fuse scale + min; otherwise fall back to PyTorch
+        if x.is_cuda:
+            return scale_min_triton(x, self.scale_factor)
+        else:
+            x = x * self.scale_factor
+            return torch.min(x, dim=1, keepdim=True)[0]
 ```
 
 [NCU PROFILING METRICS]
 {
-  "conv2d_scale_kernel": {
-    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 42.11,
-    "launch__grid_size": 516128,
-    "sm__warps_active.avg.pct_of_peak_sustained_active": 83.25,
-    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 3.51,
-    "lts__t_sector_hit_rate.pct": 97.23
-  },
-  "channel_min_kernel": {
-    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 4.76,
+  "scale_channel_min_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 4.88,
     "launch__grid_size": 32258,
-    "sm__warps_active.avg.pct_of_peak_sustained_active": 94.31,
-    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 87.55,
-    "lts__t_sector_hit_rate.pct": 7.07
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 39.04,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 90.06,
+    "lts__t_sector_hit_rate.pct": 5.49
   }
 }
 
 **Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
 
-TRITON API CONSTRAINTS (CRITICAL):
-- Triton has NO: tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+## CRITICAL — Code MUST compile and run:
+1. EVERY kernel function MUST have `@triton.jit` decorator
+2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+3. BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+4. `tl.program_id(axis)` only supports axis = 0, 1, 2
+5. No `continue`, `break`, `return` inside loops — use masking
+6. No tensor indexing with loop vars: `x[:, i]` is INVALID
+7. mask shape MUST match data shape in tl.load/tl.store
 
-OUTPUT RULES (STRICT):
-1. Follow this exact order:
-   1. Imports: torch, torch.nn, triton, triton.language as tl
-   2. @triton.jit decorated kernel function(s)
-   3. Wrapper function(s) for grid calculation and kernel launch
-   4. class ModelNew(nn.Module) that calls your kernels
-2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+## Missing Triton Functions (implement manually):
+- tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+## OUTPUT FORMAT (STRICT):
+1. Imports: torch, torch.nn, triton, triton.language as tl
+2. @triton.jit decorated kernel function(s)
+3. Wrapper function(s) for grid calculation and kernel launch
+4. class ModelNew(nn.Module) that calls your kernels
+
+Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
 
 ```python
 # <optimized Triton code>

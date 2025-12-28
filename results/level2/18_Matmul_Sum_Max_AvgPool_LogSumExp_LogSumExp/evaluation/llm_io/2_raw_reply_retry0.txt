@@ -1,6 +1,7 @@
 ```python
-# <optimized Triton code>
+# Optimized Triton code for fused linear + row reductions on RTX 4090
 
+import math
 import torch
 import torch.nn as nn
 import triton
@@ -9,192 +10,192 @@ import triton.language as tl
 
 @triton.autotune(
     configs=[
+        # Larger, more aggressive tile (use when registers allow)
         triton.Config(
-            {
-                "BLOCK_M": 64,
-                "BLOCK_K": 32,
-                "num_warps": 4,
-            },
+            {'BLOCK_M': 64, 'BLOCK_K': 128},
+            num_warps=4,
+            num_stages=3,
+        ),
+        # Balanced tile, lower register pressure
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_K': 64},
+            num_warps=4,
             num_stages=2,
         ),
+        # Small fallback tile for high-register-pressure cases
         triton.Config(
-            {
-                "BLOCK_M": 128,
-                "BLOCK_K": 32,
-                "num_warps": 4,
-            },
-            num_stages=2,
-        ),
-        triton.Config(
-            {
-                "BLOCK_M": 256,
-                "BLOCK_K": 32,
-                "num_warps": 8,
-            },
+            {'BLOCK_M': 32, 'BLOCK_K': 64},
+            num_warps=2,
             num_stages=2,
         ),
     ],
-    key=["M", "K"],
+    key=['M', 'K'],
 )
 @triton.jit
-def linear_row_sum_kernel(
-    x_ptr,        # [M, K]
-    wsum_ptr,     # [K]   = weight.sum(dim=0)
-    b_sum,        # scalar = bias.sum()
-    out_ptr,      # [M]
+def fused_row_gemv_kernel(
+    x_ptr,           # (M, K) input
+    w_eff_ptr,       # (K,)   effective weight vector
+    out_ptr,         # (M,)   output (fp32)
+    b_eff,           # scalar bias in fp32
     M, K,
     stride_xm, stride_xk,
-    stride_wk,
-    stride_outm,
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    SPLIT_K: tl.constexpr,
 ):
-    """
-    Compute, for each row i:
-
-        out[i] = sum_j (x @ W^T + b)[i, j]
-
-    Using the identity:
-
-        sum_j (x @ W^T + b)[i, j] =
-            x[i, :] · (sum_j W[j, :]) + sum_j b[j]
-
-    So the kernel only performs:
-
-        out[i] = x[i, :] · w_sum + b_sum
-
-    where w_sum = weight.sum(dim=0), b_sum = bias.sum().
-
-    Accumulation is done in fp32; result is written in the
-    dtype of out_ptr (implicit cast on store).
-    """
+    # 2D launch:
+    #   pid_m: blocks of rows
+    #   pid_k: split-K parallelism
     pid_m = tl.program_id(0)
+    pid_k = tl.program_id(1)
 
+    # Row indices for this program
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     mask_m = offs_m < M
 
+    # Column (K) tile indices
     offs_k = tl.arange(0, BLOCK_K)
 
-    # Pointers for the initial K-tile
-    x_ptrs = x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk
-    w_ptrs = wsum_ptr + offs_k * stride_wk
-
+    # FP32 accumulator: one per row in this block
     acc = tl.zeros((BLOCK_M,), dtype=tl.float32)
 
-    k = 0
-    while k < K:
-        k_remaining = K - k
-        k_mask = offs_k < k_remaining
+    # Number of tiles along K
+    k_tiles = tl.cdiv(K, BLOCK_K)
 
-        x = tl.load(
+    # Each split-K instance processes tiles: pid_k, pid_k + SPLIT_K, ...
+    for tile_idx in range(pid_k, k_tiles, SPLIT_K):
+        k_offsets = tile_idx * BLOCK_K + offs_k
+        k_mask = k_offsets < K
+
+        # Pointers for X and w tiles
+        x_ptrs = x_ptr + offs_m[:, None] * stride_xm + k_offsets[None, :] * stride_xk
+        w_ptrs = w_eff_ptr + k_offsets
+
+        # Load tiles (masked at boundaries)
+        x_tile = tl.load(
             x_ptrs,
             mask=mask_m[:, None] & k_mask[None, :],
             other=0.0,
         )
-        w = tl.load(
+        w_tile = tl.load(
             w_ptrs,
             mask=k_mask,
             other=0.0,
         )
 
-        x_fp32 = x.to(tl.float32)
-        w_fp32 = w.to(tl.float32)
+        # Promote to fp32 for accumulation
+        x_tile = x_tile.to(tl.float32)
+        w_tile = w_tile.to(tl.float32)
 
-        # GEMV tile: [BLOCK_M, BLOCK_K] @ [BLOCK_K, 1] -> [BLOCK_M]
-        acc += tl.dot(x_fp32, w_fp32[:, None])[:, 0]
+        # Dot product along K: per-row accumulation
+        acc += tl.sum(x_tile * w_tile[None, :], axis=1)
 
-        x_ptrs += BLOCK_K * stride_xk
-        w_ptrs += BLOCK_K * stride_wk
-        k += BLOCK_K
+    # Add scalar bias and write back
+    if SPLIT_K == 1:
+        # No split-K: bias added once, regular store
+        acc += b_eff
+        tl.store(out_ptr + offs_m, acc, mask=mask_m)
+    else:
+        # Split-K: only pid_k == 0 adds bias, atomic add to combine partial sums
+        if pid_k == 0:
+            acc += b_eff
+        tl.atomic_add(out_ptr + offs_m, acc, mask=mask_m)
 
-    # Add scalar bias sum
-    acc += b_sum
 
-    out_ptrs = out_ptr + offs_m * stride_outm
-    tl.store(out_ptrs, acc, mask=mask_m)
-
-
-def fused_linear_with_reductions(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor,
-) -> torch.Tensor:
+def fused_linear_and_reductions(x, weight, bias):
     """
-    Fused replacement for the reference sequence:
+    Compute:
+        y = x @ weight.T + bias   # (M, N)
+        s = torch.sum(y, dim=1, keepdim=True)  # (M, 1)
 
-        y = F.linear(x, weight, bias)          # (M, N)
-        y = torch.sum(y, dim=1, keepdim=True)  # (M, 1)
-        y = torch.max(y, dim=1, keepdim=True)[0]
-        y = torch.mean(y, dim=1, keepdim=True)
-        y = torch.logsumexp(y, dim=1, keepdim=True)
-        y = torch.logsumexp(y, dim=1, keepdim=True)
+    Using:
+        sum_n (x W^T + b)_mn = x_m · (sum_n W_n·) + sum_n b_n
 
-    For a single element per row after the first sum, all subsequent
-    reductions are mathematical no-ops, so the whole chain reduces to:
-
-        y = F.linear(x, weight, bias).sum(dim=1, keepdim=True)
-
-    For float32 inputs, we rely on PyTorch/cuBLAS for exact numerical
-    behavior. For lower-precision dtypes (float16/bfloat16), we use a
-    high-performance Triton GEMV kernel that exploits the identity:
-
-        sum_j (x @ W^T + b)[i, j] =
-            x[i, :] · (sum_j W[j, :]) + sum_j b[j]
+    So:
+        w_eff = weight.sum(dim=0)  # (K,)
+        b_eff = bias.sum()         # scalar
+        out[m] = x[m] · w_eff + b_eff
     """
-    assert x.dim() == 2, "x must be 2D (batch_size, in_features)"
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
     M, K = x.shape
-    N, K_w = weight.shape
-    assert K == K_w, "in_features mismatch between x and weight"
-    assert bias.shape == (N,), "bias must be 1D of shape (out_features,)"
+    assert weight.shape[1] == K, "weight shape must be (out_features, in_features)"
 
-    assert x.is_cuda and weight.is_cuda and bias.is_cuda, "All tensors must be on CUDA device"
+    if M == 0:
+        # Avoid launching a kernel with grid size 0
+        return x.new_empty((0, 1))
 
-    # Float32 path: rely on highly optimized cuBLAS and exact numerics.
-    if x.dtype == torch.float32:
-        y = torch.nn.functional.linear(x, weight, bias)
-        y = y.sum(dim=1, keepdim=True)
-        return y
+    # Precompute effective weight and bias in fp32
+    # These are small (O(K) and scalar), so precomputation overhead is negligible.
+    w_eff = weight.sum(dim=0, dtype=torch.float32).contiguous()  # (K,)
+    b_eff = bias.sum(dtype=torch.float32).item()                 # scalar
 
-    # Low-precision path: use Triton
-    # Precompute column-wise sum of weight and full sum of bias:
-    #   w_sum[k] = sum_j W[j, k]
-    #   b_sum    = sum_j bias[j]
-    w_sum = weight.sum(dim=0).contiguous()
-    b_sum = bias.sum(dtype=torch.float32)
+    # Split-K parallelism to boost grid size when M is small.
+    # Keep reasonably aggressive (up to 8-way) but avoid over-splitting.
+    BLOCK_K_FOR_EST = 128  # heuristic; real BLOCK_K is autotuned in the kernel
+    k_tiles = (K + BLOCK_K_FOR_EST - 1) // BLOCK_K_FOR_EST
+    max_split_k = max(1, min(8, k_tiles))
 
-    # Output is one scalar per row
-    y_vec = torch.empty(M, device=x.device, dtype=x.dtype)
+    device_index = x.device.index if x.device.index is not None else torch.cuda.current_device()
+    num_sms = torch.cuda.get_device_properties(device_index).multi_processor_count
 
-    grid = lambda META: (
-        triton.cdiv(M, META["BLOCK_M"]),
+    # Aim for at least ~3 CTAs per SM to help saturate memory BW,
+    # but don't force excessive split-K (atomic overhead).
+    target_ctas = 3 * num_sms
+
+    # We don't know BLOCK_M yet (autotuned), so estimate grid_m using 64 as typical.
+    BLOCK_M_EST = 64
+    grid_m_est = (M + BLOCK_M_EST - 1) // BLOCK_M_EST
+
+    split_k = 1
+    if grid_m_est > 0 and max_split_k > 1 and grid_m_est < target_ctas:
+        needed = (target_ctas + grid_m_est - 1) // grid_m_est
+        split_k = min(max_split_k, max(1, needed))
+    split_k = max(1, split_k)
+
+    # Allocate output buffer
+    if split_k == 1:
+        out_fp32 = torch.empty((M,), device=x.device, dtype=torch.float32)
+    else:
+        # Atomic-add path needs zero-initialized output
+        out_fp32 = torch.zeros((M,), device=x.device, dtype=torch.float32)
+
+    def grid(meta):
+        # meta['BLOCK_M'] is chosen by autotuner; ensure grid size > 0.
+        return (triton.cdiv(M, meta['BLOCK_M']), split_k)
+
+    fused_row_gemv_kernel[grid](
+        x,                     # x_ptr
+        w_eff,                 # w_eff_ptr
+        out_fp32,              # out_ptr
+        b_eff,                 # scalar bias
+        M, K,
+        x.stride(0), x.stride(1),
+        SPLIT_K=split_k,
     )
 
-    linear_row_sum_kernel[grid](
-        x,
-        w_sum,
-        b_sum,
-        y_vec,
-        M,
-        K,
-        x.stride(0),
-        x.stride(1),
-        w_sum.stride(0),
-        y_vec.stride(0),
-    )
-
-    y = y_vec.view(M, 1)
-    return y
+    # Match original model's output shape and dtype: (M, 1)
+    return out_fp32.to(x.dtype).view(M, 1)
 
 
 class ModelNew(nn.Module):
+    """
+    Optimized model using a Triton GEMV with autotuned tiling,
+    split-K parallelism, and fused bias addition plus row reduction.
+    Algebraically equivalent to:
+        y = nn.Linear(in_features, out_features)(x)
+        s = y.sum(dim=1, keepdim=True)
+    """
     def __init__(self, in_features, out_features):
         super(ModelNew, self).__init__()
-        # Match reference model structure: nn.Linear submodule named "linear"
-        self.linear = nn.Linear(in_features, out_features, bias=True)
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias = nn.Parameter(torch.empty(out_features))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Use the fused implementation; this will dispatch to Triton for
-        # low-precision dtypes and to cuBLAS (via torch.nn.functional.linear)
-        # for float32 to ensure strong numerical behavior.
-        return fused_linear_with_reductions(x, self.linear.weight, self.linear.bias)
+        # Match nn.Linear initialization
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+        bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+        nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x):
+        return fused_linear_and_reductions(x, self.weight, self.bias)
 ```

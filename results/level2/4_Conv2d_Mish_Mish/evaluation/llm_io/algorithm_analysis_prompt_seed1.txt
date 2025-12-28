@@ -1,0 +1,264 @@
+You are a GPU kernel optimization architect. Analyze the kernel and identify **ONE high-level algorithmic optimization**.
+
+# PyTorch Reference
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs a convolution, applies Mish, and another Mish.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size):
+        super(Model, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = torch.nn.functional.mish(x)
+        x = torch.nn.functional.mish(x)
+        return x
+
+batch_size   = 64  
+in_channels  = 64  
+out_channels = 128  
+height = width = 256
+kernel_size = 3
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size]
+```
+
+# Current Triton Kernel
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def conv2d_mish2_kernel(
+    x_ptr, w_ptr, b_ptr, y_ptr,
+    B, C_in, H, W,
+    C_out, KH, KW,
+    H_out, W_out,
+    K,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_wo, stride_wc, stride_wkh, stride_wkw,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    M = B * H_out * W_out
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    m_mask = offs_m < M
+    n_mask = offs_n < C_out
+
+    # Map linear output index -> (b, oh, ow)
+    hw_out = H_out * W_out
+    n_idx = offs_m // hw_out
+    rem_m = offs_m % hw_out
+    oh = rem_m // W_out
+    ow = rem_m % W_out
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k_start in range(0, K, BLOCK_K):
+        offs_k = k_start + tl.arange(0, BLOCK_K)
+        k_mask = offs_k < K
+
+        # Map K index -> (ci, kh, kw)
+        kk_hw = KH * KW
+        ci = offs_k // kk_hw
+        rem_k = offs_k % kk_hw
+        kh = rem_k // KW
+        kw = rem_k % KW
+
+        # Input pointers (B, C_in, H, W)
+        x_ptrs = (
+            x_ptr
+            + n_idx[:, None] * stride_xn
+            + ci[None, :] * stride_xc
+            + (oh[:, None] + kh[None, :]) * stride_xh
+            + (ow[:, None] + kw[None, :]) * stride_xw
+        )
+
+        # Weight pointers (C_out, C_in, KH, KW)
+        w_ptrs = (
+            w_ptr
+            + offs_n[None, :] * stride_wo
+            + ci[:, None] * stride_wc
+            + kh[:, None] * stride_wkh
+            + kw[:, None] * stride_wkw
+        )
+
+        x = tl.load(x_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
+        w = tl.load(w_ptrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0)
+
+        acc += tl.dot(x, w, allow_tf32=True)
+
+    # Add bias
+    bias = tl.load(b_ptr + offs_n, mask=n_mask, other=0.0)
+    acc = acc + bias[None, :]
+
+    # First Mish: x * tanh(softplus(x)), softplus(x) = log(1 + exp(x))
+    exp_acc = tl.exp(acc)
+    sp = tl.log(1.0 + exp_acc)
+    t2 = tl.exp(2.0 * sp)
+    th = (t2 - 1.0) / (t2 + 1.0)
+    acc = acc * th
+
+    # Second Mish on result
+    exp_acc2 = tl.exp(acc)
+    sp2 = tl.log(1.0 + exp_acc2)
+    t22 = tl.exp(2.0 * sp2)
+    th2 = (t22 - 1.0) / (t22 + 1.0)
+    acc = acc * th2
+
+    # Store result
+    y_ptrs = (
+        y_ptr
+        + n_idx[:, None] * stride_yn
+        + offs_n[None, :] * stride_yc
+        + oh[:, None] * stride_yh
+        + ow[:, None] * stride_yw
+    )
+
+    tl.store(
+        y_ptrs,
+        acc.to(tl.float32),
+        mask=m_mask[:, None] & n_mask[None, :],
+    )
+
+
+def conv2d_mish2(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor):
+    # Assumes NCHW, groups=1, stride=1, padding=0
+    B, C_in, H, W = x.shape
+    C_out, C_in_w, KH, KW = weight.shape
+    assert C_in == C_in_w, "Input channels must match weight channels"
+
+    H_out = H - KH + 1
+    W_out = W - KW + 1
+
+    x_ = x.contiguous()
+    w_ = weight.contiguous()
+    b_ = bias.contiguous()
+
+    y = torch.empty((B, C_out, H_out, W_out), device=x.device, dtype=torch.float32)
+
+    K = C_in * KH * KW
+
+    def grid(META):
+        return (
+            triton.cdiv(B * H_out * W_out, META["BLOCK_M"]),
+            triton.cdiv(C_out, META["BLOCK_N"]),
+        )
+
+    conv2d_mish2_kernel[grid](
+        x_, w_, b_, y,
+        B, C_in, H, W,
+        C_out, KH, KW,
+        H_out, W_out,
+        K,
+        x_.stride(0), x_.stride(1), x_.stride(2), x_.stride(3),
+        w_.stride(0), w_.stride(1), w_.stride(2), w_.stride(3),
+        y.stride(0), y.stride(1), y.stride(2), y.stride(3),
+        BLOCK_M=64, BLOCK_N=64, BLOCK_K=32,
+    )
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized version:
+    Conv2d (stride=1, padding=0, groups=1) + Mish + Mish fused in a single kernel.
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size):
+        super(ModelNew, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.weight = nn.Parameter(
+            torch.randn(out_channels, in_channels, kernel_size, kernel_size)
+        )
+        self.bias = nn.Parameter(torch.randn(out_channels))
+
+    def forward(self, x):
+        return conv2d_mish2(x, self.weight, self.bias)
+```
+
+# Performance
+- **PyTorch baseline**: 25.83 ms
+- **Current Triton**: 24.15 ms
+- **Current speedup**: 1.07x (+6.5% vs baseline)
+
+
+---
+
+## Analysis Steps
+
+1. **Code Analysis**: Count kernels, identify operations, check for inefficiencies
+2. **Performance Diagnosis**: Use metrics/latency to identify bottleneck type
+3. **Root Cause**: Combine code + performance to find the core issue
+
+## Optimization Categories (pick ONE if worth optimizing):
+
+### 1. Operator Fusion
+Fuse consecutive ops into fewer kernels to reduce memory traffic and launch overhead.
+
+### 2. Algorithm Replacement
+Replace naive algorithm with optimized variant.
+- For Attention: Flash Attention, online softmax
+- For Convolution: Winograd, im2col
+- **For RNN/GRU/LSTM**: Persistent kernel with HYBRID computation
+  - **CRITICAL**: Use hybrid approach for best performance:
+    * Precompute input-side gates ONCE (outside kernel): `gates_x = (T*B, In) @ W_ih`
+    * Persistent kernel (inside): only recurrent-side: `for t: gates_h = h @ W_hh`
+  - Time loop `for t in range(T)` must be inside kernel, NOT in Python
+  - Launch kernel once per layer, not once per timestep
+  - Expected speedup: 10-100x (vs per-timestep launches)
+
+### 3. Kernel Launch Reduction
+Combine multiple small kernels to reduce overhead.
+- **For RNN/GRU/LSTM**: See "Algorithm Replacement" above for persistent kernel approach
+
+### 4. Memory Layout Optimization
+Use in-place operations, buffer reuse, or better layouts.
+
+## Should We Optimize?
+
+Before proposing optimization, determine if it's worthwhile:
+- **Not worth optimizing** if:
+  - Code is already near-optimal (expected speedup < 10%)
+  - Bottleneck cannot be addressed (hardware limited, already optimal algorithm)
+  - Optimization would add significant complexity with minimal gain
+
+- **Worth optimizing** if:
+  - Clear algorithmic inefficiency exists (multiple kernels, suboptimal algorithm)
+  - Expected speedup >= 20%
+  - Concrete optimization path available
+
+## Output (JSON)
+
+```json
+{
+  "worth_optimizing": "yes/no",
+  "reason": "<Why worth or not worth optimizing, 1 sentence>",
+  "bottleneck": "<Root cause in 1-2 sentences, empty if not worth optimizing>",
+  "optimisation method": "<Specific optimization in 1-2 sentences, empty if not worth optimizing>",
+  "modification plan": "<Implementation steps in 2-3 sentences, empty if not worth optimizing>",
+  "expected_speedup": "<e.g., '30-40%', empty if not worth optimizing>"
+}
+```
+
+Return JSON only.

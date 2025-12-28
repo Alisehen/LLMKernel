@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The forward path still pays an O(out_features * in_features) cost every call to recompute reduced weights/bias, even though these reductions are independent of the batch and can be reused across forwards.",
+  "bottleneck": "In `fused_linear_chain`, `w_reduced = weight.sum(dim=0)` and `b_reduced = bias.sum()` are recomputed on every forward pass, launching extra kernels and reading the full (out_features, in_features) weight matrix each time, even when parameters are unchanged.",
+  "optimisation method": "Algorithm replacement via parameter reparameterization/caching: precompute and cache `W_reduced` and `b_reduced` as model buffers (or as the actual trainable parameters) and update them only when the underlying weights change, so each forward becomes a single matvec with already-collapsed parameters.",
+  "modification plan": "Introduce cached buffers `w_reduced` and `b_reduced` in `ModelNew`, initialized from `weight` and `bias`. During training, update these buffers once per optimizer step (e.g., via a hook or explicit `update_reduced_params()` call) by summing over the out_features dimension; in `forward`, remove the per-call reductions and use only the cached `w_reduced`/`b_reduced` in the Triton matvec kernel. For inference with frozen weights, compute the reduced parameters once at model initialization or after loading the checkpoint and reuse them for all subsequent forwards.",
+  "expected_speedup": "20-40%"
+}

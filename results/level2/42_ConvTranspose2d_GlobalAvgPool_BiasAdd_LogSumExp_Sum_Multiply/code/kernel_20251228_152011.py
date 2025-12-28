@@ -1,0 +1,211 @@
+# <complete ModelNew code with optimized Triton kernels>
+import torch, torch.nn as nn, triton, triton.language as tl
+
+
+@triton.jit
+def global_avg_kernel(
+    x_ptr, y_ptr,
+    B, C, H, W, HW,
+    stride_x_n, stride_x_c, stride_x_h, stride_x_w,
+    stride_y_n, stride_y_c,
+    BLOCK_HW: tl.constexpr,
+):
+    # One program per (b, c)
+    pid = tl.program_id(0)
+    bc = pid
+    b = bc // C
+    c = bc % C
+
+    mask_bc = b < B
+
+    base_offset = b * stride_x_n + c * stride_x_c
+
+    acc = tl.zeros((), dtype=tl.float32)
+
+    # Reduce over spatial dimension (H * W)
+    for hw_start in range(0, HW, BLOCK_HW):
+        offs = hw_start + tl.arange(0, BLOCK_HW)
+        mask = (offs < HW) & mask_bc
+
+        h_idx = offs // W
+        w_idx = offs % W
+
+        ptrs = x_ptr + base_offset + h_idx * stride_x_h + w_idx * stride_x_w
+        vals = tl.load(ptrs, mask=mask, other=0.0)
+        vals = vals.to(tl.float32)
+        acc += tl.sum(vals, axis=0)
+
+    mean_val = acc / HW
+
+    out_ptr = y_ptr + b * stride_y_n + c * stride_y_c
+    tl.store(out_ptr, mean_val.to(tl.float32), mask=mask_bc)
+
+
+@triton.jit
+def logsumexp_mul_kernel(
+    y_ptr, out_ptr,
+    B, C,
+    stride_y_b, stride_y_c,
+    stride_o_b,
+    BLOCK_C: tl.constexpr,
+):
+    # One program per batch element
+    pid = tl.program_id(0)
+    b = pid
+    mask_b = b < B
+
+    # Streaming log-sum-exp over channel dimension
+    m = tl.full((), -float("inf"), dtype=tl.float32)
+    s = tl.zeros((), dtype=tl.float32)
+
+    for c0 in range(0, C, BLOCK_C):
+        offs_c = c0 + tl.arange(0, BLOCK_C)
+        mask = (offs_c < C) & mask_b
+        ptrs = y_ptr + b * stride_y_b + offs_c * stride_y_c
+        vals = tl.load(ptrs, mask=mask, other=-float("inf"))
+        vals = vals.to(tl.float32)
+
+        block_max = tl.max(vals, axis=0)
+        m_new = tl.maximum(m, block_max)
+
+        s = s * tl.exp(m - m_new)
+        s = s + tl.sum(tl.exp(vals - m_new), axis=0)
+        m = m_new
+
+    lse = tl.log(s) + m
+    out_val = lse * 10.0
+
+    tl.store(out_ptr + b * stride_o_b, out_val.to(tl.float32), mask=mask_b)
+
+
+def fused_input_global_avg(x: torch.Tensor) -> torch.Tensor:
+    """
+    x: [B, C_in, H, W] (CUDA tensor)
+    returns avg_in: [B, C_in] with avg over (H, W)
+    """
+    assert x.is_cuda
+    B, C, H, W = x.shape
+    HW = H * W
+
+    avg_in = torch.empty((B, C), device=x.device, dtype=x.dtype)
+
+    grid = lambda META: (max(1, B * C),)
+    global_avg_kernel[grid](
+        x, avg_in,
+        B, C, H, W, HW,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        avg_in.stride(0), avg_in.stride(1),
+        BLOCK_HW=256,
+    )
+    return avg_in
+
+
+def fused_logsumexp_mul(y: torch.Tensor) -> torch.Tensor:
+    """
+    y: [B, C]
+    returns out: [B, 1] with out[b] = 10 * logsumexp_c(y[b, c])
+    """
+    assert y.is_cuda
+    B, C = y.shape
+    out = torch.empty((B, 1), device=y.device, dtype=y.dtype)
+
+    grid = lambda META: (max(1, B),)
+    logsumexp_mul_kernel[grid](
+        y, out,
+        B, C,
+        y.stride(0), y.stride(1),
+        out.stride(0),
+        BLOCK_C=128,
+    )
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model:
+
+    Replaces:
+        ConvTranspose2d(x) -> [B, C_out, H_out, W_out]
+        Global average pooling over (H_out, W_out)
+
+    with the mathematically equivalent:
+        1) Global average pooling over input x: [B, C_in]
+        2) Dense linear layer with effective weights derived from ConvTranspose2d weights
+           and spatial scaling (H_in*W_in / H_out*W_out)
+
+    Then applies:
+        + conv_transpose.bias
+        + self.bias
+        + log-sum-exp over channels
+        + sum over spatial dims (degenerate)
+        + multiply by 10.0
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, bias_shape):
+        super(ModelNew, self).__init__()
+        # Keep ConvTranspose2d module to reuse its weights & bias,
+        # but we will not execute its forward in the hot path.
+        self.conv_transpose = nn.ConvTranspose2d(in_channels, out_channels, kernel_size)
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+
+    def _compute_spatial_out(self, H_in: int, W_in: int):
+        """
+        Compute (H_out, W_out) for ConvTranspose2d given (H_in, W_in),
+        matching PyTorch's shape formula.
+        """
+        ct = self.conv_transpose
+        stride_h, stride_w = ct.stride
+        pad_h, pad_w = ct.padding
+        dil_h, dil_w = ct.dilation
+        out_pad_h, out_pad_w = ct.output_padding
+        kH, kW = ct.kernel_size
+
+        H_out = (H_in - 1) * stride_h - 2 * pad_h + dil_h * (kH - 1) + out_pad_h + 1
+        W_out = (W_in - 1) * stride_w - 2 * pad_w + dil_w * (kW - 1) + out_pad_w + 1
+        return H_out, W_out
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: [B, C_in, H_in, W_in]
+
+        Returns: [B, 1] matching the original Model's forward().
+        """
+        assert x.is_cuda, "Optimized Triton kernels require CUDA tensors"
+
+        B, C_in, H_in, W_in = x.shape
+        H_out, W_out = self._compute_spatial_out(H_in, W_in)
+
+        # 1) Global average over input spatial dimensions: [B, C_in]
+        x_avg_in = fused_input_global_avg(x)  # [B, C_in]
+
+        # 2) Effective linear weights derived from ConvTranspose2d weights
+        # conv_transpose.weight: [C_in, C_out, kH, kW]
+        weight = self.conv_transpose.weight  # Parameter on CUDA
+        # Sum over spatial kernel dims -> [C_in, C_out]
+        kernel_sum = weight.sum(dim=(2, 3))
+
+        # Scaling factor relating input average to output average
+        HW_in = H_in * W_in
+        HW_out = H_out * W_out
+        scale = HW_in / HW_out
+
+        # Effective dense layer weight: [C_in, C_out]
+        W_eff = kernel_sum * scale
+
+        # Dense projection: [B, C_in] @ [C_in, C_out] -> [B, C_out]
+        # Use cuBLAS via torch.matmul for high performance.
+        y = x_avg_in @ W_eff  # [B, C_out]
+
+        # 3) Add ConvTranspose2d bias (averaging over output keeps it unchanged)
+        if self.conv_transpose.bias is not None:
+            y = y + self.conv_transpose.bias  # [C_out] broadcast over B
+
+        # 4) Add external bias (original Model's bias after pooling)
+        bias_1d = self.bias.view(-1)  # [C_out]
+        y = y + bias_1d
+
+        # 5) Log-sum-exp over channel dimension and final *10
+        #    Original: logsumexp over dim=1 (channels), keepdim=True,
+        #    then sum over degenerate spatial dims and *10.
+        out = fused_logsumexp_mul(y)  # [B, 1]
+
+        return out

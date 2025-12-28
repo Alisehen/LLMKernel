@@ -1,5 +1,0 @@
-{
-  "critical_issue": "Custom Triton `linear_kernel` computes matmul in a different floating-point mode/order than PyTorch's `nn.Linear`, causing larger numerical differences than the test's tight atol/rtol tolerance.",
-  "why_it_matters": "Even tiny per-element accumulation differences in 8192-length dot products amplify, so the final reduced scalar deviates by ~5e-2, exceeding atol=1e-3 and rtol=1e-2 thresholds.",
-  "minimal_fix_hint": "Align Triton matmul math with PyTorch (e.g., same TF32/FP32 settings and accumulation order) or relax test tolerances / fall back to `F.linear`."
-}

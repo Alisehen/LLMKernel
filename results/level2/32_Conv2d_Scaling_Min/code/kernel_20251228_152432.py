@@ -1,0 +1,147 @@
+# Optimized Triton code for fused scale + channel-wise min/max on RTX 4090
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        # Smaller tile: lowest register pressure, good occupancy
+        triton.Config({'BLOCK_M': 64}, num_warps=2, num_stages=2),
+        # Balanced tile
+        triton.Config({'BLOCK_M': 128}, num_warps=4, num_stages=2),
+        # Largest tile: best memory coalescing if registers allow
+        triton.Config({'BLOCK_M': 256}, num_warps=8, num_stages=2),
+    ],
+    key=['M'],
+)
+@triton.jit
+def scale_channel_min_kernel(
+    x_ptr,  # *const T, (N, C, H, W)
+    y_ptr,  # *T,       (N, 1, H, W)
+    N, C, H, W, M,      # M = N * H * W
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    scale,              # float scalar (fp32)
+    IS_POS: tl.constexpr,          # True: use min, False: use max
+    BLOCK_M: tl.constexpr,         # number of (n, h, w) elements per program
+):
+    # Program id along the flattened (N, H, W) dimension
+    pid = tl.program_id(0)
+    offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offs_m < M  # (BLOCK_M,)
+
+    # Decode offs_m -> (n, h, w)
+    hw = H * W
+    n_idx = offs_m // hw
+    rem = offs_m % hw
+    h_idx = rem // W
+    w_idx = rem % W
+
+    # Base offset for each (n, h, w) pixel in x and y
+    base_x = (
+        n_idx * stride_xn
+        + h_idx * stride_xh
+        + w_idx * stride_xw
+    )
+    base_y = (
+        n_idx * stride_yn
+        + h_idx * stride_yh
+        + w_idx * stride_yw
+    )
+
+    # Initialize accumulator with +/- inf in fp32
+    pos_inf = 3.402823e38
+    neg_inf = -3.402823e38
+    if IS_POS:
+        acc = tl.full((BLOCK_M,), pos_inf, dtype=tl.float32)
+    else:
+        acc = tl.full((BLOCK_M,), neg_inf, dtype=tl.float32)
+
+    # Loop over all channels sequentially.
+    # This keeps only a single [BLOCK_M] vector in registers,
+    # dramatically reducing register pressure versus [BLOCK_M, BLOCK_C] tiles.
+    for c in range(0, C):
+        x_ptrs = x_ptr + base_x + c * stride_xc
+        # Use acc as 'other' so masked lanes remain unchanged
+        vals = tl.load(x_ptrs, mask=mask_m, other=acc)
+        vals = vals.to(tl.float32)
+
+        if IS_POS:
+            acc = tl.minimum(acc, vals)
+        else:
+            acc = tl.maximum(acc, vals)
+
+    # Apply scale after reduction (handles negative scale correctly)
+    acc = acc * scale
+
+    # Store result at channel 0: y[n, 0, h, w]
+    y_ptrs = y_ptr + base_y
+    tl.store(y_ptrs, acc, mask=mask_m)
+
+
+def scale_min_triton(conv_out: torch.Tensor, scale_factor: float) -> torch.Tensor:
+    """
+    Fused scale + channel-wise min over Conv2d output using Triton.
+
+    Args:
+        conv_out: (N, C, H, W) CUDA tensor
+        scale_factor: float scalar
+
+    Returns:
+        y: (N, 1, H, W) where
+           y[n, 0, h, w] = min_c(conv_out[n, c, h, w] * scale_factor)
+    """
+    assert conv_out.is_cuda, "Triton kernel requires CUDA tensor"
+    conv_out = conv_out.contiguous()
+
+    N, C, H, W = conv_out.shape
+    M = N * H * W
+
+    y = torch.empty((N, 1, H, W), device=conv_out.device, dtype=conv_out.dtype)
+
+    stride_xn, stride_xc, stride_xh, stride_xw = conv_out.stride()
+    stride_yn, stride_yc, stride_yh, stride_yw = y.stride()
+
+    # Select reduction type based on scale sign.
+    # For scale >= 0: min(conv * scale)  == scale * min(conv)
+    # For scale <  0: min(conv * scale)  == scale * max(conv)
+    is_pos = float(scale_factor) >= 0.0
+
+    # 1D grid over flattened (N, H, W) dimension
+    def grid(meta):
+        return (triton.cdiv(M, meta["BLOCK_M"]),)
+
+    scale_channel_min_kernel[grid](
+        conv_out,
+        y,
+        N, C, H, W, M,
+        stride_xn, stride_xc, stride_xh, stride_xw,
+        stride_yn, stride_yc, stride_yh, stride_yw,
+        float(scale_factor),
+        IS_POS=is_pos,
+    )
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model:
+    - Uses cuDNN (torch.nn.Conv2d) for convolution
+    - Uses a Triton kernel to fuse scaling and channel-wise minimum:
+        y[n, 0, h, w] = min_c( conv(x)[n, c, h, w] * scale_factor )
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, scale_factor):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.scale_factor = float(scale_factor)
+
+    def forward(self, x):
+        x = self.conv(x)
+        if x.is_cuda:
+            return scale_min_triton(x, self.scale_factor)
+        else:
+            x = x * self.scale_factor
+            return torch.min(x, dim=1, keepdim=True)[0]

@@ -1,5 +1,0 @@
-{
-  "critical_issue": "Using a Python for-loop `for j in range(BLOCK_N)` inside the Triton kernel makes `mask_n[j]` execute outside the JIT builder.",
-  "why_it_matters": "The loop isn’t converted to Triton IR, so indexing `mask_n[j]` runs in Python context, triggering the `_builder must be provided` compilation error.",
-  "minimal_fix_hint": "Replace `for j in range(BLOCK_N)` with `for j in tl.static_range(BLOCK_N)` or use a Triton reduction primitive instead."
-}

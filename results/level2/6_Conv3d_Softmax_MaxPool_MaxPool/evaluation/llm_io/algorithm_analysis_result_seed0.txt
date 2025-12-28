@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The Triton pipeline is over 2× slower than PyTorch and performs a full global-memory round-trip between Conv3d and Softmax that can be eliminated.",
+  "bottleneck": "Conv3d writes the entire [N, C_out, D', H', W'] tensor to global memory, and the softmax kernel immediately reads it back to perform a channel-wise reduction, so bandwidth and kernel-launch overhead between these two stages dominate a large part of the runtime.",
+  "optimisation method": "Fuse Conv3d and channel-wise Softmax into a single Triton kernel by implementing a stable online softmax epilogue over C_out for each (n, d, h, w) location, so the convolution outputs never need to be materialized and reread from global memory.",
+  "modification plan": "Redesign conv3d_kernel so that each program instance (or a small tile) computes all C_out channels for one (or a small tile of) spatial location(s), accumulating logits in registers and simultaneously maintaining running max and sum_exp (online softmax) across the channel dimension. After finishing accumulation over K, convert the accumulated logits into normalized softmax probabilities in-place in registers and write only the softmax output to global memory, removing the separate triton_softmax_channel kernel and its intermediate tensor from ModelNew.forward.",
+  "expected_speedup": "30-50%"
+}

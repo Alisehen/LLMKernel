@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The current pipeline materializes a large 5D conv output and then re-reads it twice for reduction and softmax, causing excessive global memory traffic and launch overhead.",
+  "bottleneck": "The 3D convolution kernel writes the full (N, Co, D_out, H_out, W_out) tensor to global memory, and the subsequent reduce-min kernel reads that entire tensor just to collapse the depth dimension, effectively turning a streaming reduction into two full global passes over a large buffer.",
+  "optimisation method": "Fuse the 3D convolution and the depth-wise min reduction into a single Triton kernel that performs an online min over od while computing the convolution, so that only the (N, Co, H_out, W_out) result is ever written to global memory.",
+  "modification plan": "Restructure the conv3d_gemm_kernel so that the M dimension tiles over (N * H_out * W_out) only, and add an explicit loop over D_out inside the kernel: for each (n, oh, ow, co) accumulate convolution results for all od and track the running minimum. Maintain a per-(BLOCK_M, BLOCK_N) accumulator initialized to +inf, update it with the conv result for each od, and after finishing the depth loop store just the final min value to y with shape (N, Co, H_out, W_out). Update the host-side wrapper to allocate only the reduced output and remove the separate reduce_min_dim2_triton call.",
+  "expected_speedup": "30-50%"
+}

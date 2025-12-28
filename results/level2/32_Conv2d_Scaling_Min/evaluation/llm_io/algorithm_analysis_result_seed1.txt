@@ -1,0 +1,10 @@
+```json
+{
+  "worth_optimizing": "yes",
+  "reason": "The Triton kernel is ~7x slower than the PyTorch/cuDNN baseline, indicating a major algorithmic inefficiency in how convolution is implemented.",
+  "bottleneck": "The convolution is implemented as a naive 3-level nested loop over Ci×Kh×Kw per (b,y,x,oc) with scalar loads, which completely misses the GEMM/Winograd-style tiling and reuse that cuDNN uses. This yields poor memory reuse, low arithmetic intensity, and very low tensor-core utilization.",
+  "optimisation method": "Replace the direct nested-loop convolution with a GEMM-based (implicit im2col) convolution inside Triton, i.e., restructure the computation so that each program instance computes a tile of [B*Ho*Wo, Co] via matrix multiply over K = Ci*Kh*Kw, then apply the scale and per-point channel-min reduction on the GEMM output.",
+  "modification plan": "Refactor the kernel so that the logical output is a 2D matrix Y of shape (N_points = B*Ho*Wo, Co) and the weights form a K×Co matrix, where K = Ci*Kh*Kw. In the Triton kernel, use standard GEMM tiling (BLOCK_M, BLOCK_N, BLOCK_K) to iterate over K, loading tiles of input patches and weights into registers/shared memory and performing a matmul-accumulate, then fuse the bias addition, scaling, and a reduction over Co to produce the [N_points] minimum values. This shifts the core conv from per-point scalar loops to a high-throughput matmul, recovering cuDNN-like efficiency while still keeping the fused scale+min.",
+  "expected_speedup": "300-600% (3-6x faster than the current Triton kernel, bringing it to at least parity and likely ahead of the PyTorch baseline due to fusion)"
+}
+```

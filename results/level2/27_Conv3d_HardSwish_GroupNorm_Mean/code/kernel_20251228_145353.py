@@ -1,0 +1,191 @@
+# Optimized Conv3d -> HardSwish -> GroupNorm -> spatial mean fused Triton kernel
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def hardswish_groupnorm_spatialmean_kernel(
+    x_ptr,        # (B, C, D, H, W)
+    weight_ptr,   # (C,)
+    bias_ptr,     # (C,)
+    out_ptr,      # (B, C)  -- spatially averaged output
+    B, C, D, H, W,
+    num_groups,
+    eps,
+    stride_n, stride_c, stride_d, stride_h, stride_w,
+    stride_on, stride_oc,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    One program computes, for a single (b, group):
+      - HardSwish on x
+      - GroupNorm statistics (mean, var) over channels in the group and all spatial positions
+      - Per-channel spatial sums of HardSwish(x)
+      - Final output: spatial mean of normalized+affine values for each channel in the group
+
+    We avoid materializing the full (B, C, D, H, W) normalized tensor and directly write (B, C).
+    """
+    pid = tl.program_id(0)  # range: [0, B * num_groups)
+    b = pid // num_groups
+    g = pid % num_groups
+
+    total_spatial = D * H * W
+    L = GROUP_SIZE * total_spatial  # elements in this (b, g) group
+
+    # Base channel index for this group
+    c0 = g * GROUP_SIZE
+
+    # Base pointer for x (b, c0, 0, 0, 0)
+    x_base = x_ptr + b * stride_n + c0 * stride_c
+
+    # --- First pass: compute group mean/var over HardSwish(x),
+    #     and per-channel spatial sums of HardSwish(x) ---
+    offs = tl.arange(0, BLOCK_SIZE)
+    sum_hs = 0.0
+    sum_hs_sq = 0.0
+
+    # Per-channel sum over spatial dims for HardSwish(x); size = GROUP_SIZE
+    sum_hs_chan = tl.zeros((GROUP_SIZE,), dtype=tl.float32)
+    chan_idxs = tl.arange(0, GROUP_SIZE)
+
+    for offset in range(0, L, BLOCK_SIZE):
+        idx = offset + offs
+        mask = idx < L
+
+        # Decompose flattened index into (channel_offset, d, h, w)
+        ch_off = idx // total_spatial
+        rem = idx % total_spatial
+        d_idx = rem // (H * W)
+        rem2 = rem % (H * W)
+        h_idx = rem2 // W
+        w_idx = rem2 % W
+
+        # Pointer for each element in this tile
+        x_ptrs = x_base + ch_off * stride_c + d_idx * stride_d + h_idx * stride_h + w_idx * stride_w
+        x = tl.load(x_ptrs, mask=mask, other=0.0)
+
+        # HardSwish: x * clamp(x + 3, 0, 6) / 6
+        t = x + 3.0
+        t = tl.minimum(t, 6.0)
+        t = tl.maximum(t, 0.0)
+        hs = x * t * (1.0 / 6.0)
+
+        # Group-wise stats
+        sum_hs += tl.sum(hs, axis=0)
+        sum_hs_sq += tl.sum(hs * hs, axis=0)
+
+        # Per-channel spatial sums for HardSwish(x)
+        # ch_off ∈ [0, GROUP_SIZE)
+        # Accumulate contributions for each channel in this group
+        for ci in range(GROUP_SIZE):
+            mask_ci = mask & (ch_off == ci)
+            hs_ci = tl.where(mask_ci, hs, 0.0)
+            contrib_ci = tl.sum(hs_ci, axis=0)
+            # Add contrib_ci to the ci-th entry of sum_hs_chan
+            delta_vec = tl.where(chan_idxs == ci, contrib_ci, 0.0)
+            sum_hs_chan += delta_vec
+
+    # --- Finalize statistics ---
+    L_f = 1.0 * L
+    mean = sum_hs / L_f
+    mean_sq = sum_hs_sq / L_f
+    var = mean_sq - mean * mean
+    var = tl.maximum(var, 0.0)
+    inv_std = 1.0 / tl.sqrt(var + eps)
+
+    total_spatial_f = 1.0 * total_spatial
+
+    # --- Compute per-channel spatial mean after GroupNorm + affine ---
+    # For channel c in this group:
+    #   μ_c = (1/S) * Σ_s HardSwish(x_{c,s})
+    #   out[b, c] = gamma_c / std * (μ_c - mean_g) + beta_c
+    chan_offsets = tl.arange(0, GROUP_SIZE)
+    c_idxs = c0 + chan_offsets  # absolute channel indices in [0, C)
+
+    # Per-channel mean of HardSwish(x) over spatial dims
+    mu_c = sum_hs_chan / total_spatial_f  # (GROUP_SIZE,)
+
+    gamma = tl.load(weight_ptr + c_idxs)
+    beta = tl.load(bias_ptr + c_idxs)
+
+    y_mean = (mu_c - mean) * inv_std
+    y_mean = y_mean * gamma + beta
+
+    # Store results for all channels in this group
+    out_ptrs = out_ptr + b * stride_on + c_idxs * stride_oc
+    tl.store(out_ptrs, y_mean)
+
+
+def hardswish_groupnorm_spatial_mean(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    num_groups: int,
+    eps: float,
+) -> torch.Tensor:
+    """
+    Fused:
+      Conv3D output x → HardSwish → GroupNorm → mean over spatial dims
+
+    x:      (B, C, D, H, W), CUDA tensor
+    weight: (C,)
+    bias:   (C,)
+
+    Returns:
+      out: (B, C) == torch.mean(GroupNorm(hardswish(x)), dim=[2,3,4])
+    """
+    assert x.is_cuda, "Input must be CUDA tensor"
+    B, C, D, H, W = x.shape
+    assert C % num_groups == 0, "C must be divisible by num_groups for GroupNorm"
+
+    group_size = C // num_groups
+
+    out = torch.empty((B, C), device=x.device, dtype=x.dtype)
+
+    stride_n, stride_c, stride_d, stride_h, stride_w = x.stride()
+    stride_on, stride_oc = out.stride()
+
+    BLOCK_SIZE = 256  # power-of-2 as required
+
+    grid = lambda META: (max(1, B * num_groups),)
+
+    hardswish_groupnorm_spatialmean_kernel[grid](
+        x, weight, bias, out,
+        B, C, D, H, W,
+        num_groups, eps,
+        stride_n, stride_c, stride_d, stride_h, stride_w,
+        stride_on, stride_oc,
+        GROUP_SIZE=group_size,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    Conv3D -> HardSwish -> GroupNorm -> spatial mean,
+    where everything after Conv3D is fused into a single high-performance Triton kernel.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, num_groups=4, bias=True):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size, bias=bias)
+        # We use GroupNorm only for its parameters (weight, bias, num_groups, eps)
+        self.group_norm = nn.GroupNorm(num_groups, out_channels)
+
+    def forward(self, x):
+        # Conv3D via cuDNN / PyTorch
+        x = self.conv(x)
+
+        # Fused HardSwish + GroupNorm + spatial mean via Triton
+        x = hardswish_groupnorm_spatial_mean(
+            x,
+            self.group_norm.weight,
+            self.group_norm.bias,
+            self.group_norm.num_groups,
+            self.group_norm.eps,
+        )
+        return x

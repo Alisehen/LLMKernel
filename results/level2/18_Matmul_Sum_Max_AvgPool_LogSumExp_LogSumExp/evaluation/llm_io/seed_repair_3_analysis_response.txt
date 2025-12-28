@@ -1,5 +1,0 @@
-{
-  "critical_issue": "The Triton matmul uses the weight in its original [out_features, in_features] layout, effectively computing x @ W instead of the nn.Linear contract x @ W^T.",
-  "why_it_matters": "Using W instead of W^T changes all linear outputs before reductions, so ModelNew’s final tensor systematically deviates from the PyTorch reference beyond the allowed atol/rtol.",
-  "minimal_fix_hint": "Adjust weight indexing/strides or pass weight.T so the kernel contracts over K with W^T, matching F.linear’s behavior."
-}

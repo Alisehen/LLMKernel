@@ -1,0 +1,354 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def conv3d_softmax_kernel(
+    x_ptr, w2d_ptr, bias_ptr, o_ptr,
+    N, C_in, D, H, W,
+    C_out, KD, KH, KW,
+    D_out, H_out, W_out,
+    M, K,
+    stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
+    stride_wk, stride_wn,
+    stride_on, stride_oc, stride_od, stride_oh, stride_ow,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    # Program ID over flattened output positions (M = N * D_out * H_out * W_out)
+    pid_m = tl.program_id(0)
+
+    # Tile indices
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Initialize accumulator for convolution outputs: [BLOCK_M, BLOCK_N]
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Precompute for mapping M index -> (n, d_out, h_out, w_out)
+    H_out_times_W_out = H_out * W_out
+    DHW_out = D_out * H_out_times_W_out
+
+    # Decompose offs_m into (n, d_out, h_out, w_out)
+    n_m = offs_m // DHW_out
+    rem_m = offs_m - n_m * DHW_out
+    d_out_m = rem_m // H_out_times_W_out
+    rem_m2 = rem_m - d_out_m * H_out_times_W_out
+    h_out_m = rem_m2 // W_out
+    w_out_m = rem_m2 - h_out_m * W_out
+
+    # GEMM-style accumulation over K dimension
+    for k_start in range(0, K, BLOCK_K):
+        k_idx = k_start + offs_k  # [BLOCK_K]
+
+        # Decompose k_idx into (c_in, kd, kh, kw)
+        kernel_spatial = KD * KH * KW
+        ci = k_idx // kernel_spatial
+        rem_k = k_idx - ci * kernel_spatial
+        kd = rem_k // (KH * KW)
+        rem_k2 = rem_k - kd * (KH * KW)
+        kh = rem_k2 // KW
+        kw = rem_k2 - kh * KW
+
+        # Compute input indices for this tile: (n_m, ci, d_in, h_in, w_in)
+        d_in = d_out_m[:, None] + kd[None, :]
+        h_in = h_out_m[:, None] + kh[None, :]
+        w_in = w_out_m[:, None] + kw[None, :]
+
+        # Pointers for input X: shape [BLOCK_M, BLOCK_K]
+        x_ptrs = (
+            x_ptr
+            + n_m[:, None] * stride_xn
+            + ci[None, :] * stride_xc
+            + d_in * stride_xd
+            + h_in * stride_xh
+            + w_in * stride_xw
+        )
+
+        mask_a = (offs_m[:, None] < M) & (k_idx[None, :] < K)
+        a = tl.load(x_ptrs, mask=mask_a, other=0.0)
+        a = a.to(tl.float32)
+
+        # Pointers for weights matrix W2D: [K, C_out] => [BLOCK_K, BLOCK_N]
+        w_ptrs = w2d_ptr + k_idx[:, None] * stride_wk + offs_n[None, :] * stride_wn
+        mask_b = (k_idx[:, None] < K) & (offs_n[None, :] < C_out)
+        b = tl.load(w_ptrs, mask=mask_b, other=0.0)
+        b = b.to(tl.float32)
+
+        # Matrix multiply accumulate
+        acc += tl.dot(a, b, allow_tf32=True)
+
+    # Add bias along channel dimension
+    bias = tl.load(bias_ptr + offs_n, mask=offs_n < C_out, other=0.0)
+    acc = acc + bias[None, :]
+
+    # ---- Fused stable softmax over channel dimension (dim=1 of PyTorch NCDHW) ----
+    # valid masks for rows (M) and channels (C_out)
+    valid_m = offs_m < M
+    valid_n = offs_n < C_out
+    mask = valid_m[:, None] & valid_n[None, :]
+
+    # Set invalid positions to -inf so they don't affect max / sum
+    neg_inf = -float("inf")
+    acc_masked = tl.where(mask, acc, neg_inf)
+
+    # Row-wise max over channels
+    row_max = tl.max(acc_masked, axis=1)  # [BLOCK_M]
+
+    # Subtract max, exponentiate
+    x_shifted = acc_masked - row_max[:, None]
+    num = tl.exp(x_shifted)
+
+    # Row-wise sum of exp
+    den = tl.sum(num, axis=1)  # [BLOCK_M]
+
+    # Normalize
+    softmax = num / den[:, None]
+
+    # ---- Store result to output tensor [N, C_out, D_out, H_out, W_out] ----
+    o_ptrs = (
+        o_ptr
+        + n_m[:, None] * stride_on
+        + offs_n[None, :] * stride_oc
+        + d_out_m[:, None] * stride_od
+        + h_out_m[:, None] * stride_oh
+        + w_out_m[:, None] * stride_ow
+    )
+    tl.store(o_ptrs, softmax, mask=mask)
+
+
+def triton_conv3d_softmax(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    Fused Conv3d + Softmax(dim=1) for 5D tensor [N, C_in, D, H, W].
+
+    x:      [N, C_in, D, H, W]
+    weight: [C_out, C_in, KD, KH, KW]
+    bias:   [C_out]
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+    x = x.contiguous()
+    weight = weight.contiguous()
+    bias = bias.contiguous()
+
+    N, C_in, D, H, W = x.shape
+    C_out, C_in_w, KD, KH, KW = weight.shape
+    assert C_in == C_in_w
+
+    # Output dimensions (no padding, stride=1, dilation=1)
+    D_out = D - KD + 1
+    H_out = H - KH + 1
+    W_out = W - KW + 1
+
+    # Flatten spatial + batch into M, channels into N for GEMM
+    M = N * D_out * H_out * W_out
+    K = C_in * KD * KH * KW
+
+    # Prepare weights as [K, C_out]
+    w2d = weight.view(C_out, -1).t().contiguous()  # [K, C_out]
+
+    # Allocate output for softmax probabilities
+    out = torch.empty((N, C_out, D_out, H_out, W_out), device=x.device, dtype=torch.float32)
+
+    stride_xn, stride_xc, stride_xd, stride_xh, stride_xw = x.stride()
+    stride_on, stride_oc, stride_od, stride_oh, stride_ow = out.stride()
+    stride_wk, stride_wn = w2d.stride()
+
+    # Block sizes (power-of-two as required)
+    BLOCK_M = 16
+    BLOCK_K = 32
+
+    # Choose BLOCK_N as next power-of-two >= C_out, capped at 256
+    BLOCK_N = 1
+    max_block_n = 256
+    while BLOCK_N < C_out and BLOCK_N < max_block_n:
+        BLOCK_N *= 2
+    # For correctness of fused softmax, all channels must be within one program instance
+    assert C_out <= BLOCK_N, "Fused conv+softmax kernel supports up to 256 output channels"
+
+    grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]),)
+
+    conv3d_softmax_kernel[grid](
+        x, w2d, bias, out,
+        N, C_in, D, H, W,
+        C_out, KD, KH, KW,
+        D_out, H_out, W_out,
+        M, K,
+        stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
+        stride_wk, stride_wn,
+        stride_on, stride_oc, stride_od, stride_oh, stride_ow,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+    )
+
+    return out
+
+
+@triton.jit
+def maxpool3d_kernel(
+    x_ptr, y_ptr,
+    N, C, D, H, W,
+    KD, KH, KW,
+    SD, SH, SW,
+    D_out, H_out, W_out,
+    stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
+    stride_yn, stride_yc, stride_yd, stride_yh, stride_yw,
+    BLOCK_W: tl.constexpr,
+):
+    # pid_m indexes over (n, c, d_out, h_out)
+    pid_m = tl.program_id(0)
+    pid_w = tl.program_id(1)
+
+    offs_w = pid_w * BLOCK_W + tl.arange(0, BLOCK_W)
+
+    # Map pid_m -> (n, c, d_out, h_out)
+    CH_out = C * D_out * H_out
+    DH_out = D_out * H_out
+
+    n = pid_m // CH_out
+    rem = pid_m - n * CH_out
+    c = rem // DH_out
+    rem2 = rem - c * DH_out
+    d_out = rem2 // H_out
+    h_out = rem2 - d_out * H_out
+
+    w_out = offs_w
+
+    # Compute input window start
+    d_start = d_out * SD
+    h_start = h_out * SH
+    w_start = w_out * SW
+
+    # Initialize max with -inf
+    val = tl.full((BLOCK_W,), -float("inf"), dtype=tl.float32)
+
+    # Iterate over kernel window
+    for kd in range(0, KD):
+        d_in = d_start + kd
+        for kh in range(0, KH):
+            h_in = h_start + kh
+            for kw in range(0, KW):
+                w_in = w_start + kw
+
+                x_ptrs = (
+                    x_ptr
+                    + n * stride_xn
+                    + c * stride_xc
+                    + d_in * stride_xd
+                    + h_in * stride_xh
+                    + w_in * stride_xw
+                )
+
+                in_bounds = (
+                    (w_out < W_out)
+                    & (d_in >= 0) & (d_in < D)
+                    & (h_in >= 0) & (h_in < H)
+                    & (w_in >= 0) & (w_in < W)
+                )
+
+                x_vals = tl.load(x_ptrs, mask=in_bounds, other=-float("inf"))
+                x_vals = x_vals.to(tl.float32)
+                val = tl.maximum(val, x_vals)
+
+    # Store result
+    y_ptrs = (
+        y_ptr
+        + n * stride_yn
+        + c * stride_yc
+        + d_out * stride_yd
+        + h_out * stride_yh
+        + w_out * stride_yw
+    )
+    mask_o = (w_out < W_out)
+    tl.store(y_ptrs, val, mask=mask_o)
+
+
+def triton_maxpool3d(x: torch.Tensor, kernel_size, stride=None) -> torch.Tensor:
+    """
+    MaxPool3d with given kernel_size and stride (no padding, no dilation), NCDHW layout.
+    """
+    assert x.is_cuda
+    x = x.contiguous()
+    N, C, D, H, W = x.shape
+
+    if isinstance(kernel_size, int):
+        KD = KH = KW = kernel_size
+    else:
+        KD, KH, KW = kernel_size
+
+    if stride is None:
+        SD = KD
+        SH = KH
+        SW = KW
+    else:
+        if isinstance(stride, int):
+            SD = SH = SW = stride
+        else:
+            SD, SH, SW = stride
+
+    # Output dims (PyTorch formula with pad=0, dilation=1)
+    D_out = (D - KD) // SD + 1
+    H_out = (H - KH) // SH + 1
+    W_out = (W - KW) // SW + 1
+
+    y = torch.empty((N, C, D_out, H_out, W_out), device=x.device, dtype=torch.float32)
+
+    stride_xn, stride_xc, stride_xd, stride_xh, stride_xw = x.stride()
+    stride_yn, stride_yc, stride_yd, stride_yh, stride_yw = y.stride()
+
+    BLOCK_W = 64
+    grid = lambda META: (
+        max(1, N * C * D_out * H_out),
+        triton.cdiv(W_out, META["BLOCK_W"]),
+    )
+
+    maxpool3d_kernel[grid](
+        x, y,
+        N, C, D, H, W,
+        KD, KH, KW,
+        SD, SH, SW,
+        D_out, H_out, W_out,
+        stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
+        stride_yn, stride_yc, stride_yd, stride_yh, stride_yw,
+        BLOCK_W=BLOCK_W,
+    )
+
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized replacement for:
+      Conv3d -> Softmax(dim=1) -> MaxPool3d -> MaxPool3d
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, pool_kernel_size):
+        super(ModelNew, self).__init__()
+
+        if isinstance(kernel_size, int):
+            kd = kh = kw = kernel_size
+        else:
+            kd, kh, kw = kernel_size
+        self.kd = kd
+        self.kh = kh
+        self.kw = kw
+
+        self.weight = nn.Parameter(torch.randn(out_channels, in_channels, kd, kh, kw))
+        self.bias = nn.Parameter(torch.randn(out_channels))
+
+        if isinstance(pool_kernel_size, int):
+            self.pool_kernel = (pool_kernel_size, pool_kernel_size, pool_kernel_size)
+        else:
+            self.pool_kernel = tuple(pool_kernel_size)
+
+    def forward(self, x):
+        # x: [N, C_in, D, H, W]
+        x = x.to(dtype=torch.float32, device=self.weight.device)
+
+        # Fused Conv3d + Softmax over channel dimension
+        x = triton_conv3d_softmax(x, self.weight, self.bias)          # [N, C_out, D', H', W']
+        # Two successive MaxPool3d operations
+        x = triton_maxpool3d(x, self.pool_kernel, self.pool_kernel)   # first MaxPool3d
+        x = triton_maxpool3d(x, self.pool_kernel, self.pool_kernel)   # second MaxPool3d
+        return x
+```

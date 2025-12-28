@@ -1,0 +1,406 @@
+import math
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+# -----------------------------
+# Conv3D + Bias + HardSwish
+# -----------------------------
+
+
+@triton.autotune(
+    configs=[
+        # Main config: balanced MxN tile
+        triton.Config(
+            {"BLOCK_CO": 32, "BLOCK_SP": 32, "BLOCK_K": 32},
+            num_warps=4,
+            num_stages=3,
+        ),
+        # Smaller spatial tile
+        triton.Config(
+            {"BLOCK_CO": 32, "BLOCK_SP": 16, "BLOCK_K": 32},
+            num_warps=4,
+            num_stages=3,
+        ),
+        # Smaller channel tile
+        triton.Config(
+            {"BLOCK_CO": 16, "BLOCK_SP": 32, "BLOCK_K": 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+    ],
+    key=["C_out", "D_out", "H_out", "W_out"],
+)
+@triton.jit
+def conv3d_hswish_kernel(
+    x_ptr,  # [B, C_in, D, H, W]
+    w_ptr,  # [C_out, K_total] flattened over (C_in, Kd, Kh, Kw)
+    b_ptr,  # [C_out]
+    y_ptr,  # [B, C_out, D_out, H_out, W_out]
+    B, C_in, D, H, W,
+    C_out, D_out, H_out, W_out,
+    K_total,
+    stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
+    stride_wm, stride_wn,
+    stride_yn, stride_yc, stride_yd, stride_yh, stride_yw,
+    Kd, Kh, Kw,
+    BLOCK_CO: tl.constexpr,
+    BLOCK_SP: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """
+    Grid:
+      axis 0: batch (B)
+      axis 1: output channels (C_out) tiled by BLOCK_CO
+      axis 2: spatial positions (D_out * H_out * W_out) tiled by BLOCK_SP
+    """
+    pid_b = tl.program_id(0)
+    pid_co = tl.program_id(1)
+    pid_sp = tl.program_id(2)
+
+    # Bounds guard for safety in degenerate cases
+    if pid_b >= B:
+        return
+    if C_out == 0:
+        return
+
+    S = D_out * H_out * W_out
+    # If there is no spatial output, nothing to do
+    if S == 0:
+        return
+
+    # Tile offsets for output channel and spatial index
+    offs_co = pid_co * BLOCK_CO + tl.arange(0, BLOCK_CO)
+    offs_sp = pid_sp * BLOCK_SP + tl.arange(0, BLOCK_SP)
+
+    # Masks for valid channels / spatial positions
+    mask_co = offs_co < C_out
+    mask_sp = offs_sp < S
+
+    # Clamp spatial indices so that all computed pointers are in-bounds,
+    # even for masked-out lanes.
+    last_sp = S - 1
+    offs_sp_clamped = tl.where(mask_sp, offs_sp, last_sp)
+
+    # Spatial indices from flattened offs_sp_clamped
+    w_out_idx = offs_sp_clamped % W_out
+    tmp = offs_sp_clamped // W_out
+    h_out_idx = tmp % H_out
+    d_out_idx = tmp // H_out
+
+    # Accumulator
+    acc = tl.zeros((BLOCK_CO, BLOCK_SP), dtype=tl.float32)
+
+    # Precompute constants for kernel index decomposition
+    Kdhw = Kd * Kh * Kw
+    KhW = Kh * Kw
+
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # K loop over flattened (C_in, Kd, Kh, Kw)
+    for k_start in range(0, K_total, BLOCK_K):
+        k_idx = k_start + offs_k  # (BLOCK_K,)
+        mask_k = k_idx < K_total
+
+        # Decompose flattened kernel index k_idx into (ci, kd, kh, kw)
+        ci = k_idx // Kdhw
+        rem1 = k_idx % Kdhw
+        kd = rem1 // KhW
+        rem2 = rem1 % KhW
+        kh = rem2 // Kw
+        kw = rem2
+
+        # Build pointers for input x: shape (BLOCK_K, BLOCK_SP)
+        ptr_x = (
+            x_ptr
+            + pid_b * stride_xn
+            + ci[:, None] * stride_xc
+            + (d_out_idx[None, :] + kd[:, None]) * stride_xd
+            + (h_out_idx[None, :] + kh[:, None]) * stride_xh
+            + (w_out_idx[None, :] + kw[:, None]) * stride_xw
+        )
+
+        mask_x = mask_k[:, None] & mask_sp[None, :]
+
+        x = tl.load(ptr_x, mask=mask_x, other=0.0).to(tl.float32)
+
+        # Load weight tile: w_flat is [C_out, K_total]
+        ptr_w = w_ptr + offs_co[:, None] * stride_wm + k_idx[None, :] * stride_wn
+        mask_w = mask_co[:, None] & mask_k[None, :]
+        w = tl.load(ptr_w, mask=mask_w, other=0.0).to(tl.float32)
+
+        # GEMM micro-kernel: (BLOCK_CO, BLOCK_K) x (BLOCK_K, BLOCK_SP)
+        acc += tl.dot(w, x)
+
+    # Bias add
+    bias = tl.load(b_ptr + offs_co, mask=mask_co, other=0.0).to(tl.float32)
+    acc = acc + bias[:, None]
+
+    # HardSwish: x * relu6(x + 3) / 6
+    hs = acc + 3.0
+    hs = tl.maximum(hs, 0.0)
+    hs = tl.minimum(hs, 6.0)
+    acc = acc * hs * (1.0 / 6.0)
+
+    # Store result
+    ptr_y = (
+        y_ptr
+        + pid_b * stride_yn
+        + offs_co[:, None] * stride_yc
+        + d_out_idx[None, :] * stride_yd
+        + h_out_idx[None, :] * stride_yh
+        + w_out_idx[None, :] * stride_yw
+    )
+    mask_y = mask_co[:, None] & mask_sp[None, :]
+    tl.store(ptr_y, acc.to(tl.float32), mask=mask_y)
+
+
+def conv3d_hardswish_triton(x, weight, bias):
+    """
+    Conv3D (valid, stride=1, no padding, no dilation) + HardSwish activation.
+    x: [B, C_in, D, H, W]
+    weight: [C_out, C_in, Kd, Kh, Kw]
+    bias: [C_out] or None
+    """
+    assert x.is_cuda and weight.is_cuda
+    x = x.contiguous()
+    weight = weight.contiguous()
+
+    B, C_in, D, H, W = x.shape
+    C_out, C_in_w, Kd, Kh, Kw = weight.shape
+    assert C_in_w == C_in
+
+    if bias is None:
+        bias = torch.zeros(C_out, device=weight.device, dtype=weight.dtype)
+    else:
+        bias = bias.contiguous()
+
+    D_out = D - Kd + 1
+    H_out = H - Kh + 1
+    W_out = W - Kw + 1
+
+    y = torch.empty((B, C_out, D_out, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    # Flatten weights over (C_in, Kd, Kh, Kw)
+    w_flat = weight.view(C_out, -1).contiguous()
+    K_total = w_flat.shape[1]
+    S = max(D_out * H_out * W_out, 0)
+
+    def grid(meta):
+        block_co = meta["BLOCK_CO"]
+        block_sp = meta["BLOCK_SP"]
+        return (
+            max(B, 1),
+            max(triton.cdiv(C_out, block_co), 1),
+            max(triton.cdiv(S, block_sp), 1),
+        )
+
+    conv3d_hswish_kernel[grid](
+        x, w_flat, bias, y,
+        B, C_in, D, H, W,
+        C_out, D_out, H_out, W_out,
+        K_total,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
+        w_flat.stride(0), w_flat.stride(1),
+        y.stride(0), y.stride(1), y.stride(2), y.stride(3), y.stride(4),
+        Kd, Kh, Kw,
+    )
+    return y
+
+
+# -----------------------------
+# GroupNorm + Mean over spatial
+# -----------------------------
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_S": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_S": 256}, num_warps=4, num_stages=2),
+    ],
+    key=["D", "H", "W"],
+)
+@triton.jit
+def groupnorm_mean_kernel(
+    x_ptr,        # [B, C, D, H, W]
+    gamma_ptr,    # [C]
+    beta_ptr,     # [C]
+    mean_ptr,     # [B, C] intermediate per-channel mean over spatial
+    out_ptr,      # [B, C]
+    B, C, D, H, W,
+    G, eps,
+    stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
+    stride_meann, stride_meanc,
+    stride_outn, stride_outc,
+    BLOCK_S: tl.constexpr,
+):
+    """
+    Fused GroupNorm + mean pooling over spatial dims.
+
+    Input:  x [B, C, D, H, W]
+    Output: out [B, C]  (mean over D,H,W of GroupNorm output)
+
+    Grid:
+      axis 0: batch index b  in [0, B)
+      axis 1: group index g  in [0, G)
+    """
+    pid_b = tl.program_id(0)
+    pid_g = tl.program_id(1)
+
+    if pid_b >= B or pid_g >= G:
+        return
+    if C == 0:
+        return
+
+    b = pid_b
+    g = pid_g
+
+    C_per_group = C // G
+    group_c_start = g * C_per_group
+
+    S = D * H * W
+    if S == 0:
+        return
+
+    group_count = C_per_group * S
+
+    # Phase 1: compute group mean/var and per-channel spatial mean
+    sum_x = 0.0
+    sum_x2 = 0.0
+
+    for c_offset in range(0, C_per_group):
+        ch = group_c_start + c_offset  # scalar channel index for this program
+        sum_c = 0.0
+
+        # iterate over spatial positions in tiles of BLOCK_S
+        for s0 in range(0, S, BLOCK_S):
+            offs_s = s0 + tl.arange(0, BLOCK_S)
+            mask_s = offs_s < S
+
+            # Clamp to in-bounds to avoid OOB pointers on masked lanes
+            last_s = S - 1
+            offs_s_clamped = tl.where(mask_s, offs_s, last_s)
+
+            w_idx = offs_s_clamped % W
+            tmp = offs_s_clamped // W
+            h_idx = tmp % H
+            d_idx = tmp // H
+
+            ptr_x = (
+                x_ptr
+                + b * stride_xn
+                + ch * stride_xc
+                + d_idx * stride_xd
+                + h_idx * stride_xh
+                + w_idx * stride_xw
+            )
+
+            x = tl.load(ptr_x, mask=mask_s, other=0.0).to(tl.float32)
+            s_block = tl.sum(x, axis=0)
+            sum_c += s_block
+            sum_x += s_block
+            sum_x2 += tl.sum(x * x, axis=0)
+
+        # store per-channel mean over spatial dims
+        mean_c = sum_c / S
+        ptr_mean = mean_ptr + b * stride_meann + ch * stride_meanc
+        tl.store(ptr_mean, mean_c)
+
+    mean = sum_x / group_count
+    var = sum_x2 / group_count - mean * mean
+    inv_std = 1.0 / tl.sqrt(var + eps)
+
+    # Phase 2: finalize per-channel output using stored spatial means
+    for c_offset in range(0, C_per_group):
+        ch = group_c_start + c_offset
+
+        mean_c = tl.load(mean_ptr + b * stride_meann + ch * stride_meanc)
+        gamma_c = tl.load(gamma_ptr + ch)
+        beta_c = tl.load(beta_ptr + ch)
+
+        out_val = gamma_c * inv_std * (mean_c - mean) + beta_c
+
+        ptr_out = out_ptr + b * stride_outn + ch * stride_outc
+        tl.store(ptr_out, out_val)
+
+
+def groupnorm_mean_triton(x, gamma, beta, num_groups, eps=1e-5):
+    """
+    x: [B, C, D, H, W]
+    gamma, beta: [C]
+    returns: [B, C]  (GroupNorm + mean over spatial dims)
+    """
+    assert x.is_cuda and gamma.is_cuda and beta.is_cuda
+    x = x.contiguous()
+    gamma = gamma.contiguous()
+    beta = beta.contiguous()
+
+    B, C, D, H, W = x.shape
+    assert num_groups > 0
+    assert C % num_groups == 0
+
+    # Output and small intermediate buffer for mean_c
+    out = torch.empty((B, C), device=x.device, dtype=x.dtype)
+    mean_buf = torch.empty((B, C), device=x.device, dtype=torch.float32)
+
+    def grid(meta):
+        return (max(B, 1), max(num_groups, 1))
+
+    groupnorm_mean_kernel[grid](
+        x, gamma, beta, mean_buf, out,
+        B, C, D, H, W,
+        num_groups, eps,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
+        mean_buf.stride(0), mean_buf.stride(1),
+        out.stride(0), out.stride(1),
+    )
+    return out
+
+
+# -----------------------------
+# High-level module
+# -----------------------------
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized replacement for:
+
+    Conv3D -> HardSwish -> GroupNorm -> mean over spatial dims
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size, num_groups=4, bias=True):
+        super(ModelNew, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.num_groups = num_groups
+        self.eps = 1e-5
+
+        k = kernel_size
+        self.weight = nn.Parameter(
+            torch.empty(out_channels, in_channels, k, k, k)
+        )
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_channels))
+        else:
+            self.register_parameter("bias", None)
+
+        # GroupNorm parameters
+        self.gn_weight = nn.Parameter(torch.ones(out_channels))
+        self.gn_bias = nn.Parameter(torch.zeros(out_channels))
+
+        # Simple initialization similar to Conv3d default
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in = in_channels * k * k * k
+            bound = 1 / math.sqrt(fan_in)
+            nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x):
+        # x: [B, C_in, D, H, W]
+        y = conv3d_hardswish_triton(x, self.weight, self.bias)
+        y = groupnorm_mean_triton(y, self.gn_weight, self.gn_bias, self.num_groups, self.eps)
+        return y

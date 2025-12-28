@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The custom Triton implementation is ~13× slower than the PyTorch/cuDNN baseline, so there is clear headroom for major improvement.",
+  "bottleneck": "The 3D convolution kernel uses a naive nested-loop implementation with scalar loads over (C_in, Kd, Kh, Kw) for each output position and output-channel tile, providing almost no data reuse or tiling and resulting in very poor FLOP utilization compared to GEMM-based/cuDNN convolutions.",
+  "optimisation method": "Replace the direct-loop 3D convolution with an implicit im2col + GEMM-style convolution (i.e., reshape the problem into a matrix multiplication and use a Triton matmul-style tiled kernel), which greatly improves data reuse, memory coalescing, and compute intensity.",
+  "modification plan": "Reformulate the convolution as a matrix multiply between an input matrix of shape (N*D_out*H_out*W_out, C_in*Kd*Kh*Kw) and a weight matrix of shape (C_in*Kd*Kh*Kw, C_out). Implement a Triton matmul kernel that tiles over the output-position dimension (M) and output-channel dimension (N), loading tiles of the 'im2col' input and weight matrices into SRAM and using tl.dot for inner products. Generate the im2col layout implicitly inside the kernel when loading tiles (rather than materializing a full im2col buffer), then keep the existing softmax and max-pool kernels unchanged on the produced output tensor.",
+  "expected_speedup": "5-10x vs the current Triton version (roughly 80-90% latency reduction), likely approaching or matching the PyTorch baseline."
+}

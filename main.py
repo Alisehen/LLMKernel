@@ -135,7 +135,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 OPTIMIZATION_STAGES = [
     {"name": "grid_and_parallel", "description": "Optimize grid layout and parallel work distribution across SMs."},
     {"name": "block_tiling", "description": "Tune BLOCK_M/N/K sizes for optimal register/memory balance."},
-    # {"name": "memory_and_tuning", "description": "Optimize memory access patterns and fine-tune num_stages/num_warps."},
+    {"name": "memory_and_tuning", "description": "Optimize memory access patterns and fine-tune num_stages/num_warps."},
 ]
 
 # ---------------------- early exit criteria (post-hoc) -----------------

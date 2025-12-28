@@ -1,0 +1,270 @@
+```python
+import math
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def fused_conv3d_hswish_groupnorm_mean_kernel(
+    x_ptr, w_ptr, b_ptr, gamma_ptr, beta_ptr, out_ptr,
+    B, C_in, D, H, W,
+    C_out, D_out, H_out, W_out,
+    K_total, G, eps,
+    stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
+    stride_wm, stride_wn,
+    stride_outn, stride_outc,
+    Kd, Kh, Kw,
+    BLOCK_CO: tl.constexpr, BLOCK_SP: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """
+    Fused kernel:
+      Conv3D (valid, stride=1, no padding) + HardSwish +
+      GroupNorm (over groups in channel dim) +
+      mean pooling over spatial dims (D_out, H_out, W_out).
+
+    Input:
+      x_ptr:   [B, C_in, D, H, W]
+      w_ptr:   [C_out, K_total]   (flattened [C_out, C_in*Kd*Kh*Kw])
+      b_ptr:   [C_out]
+      gamma:   [C_out]
+      beta:    [C_out]
+    Output:
+      out_ptr: [B, C_out] (mean over spatial dims of GroupNorm output)
+    """
+    pid_b = tl.program_id(0)  # batch index
+    pid_g = tl.program_id(1)  # group index
+
+    S = D_out * H_out * W_out
+    C_per_group = C_out // G
+    group_c_start = pid_g * C_per_group
+
+    # Channel lanes for this program: cover entire group (with masking if C_per_group < BLOCK_CO)
+    offs_co_lane = tl.arange(0, BLOCK_CO)
+    co = group_c_start + offs_co_lane
+    mask_co = offs_co_lane < C_per_group
+
+    # Preload bias for these channels
+    bias = tl.load(b_ptr + co, mask=mask_co, other=0.0).to(tl.float32)
+
+    # Accumulators:
+    # Per-channel sum over spatial dims: shape [BLOCK_CO]
+    sum_c = tl.zeros((BLOCK_CO,), dtype=tl.float32)
+    # Group-wise sum and sum of squares over all channels in group and all spatial positions
+    sum_g = 0.0
+    sum2_g = 0.0
+
+    Kdhw = Kd * Kh * Kw
+    KhW = Kh * Kw
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Loop over spatial tiles
+    for sp_start in range(0, S, BLOCK_SP):
+        offs_sp = sp_start + tl.arange(0, BLOCK_SP)
+        mask_sp = offs_sp < S
+
+        # Compute (d_out, h_out, w_out) indices from flattened spatial index
+        w_out_idx = offs_sp % W_out
+        tmp = offs_sp // W_out
+        h_out_idx = tmp % H_out
+        d_out_idx = tmp // H_out
+
+        # Accumulator for conv outputs for this spatial tile
+        acc = tl.zeros((BLOCK_CO, BLOCK_SP), dtype=tl.float32)
+
+        # Convolution: iterate over flattened kernel dimension
+        for k_start in range(0, K_total, BLOCK_K):
+            k_idx = k_start + offs_k
+            mask_k = k_idx < K_total
+
+            # Map flattened kernel index to (ci, kd, kh, kw)
+            ci = k_idx // Kdhw
+            rem1 = k_idx % Kdhw
+            kd = rem1 // KhW
+            rem2 = rem1 % KhW
+            kh = rem2 // Kw
+            kw = rem2 % Kw
+
+            # Pointers for input x: shape (BLOCK_K, BLOCK_SP)
+            ptr_x = (
+                x_ptr
+                + pid_b * stride_xn
+                + ci[:, None] * stride_xc
+                + (d_out_idx[None, :] + kd[:, None]) * stride_xd
+                + (h_out_idx[None, :] + kh[:, None]) * stride_xh
+                + (w_out_idx[None, :] + kw[:, None]) * stride_xw
+            )
+            mask_x = mask_k[:, None] & mask_sp[None, :]
+            x = tl.load(ptr_x, mask=mask_x, other=0.0).to(tl.float32)
+
+            # Load weight tile: w_flat is [C_out, K_total]
+            ptr_w = w_ptr + co[:, None] * stride_wm + k_idx[None, :] * stride_wn
+            mask_w = mask_co[:, None] & mask_k[None, :]
+            w = tl.load(ptr_w, mask=mask_w, other=0.0).to(tl.float32)
+
+            # Accumulate conv
+            acc += tl.dot(w, x, allow_tf32=True)
+
+        # Add bias (broadcast over spatial) and apply HardSwish
+        acc = acc + bias[:, None]
+
+        tmp_hs = acc + 3.0
+        tmp_hs = tl.minimum(tl.maximum(tmp_hs, 0.0), 6.0)
+        acc = acc * tmp_hs * (1.0 / 6.0)
+
+        # Zero out invalid spatial positions
+        acc = tl.where(mask_sp[None, :], acc, 0.0)
+
+        # Per-channel sums over this tile
+        tile_sum_c = tl.sum(acc, axis=1)  # [BLOCK_CO]
+        mask_co_f = mask_co.to(tl.float32)
+        sum_c += tile_sum_c * mask_co_f
+
+        # Group-wise sums over this tile
+        tile_sum_g = tl.sum(tile_sum_c * mask_co_f, axis=0)
+        sum_g += tile_sum_g
+
+        acc_sq = acc * acc
+        tile_sum_c2 = tl.sum(acc_sq, axis=1)
+        tile_sum2_g = tl.sum(tile_sum_c2 * mask_co_f, axis=0)
+        sum2_g += tile_sum2_g
+
+    # Compute group mean and variance
+    group_count = C_per_group * S
+    mean_g = sum_g / group_count
+    var_g = sum2_g / group_count - mean_g * mean_g
+    inv_std = 1.0 / tl.sqrt(var_g + eps)
+
+    # Compute per-channel pooled outputs
+    S_f = tl.float32(S)
+    mean_c = sum_c / S_f
+
+    gamma = tl.load(gamma_ptr + co, mask=mask_co, other=0.0).to(tl.float32)
+    beta = tl.load(beta_ptr + co, mask=mask_co, other=0.0).to(tl.float32)
+
+    out_vals = gamma * inv_std * (mean_c - mean_g) + beta
+
+    # Store [B, C_out]
+    ptr_out = out_ptr + pid_b * stride_outn + co * stride_outc
+    tl.store(ptr_out, out_vals, mask=mask_co)
+
+
+def fused_conv3d_hswish_groupnorm_mean(
+    x, weight, bias, gamma, beta, num_groups, eps=1e-5
+):
+    """
+    Fused implementation of:
+      Conv3D (valid, stride=1, no padding) ->
+      HardSwish ->
+      GroupNorm (num_groups) ->
+      mean over spatial dims.
+
+    Args:
+      x:      [B, C_in, D, H, W], CUDA, float32
+      weight: [C_out, C_in, Kd, Kh, Kw], CUDA, float32
+      bias:   [C_out] or None
+      gamma:  [C_out] (GroupNorm weight)
+      beta:   [C_out] (GroupNorm bias)
+      num_groups: number of groups in GroupNorm
+      eps:    numerical epsilon for GroupNorm
+
+    Returns:
+      out: [B, C_out], CUDA, float32
+    """
+    assert x.is_cuda and weight.is_cuda
+    assert gamma.is_cuda and beta.is_cuda
+    assert x.dtype == torch.float32
+    assert weight.dtype == torch.float32
+    assert gamma.dtype == torch.float32
+    assert beta.dtype == torch.float32
+
+    x = x.contiguous()
+    weight = weight.contiguous()
+    gamma = gamma.contiguous()
+    beta = beta.contiguous()
+
+    B, C_in, D, H, W = x.shape
+    C_out, C_in_w, Kd, Kh, Kw = weight.shape
+    assert C_in_w == C_in
+    assert C_out % num_groups == 0
+    C_per_group = C_out // num_groups
+
+    # BLOCK_CO must cover all channels in a group
+    BLOCK_CO = 32  # power-of-2 as required
+    assert C_per_group <= BLOCK_CO, "C_per_group > BLOCK_CO not supported in this kernel"
+
+    if bias is None:
+        bias = torch.zeros(C_out, device=weight.device, dtype=weight.dtype)
+    else:
+        bias = bias.contiguous()
+
+    D_out = D - Kd + 1
+    H_out = H - Kh + 1
+    W_out = W - Kw + 1
+
+    w_flat = weight.view(C_out, -1).contiguous()
+    K_total = w_flat.shape[1]
+
+    out = torch.empty((B, C_out), device=x.device, dtype=x.dtype)
+
+    def grid(meta):
+        return (B, num_groups)
+
+    fused_conv3d_hswish_groupnorm_mean_kernel[grid](
+        x, w_flat, bias, gamma, beta, out,
+        B, C_in, D, H, W,
+        C_out, D_out, H_out, W_out,
+        K_total, num_groups, eps,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
+        w_flat.stride(0), w_flat.stride(1),
+        out.stride(0), out.stride(1),
+        Kd, Kh, Kw,
+        BLOCK_CO=BLOCK_CO, BLOCK_SP=128, BLOCK_K=32,
+    )
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized replacement for:
+
+      Conv3D -> HardSwish -> GroupNorm -> mean over spatial dims
+
+    Behavior matches the PyTorch reference Model exactly.
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size, num_groups=4, bias=True):
+        super(ModelNew, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.num_groups = num_groups
+        self.eps = 1e-5
+
+        k = kernel_size
+        self.weight = nn.Parameter(
+            torch.empty(out_channels, in_channels, k, k, k)
+        )
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_channels))
+        else:
+            self.register_parameter("bias", None)
+
+        # GroupNorm parameters
+        self.gn_weight = nn.Parameter(torch.ones(out_channels))
+        self.gn_bias = nn.Parameter(torch.zeros(out_channels))
+
+        # Initialization similar to nn.Conv3d default
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in = in_channels * k * k * k
+            bound = 1 / math.sqrt(fan_in)
+            nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x):
+        # x: [B, C_in, D, H, W]
+        return fused_conv3d_hswish_groupnorm_mean(
+            x, self.weight, self.bias, self.gn_weight, self.gn_bias, self.num_groups, self.eps
+        )
+```

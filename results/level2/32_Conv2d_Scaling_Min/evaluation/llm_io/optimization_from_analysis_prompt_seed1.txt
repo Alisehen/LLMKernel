@@ -1,0 +1,271 @@
+You are optimizing a Triton kernel based on algorithmic analysis.
+
+# PyTorch Reference (Target Behavior)
+
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs a convolution, scales the output, and then applies a minimum operation.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, scale_factor):
+        super(Model, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.scale_factor = scale_factor
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_channels, height, width).
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_channels, height, width).
+        """
+        x = self.conv(x)
+        x = x * self.scale_factor
+        x = torch.min(x, dim=1, keepdim=True)[0]  # Minimum along channel dimension
+        return x
+
+batch_size = 64
+in_channels = 64
+out_channels = 128
+height = width = 256
+kernel_size = 3
+scale_factor = 2.0
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, scale_factor]
+```
+
+**CRITICAL**: Study the PyTorch code carefully to understand:
+- What does `forward()` return? (full output sequence vs final hidden state only)
+- What is the computational pattern?
+- What are the input/output shapes?
+
+Your optimized kernel MUST match this exact behavior.
+
+---
+
+# Analysis Results
+
+**Bottleneck**: The convolution is implemented as a naive 3-level nested loop over Ci×Kh×Kw per (b,y,x,oc) with scalar loads, which completely misses the GEMM/Winograd-style tiling and reuse that cuDNN uses. This yields poor memory reuse, low arithmetic intensity, and very low tensor-core utilization.
+
+**Optimization Strategy**: Replace the direct nested-loop convolution with a GEMM-based (implicit im2col) convolution inside Triton, i.e., restructure the computation so that each program instance computes a tile of [B*Ho*Wo, Co] via matrix multiply over K = Ci*Kh*Kw, then apply the scale and per-point channel-min reduction on the GEMM output.
+
+**Implementation Plan**: Refactor the kernel so that the logical output is a 2D matrix Y of shape (N_points = B*Ho*Wo, Co) and the weights form a K×Co matrix, where K = Ci*Kh*Kw. In the Triton kernel, use standard GEMM tiling (BLOCK_M, BLOCK_N, BLOCK_K) to iterate over K, loading tiles of input patches and weights into registers/shared memory and performing a matmul-accumulate, then fuse the bias addition, scaling, and a reduction over Co to produce the [N_points] minimum values. This shifts the core conv from per-point scalar loops to a high-throughput matmul, recovering cuDNN-like efficiency while still keeping the fused scale+min.
+
+**Expected Speedup**: 300-600% (3-6x faster than the current Triton kernel, bringing it to at least parity and likely ahead of the PyTorch baseline due to fusion)
+
+---
+
+# Current Kernel (needs optimization)
+
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def conv_scale_min_kernel(
+    x_ptr, w_ptr, bias_ptr, out_ptr,
+    B, Ci, Hi, Wi, Co, Kh, Kw, Ho, Wo,
+    stride_xb, stride_xc, stride_xh, stride_xw,
+    stride_wco, stride_wci, stride_wkh, stride_wkw,
+    stride_ob, stride_oc, stride_oh, stride_ow,
+    scale,
+    BLOCK_M: tl.constexpr,  # number of (b, y, x) points per program
+    BLOCK_CO: tl.constexpr,  # number of output channels processed per block
+):
+    pid_m = tl.program_id(0)
+
+    # Total number of output spatial points (B * Ho * Wo)
+    N_points = B * Ho * Wo
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offs_m < N_points
+
+    # Decode linear index into (b, y, x)
+    hw = Ho * Wo
+    b = offs_m // hw
+    rem = offs_m % hw
+    y = rem // Wo
+    x = rem % Wo
+
+    # Initialize running minimum (per output spatial location)
+    # Large positive value as initial min
+    min_val = tl.full((BLOCK_M,), 3.4e38, tl.float32)
+
+    # Loop over output channels in tiles of size BLOCK_CO
+    for oc_start in range(0, Co, BLOCK_CO):
+        oc_offsets = oc_start + tl.arange(0, BLOCK_CO)
+        mask_co = oc_offsets < Co
+
+        # Accumulator for this output-channel tile
+        acc = tl.zeros((BLOCK_M, BLOCK_CO), dtype=tl.float32)
+
+        # Convolution: sum over input channels and kernel spatial dims
+        # No padding, stride=1, dilation=1 assumed.
+        for ic in range(0, Ci):
+            for ky in range(0, Kh):
+                for kx in range(0, Kw):
+                    iy = y + ky
+                    ix = x + kx
+                    # Within valid region by construction for standard conv
+                    x_ptrs = (
+                        x_ptr
+                        + b * stride_xb
+                        + ic * stride_xc
+                        + iy * stride_xh
+                        + ix * stride_xw
+                    )
+                    x_vals = tl.load(x_ptrs, mask=mask_m, other=0.0)
+
+                    w_ptrs = (
+                        w_ptr
+                        + oc_offsets * stride_wco
+                        + ic * stride_wci
+                        + ky * stride_wkh
+                        + kx * stride_wkw
+                    )
+                    w_vals = tl.load(w_ptrs, mask=mask_co, other=0.0)
+
+                    acc += x_vals[:, None] * w_vals[None, :]
+
+        # Add bias for this output-channel tile
+        bias_vals = tl.load(bias_ptr + oc_offsets, mask=mask_co, other=0.0)
+        acc += bias_vals[None, :]
+
+        # Scale
+        acc = acc * scale
+
+        # Reduce over output-channel tile (per spatial point)
+        tile_min = tl.min(acc, 1)
+        min_val = tl.minimum(min_val, tile_min)
+
+    # Store result: output shape [B, 1, Ho, Wo]
+    out_ptrs = (
+        out_ptr
+        + b * stride_ob
+        + 0 * stride_oc
+        + y * stride_oh
+        + x * stride_ow
+    )
+    tl.store(out_ptrs, min_val, mask=mask_m)
+
+
+def conv_scale_min_triton(x, weight, bias, scale_factor):
+    """
+    x:       [B, Ci, Hi, Wi]
+    weight:  [Co, Ci, Kh, Kw]
+    bias:    [Co]
+    Returns: [B, 1, Ho, Wo] with Ho/Wo as in PyTorch conv2d (stride=1, padding=0, dilation=1).
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda, "Tensors must be on CUDA"
+    B, Ci, Hi, Wi = x.shape
+    Co, Ci_w, Kh, Kw = weight.shape
+    assert Ci == Ci_w, "In-channel mismatch between input and weight"
+    assert bias.shape[0] == Co, "Bias must match out_channels"
+
+    # Conv2d output spatial size for stride=1, padding=0, dilation=1
+    Ho = Hi - Kh + 1
+    Wo = Wi - Kw + 1
+    assert Ho > 0 and Wo > 0, "Invalid kernel size for given input"
+
+    out = torch.empty((B, 1, Ho, Wo), device=x.device, dtype=x.dtype)
+
+    stride_xb, stride_xc, stride_xh, stride_xw = x.stride()
+    stride_wco, stride_wci, stride_wkh, stride_wkw = weight.stride()
+    stride_ob, stride_oc, stride_oh, stride_ow = out.stride()
+
+    N_points = B * Ho * Wo
+
+    def grid(meta):
+        return (triton.cdiv(N_points, meta["BLOCK_M"]),)
+
+    conv_scale_min_kernel[grid](
+        x, weight, bias, out,
+        B, Ci, Hi, Wi, Co, Kh, Kw, Ho, Wo,
+        stride_xb, stride_xc, stride_xh, stride_xw,
+        stride_wco, stride_wci, stride_wkh, stride_wkw,
+        stride_ob, stride_oc, stride_oh, stride_ow,
+        scale_factor,
+        BLOCK_M=64,
+        BLOCK_CO=32,
+    )
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-accelerated version of:
+        Conv2d -> scale -> min over channel dim (keepdim=True)
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, scale_factor):
+        super(ModelNew, self).__init__()
+        if isinstance(kernel_size, int):
+            kh = kw = kernel_size
+        else:
+            kh, kw = kernel_size
+        self.weight = nn.Parameter(
+            torch.randn(out_channels, in_channels, kh, kw)
+        )
+        self.bias = nn.Parameter(torch.randn(out_channels))
+        self.scale_factor = float(scale_factor)
+
+    def forward(self, x):
+        return conv_scale_min_triton(x, self.weight, self.bias, self.scale_factor)
+```
+
+---
+
+# Your Task
+
+Implement the optimization strategy above. Focus on the specific bottleneck identified.
+
+## Key Requirements
+
+1. **Preserve correctness**: Maintain the same input/output behavior
+2. **Apply the optimization**: Follow the implementation plan exactly
+3. **Use valid Triton syntax**:
+   - Every kernel MUST have `@triton.jit` decorator
+   - Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+   - BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+   - No `continue`, `break`, `return` inside kernels (use masking)
+   - Prefer `tl.dot(a, b, allow_tf32=True)` for matmul operations
+
+4. **CRITICAL for RNN/GRU/LSTM Persistent Kernels**:
+   - Time loop MUST be inside @triton.jit kernel, NOT in Python forward()
+   - **HYBRID computation strategy** (CRITICAL for performance):
+     * Precompute input-side gates OUTSIDE kernel: `gates_x = (T*B, In) @ W_ih` (ONE large GEMM)
+     * INSIDE kernel: only recurrent-side: `for t: gates_h = h @ W_hh` (T small GEMMs)
+   - CORRECT (FAST - use this):
+     ```python
+     # Python forward():
+     gates_x_all = x.reshape(T*B, In) @ W_ih + b_ih  # ONE large GEMM
+     gates_x_all = gates_x_all.view(T, B, 3*H)
+     gru_persistent_kernel[grid](gates_x_all, h0, W_hh, ...)  # Launch ONCE
+
+     @triton.jit
+     def gru_persistent_kernel(gates_x_ptr, h_ptr, W_hh_ptr, ...):
+         for t in range(T):  # Inside kernel
+             gates_x_t = tl.load(gates_x_ptr + t*...)  # Precomputed
+             gates_h = h @ W_hh  # Only recurrent GEMM
+             h = (1-z)*n + z*h   # Fuse and update
+     ```
+
+5. **Output format**:
+   - Imports: `import torch, torch.nn as nn, triton, triton.language as tl`
+   - `@triton.jit` kernel(s)
+   - Wrapper function(s)
+   - `class ModelNew(nn.Module)` — REQUIRED
+   - NO testing code, NO `if __name__ == "__main__"`
+
+---
+
+Generate the optimized kernel now. Output ONLY the complete Python code.

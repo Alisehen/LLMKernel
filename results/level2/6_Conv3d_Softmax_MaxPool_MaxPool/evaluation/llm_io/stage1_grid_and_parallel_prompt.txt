@@ -1,34 +1,12 @@
 You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
 
-# Target GPU
-GPU Name: 4090
-Architecture: Ada Lovelace
-• Compute Capability: 8.9
-• Number of SMs: 128
-• Memory Bandwidth: 1008 GB/s
-• TF32 Tensor Core TFLOPS: 82.6 with dense
-• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
-• FP16 Tensor Core TFLOPS: 165.2 with dense
-• Maximum number of registers per thread: 255
-• Maximum threads per block: 1024
-• Maximum threads per SM: 1536
-• Warp size: 32
-• Maximum concurrent warps per SM: 48
-• Shared memory capacity per SM: 100 KB
-• Maximum shared memory per thread block: 99 KB
-• L2 cache (global, all SM shared): 72 MB
+# Target GPU: 4090
 
 [OPTIMIZATION STAGE]
 
 ## Current Optimization Stage
 
 Focus: Grid layout & indexing for FUSED operations.
-
-⚠️ FUSION EXCLUSIONS (do NOT apply fusion rules to these):
-- Reduction ops (sum, mean, softmax along axis)
-- Atomic operations
-- Irregular/data-dependent access patterns
-- Cross-block dependencies
 
 Key Principle:
 - All fused ops share the SAME grid AND the SAME (offsets, mask) tuple
@@ -50,169 +28,319 @@ Verification:
 
 [CURRENT CODE]
 ```python
-# <complete ModelNew code with optimized Triton kernels>
-
 import torch
 import torch.nn as nn
 import triton
 import triton.language as tl
-import math
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32}, num_warps=4),
-        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64}, num_warps=4),
-    ],
-    key=['P', 'C_out'],
-)
 @triton.jit
-def conv3d_ncdhw_kernel(
-    x_ptr, w_ptr, b_ptr, y_ptr,
-    N, C_in, C_out,
-    D_in, H_in, W_in,
-    Kd, Kh, Kw,
+def conv3d_softmax_kernel(
+    x_ptr, w2d_ptr, bias_ptr, o_ptr,
+    N, C_in, D, H, W,
+    C_out, KD, KH, KW,
     D_out, H_out, W_out,
-    P,  # N * D_out * H_out * W_out
-    stride_x_n, stride_x_c, stride_x_d, stride_x_h, stride_x_w,
-    stride_w_co, stride_w_ci, stride_w_kd, stride_w_kh, stride_w_kw,
-    stride_y_n, stride_y_c, stride_y_d, stride_y_h, stride_y_w,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    M, K,
+    stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
+    stride_wk, stride_wn,
+    stride_on, stride_oc, stride_od, stride_oh, stride_ow,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
-    # Program IDs: 2D grid over flattened output positions (M) and output channels (N)
-    pid_m = tl.program_id(0)  # over P = N * D_out * H_out * W_out
-    pid_n = tl.program_id(1)  # over C_out
+    # Program ID over flattened output positions (M = N * D_out * H_out * W_out)
+    pid_m = tl.program_id(0)
 
+    # Tile indices
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
 
-    # Masks for valid positions
-    mask_m = offs_m < P
-    mask_n = offs_n < C_out
-
-    # Decode flattened index offs_m -> (n, od, oh, ow)
-    DHW = D_out * H_out * W_out
-    HW = H_out * W_out
-
-    n_idx = offs_m // DHW
-    rem = offs_m % DHW
-    od_idx = rem // HW
-    rem = rem % HW
-    oh_idx = rem // W_out
-    ow_idx = rem % W_out
-
-    # Accumulator in fp32 for numerical stability
+    # Initialize accumulator for convolution outputs: [BLOCK_M, BLOCK_N]
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    # Convolution: loop over input channels and kernel volume
-    for ci in range(0, C_in):
-        for kd in range(0, Kd):
-            for kh in range(0, Kh):
-                for kw in range(0, Kw):
-                    # Input indices (within input volume, valid-range by construction)
-                    d_in_vals = od_idx + kd
-                    h_in_vals = oh_idx + kh
-                    w_in_vals = ow_idx + kw
+    # Precompute for mapping M index -> (n, d_out, h_out, w_out)
+    H_out_times_W_out = H_out * W_out
+    DHW_out = D_out * H_out_times_W_out
 
-                    # Pointers for input: [BLOCK_M]
-                    x_ptrs = (
-                        x_ptr
-                        + n_idx * stride_x_n
-                        + ci * stride_x_c
-                        + d_in_vals * stride_x_d
-                        + h_in_vals * stride_x_h
-                        + w_in_vals * stride_x_w
-                    )
-                    x_vals = tl.load(x_ptrs, mask=mask_m, other=0.0)
-                    x_vals = x_vals.to(tl.float32)
+    # Decompose offs_m into (n, d_out, h_out, w_out)
+    n_m = offs_m // DHW_out
+    rem_m = offs_m - n_m * DHW_out
+    d_out_m = rem_m // H_out_times_W_out
+    rem_m2 = rem_m - d_out_m * H_out_times_W_out
+    h_out_m = rem_m2 // W_out
+    w_out_m = rem_m2 - h_out_m * W_out
 
-                    # Pointers for weights: [BLOCK_N]
-                    w_ptrs = (
-                        w_ptr
-                        + offs_n * stride_w_co
-                        + ci * stride_w_ci
-                        + kd * stride_w_kd
-                        + kh * stride_w_kh
-                        + kw * stride_w_kw
-                    )
-                    w_vals = tl.load(w_ptrs, mask=mask_n, other=0.0)
-                    w_vals = w_vals.to(tl.float32)
+    # GEMM-style accumulation over K dimension
+    for k_start in range(0, K, BLOCK_K):
+        k_idx = k_start + offs_k  # [BLOCK_K]
 
-                    # Outer product and accumulate
-                    acc += x_vals[:, None] * w_vals[None, :]
+        # Decompose k_idx into (c_in, kd, kh, kw)
+        kernel_spatial = KD * KH * KW
+        ci = k_idx // kernel_spatial
+        rem_k = k_idx - ci * kernel_spatial
+        kd = rem_k // (KH * KW)
+        rem_k2 = rem_k - kd * (KH * KW)
+        kh = rem_k2 // KW
+        kw = rem_k2 - kh * KW
 
-    # Add bias if provided
-    if b_ptr is not None:
-        b_vals = tl.load(b_ptr + offs_n, mask=mask_n, other=0.0)
-        b_vals = b_vals.to(tl.float32)
-        acc += b_vals[None, :]
+        # Compute input indices for this tile: (n_m, ci, d_in, h_in, w_in)
+        d_in = d_out_m[:, None] + kd[None, :]
+        h_in = h_out_m[:, None] + kh[None, :]
+        w_in = w_out_m[:, None] + kw[None, :]
 
-    # Store result to output tensor
-    y_ptrs = (
-        y_ptr
-        + n_idx[:, None] * stride_y_n
-        + offs_n[None, :] * stride_y_c
-        + od_idx[:, None] * stride_y_d
-        + oh_idx[:, None] * stride_y_h
-        + ow_idx[:, None] * stride_y_w
-    )
-    mask = mask_m[:, None] & mask_n[None, :]
-    tl.store(y_ptrs, acc.to(tl.float32), mask=mask)
-
-
-def conv3d_triton_ncdhw(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor):
-    """
-    3D convolution (N, C, D, H, W) * (C_out, C_in, Kd, Kh, Kw) -> (N, C_out, D_out, H_out, W_out)
-    Implemented in Triton for stride=1, padding=0, dilation=1.
-    """
-    assert x.dim() == 5, "Input must be NCDHW"
-    assert weight.dim() == 5, "Weight must be (C_out, C_in, Kd, Kh, Kw)"
-    assert x.is_cuda and weight.is_cuda, "Tensors must be on CUDA device"
-
-    N, C_in, D_in, H_in, W_in = x.shape
-    C_out, C_in_w, Kd, Kh, Kw = weight.shape
-    assert C_in == C_in_w, "In-channel mismatch between input and weight"
-
-    # Output dimensions (valid convolution, no padding, stride=1)
-    D_out = D_in - Kd + 1
-    H_out = H_in - Kh + 1
-    W_out = W_in - Kw + 1
-    assert D_out > 0 and H_out > 0 and W_out > 0, "Kernel larger than input"
-
-    y = torch.empty(
-        (N, C_out, D_out, H_out, W_out),
-        device=x.device,
-        dtype=torch.float32,  # accumulator/output in fp32
-    )
-
-    # Flattened number of output positions
-    P = N * D_out * H_out * W_out
-
-    # Strides
-    stride_x_n, stride_x_c, stride_x_d, stride_x_h, stride_x_w = x.stride()
-    stride_w_co, stride_w_ci, stride_w_kd, stride_w_kh, stride_w_kw = weight.stride()
-    stride_y_n, stride_y_c, stride_y_d, stride_y_h, stride_y_w = y.stride()
-
-    # Grid over flattened spatial+batch (P) and output channels (C_out)
-    def grid(meta):
-        return (
-            triton.cdiv(P, meta['BLOCK_M']),
-            triton.cdiv(C_out, meta['BLOCK_N']),
+        # Pointers for input X: shape [BLOCK_M, BLOCK_K]
+        x_ptrs = (
+            x_ptr
+            + n_m[:, None] * stride_xn
+            + ci[None, :] * stride_xc
+            + d_in * stride_xd
+            + h_in * stride_xh
+            + w_in * stride_xw
         )
 
-    # Bias pointer (ModelNew always allocates bias, so it's non-None in practice)
-    b_ptr = bias
+        mask_a = (offs_m[:, None] < M) & (k_idx[None, :] < K)
+        a = tl.load(x_ptrs, mask=mask_a, other=0.0)
+        a = a.to(tl.float32)
 
-    conv3d_ncdhw_kernel[grid](
-        x, weight, b_ptr, y,
-        N, C_in, C_out,
-        D_in, H_in, W_in,
-        Kd, Kh, Kw,
+        # Pointers for weights matrix W2D: [K, C_out] => [BLOCK_K, BLOCK_N]
+        w_ptrs = w2d_ptr + k_idx[:, None] * stride_wk + offs_n[None, :] * stride_wn
+        mask_b = (k_idx[:, None] < K) & (offs_n[None, :] < C_out)
+        b = tl.load(w_ptrs, mask=mask_b, other=0.0)
+        b = b.to(tl.float32)
+
+        # Matrix multiply accumulate
+        acc += tl.dot(a, b, allow_tf32=True)
+
+    # Add bias along channel dimension
+    bias = tl.load(bias_ptr + offs_n, mask=offs_n < C_out, other=0.0)
+    acc = acc + bias[None, :]
+
+    # ---- Fused stable softmax over channel dimension (dim=1 of PyTorch NCDHW) ----
+    # valid masks for rows (M) and channels (C_out)
+    valid_m = offs_m < M
+    valid_n = offs_n < C_out
+    mask = valid_m[:, None] & valid_n[None, :]
+
+    # Set invalid positions to -inf so they don't affect max / sum
+    neg_inf = -float("inf")
+    acc_masked = tl.where(mask, acc, neg_inf)
+
+    # Row-wise max over channels
+    row_max = tl.max(acc_masked, axis=1)  # [BLOCK_M]
+
+    # Subtract max, exponentiate
+    x_shifted = acc_masked - row_max[:, None]
+    num = tl.exp(x_shifted)
+
+    # Row-wise sum of exp
+    den = tl.sum(num, axis=1)  # [BLOCK_M]
+
+    # Normalize
+    softmax = num / den[:, None]
+
+    # ---- Store result to output tensor [N, C_out, D_out, H_out, W_out] ----
+    o_ptrs = (
+        o_ptr
+        + n_m[:, None] * stride_on
+        + offs_n[None, :] * stride_oc
+        + d_out_m[:, None] * stride_od
+        + h_out_m[:, None] * stride_oh
+        + w_out_m[:, None] * stride_ow
+    )
+    tl.store(o_ptrs, softmax, mask=mask)
+
+
+def triton_conv3d_softmax(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    Fused Conv3d + Softmax(dim=1) for 5D tensor [N, C_in, D, H, W].
+
+    x:      [N, C_in, D, H, W]
+    weight: [C_out, C_in, KD, KH, KW]
+    bias:   [C_out]
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+    x = x.contiguous()
+    weight = weight.contiguous()
+    bias = bias.contiguous()
+
+    N, C_in, D, H, W = x.shape
+    C_out, C_in_w, KD, KH, KW = weight.shape
+    assert C_in == C_in_w
+
+    # Output dimensions (no padding, stride=1, dilation=1)
+    D_out = D - KD + 1
+    H_out = H - KH + 1
+    W_out = W - KW + 1
+
+    # Flatten spatial + batch into M, channels into N for GEMM
+    M = N * D_out * H_out * W_out
+    K = C_in * KD * KH * KW
+
+    # Prepare weights as [K, C_out]
+    w2d = weight.view(C_out, -1).t().contiguous()  # [K, C_out]
+
+    # Allocate output for softmax probabilities
+    out = torch.empty((N, C_out, D_out, H_out, W_out), device=x.device, dtype=torch.float32)
+
+    stride_xn, stride_xc, stride_xd, stride_xh, stride_xw = x.stride()
+    stride_on, stride_oc, stride_od, stride_oh, stride_ow = out.stride()
+    stride_wk, stride_wn = w2d.stride()
+
+    # Block sizes (power-of-two as required)
+    BLOCK_M = 16
+    BLOCK_K = 32
+
+    # Choose BLOCK_N as next power-of-two >= C_out, capped at 256
+    BLOCK_N = 1
+    max_block_n = 256
+    while BLOCK_N < C_out and BLOCK_N < max_block_n:
+        BLOCK_N *= 2
+    # For correctness of fused softmax, all channels must be within one program instance
+    assert C_out <= BLOCK_N, "Fused conv+softmax kernel supports up to 256 output channels"
+
+    grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]),)
+
+    conv3d_softmax_kernel[grid](
+        x, w2d, bias, out,
+        N, C_in, D, H, W,
+        C_out, KD, KH, KW,
         D_out, H_out, W_out,
-        P,
-        stride_x_n, stride_x_c, stride_x_d, stride_x_h, stride_x_w,
-        stride_w_co, stride_w_ci, stride_w_kd, stride_w_kh, stride_w_kw,
-        stride_y_n, stride_y_c, stride_y_d, stride_y_h, stride_y_w,
+        M, K,
+        stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
+        stride_wk, stride_wn,
+        stride_on, stride_oc, stride_od, stride_oh, stride_ow,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+    )
+
+    return out
+
+
+@triton.jit
+def maxpool3d_kernel(
+    x_ptr, y_ptr,
+    N, C, D, H, W,
+    KD, KH, KW,
+    SD, SH, SW,
+    D_out, H_out, W_out,
+    stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
+    stride_yn, stride_yc, stride_yd, stride_yh, stride_yw,
+    BLOCK_W: tl.constexpr,
+):
+    # pid_m indexes over (n, c, d_out, h_out)
+    pid_m = tl.program_id(0)
+    pid_w = tl.program_id(1)
+
+    offs_w = pid_w * BLOCK_W + tl.arange(0, BLOCK_W)
+
+    # Map pid_m -> (n, c, d_out, h_out)
+    CH_out = C * D_out * H_out
+    DH_out = D_out * H_out
+
+    n = pid_m // CH_out
+    rem = pid_m - n * CH_out
+    c = rem // DH_out
+    rem2 = rem - c * DH_out
+    d_out = rem2 // H_out
+    h_out = rem2 - d_out * H_out
+
+    w_out = offs_w
+
+    # Compute input window start
+    d_start = d_out * SD
+    h_start = h_out * SH
+    w_start = w_out * SW
+
+    # Initialize max with -inf
+    val = tl.full((BLOCK_W,), -float("inf"), dtype=tl.float32)
+
+    # Iterate over kernel window
+    for kd in range(0, KD):
+        d_in = d_start + kd
+        for kh in range(0, KH):
+            h_in = h_start + kh
+            for kw in range(0, KW):
+                w_in = w_start + kw
+
+                x_ptrs = (
+                    x_ptr
+                    + n * stride_xn
+                    + c * stride_xc
+                    + d_in * stride_xd
+                    + h_in * stride_xh
+                    + w_in * stride_xw
+                )
+
+                in_bounds = (
+                    (w_out < W_out)
+                    & (d_in >= 0) & (d_in < D)
+                    & (h_in >= 0) & (h_in < H)
+                    & (w_in >= 0) & (w_in < W)
+                )
+
+                x_vals = tl.load(x_ptrs, mask=in_bounds, other=-float("inf"))
+                x_vals = x_vals.to(tl.float32)
+                val = tl.maximum(val, x_vals)
+
+    # Store result
+    y_ptrs = (
+        y_ptr
+        + n * stride_yn
+        + c * stride_yc
+        + d_out * stride_yd
+        + h_out * stride_yh
+        + w_out * stride_yw
+    )
+    mask_o = (w_out < W_out)
+    tl.store(y_ptrs, val, mask=mask_o)
+
+
+def triton_maxpool3d(x: torch.Tensor, kernel_size, stride=None) -> torch.Tensor:
+    """
+    MaxPool3d with given kernel_size and stride (no padding, no dilation), NCDHW layout.
+    """
+    assert x.is_cuda
+    x = x.contiguous()
+    N, C, D, H, W = x.shape
+
+    if isinstance(kernel_size, int):
+        KD = KH = KW = kernel_size
+    else:
+        KD, KH, KW = kernel_size
+
+    if stride is None:
+        SD = KD
+        SH = KH
+        SW = KW
+    else:
+        if isinstance(stride, int):
+            SD = SH = SW = stride
+        else:
+            SD, SH, SW = stride
+
+    # Output dims (PyTorch formula with pad=0, dilation=1)
+    D_out = (D - KD) // SD + 1
+    H_out = (H - KH) // SH + 1
+    W_out = (W - KW) // SW + 1
+
+    y = torch.empty((N, C, D_out, H_out, W_out), device=x.device, dtype=torch.float32)
+
+    stride_xn, stride_xc, stride_xd, stride_xh, stride_xw = x.stride()
+    stride_yn, stride_yc, stride_yd, stride_yh, stride_yw = y.stride()
+
+    BLOCK_W = 64
+    grid = lambda META: (
+        max(1, N * C * D_out * H_out),
+        triton.cdiv(W_out, META["BLOCK_W"]),
+    )
+
+    maxpool3d_kernel[grid](
+        x, y,
+        N, C, D, H, W,
+        KD, KH, KW,
+        SD, SH, SW,
+        D_out, H_out, W_out,
+        stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
+        stride_yn, stride_yc, stride_yd, stride_yh, stride_yw,
+        BLOCK_W=BLOCK_W,
     )
 
     return y
@@ -220,72 +348,79 @@ def conv3d_triton_ncdhw(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tenso
 
 class ModelNew(nn.Module):
     """
-    Triton-accelerated version of:
-      Conv3d -> Softmax (dim=1) -> MaxPool3d -> MaxPool3d
-    Conv3d is implemented in Triton; softmax and pooling use PyTorch.
+    Triton-optimized replacement for:
+      Conv3d -> Softmax(dim=1) -> MaxPool3d -> MaxPool3d
     """
-
     def __init__(self, in_channels, out_channels, kernel_size, pool_kernel_size):
         super(ModelNew, self).__init__()
 
-        # Normalize kernel_size to 3D (int -> (k,k,k))
         if isinstance(kernel_size, int):
             kd = kh = kw = kernel_size
         else:
             kd, kh, kw = kernel_size
-        self.kernel_size = (kd, kh, kw)
+        self.kd = kd
+        self.kh = kh
+        self.kw = kw
 
-        # Parameters for Conv3d: (C_out, C_in, Kd, Kh, Kw)
-        self.weight = nn.Parameter(
-            torch.empty(out_channels, in_channels, kd, kh, kw)
-        )
-        self.bias = nn.Parameter(torch.empty(out_channels))
+        self.weight = nn.Parameter(torch.randn(out_channels, in_channels, kd, kh, kw))
+        self.bias = nn.Parameter(torch.randn(out_channels))
 
-        # Use a similar initialization to nn.Conv3d
-        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
-        fan_in = in_channels * kd * kh * kw
-        bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
-        nn.init.uniform_(self.bias, -bound, bound)
-
-        # Max pooling layers (same as original)
-        self.pool1 = nn.MaxPool3d(pool_kernel_size)
-        self.pool2 = nn.MaxPool3d(pool_kernel_size)
+        if isinstance(pool_kernel_size, int):
+            self.pool_kernel = (pool_kernel_size, pool_kernel_size, pool_kernel_size)
+        else:
+            self.pool_kernel = tuple(pool_kernel_size)
 
     def forward(self, x):
-        # x: (N, C_in, D, H, W)
-        # Conv3d via Triton
-        y = conv3d_triton_ncdhw(x, self.weight, self.bias)
+        # x: [N, C_in, D, H, W]
+        x = x.to(dtype=torch.float32, device=self.weight.device)
 
-        # Softmax over channels (dim=1), then two max-pool layers
-        y = torch.softmax(y, dim=1)
-        y = self.pool1(y)
-        y = self.pool2(y)
-        return y
+        # Fused Conv3d + Softmax over channel dimension
+        x = triton_conv3d_softmax(x, self.weight, self.bias)          # [N, C_out, D', H', W']
+        # Two successive MaxPool3d operations
+        x = triton_maxpool3d(x, self.pool_kernel, self.pool_kernel)   # first MaxPool3d
+        x = triton_maxpool3d(x, self.pool_kernel, self.pool_kernel)   # second MaxPool3d
+        return x
 ```
 
 [NCU PROFILING METRICS]
 {
-  "conv3d_ncdhw_kernel": {
-    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 57.24,
-    "launch__grid_size": 25200,
-    "sm__warps_active.avg.pct_of_peak_sustained_active": 16.57,
-    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 4.43,
-    "lts__t_sector_hit_rate.pct": 89.33
+  "conv3d_softmax_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 77.72,
+    "launch__grid_size": 100800,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 82.09,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 10.4,
+    "lts__t_sector_hit_rate.pct": 97.2
+  },
+  "maxpool3d_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 85.54,
+    "launch__grid_size": 43008,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 88.61,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 14.66,
+    "lts__t_sector_hit_rate.pct": 28.55
   }
 }
 
 **Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
 
-TRITON API CONSTRAINTS (CRITICAL):
-- Triton has NO: tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+## CRITICAL — Code MUST compile and run:
+1. EVERY kernel function MUST have `@triton.jit` decorator
+2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+3. BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+4. `tl.program_id(axis)` only supports axis = 0, 1, 2
+5. No `continue`, `break`, `return` inside loops — use masking
+6. No tensor indexing with loop vars: `x[:, i]` is INVALID
+7. mask shape MUST match data shape in tl.load/tl.store
 
-OUTPUT RULES (STRICT):
-1. Follow this exact order:
-   1. Imports: torch, torch.nn, triton, triton.language as tl
-   2. @triton.jit decorated kernel function(s)
-   3. Wrapper function(s) for grid calculation and kernel launch
-   4. class ModelNew(nn.Module) that calls your kernels
-2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+## Missing Triton Functions (implement manually):
+- tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+## OUTPUT FORMAT (STRICT):
+1. Imports: torch, torch.nn, triton, triton.language as tl
+2. @triton.jit decorated kernel function(s)
+3. Wrapper function(s) for grid calculation and kernel launch
+4. class ModelNew(nn.Module) that calls your kernels
+
+Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
 
 ```python
 # <optimized Triton code>

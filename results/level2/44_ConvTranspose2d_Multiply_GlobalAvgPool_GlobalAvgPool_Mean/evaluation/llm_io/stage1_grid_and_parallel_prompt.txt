@@ -1,34 +1,12 @@
 You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
 
-# Target GPU
-GPU Name: 4090
-Architecture: Ada Lovelace
-• Compute Capability: 8.9
-• Number of SMs: 128
-• Memory Bandwidth: 1008 GB/s
-• TF32 Tensor Core TFLOPS: 82.6 with dense
-• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
-• FP16 Tensor Core TFLOPS: 165.2 with dense
-• Maximum number of registers per thread: 255
-• Maximum threads per block: 1024
-• Maximum threads per SM: 1536
-• Warp size: 32
-• Maximum concurrent warps per SM: 48
-• Shared memory capacity per SM: 100 KB
-• Maximum shared memory per thread block: 99 KB
-• L2 cache (global, all SM shared): 72 MB
+# Target GPU: 4090
 
 [OPTIMIZATION STAGE]
 
 ## Current Optimization Stage
 
 Focus: Grid layout & indexing for FUSED operations.
-
-⚠️ FUSION EXCLUSIONS (do NOT apply fusion rules to these):
-- Reduction ops (sum, mean, softmax along axis)
-- Atomic operations
-- Irregular/data-dependent access patterns
-- Cross-block dependencies
 
 Key Principle:
 - All fused ops share the SAME grid AND the SAME (offsets, mask) tuple
@@ -50,6 +28,7 @@ Verification:
 
 [CURRENT CODE]
 ```python
+import math
 import torch
 import torch.nn as nn
 import triton
@@ -57,155 +36,456 @@ import triton.language as tl
 
 
 @triton.jit
-def fused_multiply_gap_kernel(
-    x_ptr,  # Input pointer
-    out_ptr,  # Output pointer
-    multiplier,
-    N, C, H, W,
-    stride_xn, stride_xc, stride_xh, stride_xw,
-    stride_on, stride_oc, stride_oh, stride_ow,
-    BLOCK_C: tl.constexpr,
-    BLOCK_HW: tl.constexpr,
+def compute_u_kernel(
+    x_ptr,      # float32[B, Cin, H_in, W_in]
+    u_ptr,      # float32[B, Cin, K_h, K_w]
+    B,          # batch size (runtime)
+    H_in, W_in,
+    H_out, W_out,
+    stride_h, stride_w,
+    pad_h, pad_w,
+    stride_xb, stride_xc, stride_xh, stride_xw,
+    stride_ub, stride_uci, stride_ukh, stride_ukw,
+    Cin: tl.constexpr,
+    KERNEL_H: tl.constexpr,
+    KERNEL_W: tl.constexpr,
+    H_IN: tl.constexpr,
+    W_IN: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+    KH_BLOCK: tl.constexpr,
+    KW_BLOCK: tl.constexpr,
 ):
     """
-    Fused kernel: Multiply scalar + Global Average Pooling over H,W
-    Input: [N, C, H, W] -> Output: [N, C, 1, 1]
+    Stage 1: For each (b, ci), compute
+
+        U[b, ci, kh, kw] = sum_{hi, wi} x[b, ci, hi, wi] *
+                           I_h(hi, kh) * I_w(wi, kw)
+
+    where:
+        ho = hi * stride_h - pad_h + kh
+        wo = wi * stride_w - pad_w + kw
+        I_h(hi, kh) = 1 if 0 <= ho < H_out else 0
+        I_w(wi, kw) = 1 if 0 <= wo < W_out else 0
+
+    This is the spatially aggregated contribution of input channel ci
+    for kernel tap (kh, kw), independent of output channels.
     """
-    pid_n = tl.program_id(0)  # Batch dimension
-    pid_c = tl.program_id(1)  # Channel block index
-    
-    if pid_n >= N:
+    pid_b = tl.program_id(0)
+    pid_ci = tl.program_id(1)
+
+    # Guard (in case grid is larger than B or Cin)
+    if (pid_b >= B) or (pid_ci >= Cin):
         return
-    
-    # Channel offsets for this block
-    c_offsets = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
-    c_mask = c_offsets < C
-    
-    # Initialize accumulation for each channel in this block
-    channel_sum = tl.zeros((BLOCK_C,), dtype=tl.float32)
-    
-    # Process spatial dimensions in tiles
-    hw_size = H * W
-    for hw_start in range(0, hw_size, BLOCK_HW):
-        hw_offsets = hw_start + tl.arange(0, BLOCK_HW)
-        hw_mask = hw_offsets < hw_size
-        
-        # Convert 1D spatial offset to 2D (h, w)
-        h = hw_offsets // W
-        w = hw_offsets % W
-        
-        # Load and process tile for all channels in block
-        # Compute pointer offsets for all channels in block
-        x_base = pid_n * stride_xn + c_offsets[:, None] * stride_xc
-        
-        # Compute spatial offsets (broadcast across channels)
-        h_offsets = h[None, :] * stride_xh
-        w_offsets = w[None, :] * stride_xw
-        
-        # Combined pointer offsets for all (channel, spatial) combinations
-        ptr_offsets = x_base + h_offsets + w_offsets  # Shape: [BLOCK_C, BLOCK_HW]
-        
-        # Create 2D mask for valid (channel, spatial) positions
-        mask_2d = c_mask[:, None] & hw_mask[None, :]
-        
-        # Load data block with masking
-        block = tl.load(x_ptr + ptr_offsets, mask=mask_2d, other=0.0)
-        
-        # Accumulate over spatial dimension
-        channel_sum += tl.sum(block, axis=1)
-    
-    # Compute average and apply multiplier
-    spatial_size = H * W
-    channel_avg = channel_sum / spatial_size
-    result = channel_avg * multiplier
-    
-    # Store results at position (n, c, 0, 0)
-    out_base = pid_n * stride_on + c_offsets * stride_oc
-    tl.store(out_ptr + out_base, result, mask=c_mask)
+
+    # Accumulator over kernel taps: [KH_BLOCK, KW_BLOCK]
+    # KH_BLOCK, KW_BLOCK are power-of-two supersets of KERNEL_H/W.
+    acc = tl.zeros((KH_BLOCK, KW_BLOCK), dtype=tl.float32)
+
+    # Kernel offset vectors (padded to power-of-two)
+    offs_kh = tl.arange(0, KH_BLOCK)
+    offs_kw = tl.arange(0, KW_BLOCK)
+    mask_kh = offs_kh < KERNEL_H
+    mask_kw = offs_kw < KERNEL_W
+
+    # Loop over input height
+    for hi in range(0, H_IN):
+        # Row accumulator over kw for this hi: [KW_BLOCK]
+        row_acc_kw = tl.zeros((KW_BLOCK,), dtype=tl.float32)
+
+        # Base pointer for this input row
+        row_ptr = (
+            x_ptr
+            + pid_b * stride_xb
+            + pid_ci * stride_xc
+            + hi * stride_xh
+        )
+
+        # Tile over width
+        for w_start in range(0, W_IN, BLOCK_W):
+            offs_w = w_start + tl.arange(0, BLOCK_W)
+            mask_w = offs_w < W_in
+
+            x_ptrs = row_ptr + offs_w * stride_xw
+            x_vals = tl.load(x_ptrs, mask=mask_w, other=0.0)  # [BLOCK_W]
+
+            # Compute contributions for all kw in a vectorized way.
+            # wi: [1, BLOCK_W]
+            wi = offs_w[None, :]
+            # kw: [KW_BLOCK, 1]
+            kw2d = offs_kw[:, None]
+
+            # wo = wi * stride_w - pad_w + kw, shape [KW_BLOCK, BLOCK_W]
+            wo = wi * stride_w - pad_w + kw2d
+
+            # Valid width mask: [KW_BLOCK, BLOCK_W]
+            valid_w = (
+                (wo >= 0)
+                & (wo < W_out)
+                & (mask_w[None, :])
+                & (mask_kw[:, None])
+            )
+
+            # Broadcast x_vals to [1, BLOCK_W] -> [KW_BLOCK, BLOCK_W]
+            x2d = x_vals[None, :]
+
+            contrib = tl.where(valid_w, x2d, 0.0)  # [KW_BLOCK, BLOCK_W]
+            # Sum over width dimension -> [KW_BLOCK]
+            row_acc_kw += tl.sum(contrib, axis=1)
+
+        # Now combine along height dimension using I_h(hi, kh)
+        ho_base = hi * stride_h - pad_h
+        ho = ho_base + offs_kh  # [KH_BLOCK]
+        valid_h = (
+            (ho >= 0)
+            & (ho < H_out)
+            & mask_kh
+        )
+        valid_h_f = valid_h.to(tl.float32)  # [KH_BLOCK]
+
+        # Outer product: [KH_BLOCK, 1] * [1, KW_BLOCK] -> [KH_BLOCK, KW_BLOCK]
+        valid_h_2d = valid_h_f[:, None]
+        row_acc_2d = row_acc_kw[None, :]
+
+        acc += valid_h_2d * row_acc_2d
+
+    # Store U[b, ci, :, :]
+    base_u_ptr = u_ptr + pid_b * stride_ub + pid_ci * stride_uci
+    offs_kh_2d = offs_kh[:, None]
+    offs_kw_2d = offs_kw[None, :]
+    u_ptrs = base_u_ptr + offs_kh_2d * stride_ukh + offs_kw_2d * stride_ukw
+    mask_store = (offs_kh_2d < KERNEL_H) & (offs_kw_2d < KERNEL_W)
+    tl.store(u_ptrs, acc, mask=mask_store)
 
 
-def fused_multiply_gap(x, multiplier):
+@triton.jit
+def contract_u_w_kernel(
+    u_ptr,      # float32[B, Cin, K_h, K_w]
+    w_ptr,      # float32[Cin, Cout, K_h, K_w]
+    sum_ptr,    # float32[B, Cout] (spatially summed conv output, no bias)
+    B, Cout,
+    stride_ub, stride_uci, stride_ukh, stride_ukw,
+    stride_wci, stride_wco, stride_wkh, stride_wkw,
+    stride_sum_b, stride_sum_c,
+    Cin: tl.constexpr,
+    KERNEL_H: tl.constexpr,
+    KERNEL_W: tl.constexpr,
+    BLOCK_CO: tl.constexpr,
+):
     """
-    Fused: Multiply scalar + Global Average Pooling
-    Input: [N, C, H, W] -> Output: [N, C, 1, 1]
+    Stage 2: Contract U with weights to get the global spatial sums
+    over output channels:
+
+        S[b, co] = sum_{ci, kh, kw} U[b, ci, kh, kw] * w[ci, co, kh, kw]
     """
-    N, C, H, W = x.shape
-    
-    # Output tensor with shape [N, C, 1, 1]
-    out = torch.empty((N, C, 1, 1), device=x.device, dtype=x.dtype)
-    
-    # Choose block sizes as powers of 2
-    # Limit BLOCK_C to improve occupancy
-    BLOCK_C = min(triton.next_power_of_2(C), 128)
-    # Adjust BLOCK_HW based on available shared memory and register pressure
-    max_hw = min(H * W, 1024 // BLOCK_C)  # Heuristic for better performance
-    BLOCK_HW = min(triton.next_power_of_2(max_hw), 256)
-    
-    # Grid: (N, number of channel blocks)
-    grid = (N, triton.cdiv(C, BLOCK_C))
-    
-    # Launch kernel
-    fused_multiply_gap_kernel[grid](
-        x, out, multiplier,
-        N, C, H, W,
-        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
-        out.stride(0), out.stride(1), out.stride(2), out.stride(3),
-        BLOCK_C=BLOCK_C,
-        BLOCK_HW=BLOCK_HW,
+    pid_b = tl.program_id(0)
+    pid_co_block = tl.program_id(1)
+
+    if pid_b >= B:
+        return
+
+    offs_co = pid_co_block * BLOCK_CO + tl.arange(0, BLOCK_CO)
+    mask_co = offs_co < Cout
+
+    # Accumulator over output channel block
+    acc_co = tl.zeros((BLOCK_CO,), dtype=tl.float32)
+
+    # Loop over input channels and kernel taps
+    for ci in range(0, Cin):
+        # Base pointer for U[b, ci, :, :]
+        base_u_ptr = u_ptr + pid_b * stride_ub + ci * stride_uci
+
+        for kh in range(0, KERNEL_H):
+            for kw in range(0, KERNEL_W):
+                # Load scalar U[b, ci, kh, kw]
+                u_val_ptr = base_u_ptr + kh * stride_ukh + kw * stride_ukw
+                u_val = tl.load(u_val_ptr)
+
+                # Load weight vector w[ci, offs_co, kh, kw]
+                w_ptrs = (
+                    w_ptr
+                    + ci * stride_wci
+                    + offs_co * stride_wco
+                    + kh * stride_wkh
+                    + kw * stride_wkw
+                )
+                w_vals = tl.load(w_ptrs, mask=mask_co, other=0.0)
+
+                acc_co += w_vals * u_val
+
+    # Store the accumulated spatial sums
+    sum_ptrs = sum_ptr + pid_b * stride_sum_b + offs_co * stride_sum_c
+    tl.store(sum_ptrs, acc_co, mask=mask_co)
+
+
+@triton.jit
+def avg_affine_kernel(
+    sum_ptr,      # float32[B, C]
+    bias_ptr,     # float32[C]
+    out_ptr,      # float32[B, C]
+    B, C,
+    spatial_size,
+    multiplier,
+    stride_sum_b, stride_sum_c,
+    stride_out_b, stride_out_c,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    total = B * C
+    mask = offs < total
+
+    b = offs // C
+    c = offs - b * C
+
+    sum_ptrs = sum_ptr + b * stride_sum_b + c * stride_sum_c
+    s = tl.load(sum_ptrs, mask=mask, other=0.0)
+
+    bias = tl.load(bias_ptr + c, mask=mask, other=0.0)
+
+    # First global average pooling, then add bias, then multiply by scalar.
+    val = multiplier * (s / spatial_size + bias)
+
+    out_ptrs = out_ptr + b * stride_out_b + c * stride_out_c
+    tl.store(out_ptrs, val, mask=mask)
+
+
+def conv_transpose2d_global_avg_triton(x, weight, bias, stride, padding, output_padding, multiplier):
+    """
+    Computes:
+        y = conv_transpose2d(x, weight, bias, stride, padding, output_padding)
+        y = y * multiplier
+        y = global_avg_pool(y)  # over H_out, W_out
+        y = global_avg_pool(y)  # over spatial 1x1 => no-op
+
+    Returns tensor of shape [B, C_out, 1, 1].
+
+    Implementation uses a two-stage algorithm:
+      1) Aggregate input contributions per (b, ci, kh, kw) (independent of output channels).
+      2) Contract those aggregates with weights to get spatial sums per (b, co).
+      3) Apply global average pooling, bias, and multiplier.
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+    assert x.dtype == torch.float32 and weight.dtype == torch.float32 and bias.dtype == torch.float32
+
+    B, Cin, H_in, W_in = x.shape
+    Cin_w, Cout, K_h, K_w = weight.shape
+    assert Cin_w == Cin, "Weight in_channels must match input channels"
+
+    # Normalize stride/padding/output_padding to 2D tuples
+    def _to_pair(v):
+        if isinstance(v, int):
+            return (v, v)
+        return v
+
+    stride_h, stride_w = _to_pair(stride)
+    pad_h, pad_w = _to_pair(padding)
+    out_pad_h, out_pad_w = _to_pair(output_padding)
+
+    # Compute output spatial size (PyTorch conv_transpose2d formula, dilation=1)
+    H_out = (H_in - 1) * stride_h - 2 * pad_h + (K_h - 1) + out_pad_h + 1
+    W_out = (W_in - 1) * stride_w - 2 * pad_w + (K_w - 1) + out_pad_w + 1
+
+    # Stage 1: compute U[b, ci, kh, kw]
+    U = torch.empty((B, Cin, K_h, K_w), device=x.device, dtype=torch.float32)
+
+    stride_xb, stride_xc, stride_xh, stride_xw = x.stride()
+    stride_ub, stride_uci, stride_ukh, stride_ukw = U.stride()
+
+    # Tile width for stage-1 reduction (power of two)
+    BLOCK_W = 64
+
+    # Choose power-of-two blocks that cover kernel sizes
+    def _next_power_of_2(v: int) -> int:
+        if v <= 1:
+            return 1
+        return 1 << (v - 1).bit_length()
+
+    KH_BLOCK = _next_power_of_2(K_h)
+    KW_BLOCK = _next_power_of_2(K_w)
+
+    # Ensure grid dims are positive
+    grid1 = (max(1, B), max(1, Cin))
+    compute_u_kernel[grid1](
+        x,
+        U,
+        B,
+        H_in,
+        W_in,
+        H_out,
+        W_out,
+        stride_h,
+        stride_w,
+        pad_h,
+        pad_w,
+        stride_xb,
+        stride_xc,
+        stride_xh,
+        stride_xw,
+        stride_ub,
+        stride_uci,
+        stride_ukh,
+        stride_ukw,
+        Cin=Cin,
+        KERNEL_H=K_h,
+        KERNEL_W=K_w,
+        H_IN=H_in,
+        W_IN=W_in,
+        BLOCK_W=BLOCK_W,
+        KH_BLOCK=KH_BLOCK,
+        KW_BLOCK=KW_BLOCK,
     )
-    return out
+
+    # Stage 2: contract U with weights to get spatial sums S_conv[b, co]
+    sum_conv = torch.empty((B, Cout), device=x.device, dtype=torch.float32)
+
+    stride_wci, stride_wco, stride_wkh, stride_wkw = weight.stride()
+    stride_sum_b, stride_sum_c = sum_conv.stride()
+
+    BLOCK_CO = 64  # power-of-two block for output channels
+    grid2 = (max(1, B), triton.cdiv(Cout, BLOCK_CO))
+
+    contract_u_w_kernel[grid2](
+        U,
+        weight,
+        sum_conv,
+        B,
+        Cout,
+        stride_ub,
+        stride_uci,
+        stride_ukh,
+        stride_ukw,
+        stride_wci,
+        stride_wco,
+        stride_wkh,
+        stride_wkw,
+        stride_sum_b,
+        stride_sum_c,
+        Cin=Cin,
+        KERNEL_H=K_h,
+        KERNEL_W=K_w,
+        BLOCK_CO=BLOCK_CO,
+    )
+
+    # Stage 3: apply global average pooling, bias, and multiplier
+    out = torch.empty_like(sum_conv)
+
+    stride_out_b, stride_out_c = out.stride()
+    spatial_size = H_out * W_out
+
+    BLOCK = 128  # power-of-two block for (B * Cout)
+    grid3 = (max(1, triton.cdiv(B * Cout, BLOCK)),)
+
+    avg_affine_kernel[grid3](
+        sum_conv,
+        bias,
+        out,
+        B,
+        Cout,
+        spatial_size,
+        float(multiplier),
+        stride_sum_b,
+        stride_sum_c,
+        stride_out_b,
+        stride_out_c,
+        BLOCK=BLOCK,
+    )
+
+    # Second global average pooling over 1x1 is a no-op.
+    return out.view(B, Cout, 1, 1)
 
 
 class ModelNew(nn.Module):
-    """
-    ConvTranspose2d (PyTorch native) + Fused multiply + GAP
-    
-    NOTE: ConvTranspose2d uses PyTorch's native implementation.
-    Only the scalar multiplication and global average pooling are fused in Triton.
-    """
-    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, 
-                 output_padding, multiplier):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, multiplier):
         super(ModelNew, self).__init__()
-        # ConvTranspose2d remains PyTorch native
-        self.conv_transpose = nn.ConvTranspose2d(
-            in_channels, out_channels, kernel_size, 
-            stride=stride, padding=padding, 
-            output_padding=output_padding
-        )
-        self.multiplier = multiplier
-    
+
+        # Normalize kernel_size/stride/padding/output_padding
+        def _to_pair(v):
+            if isinstance(v, int):
+                return (v, v)
+            return v
+
+        if isinstance(kernel_size, int):
+            k_h = k_w = kernel_size
+        else:
+            k_h, k_w = kernel_size
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = (k_h, k_w)
+        self.stride = _to_pair(stride)
+        self.padding = _to_pair(padding)
+        self.output_padding = _to_pair(output_padding)
+        self.multiplier = float(multiplier)
+
+        # Parameters to be mapped from original ConvTranspose2d
+        # Weight layout matches nn.ConvTranspose2d: [in_channels, out_channels, k_h, k_w]
+        self.weight = nn.Parameter(torch.empty(in_channels, out_channels, k_h, k_w))
+        self.bias = nn.Parameter(torch.empty(out_channels))
+
+        # Initialize similarly to nn.ConvTranspose2d (Kaiming uniform)
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        fan_in = in_channels * k_h * k_w
+        bound = 1 / math.sqrt(fan_in)
+        nn.init.uniform_(self.bias, -bound, bound)
+
     def forward(self, x):
-        # Step 1: PyTorch native ConvTranspose2d
-        x = self.conv_transpose(x)
-        # Step 2: Fused scalar multiplication + global average pooling
-        x = fused_multiply_gap(x, self.multiplier)
-        # Second GAP is redundant (input is already 1x1)
-        return x
+        return conv_transpose2d_global_avg_triton(
+            x,
+            self.weight,
+            self.bias,
+            self.stride,
+            self.padding,
+            self.output_padding,
+            self.multiplier,
+        )
 ```
 
 [NCU PROFILING METRICS]
 {
-  "fused_multiply_gap_kernel": {
-    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 0.49,
-    "launch__grid_size": 16,
+  "compute_u_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 79.15,
+    "launch__grid_size": 1024,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 60.67,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 36.65,
+    "lts__t_sector_hit_rate.pct": 0.58
+  },
+  "contract_u_w_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 3.13,
+    "launch__grid_size": 32,
     "sm__warps_active.avg.pct_of_peak_sustained_active": 8.33,
-    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 13.07,
-    "lts__t_sector_hit_rate.pct": 0.05
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 1.04,
+    "lts__t_sector_hit_rate.pct": 93.24
+  },
+  "avg_affine_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 0.21,
+    "launch__grid_size": 16,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 8.28,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 0.61,
+    "lts__t_sector_hit_rate.pct": 85.18
   }
 }
 
 **Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
 
-TRITON API CONSTRAINTS (CRITICAL):
-- Triton has NO: tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+## CRITICAL — Code MUST compile and run:
+1. EVERY kernel function MUST have `@triton.jit` decorator
+2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+3. BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+4. `tl.program_id(axis)` only supports axis = 0, 1, 2
+5. No `continue`, `break`, `return` inside loops — use masking
+6. No tensor indexing with loop vars: `x[:, i]` is INVALID
+7. mask shape MUST match data shape in tl.load/tl.store
 
-OUTPUT RULES (STRICT):
-1. Follow this exact order:
-   1. Imports: torch, torch.nn, triton, triton.language as tl
-   2. @triton.jit decorated kernel function(s)
-   3. Wrapper function(s) for grid calculation and kernel launch
-   4. class ModelNew(nn.Module) that calls your kernels
-2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+## Missing Triton Functions (implement manually):
+- tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+## OUTPUT FORMAT (STRICT):
+1. Imports: torch, torch.nn, triton, triton.language as tl
+2. @triton.jit decorated kernel function(s)
+3. Wrapper function(s) for grid calculation and kernel launch
+4. class ModelNew(nn.Module) that calls your kernels
+
+Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
 
 ```python
 # <optimized Triton code>

@@ -1,174 +1,192 @@
 You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
 
-# Target GPU
-GPU Name: 4090
-Architecture: Ada Lovelace
-• Compute Capability: 8.9
-• Number of SMs: 128
-• Memory Bandwidth: 1008 GB/s
-• TF32 Tensor Core TFLOPS: 82.6 with dense
-• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
-• FP16 Tensor Core TFLOPS: 165.2 with dense
-• Maximum number of registers per thread: 255
-• Maximum threads per block: 1024
-• Maximum threads per SM: 1536
-• Warp size: 32
-• Maximum concurrent warps per SM: 48
-• Shared memory capacity per SM: 100 KB
-• Maximum shared memory per thread block: 99 KB
-• L2 cache (global, all SM shared): 72 MB
+# Target GPU: 4090
 
 [OPTIMIZATION STAGE]
 
 ## Current Optimization Stage
 
-Focus: Grid layout & parallelism.
+Focus: Grid layout & indexing for FUSED operations.
 
-Metrics:
-- sm__throughput.avg.pct_of_peak_sustained_elapsed (>60%)
-- launch__grid_size
+Key Principle:
+- All fused ops share the SAME grid AND the SAME (offsets, mask) tuple
+- Grid covers OUTPUT tensor dimensions
 
-Rules:
-- 1D: (cdiv(N, BLOCK))
-- 2D: (cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))
-- 3D: (batch, cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))
-- >3D: flatten ONLY independent dims
-- Prefer batch / head / expert parallelism before shrinking BLOCK
-- Change grid only if SM utilization is clearly low
+Hard Rules:
+- Every fused op MUST use identical offset calculation
+- Every fused op MUST use identical boundary mask
+- If broadcast needed: explicit `[None, :]` or `[:, None]`, NOT different offsets
+- Element-wise: 1D grid, single `offs = pid * BLOCK + tl.arange(0, BLOCK)`
+- Matmul fusion: 2D grid, `offs_m/offs_n` shared by bias add & activation
 
-Safety:
-- Max 3 grid dims, static rank
-- grid=(G0,G1,G2) must match tl.program_id(0/1/2)
-- If unsure about correctness, do NOT change grid
-
-Autotune:
-- Autotune either BLOCK_* OR (num_warps, num_stages)
-- If autotuning BLOCK_*, use grid=lambda META: (...)
-- Never redefine BLOCK_* in both kernel and launch
+Verification:
+- Check: all tl.load/tl.store use same `offsets` variable
+- Check: all masks derived from same boundary condition
+- If ANY op needs different indexing → do NOT fuse, split kernel
 
 
 
 [CURRENT CODE]
 ```python
-import torch
-import torch.nn as nn
-import triton
-import triton.language as tl
+import torch, torch.nn as nn, triton, triton.language as tl
+
 
 @triton.jit
-def mish_kernel(
-    input_ptr,
-    output_ptr,
+def mish2_kernel(
+    x_ptr,
     n_elements,
     BLOCK_SIZE: tl.constexpr,
 ):
-    pid = tl.program_id(axis=0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    """
+    In-place fused Mish(Mish(x)) kernel.
+    Operates over a flat 1D view of the tensor.
+    """
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
-    
-    x = tl.load(input_ptr + offsets, mask=mask)
-    
-    # Mish activation: x * tanh(softplus(x))
-    # softplus(x) = log(1 + exp(x))
-    # tanh(y) = (exp(2*y) - 1) / (exp(2*y) + 1)
-    softplus = tl.log(1.0 + tl.exp(x))
-    # Compute tanh(softplus) using exp formula
-    exp_2s = tl.exp(2.0 * softplus)
-    tanh_softplus = (exp_2s - 1.0) / (exp_2s + 1.0)
-    mish_out = x * tanh_softplus
-    
-    tl.store(output_ptr + offsets, mish_out, mask=mask)
 
-@triton.jit
-def double_mish_kernel(
-    input_ptr,
-    output_ptr,
-    n_elements,
-    BLOCK_SIZE: tl.constexpr,
-):
-    pid = tl.program_id(axis=0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-    
-    x = tl.load(input_ptr + offsets, mask=mask)
-    
-    # First Mish
-    softplus1 = tl.log(1.0 + tl.exp(x))
-    exp_2s1 = tl.exp(2.0 * softplus1)
-    tanh_softplus1 = (exp_2s1 - 1.0) / (exp_2s1 + 1.0)
-    y = x * tanh_softplus1
-    
-    # Second Mish
-    softplus2 = tl.log(1.0 + tl.exp(y))
-    exp_2s2 = tl.exp(2.0 * softplus2)
-    tanh_softplus2 = (exp_2s2 - 1.0) / (exp_2s2 + 1.0)
-    z = y * tanh_softplus2
-    
-    tl.store(output_ptr + offsets, z, mask=mask)
+    # Load original values
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    x_dtype = x.dtype
+    x_fp = x.to(tl.float32)
 
-def triton_mish(x: torch.Tensor) -> torch.Tensor:
-    output = torch.empty_like(x)
-    n_elements = output.numel()
-    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
-    BLOCK_SIZE = 1024
-    mish_kernel[grid](x, output, n_elements, BLOCK_SIZE=BLOCK_SIZE)
-    return output
+    # ---------- Mish #1 ----------
+    # Numerically stable softplus:
+    # softplus(x) = log(1 + exp(x)) but with branching to avoid overflow
+    pos = x_fp > 0.0
+    sp_pos = x_fp + tl.log(1.0 + tl.exp(-x_fp))  # x + log(1 + exp(-x)) for x > 0
+    sp_neg = tl.log(1.0 + tl.exp(x_fp))          # log(1 + exp(x)) for x <= 0
+    sp = tl.where(pos, sp_pos, sp_neg)
 
-def triton_double_mish(x: torch.Tensor) -> torch.Tensor:
-    output = torch.empty_like(x)
-    n_elements = output.numel()
-    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
-    BLOCK_SIZE = 1024
-    double_mish_kernel[grid](x, output, n_elements, BLOCK_SIZE=BLOCK_SIZE)
-    return output
+    # tanh(softplus(x)) computed via sigmoid for numerical stability
+    t = tl.sigmoid(2.0 * sp)
+    tanh_sp = 2.0 * t - 1.0
+
+    y_fp = x_fp * tanh_sp
+
+    # ---------- Mish #2 ----------
+    pos2 = y_fp > 0.0
+    sp_pos2 = y_fp + tl.log(1.0 + tl.exp(-y_fp))
+    sp_neg2 = tl.log(1.0 + tl.exp(y_fp))
+    sp2 = tl.where(pos2, sp_pos2, sp_neg2)
+
+    t2 = tl.sigmoid(2.0 * sp2)
+    tanh_sp2 = 2.0 * t2 - 1.0
+
+    y2_fp = y_fp * tanh_sp2
+
+    # Cast back to original dtype and store in-place
+    y2 = y2_fp.to(x_dtype)
+    tl.store(x_ptr + offsets, y2, mask=mask)
+
+
+def mish_mish_inplace(x: torch.Tensor) -> torch.Tensor:
+    """
+    Apply Mish(Mish(x)) to `x` in-place using a Triton kernel.
+    Assumes `x` is on CUDA and contiguous.
+    """
+    assert x.is_cuda, "Triton kernel requires CUDA tensor"
+    assert x.is_contiguous(), "Activation kernel currently assumes contiguous tensor"
+
+    n_elements = x.numel()
+    if n_elements == 0:
+        return x
+
+    BLOCK_SIZE = 1024  # power-of-two as required
+
+    grid = lambda META: (
+        triton.cdiv(max(n_elements, 1), META["BLOCK_SIZE"]),
+    )
+
+    mish2_kernel[grid](
+        x,
+        n_elements,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=4,
+        num_stages=2,
+    )
+    return x
+
+
+def conv2d_mish2(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    Hybrid implementation:
+    - Use cuDNN via torch.nn.functional.conv2d for convolution
+    - Apply fused Mish(Mish(.)) in a single Triton kernel pass
+    """
+    # Conv2d: stride=1, padding=0, dilation=1, groups=1 (to match reference)
+    y = torch.nn.functional.conv2d(
+        x, weight, bias,
+        stride=1,
+        padding=0,
+        dilation=1,
+        groups=1,
+    )
+    # Fused Mish(Mish(.)) in-place
+    mish_mish_inplace(y)
+    return y
+
 
 class ModelNew(nn.Module):
     """
-    Simple model that performs a convolution, applies Mish, and another Mish.
-    Uses fused Triton kernels for the Mish activations.
+    Optimized model:
+    - Convolution via cuDNN (torch.nn.functional.conv2d)
+    - Fused Mish + Mish via a Triton pointwise kernel
+    Behavior matches:
+        y = conv2d(x)
+        y = mish(y)
+        y = mish(y)
     """
     def __init__(self, in_channels, out_channels, kernel_size):
         super(ModelNew, self).__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        assert isinstance(kernel_size, int), "Only integer kernel_size is supported"
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
 
-    def forward(self, x):
-        x = self.conv(x)
-        # Use fused double mish kernel instead of two separate calls
-        x = triton_double_mish(x)
-        return x
+        # Match the parameter interface of the previous custom conv:
+        # weight: [Cout, Cin, Kh, Kw], bias: [Cout]
+        self.weight = nn.Parameter(
+            torch.randn(out_channels, in_channels, kernel_size, kernel_size)
+        )
+        self.bias = nn.Parameter(torch.randn(out_channels))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return conv2d_mish2(x, self.weight, self.bias)
 ```
 
 [NCU PROFILING METRICS]
 {
-  "double_mish_kernel": [
-    {
-      "sm__throughput.avg.pct_of_peak_sustained_elapsed": 27.62,
-      "launch__grid_size": 516128,
-      "sm__warps_active.avg.pct_of_peak_sustained_active": 81.15,
-      "dram__throughput.avg.pct_of_peak_sustained_elapsed": 92.73,
-      "lts__t_sector_hit_rate.pct": 50.0
-    },
-    {
-      "sm__throughput.avg.pct_of_peak_sustained_elapsed": 27.62,
-      "launch__grid_size": 516128,
-      "sm__warps_active.avg.pct_of_peak_sustained_active": 81.15,
-      "dram__throughput.avg.pct_of_peak_sustained_elapsed": 92.73,
-      "lts__t_sector_hit_rate.pct": 50.0
-    }
-  ]
+  "mish2_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 47.45,
+    "launch__grid_size": 516128,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 87.58,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 93.11,
+    "lts__t_sector_hit_rate.pct": 50.01
+  }
 }
 
 **Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
 
-OUTPUT RULES (STRICT):
-1. Follow this exact order:
-   1. Imports: torch, torch.nn, triton, triton.language as tl
-   2. @triton.jit decorated kernel function(s)
-   3. Wrapper function(s) for grid calculation and kernel launch
-   4. class ModelNew(nn.Module) that calls your kernels
-2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+## CRITICAL — Code MUST compile and run:
+1. EVERY kernel function MUST have `@triton.jit` decorator
+2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+3. BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+4. `tl.program_id(axis)` only supports axis = 0, 1, 2
+5. No `continue`, `break`, `return` inside loops — use masking
+6. No tensor indexing with loop vars: `x[:, i]` is INVALID
+7. mask shape MUST match data shape in tl.load/tl.store
+
+## Missing Triton Functions (implement manually):
+- tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+## OUTPUT FORMAT (STRICT):
+1. Imports: torch, torch.nn, triton, triton.language as tl
+2. @triton.jit decorated kernel function(s)
+3. Wrapper function(s) for grid calculation and kernel launch
+4. class ModelNew(nn.Module) that calls your kernels
+
+Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
 
 ```python
 # <optimized Triton code>

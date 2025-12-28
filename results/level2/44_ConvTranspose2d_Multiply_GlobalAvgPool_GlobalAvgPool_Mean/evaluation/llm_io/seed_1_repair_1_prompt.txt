@@ -1,0 +1,298 @@
+Fix the Triton kernel errors. Generate correct code.
+
+## ERROR LOG
+```
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 536, in compare_and_bench
+    test_model = ModelNew(*init_args, **init_kwargs)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251228_142941_batch_range36to44_openai_deepseek/44_ConvTranspose2d_Multiply_GlobalAvgPool_GlobalAvgPool_Mean/code/kernel_20251228_154116.py", line 243, in __init__
+    nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+                                            ^^^^
+NameError: name 'math' is not defined
+```
+
+## Broken Code
+```python
+import torch, torch.nn as nn, triton, triton.language as tl
+
+
+@triton.jit
+def conv_transpose2d_global_sum_kernel(
+    x_ptr,        # float32[B, Cin, H_in, W_in]
+    w_ptr,        # float32[Cin, Cout, K_h, K_w]
+    sum_ptr,      # float32[B, Cout]  (accumulator over spatial positions)
+    B, Cin, Cout,
+    H_in, W_in, H_out, W_out,
+    stride_h, stride_w,
+    pad_h, pad_w,
+    stride_xb, stride_xc, stride_xh, stride_xw,
+    stride_wci, stride_wco, stride_wkh, stride_wkw,
+    stride_sum_b, stride_sum_c,
+    KERNEL_H: tl.constexpr,
+    KERNEL_W: tl.constexpr,
+    BLOCK_CO: tl.constexpr,
+    BLOCK_P: tl.constexpr,
+):
+    pid_b = tl.program_id(0)   # batch index
+    pid_co = tl.program_id(1)  # block of output channels
+    pid_p = tl.program_id(2)   # block of spatial positions
+
+    offs_co = pid_co * BLOCK_CO + tl.arange(0, BLOCK_CO)
+    offs_p = pid_p * BLOCK_P + tl.arange(0, BLOCK_P)
+
+    mask_co = offs_co < Cout
+    spatial_size = H_out * W_out
+    mask_p = offs_p < spatial_size
+
+    # Spatial indices (ho, wo) for this tile
+    ho = offs_p // W_out
+    wo = offs_p - ho * W_out
+
+    # Accumulator for sum over all spatial positions in this tile, per output channel
+    acc_co = tl.zeros((BLOCK_CO,), dtype=tl.float32)
+
+    # Loop over input channels
+    for ci in range(0, Cin):
+        # Loop over kernel height
+        for kh in range(0, KERNEL_H):
+            # Compute candidate input height indices for all positions in tile
+            hi_nom = ho + pad_h - kh  # int32 tensor
+            hi_f = hi_nom.to(tl.float32) / stride_h
+            hi_int = tl.floor(hi_f)
+            mask_hi = (hi_f == hi_int) & (hi_int >= 0) & (hi_int < H_in)
+
+            hi = hi_int.to(tl.int32)
+
+            # Loop over kernel width
+            for kw in range(0, KERNEL_W):
+                wi_nom = wo + pad_w - kw
+                wi_f = wi_nom.to(tl.float32) / stride_w
+                wi_int = tl.floor(wi_f)
+                mask_wi = (wi_f == wi_int) & (wi_int >= 0) & (wi_int < W_in)
+
+                wi = wi_int.to(tl.int32)
+
+                mask_hw = mask_p & mask_hi & mask_wi
+
+                # Load input values for this (b, ci, kh, kw) across spatial tile
+                x_ptrs = (
+                    x_ptr
+                    + pid_b * stride_xb
+                    + ci * stride_xc
+                    + hi * stride_xh
+                    + wi * stride_xw
+                )
+
+                x_vals = tl.load(x_ptrs, mask=mask_hw, other=0.0)  # [BLOCK_P], fp32
+
+                # Sum across spatial positions in this tile
+                sum_x = tl.sum(x_vals, axis=0)  # scalar
+
+                # Load weights for this (ci, kh, kw) across output channels
+                w_ptrs = (
+                    w_ptr
+                    + ci * stride_wci
+                    + offs_co * stride_wco
+                    + kh * stride_wkh
+                    + kw * stride_wkw
+                )
+                w_vals = tl.load(w_ptrs, mask=mask_co, other=0.0)  # [BLOCK_CO]
+
+                # Accumulate contribution to global spatial sum per output channel
+                acc_co += w_vals * sum_x
+
+    # Atomically add tile contribution into global sum buffer
+    sum_ptrs = sum_ptr + pid_b * stride_sum_b + offs_co * stride_sum_c
+    tl.atomic_add(sum_ptrs, acc_co, mask=mask_co)
+
+
+@triton.jit
+def avg_affine_kernel(
+    sum_ptr,      # float32[B, C]
+    bias_ptr,     # float32[C]
+    out_ptr,      # float32[B, C]
+    B, C,
+    spatial_size,
+    multiplier,
+    stride_sum_b, stride_sum_c,
+    stride_out_b, stride_out_c,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    total = B * C
+    mask = offs < total
+
+    b = offs // C
+    c = offs - b * C
+
+    sum_ptrs = sum_ptr + b * stride_sum_b + c * stride_sum_c
+    s = tl.load(sum_ptrs, mask=mask, other=0.0)
+
+    bias = tl.load(bias_ptr + c, mask=mask, other=0.0)
+
+    val = multiplier * (s / spatial_size + bias)
+
+    out_ptrs = out_ptr + b * stride_out_b + c * stride_out_c
+    tl.store(out_ptrs, val, mask=mask)
+
+
+def conv_transpose2d_global_avg_triton(x, weight, bias, stride, padding, output_padding, multiplier):
+    """
+    Computes:
+        y = conv_transpose2d(x, weight, bias, stride, padding, output_padding)
+        y = y * multiplier
+        y = global_avg_pool(y)  # over H_out, W_out
+        y = global_avg_pool(y)  # over spatial 1x1 => no-op
+
+    Returns tensor of shape [B, C_out, 1, 1].
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+    assert x.dtype == torch.float32 and weight.dtype == torch.float32 and bias.dtype == torch.float32
+
+    B, Cin, H_in, W_in = x.shape
+    Cin_w, Cout, K_h, K_w = weight.shape
+    assert Cin_w == Cin, "Weight in_channels must match input channels"
+
+    # Normalize stride/padding/output_padding to 2D tuples
+    def _to_pair(v):
+        if isinstance(v, int):
+            return (v, v)
+        return v
+
+    stride_h, stride_w = _to_pair(stride)
+    pad_h, pad_w = _to_pair(padding)
+    out_pad_h, out_pad_w = _to_pair(output_padding)
+
+    # Compute output spatial size (PyTorch conv_transpose2d formula, dilation=1)
+    H_out = (H_in - 1) * stride_h - 2 * pad_h + (K_h - 1) + out_pad_h + 1
+    W_out = (W_in - 1) * stride_w - 2 * pad_w + (K_w - 1) + out_pad_w + 1
+
+    # Accumulator over spatial positions: [B, Cout]
+    sum_conv = torch.zeros((B, Cout), device=x.device, dtype=torch.float32)
+
+    # Strides
+    stride_xb, stride_xc, stride_xh, stride_xw = x.stride()
+    stride_wci, stride_wco, stride_wkh, stride_wkw = weight.stride()
+    stride_sum_b, stride_sum_c = sum_conv.stride()
+
+    # Launch conv_transpose2d + spatial sum kernel
+    BLOCK_CO = 32
+    BLOCK_P = 64
+
+    grid = (
+        B,
+        triton.cdiv(Cout, BLOCK_CO),
+        triton.cdiv(H_out * W_out, BLOCK_P),
+    )
+
+    conv_transpose2d_global_sum_kernel[grid](
+        x, weight,
+        sum_conv,
+        B, Cin, Cout,
+        H_in, W_in, H_out, W_out,
+        stride_h, stride_w,
+        pad_h, pad_w,
+        stride_xb, stride_xc, stride_xh, stride_xw,
+        stride_wci, stride_wco, stride_wkh, stride_wkw,
+        stride_sum_b, stride_sum_c,
+        KERNEL_H=K_h,
+        KERNEL_W=K_w,
+        BLOCK_CO=BLOCK_CO,
+        BLOCK_P=BLOCK_P,
+    )
+
+    # Second kernel: apply averaging over H_out * W_out, add bias, multiply by scalar
+    out = torch.empty_like(sum_conv)
+
+    stride_out_b, stride_out_c = out.stride()
+    spatial_size = H_out * W_out
+
+    BLOCK = 128
+    grid2 = (triton.cdiv(B * Cout, BLOCK),)
+
+    avg_affine_kernel[grid2](
+        sum_conv,
+        bias,
+        out,
+        B, Cout,
+        spatial_size,
+        multiplier,
+        stride_sum_b, stride_sum_c,
+        stride_out_b, stride_out_c,
+        BLOCK=BLOCK,
+    )
+
+    # Output pooling is applied twice in the original model; second pooling over 1x1 is a no-op.
+    return out.view(B, Cout, 1, 1)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, multiplier):
+        super(ModelNew, self).__init__()
+
+        # Normalize kernel_size/stride/padding/output_padding
+        def _to_pair(v):
+            if isinstance(v, int):
+                return (v, v)
+            return v
+
+        if isinstance(kernel_size, int):
+            k_h = k_w = kernel_size
+        else:
+            k_h, k_w = kernel_size
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = (k_h, k_w)
+        self.stride = _to_pair(stride)
+        self.padding = _to_pair(padding)
+        self.output_padding = _to_pair(output_padding)
+        self.multiplier = float(multiplier)
+
+        # Parameters to be mapped from original ConvTranspose2d
+        self.weight = nn.Parameter(torch.empty(in_channels, out_channels, k_h, k_w))
+        self.bias = nn.Parameter(torch.empty(out_channels))
+
+        # Initialize similarly to nn.ConvTranspose2d (Kaiming uniform)
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        fan_in = in_channels * k_h * k_w
+        bound = 1 / math.sqrt(fan_in)
+        nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x):
+        return conv_transpose2d_global_avg_triton(
+            x,
+            self.weight,
+            self.bias,
+            self.stride,
+            self.padding,
+            self.output_padding,
+            self.multiplier,
+        )
+```
+
+## CRITICAL — These cause 60%+ of failures:
+1. EVERY kernel function MUST have `@triton.jit` decorator — MANDATORY
+2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+3. BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+4. `tl.program_id(axis)` only supports axis = 0, 1, 2
+5. No `continue`, `break`, `return` inside loops — use masking
+6. No tensor indexing with loop vars: `x[:, i]` is INVALID
+7. mask shape MUST match data shape in tl.load/tl.store
+
+## Missing Triton Functions (implement manually):
+- tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+## OUTPUT FORMAT (STRICT):
+1. Imports: torch, torch.nn, triton, triton.language as tl (and math if needed)
+2. @triton.jit decorated kernel function(s)
+3. Wrapper function(s) for grid calculation and kernel launch
+4. class ModelNew(nn.Module) — REQUIRED
+
+Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <corrected code>
+```

@@ -1,0 +1,292 @@
+You are optimizing a Triton kernel based on algorithmic analysis.
+
+# PyTorch Reference (Target Behavior)
+
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs a convolution, applies Mish, and another Mish.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size):
+        super(Model, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = torch.nn.functional.mish(x)
+        x = torch.nn.functional.mish(x)
+        return x
+
+batch_size   = 64  
+in_channels  = 64  
+out_channels = 128  
+height = width = 256
+kernel_size = 3
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size]
+```
+
+**CRITICAL**: Study the PyTorch code carefully to understand:
+- What does `forward()` return? (full output sequence vs final hidden state only)
+- What is the computational pattern?
+- What are the input/output shapes?
+
+Your optimized kernel MUST match this exact behavior.
+
+---
+
+# Analysis Results
+
+**Bottleneck**: The kernel reimplements a full direct convolution in Triton, which is unlikely to match cuDNN’s highly tuned conv2d, so most runtime is spent in a slower convolution while the extra fusion of Mish+Mish does not compensate for this deficit.
+
+**Optimization Strategy**: Replace the current all-in-one Triton conv+Mish kernel with a hybrid approach: use PyTorch’s/cuDNN’s conv2d for the convolution, and add a separate Triton kernel that fuses the two Mish activations into a single pointwise pass computing mish(mish(x)).
+
+**Implementation Plan**: In ModelNew.forward, first call torch.nn.functional.conv2d(x, self.weight, self.bias, stride=1, padding=0, dilation=1, groups=1) to obtain the convolution output using cuDNN. Then launch a simple Triton kernel over the output tensor that performs mish(mish(x)) in one pass (optionally using efficient intrinsics like tl.softplus + tl.tanh), writing in-place or to a new tensor. Remove the convolution loops and indexing logic from the Triton kernel, keeping it purely as an optimized fused-activation kernel after conv2d.
+
+**Expected Speedup**: 30-40% vs the current Triton kernel (and likely modestly faster than the PyTorch baseline by eliminating one of the two Mish kernel passes and an extra memory round-trip).
+
+---
+
+# Current Kernel (needs optimization)
+
+```python
+import torch, torch.nn as nn, triton, triton.language as tl
+
+
+@triton.jit
+def conv2d_mish2_kernel(
+    x_ptr, w_ptr, b_ptr, y_ptr,
+    N, Cin, Hin, Win,
+    Cout, Kh, Kw,
+    Ho, Wo,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_wn, stride_wc, stride_wh, stride_ww,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    Ktotal,
+    BLOCK_M: tl.constexpr,  # tile over [N * Ho * Wo]
+    BLOCK_N: tl.constexpr,  # tile over Cout
+    BLOCK_K: tl.constexpr,  # reduction tile over Cin * Kh * Kw
+):
+    # Program ids along M (N*Ho*Wo) and N (Cout)
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    M = N * Ho * Wo
+    mask_m = offs_m < M
+    mask_n = offs_n < Cout
+
+    # Decode linear M index -> (n, oh, ow)
+    ho_wo = Ho * Wo
+    n_idx = offs_m // ho_wo
+    rem = offs_m % ho_wo
+    oh = rem // Wo
+    ow = rem % Wo
+
+    # Accumulator
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    offs_k = tl.arange(0, BLOCK_K)
+    for k0 in range(0, Ktotal, BLOCK_K):
+        k_ids = k0 + offs_k  # [BLOCK_K]
+        mask_k = k_ids < Ktotal
+
+        # Decode k_ids -> (ic, kh, kw)
+        kk = Kh * Kw
+        ic = k_ids // kk
+        rem2 = k_ids % kk
+        kh = rem2 // Kw
+        kw = rem2 % Kw
+
+        # Input coordinates
+        ih = oh[:, None] + kh[None, :]
+        iw = ow[:, None] + kw[None, :]
+
+        # Pointers for x: [BLOCK_M, BLOCK_K]
+        x_ptrs = (
+            x_ptr
+            + n_idx[:, None] * stride_xn
+            + ic[None, :] * stride_xc
+            + ih * stride_xh
+            + iw * stride_xw
+        )
+        mask_x = (
+            mask_m[:, None] & mask_k[None, :]
+            & (ih >= 0) & (ih < Hin)
+            & (iw >= 0) & (iw < Win)
+        )
+        x_vals = tl.load(x_ptrs, mask=mask_x, other=0.0)
+
+        # Pointers for w: [BLOCK_K, BLOCK_N]
+        w_ptrs = (
+            w_ptr
+            + offs_n[None, :] * stride_wn
+            + ic[:, None] * stride_wc
+            + kh[:, None] * stride_wh
+            + kw[:, None] * stride_ww
+        )
+        mask_w = mask_k[:, None] & mask_n[None, :]
+        w_vals = tl.load(w_ptrs, mask=mask_w, other=0.0)
+
+        # GEMM-style accumulation
+        acc += tl.dot(x_vals, w_vals, allow_tf32=True)
+
+    # Add bias
+    bias = tl.load(b_ptr + offs_n, mask=mask_n, other=0.0)
+    acc = acc + bias[None, :]
+
+    # ---- Mish, applied twice: y = mish(mish(acc)) ----
+    # mish(x) = x * tanh(softplus(x)), softplus(x) = log(1 + exp(x))
+    # tanh(z) = (exp(2*z) - 1) / (exp(2*z) + 1)
+    val = acc
+
+    # first mish
+    sp1 = tl.log(1.0 + tl.exp(val))
+    t1 = (tl.exp(2.0 * sp1) - 1.0) / (tl.exp(2.0 * sp1) + 1.0)
+    val = val * t1
+
+    # second mish
+    sp2 = tl.log(1.0 + tl.exp(val))
+    t2 = (tl.exp(2.0 * sp2) - 1.0) / (tl.exp(2.0 * sp2) + 1.0)
+    val = val * t2
+
+    # Store output: map (offs_m, offs_n) -> (n, oc, oh, ow)
+    y_ptrs = (
+        y_ptr
+        + n_idx[:, None] * stride_yn
+        + offs_n[None, :] * stride_yc
+        + oh[:, None] * stride_yh
+        + ow[:, None] * stride_yw
+    )
+    mask_y = mask_m[:, None] & mask_n[None, :]
+    tl.store(y_ptrs, val, mask=mask_y)
+
+
+def conv2d_mish2(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    # Ensure contiguous for predictable strides
+    x = x.contiguous()
+    weight = weight.contiguous()
+    bias = bias.contiguous()
+
+    N, Cin, Hin, Win = x.shape
+    Cout, Cin_w, Kh, Kw = weight.shape
+    assert Cin == Cin_w, "In-channel mismatch between input and weight"
+    assert Kh == Kw, "This implementation assumes square kernels"
+
+    # Stride = 1, padding = 0, dilation = 1 (to match default nn.Conv2d)
+    Ho = Hin - Kh + 1
+    Wo = Win - Kw + 1
+    assert Ho > 0 and Wo > 0, "Kernel larger than input with zero padding"
+
+    y = torch.empty((N, Cout, Ho, Wo), device=x.device, dtype=x.dtype)
+
+    # Strides
+    stride_xn, stride_xc, stride_xh, stride_xw = x.stride()
+    stride_wn, stride_wc, stride_wh, stride_ww = weight.stride()
+    stride_yn, stride_yc, stride_yh, stride_yw = y.stride()
+
+    Ktotal = Cin * Kh * Kw
+    M = N * Ho * Wo
+
+    BLOCK_M = 64
+    BLOCK_N = 64
+    BLOCK_K = 32
+
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_M"]),
+        triton.cdiv(Cout, META["BLOCK_N"]),
+    )
+
+    conv2d_mish2_kernel[grid](
+        x, weight, bias, y,
+        N, Cin, Hin, Win,
+        Cout, Kh, Kw,
+        Ho, Wo,
+        stride_xn, stride_xc, stride_xh, stride_xw,
+        stride_wn, stride_wc, stride_wh, stride_ww,
+        stride_yn, stride_yc, stride_yh, stride_yw,
+        Ktotal,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        num_warps=4,
+        num_stages=2,
+    )
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized version:
+    Conv2d (stride=1, padding=0, dilation=1, groups=1) + Mish + Mish fused.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size):
+        super(ModelNew, self).__init__()
+        assert isinstance(kernel_size, int), "Only integer kernel_size is supported"
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+
+        self.weight = nn.Parameter(
+            torch.randn(out_channels, in_channels, kernel_size, kernel_size)
+        )
+        self.bias = nn.Parameter(torch.randn(out_channels))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return conv2d_mish2(x, self.weight, self.bias)
+```
+
+---
+
+# Your Task
+
+Implement the optimization strategy above. Focus on the specific bottleneck identified.
+
+## Key Requirements
+
+1. **Preserve correctness**: Maintain the same input/output behavior
+2. **Apply the optimization**: Follow the implementation plan exactly
+3. **Use valid Triton syntax**:
+   - Every kernel MUST have `@triton.jit` decorator
+   - Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+   - BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+   - No `continue`, `break`, `return` inside kernels (use masking)
+   - Prefer `tl.dot(a, b, allow_tf32=True)` for matmul operations
+
+4. **CRITICAL for RNN/GRU/LSTM Persistent Kernels**:
+   - Time loop MUST be inside @triton.jit kernel, NOT in Python forward()
+   - **HYBRID computation strategy** (CRITICAL for performance):
+     * Precompute input-side gates OUTSIDE kernel: `gates_x = (T*B, In) @ W_ih` (ONE large GEMM)
+     * INSIDE kernel: only recurrent-side: `for t: gates_h = h @ W_hh` (T small GEMMs)
+   - CORRECT (FAST - use this):
+     ```python
+     # Python forward():
+     gates_x_all = x.reshape(T*B, In) @ W_ih + b_ih  # ONE large GEMM
+     gates_x_all = gates_x_all.view(T, B, 3*H)
+     gru_persistent_kernel[grid](gates_x_all, h0, W_hh, ...)  # Launch ONCE
+
+     @triton.jit
+     def gru_persistent_kernel(gates_x_ptr, h_ptr, W_hh_ptr, ...):
+         for t in range(T):  # Inside kernel
+             gates_x_t = tl.load(gates_x_ptr + t*...)  # Precomputed
+             gates_h = h @ W_hh  # Only recurrent GEMM
+             h = (1-z)*n + z*h   # Fuse and update
+     ```
+
+5. **Output format**:
+   - Imports: `import torch, torch.nn as nn, triton, triton.language as tl`
+   - `@triton.jit` kernel(s)
+   - Wrapper function(s)
+   - `class ModelNew(nn.Module)` — REQUIRED
+   - NO testing code, NO `if __name__ == "__main__"`
+
+---
+
+Generate the optimized kernel now. Output ONLY the complete Python code.

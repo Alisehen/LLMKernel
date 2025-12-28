@@ -1,0 +1,363 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 32, 'BLOCK_K': 32}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_M': 16, 'BLOCK_K': 32}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_K': 16}, num_warps=2, num_stages=3),
+    ],
+    key=['M', 'K', 'C_out'],
+)
+@triton.jit
+def conv3d_softmax_kernel(
+    x_ptr, w2d_ptr, bias_ptr, o_ptr,
+    N, C_in, D, H, W,
+    C_out, KD, KH, KW,
+    D_out, H_out, W_out,
+    M, K,
+    stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
+    stride_wk, stride_wn,
+    stride_on, stride_oc, stride_od, stride_oh, stride_ow,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    # ------------------------------
+    # Program id and row/col offsets
+    # ------------------------------
+    pid_m = tl.program_id(0)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    mask_m = offs_m < M
+    mask_n = offs_n < C_out
+    mask_mn = mask_m[:, None] & mask_n[None, :]
+
+    # ------------------------------
+    # Map offs_m -> (n, d_out, h_out, w_out)
+    # ------------------------------
+    H_out_times_W_out = H_out * W_out
+    DHW_out = D_out * H_out_times_W_out
+
+    n_m = offs_m // DHW_out
+    rem_m = offs_m - n_m * DHW_out
+    d_out_m = rem_m // H_out_times_W_out
+    rem_m2 = rem_m - d_out_m * H_out_times_W_out
+    h_out_m = rem_m2 // W_out
+    w_out_m = rem_m2 - h_out_m * W_out
+
+    # ------------------------------
+    # GEMM-style K-reduction
+    # ------------------------------
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    kernel_spatial = KD * KH * KW
+    KH_KW = KH * KW
+
+    base_x = x_ptr + n_m[:, None] * stride_xn
+    base_o_d = d_out_m[:, None]
+    base_o_h = h_out_m[:, None]
+    base_o_w = w_out_m[:, None]
+
+    for k_start in range(0, K, BLOCK_K):
+        k_idx = k_start + offs_k
+        mask_k = k_idx < K
+
+        # Decompose k_idx -> (c_in, kd, kh, kw)
+        ci = k_idx // kernel_spatial
+        rem_k = k_idx - ci * kernel_spatial
+        kd = rem_k // KH_KW
+        rem_k2 = rem_k - kd * KH_KW
+        kh = rem_k2 // KW
+        kw = rem_k2 - kh * KW
+
+        # Input positions
+        d_in = base_o_d + kd[None, :]
+        h_in = base_o_h + kh[None, :]
+        w_in = base_o_w + kw[None, :]
+
+        # X pointers [BLOCK_M, BLOCK_K]
+        x_ptrs = (
+            base_x
+            + ci[None, :] * stride_xc
+            + d_in * stride_xd
+            + h_in * stride_xh
+            + w_in * stride_xw
+        )
+
+        # W pointers [BLOCK_K, BLOCK_N]
+        w_ptrs = w2d_ptr + k_idx[:, None] * stride_wk + offs_n[None, :] * stride_wn
+
+        mask_a = mask_m[:, None] & mask_k[None, :]
+        mask_b = mask_k[:, None] & mask_n[None, :]
+
+        a = tl.load(x_ptrs, mask=mask_a, other=0.0)
+        b = tl.load(w_ptrs, mask=mask_b, other=0.0)
+
+        acc += tl.dot(a, b, allow_tf32=True)
+
+    # ------------------------------
+    # Bias add
+    # ------------------------------
+    bias = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0)
+    acc = acc + bias[None, :]
+
+    # ------------------------------
+    # Fused stable softmax over channels
+    # Use in-place style updates to reduce register pressure
+    # ------------------------------
+    neg_inf = -float("inf")
+    acc = tl.where(mask_mn, acc, neg_inf)
+
+    row_max = tl.max(acc, axis=1)
+    acc = acc - row_max[:, None]
+
+    acc = tl.exp(acc)
+    den = tl.sum(acc, axis=1)
+    acc = acc / den[:, None]
+
+    # ------------------------------
+    # Store output [N, C_out, D_out, H_out, W_out]
+    # ------------------------------
+    o_ptrs = (
+        o_ptr
+        + n_m[:, None] * stride_on
+        + offs_n[None, :] * stride_oc
+        + d_out_m[:, None] * stride_od
+        + h_out_m[:, None] * stride_oh
+        + w_out_m[:, None] * stride_ow
+    )
+    tl.store(o_ptrs, acc, mask=mask_mn)
+
+
+def triton_conv3d_softmax(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    Fused Conv3d + Softmax(dim=1) on NCDHW input.
+    x:      [N, C_in, D, H, W]
+    weight: [C_out, C_in, KD, KH, KW]
+    bias:   [C_out]
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+
+    x = x.contiguous()
+    weight = weight.contiguous()
+    bias = bias.contiguous()
+
+    N, C_in, D, H, W = x.shape
+    C_out, C_in_w, KD, KH, KW = weight.shape
+    assert C_in == C_in_w
+
+    # Output dims (no padding, stride=1, dilation=1)
+    D_out = D - KD + 1
+    H_out = H - KH + 1
+    W_out = W - KW + 1
+
+    # Flatten spatial+batch into M, channels into N for GEMM
+    M = N * D_out * H_out * W_out
+    K = C_in * KD * KH * KW
+
+    # Weights as [K, C_out]
+    w2d = weight.view(C_out, -1).t().contiguous()
+
+    out = torch.empty((N, C_out, D_out, H_out, W_out),
+                      device=x.device, dtype=torch.float32)
+
+    stride_xn, stride_xc, stride_xd, stride_xh, stride_xw = x.stride()
+    stride_on, stride_oc, stride_od, stride_oh, stride_ow = out.stride()
+    stride_wk, stride_wn = w2d.stride()
+
+    # Choose BLOCK_N as small as possible (power-of-2), but cover all channels
+    # Cap at 128 to keep register pressure under control on RTX 4090
+    BLOCK_N = 1
+    max_block_n = 128
+    while BLOCK_N < C_out and BLOCK_N < max_block_n:
+        BLOCK_N *= 2
+    assert C_out <= BLOCK_N, "Fused conv+softmax kernel supports up to 128 output channels"
+
+    grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]),)
+
+    conv3d_softmax_kernel[grid](
+        x, w2d, bias, out,
+        N, C_in, D, H, W,
+        C_out, KD, KH, KW,
+        D_out, H_out, W_out,
+        M, K,
+        stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
+        stride_wk, stride_wn,
+        stride_on, stride_oc, stride_od, stride_oh, stride_ow,
+        BLOCK_N=BLOCK_N,
+    )
+
+    return out
+
+
+@triton.jit
+def maxpool3d_kernel(
+    x_ptr, y_ptr,
+    N, C, D, H, W,
+    KD, KH, KW,
+    SD, SH, SW,
+    D_out, H_out, W_out,
+    stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
+    stride_yn, stride_yc, stride_yd, stride_yh, stride_yw,
+    BLOCK_W: tl.constexpr,
+):
+    # Grid:
+    #  axis 0: (n, c, d_out, h_out)
+    #  axis 1: w_out tiles
+    pid_m = tl.program_id(0)
+    pid_w = tl.program_id(1)
+
+    offs_w = pid_w * BLOCK_W + tl.arange(0, BLOCK_W)
+
+    CH_out = C * D_out * H_out
+    DH_out = D_out * H_out
+
+    n = pid_m // CH_out
+    rem = pid_m - n * CH_out
+    c = rem // DH_out
+    rem2 = rem - c * DH_out
+    d_out = rem2 // H_out
+    h_out = rem2 - d_out * H_out
+
+    w_out = offs_w
+    mask_w = w_out < W_out
+
+    # Compute input window origin
+    d_start = d_out * SD
+    h_start = h_out * SH
+    w_start = w_out * SW
+
+    base_x = x_ptr + n * stride_xn + c * stride_xc
+
+    val = tl.full((BLOCK_W,), -float("inf"), dtype=tl.float32)
+
+    for kd in range(0, KD):
+        d_in = d_start + kd
+        in_d_ok = (d_in >= 0) & (d_in < D)
+
+        for kh in range(0, KH):
+            h_in = h_start + kh
+            in_h_ok = (h_in >= 0) & (h_in < H)
+
+            for kw in range(0, KW):
+                w_in = w_start + kw
+                in_w_ok = (w_in >= 0) & (w_in < W)
+
+                x_ptrs = (
+                    base_x
+                    + d_in * stride_xd
+                    + h_in * stride_xh
+                    + w_in * stride_xw
+                )
+
+                in_bounds = mask_w & in_d_ok & in_h_ok & in_w_ok
+
+                x_vals = tl.load(x_ptrs, mask=in_bounds, other=-float("inf"))
+                val = tl.maximum(val, x_vals)
+
+    y_ptrs = (
+        y_ptr
+        + n * stride_yn
+        + c * stride_yc
+        + d_out * stride_yd
+        + h_out * stride_yh
+        + w_out * stride_yw
+    )
+    tl.store(y_ptrs, val, mask=mask_w)
+
+
+def triton_maxpool3d(x: torch.Tensor, kernel_size, stride=None) -> torch.Tensor:
+    """
+    MaxPool3d (no padding, no dilation), NCDHW layout.
+    """
+    assert x.is_cuda
+    x = x.contiguous()
+    N, C, D, H, W = x.shape
+
+    if isinstance(kernel_size, int):
+        KD = KH = KW = kernel_size
+    else:
+        KD, KH, KW = kernel_size
+
+    if stride is None:
+        SD = KD
+        SH = KH
+        SW = KW
+    else:
+        if isinstance(stride, int):
+            SD = SH = SW = stride
+        else:
+            SD, SH, SW = stride
+
+    D_out = (D - KD) // SD + 1
+    H_out = (H - KH) // SH + 1
+    W_out = (W - KW) // SW + 1
+
+    y = torch.empty((N, C, D_out, H_out, W_out),
+                    device=x.device, dtype=torch.float32)
+
+    stride_xn, stride_xc, stride_xd, stride_xh, stride_xw = x.stride()
+    stride_yn, stride_yc, stride_yd, stride_yh, stride_yw = y.stride()
+
+    BLOCK_W = 64  # good balance for 4090; high occupancy, moderate register use
+
+    grid = lambda META: (
+        max(1, N * C * D_out * H_out),
+        triton.cdiv(W_out, META["BLOCK_W"]),
+    )
+
+    maxpool3d_kernel[grid](
+        x, y,
+        N, C, D, H, W,
+        KD, KH, KW,
+        SD, SH, SW,
+        D_out, H_out, W_out,
+        stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
+        stride_yn, stride_yc, stride_yd, stride_yh, stride_yw,
+        BLOCK_W=BLOCK_W,
+        num_warps=4,
+        num_stages=2,
+    )
+
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized pipeline:
+      Conv3d -> Softmax(dim=1) -> MaxPool3d -> MaxPool3d
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, pool_kernel_size):
+        super(ModelNew, self).__init__()
+
+        if isinstance(kernel_size, int):
+            kd = kh = kw = kernel_size
+        else:
+            kd, kh, kw = kernel_size
+        self.kd = kd
+        self.kh = kh
+        self.kw = kw
+
+        self.weight = nn.Parameter(
+            torch.randn(out_channels, in_channels, kd, kh, kw)
+        )
+        self.bias = nn.Parameter(
+            torch.randn(out_channels)
+        )
+
+        if isinstance(pool_kernel_size, int):
+            self.pool_kernel = (pool_kernel_size, pool_kernel_size, pool_kernel_size)
+        else:
+            self.pool_kernel = tuple(pool_kernel_size)
+
+    def forward(self, x):
+        x = x.to(dtype=torch.float32, device=self.weight.device)
+        x = triton_conv3d_softmax(x, self.weight, self.bias)
+        x = triton_maxpool3d(x, self.pool_kernel, self.pool_kernel)
+        x = triton_maxpool3d(x, self.pool_kernel, self.pool_kernel)
+        return x

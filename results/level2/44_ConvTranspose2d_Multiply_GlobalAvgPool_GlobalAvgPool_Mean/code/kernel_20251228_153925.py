@@ -1,0 +1,120 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def mul_global_avg2d_kernel(
+    x_ptr, y_ptr,
+    B, C, H, W,
+    stride_xb, stride_xc, stride_xh, stride_xw,
+    stride_yb, stride_yc, stride_yh, stride_yw,
+    scale,                      # precomputed = multiplier / (H * W)
+    BLOCK_HW: tl.constexpr,     # tile size over H*W
+):
+    pid = tl.program_id(0)
+    # total number of (b, c) pairs
+    n_bc = B * C
+    bc_mask = pid < n_bc
+
+    # Decode (b, c) from linear pid
+    b = pid // C
+    c = pid - b * C
+
+    hw = H * W
+    offs = tl.arange(0, BLOCK_HW)
+    acc = tl.zeros((), dtype=tl.float32)
+
+    # Reduce over spatial dimension in tiles of BLOCK_HW
+    for hw_start in range(0, hw, BLOCK_HW):
+        idx = hw_start + offs
+        mask_hw = (idx < hw) & bc_mask
+
+        h = idx // W
+        w = idx - h * W
+
+        x_ptrs = (
+            x_ptr
+            + b * stride_xb
+            + c * stride_xc
+            + h * stride_xh
+            + w * stride_xw
+        )
+
+        vals = tl.load(x_ptrs, mask=mask_hw, other=0.0)
+        vals_f32 = vals.to(tl.float32)
+        acc += tl.sum(vals_f32, axis=0)
+
+    # Apply combined scaling: (sum / (H*W)) * multiplier = sum * scale
+    out_val = acc * scale
+
+    # Store to (b, c, 0, 0)
+    y_ptrs = (
+        y_ptr
+        + b * stride_yb
+        + c * stride_yc
+        + 0 * stride_yh
+        + 0 * stride_yw
+    )
+    tl.store(y_ptrs, out_val, mask=bc_mask)
+
+
+def mul_global_avg2d(x: torch.Tensor, multiplier: float) -> torch.Tensor:
+    """
+    Fused operation:
+      y[n, c, 0, 0] = multiplier * mean_{h, w} x[n, c, h, w]
+
+    This replaces:
+      x = x * multiplier
+      x = torch.mean(x, dim=[2, 3], keepdim=True)
+      x = torch.mean(x, dim=[2, 3], keepdim=True)  # no-op after keepdim
+    """
+    assert x.ndim == 4, "Expected NCHW tensor"
+    B, C, H, W = x.shape
+    device = x.device
+    dtype = x.dtype
+
+    y = torch.empty((B, C, 1, 1), device=device, dtype=dtype)
+
+    scale = float(multiplier) / float(H * W)
+
+    grid = lambda META: (triton.cdiv(B * C, 1),)
+
+    mul_global_avg2d_kernel[grid](
+        x, y,
+        B, C, H, W,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        y.stride(0), y.stride(1), y.stride(2), y.stride(3),
+        scale,
+        BLOCK_HW=256,
+        num_warps=4,
+    )
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Model that performs a transposed convolution, multiplies by a scalar,
+    and applies two global average poolings (fused into one in Triton).
+    """
+    def __init__(self, in_channels, out_channels, kernel_size,
+                 stride, padding, output_padding, multiplier):
+        super(ModelNew, self).__init__()
+        # Keep conv_transpose2d as in the original model for correctness & cuDNN speed
+        self.conv_transpose = nn.ConvTranspose2d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            output_padding=output_padding,
+        )
+        self.multiplier = float(multiplier)
+
+    def forward(self, x):
+        # cuDNN-optimized transposed convolution
+        x = self.conv_transpose(x)
+        # Fused multiplier + double global average pooling in Triton
+        x = mul_global_avg2d(x, self.multiplier)
+        return x

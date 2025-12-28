@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "Most runtime is spent in ConvTranspose2d whose spatial output is immediately destroyed by global average pooling, so its full convolution is algorithmically redundant.",
+  "bottleneck": "The ConvTranspose2d computes a full high‑resolution feature map (B, C_out, H_out, W_out), but the model only ever uses its global spatial average per output channel; all spatial detail is thrown away. Your Triton kernels optimize the tiny tail (pool+bias+logsumexp), leaving the dominant conv_transpose cost untouched.",
+  "optimisation method": "Replace `conv_transpose + global average pooling` with a much cheaper two‑step linear operation: first globally average the *input* over (H_in, W_in) to get [B, C_in], then apply a dense linear layer whose weights are the spatial sum of the transposed-conv kernels, scaled by (H_in*W_in / H_out*W_out). This is mathematically equivalent but avoids computing/storing any (H_out, W_out) feature maps.",
+  "modification plan": "1) In `__init__`, precompute an effective weight matrix `W_eff` from the ConvTranspose2d weights: `kernel_sum = conv_transpose.weight.sum(dim=(2,3))` (shape [C_in, C_out]) and then, given fixed spatial sizes, scale as `W_eff = kernel_sum * (H_in*W_in / (H_out*W_out))`. 2) In `forward`, replace `x = conv_transpose(x); x = mean_{h,w}(x)` with `x_in_avg = x.mean(dim=(2,3)); x = x_in_avg @ W_eff  + bias` to get the same [B, C_out] tensor as before. 3) Keep (or re‑tune) your existing Triton logsumexp+mul kernel on this [B, C] output; if desired, you can later fuse the input GAP and linear into a single Triton kernel, but the main win comes from eliminating ConvTranspose2d.",
+  "expected_speedup": "5-10x"
+}

@@ -1,0 +1,152 @@
+# Corrected and optimized Triton kernel for fused linear + reductions
+
+import math
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def fused_row_gemv_kernel(
+    x_ptr,           # (M, K) input
+    w_eff_ptr,       # (K,)   effective weight vector = weight.sum(dim=0)
+    out_ptr,         # (M,)   output
+    M, K,
+    stride_xm, stride_xk,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # Program id along M dimension
+    pid_m = tl.program_id(0)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offs_m < M
+
+    # Initialize fp32 accumulator for each row in the block
+    acc = tl.zeros((BLOCK_M,), dtype=tl.float32)
+
+    # Offsets along K dimension for tiling
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Iterate over K dimension in BLOCK_K tiles
+    k_tiles = tl.cdiv(K, BLOCK_K)
+    for tile_idx in range(0, k_tiles):
+        k_offsets = tile_idx * BLOCK_K + offs_k          # (BLOCK_K,)
+        k_mask = k_offsets < K                           # (BLOCK_K,)
+
+        # Compute pointers for this tile
+        x_ptrs = x_ptr + offs_m[:, None] * stride_xm + k_offsets[None, :] * stride_xk
+        w_ptrs = w_eff_ptr + k_offsets
+
+        # Load a (BLOCK_M, BLOCK_K) tile from x
+        x_tile = tl.load(
+            x_ptrs,
+            mask=mask_m[:, None] & k_mask[None, :],
+            other=0.0,
+        )
+        # Load a (BLOCK_K,) tile from w_eff
+        w_tile = tl.load(
+            w_ptrs,
+            mask=k_mask,
+            other=0.0,
+        )
+
+        # Cast to fp32 for accumulation (handles fp16/bf16 inputs as well)
+        x_tile = x_tile.to(tl.float32)
+        w_tile = w_tile.to(tl.float32)
+
+        # Partial dot-product along K for each row:
+        #   acc[m] += sum_k x_tile[m, k] * w_tile[k]
+        acc += tl.sum(x_tile * w_tile[None, :], axis=1)
+
+    # Store result
+    tl.store(out_ptr + offs_m, acc, mask=mask_m)
+
+
+def fused_linear_and_reductions(x, weight, bias):
+    """
+    Computes the same result as:
+
+        y = x @ weight.T + bias          # (M, N)
+        s = torch.sum(y, dim=1, keepdim=True)
+        s = torch.max(s, dim=1, keepdim=True)[0]
+        s = torch.mean(s, dim=1, keepdim=True)
+        s = torch.logsumexp(s, dim=1, keepdim=True)
+        s = torch.logsumexp(s, dim=1, keepdim=True)
+
+    For this model, all reductions after the first sum are no-ops because
+    dim=1 has size 1, so the final result equals the row-wise sum of y.
+
+    Using the identity:
+        sum_n (x W^T + b)_mn = x_m · (sum_n W_n·) + sum_n b_n
+
+    we replace the GEMM + row-sum with a single GEMV:
+        out[m] = x[m] · w_eff + b_eff
+    where:
+        w_eff = weight.sum(dim=0)
+        b_eff = bias.sum()
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+    M, K = x.shape
+    assert weight.shape[1] == K, "weight shape must be (out_features, in_features)"
+
+    # Precompute effective weight vector and bias (once per forward)
+    # Sum over output features N to get a single vector over K
+    w_eff = weight.sum(dim=0, dtype=torch.float32)   # (K,)
+    b_eff = bias.sum(dtype=torch.float32)            # scalar tensor on device
+
+    # Allocate fp32 output buffer for better accumulation accuracy
+    out_fp32 = torch.empty((M,), device=x.device, dtype=torch.float32)
+
+    def grid(meta):
+        return (triton.cdiv(M, meta["BLOCK_M"]),)
+
+    fused_row_gemv_kernel[grid](
+        x,                     # x_ptr
+        w_eff,                 # w_eff_ptr
+        out_fp32,              # out_ptr
+        M, K,
+        x.stride(0), x.stride(1),
+        BLOCK_M=128,
+        BLOCK_K=128,
+        num_warps=4,
+        num_stages=2,
+    )
+
+    # Add scalar bias contribution on GPU
+    out_fp32.add_(b_eff)
+
+    # Match original model's output shape: (M, 1)
+    return out_fp32.to(x.dtype).view(M, 1)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model using an algebraically reduced Triton kernel.
+
+    Original sequence:
+        - Linear: y = x @ W^T + b      (M, N)
+        - Sum over features (dim=1)
+        - Max / Mean / LogSumExp / LogSumExp over size-1 dimension
+
+    Since all post-sum reductions are no-ops on size-1 dim, the final output
+    equals row-wise sum of y. Using:
+
+        sum_n (x W^T + b)_mn = x_m · (sum_n W_n·) + sum_n b_n
+
+    we compute w_eff = W.sum(dim=0) and b_eff = b.sum(), then perform a single
+    GEMV in Triton: out[m] = dot(x[m], w_eff) + b_eff, producing (M, 1).
+    """
+    def __init__(self, in_features, out_features):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias = nn.Parameter(torch.empty(out_features))
+
+        # Match nn.Linear initialization
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+        bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+        nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x):
+        return fused_linear_and_reductions(x, self.weight, self.bias)

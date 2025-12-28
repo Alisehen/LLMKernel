@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "There is still an extra GEMM output tensor and kernel launch for logsumexp that can be eliminated by fusing them.",
+  "bottleneck": "After the main reduction over H,W, the pipeline does a GEMM to produce g[B, C_out], writes it to memory, then a separate kernel reads g back to compute logsumexp along C_out. This introduces a full extra global-memory round-trip for g and an additional kernel launch with very little useful computation.",
+  "optimisation method": "Fuse `gemm_mean_bias_kernel` and `row_logsumexp_kernel` into a single Triton kernel that computes an online log-sum-exp over the output-channel dimension while accumulating the GEMM, so only the final [B, 1] result is written to global memory instead of the full [B, C_out] matrix.",
+  "modification plan": "Redesign the GEMM kernel so that each program (or program group) owns one or more rows in M (batch) and iterates over N (C_out) in tiles: for each (m, n_tile) it computes the partial GEMM block (including scaling and bias), and instead of storing it, it updates per-row running `max_val` and `sum_exp` using the stable online logsumexp formulation. After all K and N tiles are processed, compute `out[m] = 10 * (log(sum_exp[m]) + max_val[m])` and write only this scalar per batch row. Remove the separate `g` buffer and `triton_logsumexp_10` kernel from the Python side and adjust the launch grid/strides accordingly.",
+  "expected_speedup": "10-25%"
+}

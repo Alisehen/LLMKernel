@@ -1,199 +1,238 @@
 ```python
-# <corrected code>
 import torch
 import torch.nn as nn
 import triton
 import triton.language as tl
 
 
-# Fast path: contiguous [N, C, D, H, W] with standard layout
+@triton.jit
+def bn3d_partial_reduce_kernel(
+    x_ptr,               # float32* [N, C, D, H, W] contiguous => [N, C, S]
+    partial_sum_ptr,     # float32* [C, NUM_TILES]
+    partial_sq_ptr,      # float32* [C, NUM_TILES]
+    N, C, S,             # int32
+    T,                   # int32, T = N * S
+    NUM_TILES,           # int32, number of tiles along T
+    BLOCK_T: tl.constexpr,
+):
+    # 2D grid: [C, NUM_TILES]
+    pid_c = tl.program_id(0)
+    pid_tile = tl.program_id(1)
+
+    # Tile over the flattened (N * S) dimension
+    t_start = pid_tile * BLOCK_T
+    offs_t = t_start + tl.arange(0, BLOCK_T)
+    mask_t = offs_t < T
+
+    # Map flattened index t -> (n, s)
+    t = offs_t
+    n = t // S
+    s = t - n * S
+
+    # x index: ((n * C) + pid_c) * S + s
+    idx = ((n * C) + pid_c) * S + s
+
+    x = tl.load(x_ptr + idx, mask=mask_t, other=0.0)
+    x = x.to(tl.float32)
+
+    # Compute partial sums over this tile
+    sum_x = tl.sum(x, axis=0)
+    sum_x2 = tl.sum(x * x, axis=0)
+
+    # Store per-tile partial sums for this channel
+    tile_offset = pid_c * NUM_TILES + pid_tile
+    tl.store(partial_sum_ptr + tile_offset, sum_x)
+    tl.store(partial_sq_ptr + tile_offset, sum_x2)
+
+
+@triton.jit
+def bn3d_final_reduce_kernel(
+    partial_sum_ptr,     # float32* [C, NUM_TILES]
+    partial_sq_ptr,      # float32* [C, NUM_TILES]
+    mean_ptr,            # float32* [C]
+    var_ptr,             # float32* [C]
+    C,                   # int32
+    NUM_TILES,           # int32
+    T,                   # int32, T = N * S
+    BLOCK_TILES: tl.constexpr,
+):
+    # One program per channel
+    c = tl.program_id(0)
+
+    offs = tl.arange(0, BLOCK_TILES)
+
+    # Scalar accumulators to minimize register pressure
+    sum_x = tl.zeros((), dtype=tl.float32)
+    sum_x2 = tl.zeros((), dtype=tl.float32)
+
+    # Reduce over all tiles for this channel
+    for tile_start in range(0, NUM_TILES, BLOCK_TILES):
+        tile_idx = tile_start + offs
+        mask = tile_idx < NUM_TILES
+        base = c * NUM_TILES + tile_idx
+
+        part_sum = tl.load(partial_sum_ptr + base, mask=mask, other=0.0)
+        part_sq = tl.load(partial_sq_ptr + base, mask=mask, other=0.0)
+
+        # Reduce vector into scalar and accumulate
+        sum_x += tl.sum(part_sum, axis=0)
+        sum_x2 += tl.sum(part_sq, axis=0)
+
+    E = T
+    E_f = E.to(tl.float32)
+
+    mean = sum_x / E_f
+    var = sum_x2 / E_f - mean * mean
+
+    tl.store(mean_ptr + c, mean)
+    tl.store(var_ptr + c, var)
+
+
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_T': 128}, num_warps=2, num_stages=2),
-        triton.Config({'BLOCK_T': 256}, num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_T': 512}, num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_T': 1024}, num_warps=8, num_stages=2),
+        # Smaller tile: lower register pressure, higher occupancy
+        triton.Config({'BLOCK_S': 128}, num_warps=2),
+        # Balanced config
+        triton.Config({'BLOCK_S': 256}, num_warps=2),
+        # Larger tile: more ILP if registers allow
+        triton.Config({'BLOCK_S': 256}, num_warps=4),
     ],
-    key=['S'],  # tune based on spatial size
+    key=['S'],  # Autotune per spatial size
 )
 @triton.jit
-def subtract_spatial_mean_kernel_contiguous(
-    x_ptr, out_ptr,
-    NC, S,
-    BLOCK_T: tl.constexpr,
+def bn3d_norm_sub_mean_kernel(
+    x_ptr,            # float32* [N, C, D, H, W] contiguous
+    mean_ptr,         # float32* [C]
+    var_ptr,          # float32* [C]
+    weight_ptr,       # float32* [C]
+    bias_ptr,         # float32* [C]
+    out_ptr,          # float32* [N, C, D, H, W] contiguous
+    N, C, S,          # int32 N, C, S = D*H*W
+    eps,              # float32
+    BLOCK_S: tl.constexpr,
 ):
+    # One program per (n, c)
+    nc = tl.program_id(0)
+    n = nc // C
+    c = nc - n * C
+
+    mean_c = tl.load(mean_ptr + c)
+    var_c = tl.load(var_ptr + c)
+    gamma = tl.load(weight_ptr + c)
+    beta = tl.load(bias_ptr + c)
+
+    inv_std = 1.0 / tl.sqrt(var_c + eps)
+
+    base = (n * C + c) * S
+
+    # First pass: compute spatial mean after BN for this (n, c)
+    sum_y = tl.zeros((), dtype=tl.float32)
+    for s_start in range(0, S, BLOCK_S):
+        offs = s_start + tl.arange(0, BLOCK_S)
+        mask = offs < S
+
+        x = tl.load(x_ptr + base + offs, mask=mask, other=0.0)
+        x = x.to(tl.float32)
+        y = ((x - mean_c) * inv_std) * gamma + beta
+
+        # Mask out invalid elements before reduction
+        y_masked = tl.where(mask, y, 0.0)
+        sum_y += tl.sum(y_masked, axis=0)
+
+    S_f = S.to(tl.float32)
+    mean_spatial = sum_y / S_f
+
+    # Second pass: write normalized output minus spatial mean
+    for s_start in range(0, S, BLOCK_S):
+        offs = s_start + tl.arange(0, BLOCK_S)
+        mask = offs < S
+
+        x = tl.load(x_ptr + base + offs, mask=mask, other=0.0)
+        x = x.to(tl.float32)
+        y = ((x - mean_c) * inv_std) * gamma + beta
+        y = y - mean_spatial
+        tl.store(out_ptr + base + offs, y, mask=mask)
+
+
+def bn3d_norm_sub_mean(x, weight, bias, eps):
     """
-    x, out are contiguous tensors with shape [N, C, D, H, W] flattened to:
-        [NC, S] where NC = N * C and S = D * H * W
+    BatchNorm3d (training semantics: per-batch channel-wise mean/var)
+    followed by subtracting per-sample spatial mean, implemented in Triton.
 
-    For each (n, c) slice (i.e., each row in [NC, S]):
-        out[nc, s] = x[nc, s] - mean_s(x[nc, :])
+    x: [N, C, D, H, W] contiguous, float32, CUDA
+    weight, bias: [C]
     """
-    pid = tl.program_id(axis=0)
-    if pid >= NC:
-        return
-
-    # Base pointers for this (n, c) slice
-    base_x = x_ptr + pid * S
-    base_out = out_ptr + pid * S
-
-    offs = tl.arange(0, BLOCK_T)
-    tl.multiple_of(offs, BLOCK_T)
-    tl.max_contiguous(offs, BLOCK_T)
-
-    # -------------------------------------------------------------------------
-    # Pass 1: compute mean over spatial dimension for this (n, c)
-    # -------------------------------------------------------------------------
-    sum_val = tl.zeros((), dtype=tl.float32)
-
-    # Same offsets + mask pattern will be reused in pass 2
-    for start in range(0, S, BLOCK_T):
-        idx = start + offs
-        mask = idx < S
-
-        x_vals = tl.load(base_x + idx, mask=mask, other=0.0)
-        x_vals_f32 = x_vals.to(tl.float32)
-        sum_val += tl.sum(x_vals_f32, axis=0)
-
-    # S is an integer scalar; Triton will promote it to float for division
-    mean = sum_val / S
-
-    # -------------------------------------------------------------------------
-    # Pass 2: subtract mean and write result
-    # -------------------------------------------------------------------------
-    for start in range(0, S, BLOCK_T):
-        idx = start + offs
-        mask = idx < S
-
-        x_vals = tl.load(base_x + idx, mask=mask, other=0.0)
-        mean_cast = tl.cast(mean, x_vals.dtype)
-        y = x_vals - mean_cast
-        tl.store(base_out + idx, y, mask=mask)
-
-
-# Fallback: general-stride version (kept for correctness, not optimized as hard)
-@triton.jit
-def subtract_spatial_mean_kernel_generic(
-    x_ptr, out_ptr,
-    N, C, D, H, W,
-    stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
-    stride_on, stride_oc, stride_od, stride_oh, stride_ow,
-    BLOCK_T: tl.constexpr,
-):
-    """
-    Generic-stride implementation matching the original semantics, used when
-    input/output are not contiguous in memory.
-    """
-    pid = tl.program_id(axis=0)
-    NC = N * C
-
-    if pid >= NC:
-        return
-
-    n = pid // C
-    c = pid % C
-
-    base_x = x_ptr + n * stride_xn + c * stride_xc
-    base_out = out_ptr + n * stride_on + c * stride_oc
-
-    S = D * H * W
-    offs = tl.arange(0, BLOCK_T)
-
-    # Pass 1: compute mean
-    sum_val = tl.zeros((), dtype=tl.float32)
-    for start in range(0, S, BLOCK_T):
-        idx = start + offs
-        mask = idx < S
-
-        w = idx % W
-        tmp = idx // W
-        h = tmp % H
-        d = tmp // H
-
-        x_ptrs = base_x + d * stride_xd + h * stride_xh + w * stride_xw
-        x_vals = tl.load(x_ptrs, mask=mask, other=0.0)
-        x_vals_f32 = x_vals.to(tl.float32)
-        sum_val += tl.sum(x_vals_f32, axis=0)
-
-    # Same fix: divide by integer S directly; Triton promotes types
-    mean = sum_val / S
-
-    # Pass 2: subtract mean
-    for start in range(0, S, BLOCK_T):
-        idx = start + offs
-        mask = idx < S
-
-        w = idx % W
-        tmp = idx // W
-        h = tmp % H
-        d = tmp // H
-
-        x_ptrs = base_x + d * stride_xd + h * stride_xh + w * stride_xw
-        out_ptrs = base_out + d * stride_od + h * stride_oh + w * stride_ow
-
-        x_vals = tl.load(x_ptrs, mask=mask, other=0.0)
-        mean_cast = tl.cast(mean, x_vals.dtype)
-        y = x_vals - mean_cast
-        tl.store(out_ptrs, y, mask=mask)
-
-
-def subtract_spatial_mean_triton(x: torch.Tensor) -> torch.Tensor:
-    """
-    Subtract spatial mean over (D, H, W) from each (N, C) slice of a 5D tensor:
-        out = x - mean(x, dim=(2, 3, 4), keepdim=True)
-
-    Fast path: assumes x is contiguous in standard layout and uses a heavily
-    optimized kernel with simple linear indexing.
-    Fallback path: generic-stride kernel for non-contiguous tensors.
-    """
-    assert x.ndim == 5, "Input must be a 5D tensor [N, C, D, H, W]"
-    assert x.is_cuda, "Input tensor must be on CUDA device"
-
-    # Ensure dtype is supported by Triton (common cases: fp16, bf16, fp32)
-    assert x.dtype in (torch.float16, torch.bfloat16, torch.float32), \
-        "Supported dtypes: float16, bfloat16, float32"
-
+    assert x.is_cuda
+    x = x.contiguous()
     N, C, D, H, W = x.shape
-    out = torch.empty_like(x)
-
-    # Spatial size and number of (n, c) slices
     S = D * H * W
-    NC = N * C
+    T = N * S  # Flattened (N, D, H, W) dimension per channel
 
-    # Fast path: standard contiguous layout (most common after conv + BN)
-    if x.is_contiguous(memory_format=torch.contiguous_format) and \
-       x.stride(0) == C * S and x.stride(1) == S and \
-       x.stride(2) == H * W and x.stride(3) == W and x.stride(4) == 1:
+    # Allocate per-channel statistics
+    mean = torch.empty(C, device=x.device, dtype=torch.float32)
+    var = torch.empty(C, device=x.device, dtype=torch.float32)
 
-        grid = (NC,)
-        subtract_spatial_mean_kernel_contiguous[grid](
-            x, out,
-            NC, S,
-        )
-    else:
-        # Fallback to generic-stride kernel
-        BLOCK_T = 256  # reasonable default
-        grid = (N * C,)
-        subtract_spatial_mean_kernel_generic[grid](
-            x, out,
-            N, C, D, H, W,
-            x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
-            out.stride(0), out.stride(1), out.stride(2), out.stride(3), out.stride(4),
-            BLOCK_T=BLOCK_T,
-        )
+    # Parallel multi-block reduction over (N * S) for each channel
+    BLOCK_T = 256  # Conservative, bandwidth-saturating and register-safe
+    num_tiles = triton.cdiv(T, BLOCK_T)
 
+    partial_sum = torch.empty(
+        (C * num_tiles,), device=x.device, dtype=torch.float32
+    )
+    partial_sq = torch.empty_like(partial_sum)
+
+    # Kernel 1: compute per-channel partial sums over tiles of N*S
+    grid_partial = lambda META: (C, num_tiles)
+    bn3d_partial_reduce_kernel[grid_partial](
+        x,
+        partial_sum,
+        partial_sq,
+        N,
+        C,
+        S,
+        T,
+        num_tiles,
+        BLOCK_T=BLOCK_T,
+        num_warps=4,
+    )
+
+    # Kernel 2: reduce partial sums to final per-channel mean and variance
+    BLOCK_TILES = 256
+    grid_final = lambda META: (C,)
+    bn3d_final_reduce_kernel[grid_final](
+        partial_sum,
+        partial_sq,
+        mean,
+        var,
+        C,
+        num_tiles,
+        T,
+        BLOCK_TILES=BLOCK_TILES,
+        num_warps=1,
+    )
+
+    # Kernel 3: apply BN and subtract per-sample spatial mean
+    out = torch.empty_like(x, dtype=torch.float32)
+    grid_norm = lambda META: (N * C,)
+    bn3d_norm_sub_mean_kernel[grid_norm](
+        x,
+        mean,
+        var,
+        weight,
+        bias,
+        out,
+        N,
+        C,
+        S,
+        eps,
+    )
     return out
 
 
 class ModelNew(nn.Module):
     """
-    ConvTranspose3d (PyTorch native) + BatchNorm3d (PyTorch native) +
-    Triton-accelerated spatial mean subtraction.
-
-    Semantics:
-        x = conv_transpose(x)
-        x = batch_norm(x)
-        x = x - torch.mean(x, dim=(2, 3, 4), keepdim=True)
+    ConvTranspose3d + BatchNorm3d (training-style per-batch stats) +
+    subtraction of spatial mean, with BN + mean-sub fused in Triton.
     """
     def __init__(self, in_channels, out_channels, kernel_size, stride, padding, bias=True):
         super(ModelNew, self).__init__()
@@ -205,11 +244,15 @@ class ModelNew(nn.Module):
             padding=padding,
             bias=bias,
         )
+        # Keep BatchNorm3d for learnable parameters (weight, bias) and eps.
         self.batch_norm = nn.BatchNorm3d(out_channels)
 
     def forward(self, x):
         x = self.conv_transpose(x)
-        x = self.batch_norm(x)
-        x = subtract_spatial_mean_triton(x)
+        # Use training-mode BatchNorm semantics: per-batch statistics
+        weight = self.batch_norm.weight
+        bias = self.batch_norm.bias
+        eps = self.batch_norm.eps
+        x = bn3d_norm_sub_mean(x, weight, bias, eps)
         return x
 ```

@@ -1,0 +1,199 @@
+# Optimized Triton code for fused linear + row reductions on RTX 4090
+
+import math
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        # Larger, more aggressive tile (use when registers allow)
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_K': 128},
+            num_warps=4,
+            num_stages=3,
+        ),
+        # Balanced tile, lower register pressure
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_K': 64},
+            num_warps=4,
+            num_stages=2,
+        ),
+        # Small fallback tile for high-register-pressure cases
+        triton.Config(
+            {'BLOCK_M': 32, 'BLOCK_K': 64},
+            num_warps=2,
+            num_stages=2,
+        ),
+    ],
+    key=['M', 'K'],
+)
+@triton.jit
+def fused_row_gemv_kernel(
+    x_ptr,           # (M, K) input
+    w_eff_ptr,       # (K,)   effective weight vector
+    out_ptr,         # (M,)   output (fp32)
+    b_eff,           # scalar bias in fp32
+    M, K,
+    stride_xm, stride_xk,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+):
+    # 2D launch:
+    #   pid_m: blocks of rows
+    #   pid_k: split-K parallelism
+    pid_m = tl.program_id(0)
+    pid_k = tl.program_id(1)
+
+    # Row indices for this program
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offs_m < M
+
+    # Column (K) tile indices
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # FP32 accumulator: one per row in this block
+    acc = tl.zeros((BLOCK_M,), dtype=tl.float32)
+
+    # Number of tiles along K
+    k_tiles = tl.cdiv(K, BLOCK_K)
+
+    # Each split-K instance processes tiles: pid_k, pid_k + SPLIT_K, ...
+    for tile_idx in range(pid_k, k_tiles, SPLIT_K):
+        k_offsets = tile_idx * BLOCK_K + offs_k
+        k_mask = k_offsets < K
+
+        # Pointers for X and w tiles
+        x_ptrs = x_ptr + offs_m[:, None] * stride_xm + k_offsets[None, :] * stride_xk
+        w_ptrs = w_eff_ptr + k_offsets
+
+        # Load tiles (masked at boundaries)
+        x_tile = tl.load(
+            x_ptrs,
+            mask=mask_m[:, None] & k_mask[None, :],
+            other=0.0,
+        )
+        w_tile = tl.load(
+            w_ptrs,
+            mask=k_mask,
+            other=0.0,
+        )
+
+        # Promote to fp32 for accumulation
+        x_tile = x_tile.to(tl.float32)
+        w_tile = w_tile.to(tl.float32)
+
+        # Dot product along K: per-row accumulation
+        acc += tl.sum(x_tile * w_tile[None, :], axis=1)
+
+    # Add scalar bias and write back
+    if SPLIT_K == 1:
+        # No split-K: bias added once, regular store
+        acc += b_eff
+        tl.store(out_ptr + offs_m, acc, mask=mask_m)
+    else:
+        # Split-K: only pid_k == 0 adds bias, atomic add to combine partial sums
+        if pid_k == 0:
+            acc += b_eff
+        tl.atomic_add(out_ptr + offs_m, acc, mask=mask_m)
+
+
+def fused_linear_and_reductions(x, weight, bias):
+    """
+    Compute:
+        y = x @ weight.T + bias   # (M, N)
+        s = torch.sum(y, dim=1, keepdim=True)  # (M, 1)
+
+    Using:
+        sum_n (x W^T + b)_mn = x_m · (sum_n W_n·) + sum_n b_n
+
+    So:
+        w_eff = weight.sum(dim=0)  # (K,)
+        b_eff = bias.sum()         # scalar
+        out[m] = x[m] · w_eff + b_eff
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+    M, K = x.shape
+    assert weight.shape[1] == K, "weight shape must be (out_features, in_features)"
+
+    if M == 0:
+        # Avoid launching a kernel with grid size 0
+        return x.new_empty((0, 1))
+
+    # Precompute effective weight and bias in fp32
+    # These are small (O(K) and scalar), so precomputation overhead is negligible.
+    w_eff = weight.sum(dim=0, dtype=torch.float32).contiguous()  # (K,)
+    b_eff = bias.sum(dtype=torch.float32).item()                 # scalar
+
+    # Split-K parallelism to boost grid size when M is small.
+    # Keep reasonably aggressive (up to 8-way) but avoid over-splitting.
+    BLOCK_K_FOR_EST = 128  # heuristic; real BLOCK_K is autotuned in the kernel
+    k_tiles = (K + BLOCK_K_FOR_EST - 1) // BLOCK_K_FOR_EST
+    max_split_k = max(1, min(8, k_tiles))
+
+    device_index = x.device.index if x.device.index is not None else torch.cuda.current_device()
+    num_sms = torch.cuda.get_device_properties(device_index).multi_processor_count
+
+    # Aim for at least ~3 CTAs per SM to help saturate memory BW,
+    # but don't force excessive split-K (atomic overhead).
+    target_ctas = 3 * num_sms
+
+    # We don't know BLOCK_M yet (autotuned), so estimate grid_m using 64 as typical.
+    BLOCK_M_EST = 64
+    grid_m_est = (M + BLOCK_M_EST - 1) // BLOCK_M_EST
+
+    split_k = 1
+    if grid_m_est > 0 and max_split_k > 1 and grid_m_est < target_ctas:
+        needed = (target_ctas + grid_m_est - 1) // grid_m_est
+        split_k = min(max_split_k, max(1, needed))
+    split_k = max(1, split_k)
+
+    # Allocate output buffer
+    if split_k == 1:
+        out_fp32 = torch.empty((M,), device=x.device, dtype=torch.float32)
+    else:
+        # Atomic-add path needs zero-initialized output
+        out_fp32 = torch.zeros((M,), device=x.device, dtype=torch.float32)
+
+    def grid(meta):
+        # meta['BLOCK_M'] is chosen by autotuner; ensure grid size > 0.
+        return (triton.cdiv(M, meta['BLOCK_M']), split_k)
+
+    fused_row_gemv_kernel[grid](
+        x,                     # x_ptr
+        w_eff,                 # w_eff_ptr
+        out_fp32,              # out_ptr
+        b_eff,                 # scalar bias
+        M, K,
+        x.stride(0), x.stride(1),
+        SPLIT_K=split_k,
+    )
+
+    # Match original model's output shape and dtype: (M, 1)
+    return out_fp32.to(x.dtype).view(M, 1)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model using a Triton GEMV with autotuned tiling,
+    split-K parallelism, and fused bias addition plus row reduction.
+    Algebraically equivalent to:
+        y = nn.Linear(in_features, out_features)(x)
+        s = y.sum(dim=1, keepdim=True)
+    """
+    def __init__(self, in_features, out_features):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias = nn.Parameter(torch.empty(out_features))
+
+        # Match nn.Linear initialization
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+        bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+        nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x):
+        return fused_linear_and_reductions(x, self.weight, self.bias)

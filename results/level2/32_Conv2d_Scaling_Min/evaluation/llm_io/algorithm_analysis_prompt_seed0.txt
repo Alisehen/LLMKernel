@@ -1,0 +1,318 @@
+You are a GPU kernel optimization architect. Analyze the kernel and identify **ONE high-level algorithmic optimization**.
+
+# PyTorch Reference
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs a convolution, scales the output, and then applies a minimum operation.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, scale_factor):
+        super(Model, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.scale_factor = scale_factor
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_channels, height, width).
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_channels, height, width).
+        """
+        x = self.conv(x)
+        x = x * self.scale_factor
+        x = torch.min(x, dim=1, keepdim=True)[0]  # Minimum along channel dimension
+        return x
+
+batch_size = 64
+in_channels = 64
+out_channels = 128
+height = width = 256
+kernel_size = 3
+scale_factor = 2.0
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, scale_factor]
+```
+
+# Current Triton Kernel
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def conv_scale_min_kernel(
+    x_ptr, w_ptr, bias_ptr, y_ptr,
+    N, C_in, H, W,
+    C_out, KH, KW,
+    H_out, W_out,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_wk, stride_wn,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    scale,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # Program id along the flattened output pixel dimension (N * H_out * W_out)
+    pid_m = tl.program_id(0)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    M = N * H_out * W_out
+    mask_m = offs_m < M
+
+    # Decode linear index offs_m -> (n, oh, ow)
+    ohw = H_out * W_out
+    n_idx = offs_m // ohw
+    rem = offs_m % ohw
+    oh = rem // W_out
+    ow = rem % W_out
+
+    # Total reduction dimension (C_in * KH * KW)
+    K_total = C_in * KH * KW
+
+    # Initialize running minimum for each (n, oh, ow)
+    # Use a very large positive value as initial minimum
+    min_val = tl.full((BLOCK_M,), 3.402823e38, dtype=tl.float32)
+
+    # Offsets along output-channel dimension
+    for oc_start in range(0, C_out, BLOCK_N):
+        offs_n = oc_start + tl.arange(0, BLOCK_N)
+        mask_n = offs_n < C_out
+
+        # Accumulator for conv outputs for this (M-tile, oc-tile)
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+        offs_k = tl.arange(0, BLOCK_K)
+
+        # Reduction over K (C_in * KH * KW)
+        for k in range(0, K_total, BLOCK_K):
+            k_idx = k + offs_k  # [BLOCK_K]
+            mask_k = k_idx < K_total
+
+            # Decompose K index -> (c_in, kh, kw)
+            cin_mul = KH * KW
+            c_in_idx = k_idx // cin_mul
+            remk = k_idx % cin_mul
+            kh = remk // KW
+            kw = remk % KW
+
+            # Compute input spatial coords for each (m, k)
+            ih = oh[:, None] + kh[None, :]
+            iw = ow[:, None] + kw[None, :]
+
+            # Compute input pointers (NCHW)
+            x_ptrs = (
+                x_ptr
+                + n_idx[:, None] * stride_xn
+                + c_in_idx[None, :] * stride_xc
+                + ih * stride_xh
+                + iw * stride_xw
+            )
+
+            # Valid loads only for in-range m and k
+            mask_x = mask_m[:, None] & mask_k[None, :]
+
+            a = tl.load(x_ptrs, mask=mask_x, other=0.0)
+
+            # Weight matrix is (K_total, C_out) = (K, N) layout
+            w_ptrs = (
+                w_ptr
+                + k_idx[:, None] * stride_wk
+                + offs_n[None, :] * stride_wn
+            )
+            mask_w = mask_k[:, None] & mask_n[None, :]
+
+            b = tl.load(w_ptrs, mask=mask_w, other=0.0)
+
+            # Matrix multiply accumulate
+            acc += tl.dot(a, b, allow_tf32=True)
+
+        # Add bias for this oc-tile
+        bias_tile = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0)
+        acc = acc + bias_tile[None, :]
+
+        # Scale
+        acc = acc * scale
+
+        # Reduce over output channels within this tile: min over N-axis
+        tile_min = tl.min(acc, axis=1)
+
+        # Update running minimum
+        min_val = tl.minimum(min_val, tile_min)
+
+    # Store result: output shape (N, 1, H_out, W_out)
+    y_ptrs = (
+        y_ptr
+        + n_idx * stride_yn
+        + 0 * stride_yc
+        + oh * stride_yh
+        + ow * stride_yw
+    )
+    tl.store(y_ptrs, min_val, mask=mask_m)
+
+
+def conv_scale_min_triton(x, weight, bias, scale_factor):
+    """
+    Fused conv2d (stride=1, padding=0, dilation=1, groups=1) + scale + min over channels.
+    Args:
+        x: (N, C_in, H, W), contiguous, float32
+        weight: (C_out, C_in, KH, KW), contiguous
+        bias: (C_out,)
+        scale_factor: float
+    Returns:
+        y: (N, 1, H_out, W_out) where H_out = H-KH+1, W_out = W-KW+1
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda, "All tensors must be on CUDA"
+    x = x.contiguous()
+    weight = weight.contiguous()
+    bias = bias.contiguous()
+
+    N, C_in, H, W = x.shape
+    C_out, C_in_w, KH, KW = weight.shape
+    assert C_in_w == C_in, "Incompatible in_channels"
+
+    # Only support standard Conv2d defaults: stride=1, padding=0, dilation=1, groups=1
+    H_out = H - KH + 1
+    W_out = W - KW + 1
+    assert H_out > 0 and W_out > 0, "Invalid kernel size for given input"
+
+    # Reshape weights to (K_total, C_out) for GEMM-friendly layout
+    K_total = C_in * KH * KW
+    w2d = weight.view(C_out, K_total).transpose(0, 1).contiguous()  # (K_total, C_out)
+
+    # Allocate output: channel dimension reduced to 1
+    y = torch.empty((N, 1, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    stride_xn, stride_xc, stride_xh, stride_xw = x.stride()
+    stride_wk, stride_wn = w2d.stride()  # (K_total, C_out)
+    stride_yn, stride_yc, stride_yh, stride_yw = y.stride()
+
+    M = N * H_out * W_out
+
+    BLOCK_M = 64
+    BLOCK_N = 64
+    BLOCK_K = 32
+
+    grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]),)
+
+    conv_scale_min_kernel[grid](
+        x, w2d, bias, y,
+        N, C_in, H, W,
+        C_out, KH, KW,
+        H_out, W_out,
+        stride_xn, stride_xc, stride_xh, stride_xw,
+        stride_wk, stride_wn,
+        stride_yn, stride_yc, stride_yh, stride_yw,
+        scale_factor,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        num_warps=4,
+        num_stages=2,
+    )
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized model:
+    Conv2d (stride=1, padding=0) + scaling + min over channels.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, scale_factor):
+        super(ModelNew, self).__init__()
+        if isinstance(kernel_size, (tuple, list)):
+            assert kernel_size[0] == kernel_size[1], "Only square kernels supported"
+            k = int(kernel_size[0])
+        else:
+            k = int(kernel_size)
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = k
+        self.scale_factor = float(scale_factor)
+
+        # Match Conv2d parameter shapes
+        self.weight = nn.Parameter(
+            torch.randn(out_channels, in_channels, k, k)
+        )
+        self.bias = nn.Parameter(
+            torch.randn(out_channels)
+        )
+
+    def forward(self, x):
+        return conv_scale_min_triton(x, self.weight, self.bias, self.scale_factor)
+```
+
+# Performance
+- **PyTorch baseline**: 23.56 ms
+- **Current Triton**: 21.89 ms
+- **Current speedup**: 1.08x (+7.1% vs baseline)
+
+
+---
+
+## Analysis Steps
+
+1. **Code Analysis**: Count kernels, identify operations, check for inefficiencies
+2. **Performance Diagnosis**: Use metrics/latency to identify bottleneck type
+3. **Root Cause**: Combine code + performance to find the core issue
+
+## Optimization Categories (pick ONE if worth optimizing):
+
+### 1. Operator Fusion
+Fuse consecutive ops into fewer kernels to reduce memory traffic and launch overhead.
+
+### 2. Algorithm Replacement
+Replace naive algorithm with optimized variant.
+- For Attention: Flash Attention, online softmax
+- For Convolution: Winograd, im2col
+- **For RNN/GRU/LSTM**: Persistent kernel with HYBRID computation
+  - **CRITICAL**: Use hybrid approach for best performance:
+    * Precompute input-side gates ONCE (outside kernel): `gates_x = (T*B, In) @ W_ih`
+    * Persistent kernel (inside): only recurrent-side: `for t: gates_h = h @ W_hh`
+  - Time loop `for t in range(T)` must be inside kernel, NOT in Python
+  - Launch kernel once per layer, not once per timestep
+  - Expected speedup: 10-100x (vs per-timestep launches)
+
+### 3. Kernel Launch Reduction
+Combine multiple small kernels to reduce overhead.
+- **For RNN/GRU/LSTM**: See "Algorithm Replacement" above for persistent kernel approach
+
+### 4. Memory Layout Optimization
+Use in-place operations, buffer reuse, or better layouts.
+
+## Should We Optimize?
+
+Before proposing optimization, determine if it's worthwhile:
+- **Not worth optimizing** if:
+  - Code is already near-optimal (expected speedup < 10%)
+  - Bottleneck cannot be addressed (hardware limited, already optimal algorithm)
+  - Optimization would add significant complexity with minimal gain
+
+- **Worth optimizing** if:
+  - Clear algorithmic inefficiency exists (multiple kernels, suboptimal algorithm)
+  - Expected speedup >= 20%
+  - Concrete optimization path available
+
+## Output (JSON)
+
+```json
+{
+  "worth_optimizing": "yes/no",
+  "reason": "<Why worth or not worth optimizing, 1 sentence>",
+  "bottleneck": "<Root cause in 1-2 sentences, empty if not worth optimizing>",
+  "optimisation method": "<Specific optimization in 1-2 sentences, empty if not worth optimizing>",
+  "modification plan": "<Implementation steps in 2-3 sentences, empty if not worth optimizing>",
+  "expected_speedup": "<e.g., '30-40%', empty if not worth optimizing>"
+}
+```
+
+Return JSON only.
