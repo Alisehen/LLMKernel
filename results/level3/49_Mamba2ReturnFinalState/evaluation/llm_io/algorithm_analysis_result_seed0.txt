@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The y_diag computation is still O(L^2) in sequence length inside the Triton kernel, even though an O(L) recurrence exists for this structured SSM.",
+  "bottleneck": "The current y_diag_kernel loops over all source positions s and time positions t (quadratic in BLOCK_L) and over d_state, performing a dense causal matmul with implicit L[t,s]=u[t]v[s] plus a causal mask. This quadratic work and repeated global-memory traffic for B/C/X dominate the runtime and negate any benefit over the baseline einsum.",
+  "optimisation method": "Replace the quadratic exp(segsum(A))-based formulation of Y_diag with a linear-time online scan: maintain a per-(b,c,h) prefix state S_t over (d_state, d_head) updated as S_t = S_{t-1} + v_t * (B_t ⊗ X_t), and compute Y_t = u_t * (C_t · S_t), thus removing the inner loop over s and the causal mask.",
+  "modification plan": "Derive the recurrence: define S_t[n,p] = Σ_{s≤t} v_s * B[s,n] * X[s,p]; this satisfies S_t = S_{t-1} + v_t * (B_t ⊗ X_t). Then Y[t,p] = u_t * Σ_n C[t,n] * S_t[n,p], which implements the same operator as the original causal exp(segsum(A)) weighting but in O(L * d_state * P). Implement a new Triton kernel that, for each (b,c,h) group, loops only over t (time), keeps S_t in registers/shared or L2-backed tiles, updates S_t from the current B_t, v_t, X_t, immediately computes Y_t with a dot over n using C_t and u_t, and writes Y_t; remove the inner s-loop, causal_mask, and per-(t,s) recomputation. Replace the existing y_diag_kernel call in fused_y_diag with this scan-based kernel while keeping the high-level interface unchanged.",
+  "expected_speedup": "30-40% end-to-end (2-3x speedup for the y_diag part, which is currently the dominant cost)."
+}

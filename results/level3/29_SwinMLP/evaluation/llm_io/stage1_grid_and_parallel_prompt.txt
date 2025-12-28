@@ -1,34 +1,12 @@
 You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
 
-# Target GPU
-GPU Name: 4090
-Architecture: Ada Lovelace
-• Compute Capability: 8.9
-• Number of SMs: 128
-• Memory Bandwidth: 1008 GB/s
-• TF32 Tensor Core TFLOPS: 82.6 with dense
-• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
-• FP16 Tensor Core TFLOPS: 165.2 with dense
-• Maximum number of registers per thread: 255
-• Maximum threads per block: 1024
-• Maximum threads per SM: 1536
-• Warp size: 32
-• Maximum concurrent warps per SM: 48
-• Shared memory capacity per SM: 100 KB
-• Maximum shared memory per thread block: 99 KB
-• L2 cache (global, all SM shared): 72 MB
+# Target GPU: 4090
 
-[OPTIMIZATION STAGE]f
+[OPTIMIZATION STAGE]
 
 ## Current Optimization Stage
 
 Focus: Grid layout & indexing for FUSED operations.
-
-⚠️ FUSION EXCLUSIONS (do NOT apply fusion rules to these):
-- Reduction ops (sum, mean, softmax along axis)
-- Atomic operations
-- Irregular/data-dependent access patterns
-- Cross-block dependencies
 
 Key Principle:
 - All fused ops share the SAME grid AND the SAME (offsets, mask) tuple
@@ -50,167 +28,537 @@ Verification:
 
 [CURRENT CODE]
 ```python
-# <complete ModelNew code with optimized Triton kernels>
-
-import math
-import collections.abc
-from itertools import repeat
-
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import triton
 import triton.language as tl
-from torch.utils.checkpoint import checkpoint
+import math
 
 
-# -----------------------------
-# Triton kernel: fused linear (GEMM + bias)
-# -----------------------------
+# ==============================
+# Triton Kernels
+# ==============================
 
-@triton.autotune(
-    configs=[
-        triton.Config(
-            {'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32},
-            num_warps=4,
-        ),
-        triton.Config(
-            {'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32},
-            num_warps=8,
-        ),
-    ],
-    key=['M', 'N', 'K'],
-)
 @triton.jit
-def _linear_kernel(
+def linear_kernel(
     a_ptr, b_ptr, bias_ptr, c_ptr,
     M, N, K,
     stride_am, stride_ak,
     stride_bk, stride_bn,
     stride_cm, stride_cn,
     HAS_BIAS: tl.constexpr,
-    BLOCK_M: tl.constexpr,  # power of 2
-    BLOCK_N: tl.constexpr,  # power of 2
-    BLOCK_K: tl.constexpr,  # power of 2
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
 ):
     """
-    Compute C = A @ B + bias
-    A: [M, K]
-    B: [K, N]
+    Computes: C[M, N] = A[M, K] @ B[K, N] (+ bias[N])
+    A: [M, K] with strides (stride_am, stride_ak)
+    B: [K, N] with strides (stride_bk, stride_bn)
     bias: [N]
-    C: [M, N]
     """
-
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_k = tl.arange(0, BLOCK_K)
-
-    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
-    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    k_iter = 0
-    while k_iter < K:
-        k_remaining = K - k_iter
-        k_mask_a = offs_k[None, :] < k_remaining
-        k_mask_b = offs_k[:, None] < k_remaining
+    for k0 in range(0, K, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)
 
-        a = tl.load(
-            a_ptrs,
-            mask=(offs_m[:, None] < M) & k_mask_a,
-            other=0.0,
-        )
-        b = tl.load(
-            b_ptrs,
-            mask=k_mask_b & (offs_n[None, :] < N),
-            other=0.0,
-        )
+        a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+        b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+        a_mask = (offs_m[:, None] < M) & (offs_k[None, :] < K)
+        b_mask = (offs_k[:, None] < K) & (offs_n[None, :] < N)
+
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
         acc += tl.dot(a, b, allow_tf32=True)
-
-        a_ptrs += BLOCK_K * stride_ak
-        b_ptrs += BLOCK_K * stride_bk
-        k_iter += BLOCK_K
 
     if HAS_BIAS:
         bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
         acc += bias[None, :]
 
     c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
-    tl.store(
-        c_ptrs,
-        acc,
-        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, acc, mask=c_mask)
+
+
+@triton.jit
+def linear_gelu_kernel(
+    a_ptr, b_ptr, bias_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    HAS_BIAS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """
+    Computes: GELU(A @ B + bias)
+    GELU uses tanh-based approximation, implemented with a numerically-stable tanh.
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k0 in range(0, K, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+
+        a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+        b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+        a_mask = (offs_m[:, None] < M) & (offs_k[None, :] < K)
+        b_mask = (offs_k[:, None] < K) & (offs_n[None, :] < N)
+
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+        acc += tl.dot(a, b, allow_tf32=True)
+
+    if HAS_BIAS:
+        bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+        acc += bias[None, :]
+
+    # GELU via tanh approximation:
+    # gelu(x) = 0.5 * x * (1 + tanh(sqrt(2/pi)*(x + 0.044715*x^3)))
+    c = 0.044715
+    sqrt_2_over_pi = 0.7978845608028654
+    x = acc
+    x3 = x * x * x
+    inner = sqrt_2_over_pi * (x + c * x3)
+
+    # Numerically-stable tanh(inner)
+    abs_inner = tl.abs(inner)
+    exp_neg2 = tl.exp(-2.0 * abs_inner)
+    tanh_mag = (1.0 - exp_neg2) / (1.0 + exp_neg2)
+    sign = tl.where(inner >= 0.0, 1.0, -1.0)
+    tanh_inner = tanh_mag * sign
+
+    gelu = 0.5 * x * (1.0 + tanh_inner)
+
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, gelu, mask=c_mask)
+
+
+@triton.jit
+def layer_norm_forward_kernel(
+    x_ptr, y_ptr,
+    weight_ptr, bias_ptr,
+    stride, C, eps,
+    USE_WEIGHT: tl.constexpr,
+    USE_BIAS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    LayerNorm over last dimension size C for each row.
+    x, y: [M, C] with stride between rows = stride (in elements).
+    """
+    row = tl.program_id(0)
+    row_start = row * stride
+
+    # First pass: compute mean
+    mean = tl.zeros((), dtype=tl.float32)
+    C_f = tl.full((), C, dtype=tl.float32)
+
+    for c0 in range(0, C, BLOCK_SIZE):
+        offs = c0 + tl.arange(0, BLOCK_SIZE)
+        mask = offs < C
+        x_chunk = tl.load(x_ptr + row_start + offs, mask=mask, other=0.0)
+        x_chunk_fp32 = x_chunk.to(tl.float32)
+        mean += tl.sum(x_chunk_fp32, axis=0)
+
+    mean = mean / C_f
+
+    # Second pass: compute variance
+    var = tl.zeros((), dtype=tl.float32)
+    for c0 in range(0, C, BLOCK_SIZE):
+        offs = c0 + tl.arange(0, BLOCK_SIZE)
+        mask = offs < C
+        x_chunk = tl.load(x_ptr + row_start + offs, mask=mask, other=0.0)
+        x_chunk_fp32 = x_chunk.to(tl.float32)
+        diff = x_chunk_fp32 - mean
+        diff = tl.where(mask, diff, 0.0)
+        var += tl.sum(diff * diff, axis=0)
+
+    var = var / C_f
+    rstd = 1.0 / tl.sqrt(var + eps)
+
+    # Third pass: normalize and apply affine, then store
+    for c0 in range(0, C, BLOCK_SIZE):
+        offs = c0 + tl.arange(0, BLOCK_SIZE)
+        mask = offs < C
+        x_chunk = tl.load(x_ptr + row_start + offs, mask=mask, other=0.0)
+        x_chunk_fp32 = x_chunk.to(tl.float32)
+
+        y_norm = (x_chunk_fp32 - mean) * rstd
+
+        if USE_WEIGHT:
+            w = tl.load(weight_ptr + offs, mask=mask, other=1.0).to(tl.float32)
+            y_norm = y_norm * w
+        if USE_BIAS:
+            b = tl.load(bias_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+            y_norm = y_norm + b
+
+        y = y_norm.to(x_chunk.dtype)
+        tl.store(y_ptr + row_start + offs, y, mask=mask)
+
+
+@triton.jit
+def spatial_mlp_shifted_kernel(
+    x_ptr,          # [B, H, W, C]
+    w_ptr,          # [NUM_HEADS*T, T]
+    b_ptr,          # [NUM_HEADS*T] or dummy
+    out_ptr,        # [B, H, W, C]
+    B, H, W, C,
+    WINDOWS_H, WINDOWS_W,
+    P_T, P_L,
+    HEAD_DIM,
+    HAS_SHIFT: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    WINDOW_SIZE: tl.constexpr,
+    NUM_HEADS: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_TOK: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """
+    Fused shifted-window spatial MLP.
+
+    For each window and head, applies a grouped Conv1d with kernel_size=1 over
+    the token dimension, equivalent to a per-head [T x T] linear over window tokens.
+    """
+    pid_w = tl.program_id(0)
+    pid_d = tl.program_id(1)
+
+    windows_per_batch = WINDOWS_H * WINDOWS_W
+    batch_idx = pid_w // windows_per_batch
+    win_idx = pid_w % windows_per_batch
+
+    valid_batch = batch_idx < B
+
+    # feature-tile
+    base_d = pid_d * BLOCK_D
+    offs_d = base_d + tl.arange(0, BLOCK_D)
+    mask_d = offs_d < HEAD_DIM
+
+    # token indices for outputs (we process all tokens in a single block)
+    T = WINDOW_SIZE * WINDOW_SIZE
+    offs_tok_out = tl.arange(0, BLOCK_TOK)
+    mask_tok_out = offs_tok_out < T
+
+    win_row = win_idx // WINDOWS_W
+    win_col = win_idx % WINDOWS_W
+
+    # padded coordinates for output tokens
+    th_out = offs_tok_out // WINDOW_SIZE
+    tw_out = offs_tok_out % WINDOW_SIZE
+    ph_out = win_row * WINDOW_SIZE + th_out
+    pw_out = win_col * WINDOW_SIZE + tw_out
+
+    if HAS_SHIFT:
+        h_out = ph_out - P_T
+        w_out = pw_out - P_L
+    else:
+        h_out = ph_out
+        w_out = pw_out
+
+    valid_hw_out = (
+        (h_out >= 0)
+        & (h_out < H)
+        & (w_out >= 0)
+        & (w_out < W)
+        & mask_tok_out
+        & valid_batch
     )
 
+    # base offset for batch
+    base_B = batch_idx * H * W * C
 
-def triton_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
+    # Loop over heads
+    for head_id in range(NUM_HEADS):
+        head_offset_c = head_id * HEAD_DIM
+
+        acc = tl.zeros((BLOCK_TOK, BLOCK_D), dtype=tl.float32)
+
+        # GEMM over input tokens
+        for k0 in range(0, T, BLOCK_K):
+            offs_tok_in = k0 + tl.arange(0, BLOCK_K)
+            mask_tok_in = offs_tok_in < T
+
+            th_in = offs_tok_in // WINDOW_SIZE
+            tw_in = offs_tok_in % WINDOW_SIZE
+            ph_in = win_row * WINDOW_SIZE + th_in
+            pw_in = win_col * WINDOW_SIZE + tw_in
+
+            if HAS_SHIFT:
+                h_in = ph_in - P_T
+                w_in = pw_in - P_L
+            else:
+                h_in = ph_in
+                w_in = pw_in
+
+            valid_hw_in = (
+                (h_in >= 0)
+                & (h_in < H)
+                & (w_in >= 0)
+                & (w_in < W)
+                & mask_tok_in
+                & valid_batch
+            )
+
+            # Input pointers
+            base_hw_in = (h_in * W + w_in) * C + head_offset_c + base_d
+            base_hw_in = tl.where(valid_hw_in, base_hw_in, 0)
+            x_ptrs = x_ptr + base_B + base_hw_in[:, None] + offs_d[None, :]
+            mask_x = valid_hw_in[:, None] & mask_d[None, :]
+
+            x_sub = tl.load(x_ptrs, mask=mask_x, other=0.0).to(tl.float32)
+
+            # Weight pointers
+            row_idx = head_id * T + offs_tok_out
+            col_idx = offs_tok_in
+            w_rows = row_idx[:, None] * T + col_idx[None, :]
+            w_ptrs = w_ptr + w_rows
+            mask_w = mask_tok_out[:, None] & mask_tok_in[None, :]
+            w_sub = tl.load(w_ptrs, mask=mask_w, other=0.0).to(tl.float32)
+
+            acc += tl.dot(w_sub, x_sub)
+
+        # Add bias
+        if HAS_BIAS:
+            b_idx = head_id * T + offs_tok_out
+            b = tl.load(b_ptr + b_idx, mask=mask_tok_out, other=0.0).to(tl.float32)
+            acc = acc + b[:, None]
+
+        # Store outputs
+        base_hw_out = (h_out * W + w_out) * C + head_offset_c + base_d
+        base_hw_out = tl.where(valid_hw_out, base_hw_out, 0)
+        out_ptrs = out_ptr + base_B + base_hw_out[:, None] + offs_d[None, :]
+        mask_out = valid_hw_out[:, None] & mask_d[None, :]
+
+        out_sub = acc.to(tl.float32)
+        tl.store(out_ptrs, out_sub, mask=mask_out)
+
+
+# ==============================
+# Triton Wrapper Functions
+# ==============================
+
+def _triton_linear_impl(x_2d: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor = None, gelu: bool = False):
     """
-    Fused linear using Triton: y = x @ weight.T + bias
-
-    x: [M, K]
-    weight: [N, K] (nn.Linear.weight layout: [out_features, in_features])
+    x_2d: [M, K]
+    weight: [N, K] (nn.Linear.weight)
     bias: [N] or None
     """
-    assert x.is_cuda and weight.is_cuda, "triton_linear only supports CUDA tensors"
+    assert x_2d.is_cuda and weight.is_cuda
+    assert x_2d.dtype == weight.dtype
 
-    M, K = x.shape
-    N = weight.shape[0]
-    assert weight.shape[1] == K, "Incompatible shapes for linear"
+    M, K = x_2d.shape
+    N, K_w = weight.shape
+    assert K == K_w
 
-    # B = weight.T of shape [K, N]
-    b_mat = weight.t().contiguous()
-    y = torch.empty((M, N), device=x.device, dtype=x.dtype)
+    # B is [K, N]
+    B_t = weight.t().contiguous()
+    y = torch.empty((M, N), device=x_2d.device, dtype=x_2d.dtype)
 
-    has_bias = bias is not None
-    if has_bias:
-        bias_ptr = bias
+    BLOCK_M = 64
+    BLOCK_N = 64
+    BLOCK_K = 32
+
+    def grid(meta):
+        return (
+            max(1, triton.cdiv(M, meta['BLOCK_M'])),
+            max(1, triton.cdiv(N, meta['BLOCK_N'])),
+        )
+
+    if gelu:
+        linear_gelu_kernel[grid](
+            x_2d, B_t, bias if bias is not None else B_t, y,
+            M, N, K,
+            x_2d.stride(0), x_2d.stride(1),
+            B_t.stride(0), B_t.stride(1),
+            y.stride(0), y.stride(1),
+            bias is not None,
+            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        )
     else:
-        # dummy tensor to satisfy kernel arg; not used when HAS_BIAS=False
-        bias_ptr = weight.new_empty(1)
+        linear_kernel[grid](
+            x_2d, B_t, bias if bias is not None else B_t, y,
+            M, N, K,
+            x_2d.stride(0), x_2d.stride(1),
+            B_t.stride(0), B_t.stride(1),
+            y.stride(0), y.stride(1),
+            bias is not None,
+            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        )
 
-    grid = lambda META: (
-        triton.cdiv(M, META['BLOCK_M']),
-        triton.cdiv(N, META['BLOCK_N'])
-    )
+    return y
 
-    _linear_kernel[grid](
-        x, b_mat, bias_ptr, y,
-        M, N, K,
-        x.stride(0), x.stride(1),
-        b_mat.stride(0), b_mat.stride(1),
-        y.stride(0), y.stride(1),
-        HAS_BIAS=has_bias,
+
+def triton_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor = None):
+    """
+    x: [..., K]
+    weight: [N, K]
+    """
+    orig_shape = x.shape
+    K = orig_shape[-1]
+    M = x.numel() // K
+    x_2d = x.contiguous().view(M, K)
+    y_2d = _triton_linear_impl(x_2d, weight, bias, gelu=False)
+    N = y_2d.shape[1]
+    return y_2d.view(*orig_shape[:-1], N)
+
+
+def triton_linear_gelu(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor = None):
+    """
+    x: [..., K]
+    weight: [N, K]
+    Applies fused Linear + GELU.
+    """
+    orig_shape = x.shape
+    K = orig_shape[-1]
+    M = x.numel() // K
+    x_2d = x.contiguous().view(M, K)
+    y_2d = _triton_linear_impl(x_2d, weight, bias, gelu=True)
+    N = y_2d.shape[1]
+    return y_2d.view(*orig_shape[:-1], N)
+
+
+def layer_norm_triton(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, eps: float):
+    """
+    x: [M, C] contiguous
+    weight, bias: [C] or None
+    """
+    assert x.is_cuda
+    M, C = x.shape
+    y = torch.empty_like(x)
+
+    stride = x.stride(0)
+
+    # Choose BLOCK_SIZE as power-of-two up to 1024
+    BLOCK_SIZE = 1
+    while BLOCK_SIZE < C and BLOCK_SIZE < 1024:
+        BLOCK_SIZE *= 2
+
+    def grid(meta):
+        return (max(1, triton.cdiv(M, 1)),)
+
+    layer_norm_forward_kernel[grid](
+        x, y,
+        weight if weight is not None else x,
+        bias if bias is not None else x,
+        stride, C, eps,
+        weight is not None,
+        bias is not None,
+        BLOCK_SIZE=BLOCK_SIZE,
     )
     return y
 
 
-# -----------------------------
-# Helper utilities
-# -----------------------------
+def spatial_mlp_fused_triton(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    num_heads: int,
+    window_size: int,
+    shift_size: int,
+    padding,
+) -> torch.Tensor:
+    """
+    Fused shifted-window spatial MLP.
 
-def _ntuple(n):
-    def parse(x):
-        if isinstance(x, collections.abc.Iterable) and not isinstance(x, str):
-            return tuple(x)
-        return tuple(repeat(x, n))
-    return parse
+    x: [B, H, W, C] contiguous
+    weight: Conv1d.weight, shape [num_heads*ws^2, ws^2, 1]
+    bias: Conv1d.bias, shape [num_heads*ws^2]
+    """
+    assert x.is_cuda
+    B, H, W, C = x.shape
+    assert C % num_heads == 0
+    head_dim = C // num_heads
+    T = window_size * window_size
+
+    if shift_size > 0:
+        P_l, P_r, P_t, P_b = padding
+        _H = H + P_t + P_b
+        _W = W + P_l + P_r
+        windows_h = _H // window_size
+        windows_w = _W // window_size
+        HAS_SHIFT = True
+    else:
+        P_l = P_r = P_t = P_b = 0
+        _H = H
+        _W = W
+        windows_h = H // window_size
+        windows_w = W // window_size
+        HAS_SHIFT = False
+
+    # Validate Conv1d weight layout
+    C_out, C_in_group, k1 = weight.shape
+    assert k1 == 1
+    assert C_out == num_heads * T
+    assert C_in_group == T
+
+    # Reshape weights to [num_heads*T, T]
+    W_mat = weight.view(num_heads * T, T).contiguous()
+    B_vec = bias.view(num_heads * T).contiguous() if bias is not None else None
+
+    out = torch.empty_like(x)
+
+    BLOCK_D = 32
+    BLOCK_TOK = 64
+    BLOCK_K = 64
+
+    total_windows = B * windows_h * windows_w
+    grid0 = max(1, total_windows)
+    n_d_tiles = max(1, triton.cdiv(head_dim, BLOCK_D))
+
+    def grid(meta):
+        return (grid0, n_d_tiles)
+
+    spatial_mlp_shifted_kernel[grid](
+        x, W_mat, B_vec if B_vec is not None else x, out,
+        B, H, W, C,
+        windows_h, windows_w,
+        P_t, P_l,
+        head_dim,
+        HAS_SHIFT=HAS_SHIFT,
+        HAS_BIAS=B_vec is not None,
+        WINDOW_SIZE=window_size,
+        NUM_HEADS=num_heads,
+        BLOCK_D=BLOCK_D,
+        BLOCK_TOK=BLOCK_TOK,
+        BLOCK_K=BLOCK_K,
+    )
+
+    return out
 
 
-to_2tuple = _ntuple(2)
+# ==============================
+# Utility Functions
+# ==============================
 
+def to_2tuple(x):
+    if isinstance(x, tuple):
+        return x
+    return (x, x)
 
-# -----------------------------
-# Window partition / reverse
-# -----------------------------
 
 def window_partition(x, window_size):
     """
     x: (B, H, W, C)
-    returns windows: (num_windows*B, window_size, window_size, C)
+    return: (num_windows*B, window_size, window_size, C)
     """
     B, H, W, C = x.shape
     x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
@@ -221,7 +569,7 @@ def window_partition(x, window_size):
 def window_reverse(windows, window_size, H, W):
     """
     windows: (num_windows*B, window_size, window_size, C)
-    returns x: (B, H, W, C)
+    return: (B, H, W, C)
     """
     B = int(windows.shape[0] / (H * W / window_size / window_size))
     x = windows.view(B, H // window_size, W // window_size, window_size, window_size, -1)
@@ -229,25 +577,46 @@ def window_reverse(windows, window_size, H, W):
     return x
 
 
-# -----------------------------
-# MLP with Triton-linear fusion
-# -----------------------------
+# ==============================
+# Triton-based Modules
+# ==============================
 
-class Mlp(nn.Module):
-    """
-    Two-layer MLP:
-    x -> Linear(in, hidden) -> GELU -> Dropout
-      -> Linear(hidden, out) -> Dropout
+class LayerNormTriton(nn.Module):
+    def __init__(self, normalized_shape, eps=1e-5, elementwise_affine=True):
+        super().__init__()
+        if isinstance(normalized_shape, int):
+            normalized_shape = (normalized_shape,)
+        assert len(normalized_shape) == 1, "Only 1D LayerNorm is supported"
+        self.normalized_shape = normalized_shape[0]
+        self.eps = eps
+        if elementwise_affine:
+            self.weight = nn.Parameter(torch.ones(self.normalized_shape))
+            self.bias = nn.Parameter(torch.zeros(self.normalized_shape))
+        else:
+            self.weight = None
+            self.bias = None
 
-    The Linear projections are computed with a fused Triton GEMM (+bias).
-    """
-    def __init__(self, in_features, hidden_features=None, out_features=None,
-                 act_layer=nn.GELU, drop=0.):
+    def forward(self, x):
+        # x: [..., C]
+        C = self.normalized_shape
+        assert x.shape[-1] == C
+        orig_shape = x.shape
+        x_2d = x.contiguous().view(-1, C)
+        w = self.weight
+        b = self.bias
+        if w is not None:
+            w = w.to(x_2d.device, x_2d.dtype)
+        if b is not None:
+            b = b.to(x_2d.device, x_2d.dtype)
+        y_2d = layer_norm_triton(x_2d, w, b, self.eps)
+        return y_2d.view(orig_shape)
+
+
+class MlpTriton(nn.Module):
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
-
-        # Keep nn.Linear modules for parameter management and weight init
         self.fc1 = nn.Linear(in_features, hidden_features)
         self.act = act_layer()
         self.fc2 = nn.Linear(hidden_features, out_features)
@@ -255,175 +624,21 @@ class Mlp(nn.Module):
 
     def forward(self, x):
         # x: [B, L, C]
-        B, L, C = x.shape
-
-        # First linear with Triton
-        x_2d = x.contiguous().view(B * L, C)
-        x_2d = triton_linear(x_2d, self.fc1.weight, self.fc1.bias)
-        x = x_2d.view(B, L, self.fc1.out_features)
-
-        x = self.act(x)
+        if isinstance(self.act, nn.GELU):
+            x = triton_linear_gelu(x, self.fc1.weight, self.fc1.bias)
+        else:
+            x = triton_linear(x, self.fc1.weight, self.fc1.bias)
+            x = self.act(x)
         x = self.drop(x)
-
-        # Second linear with Triton
-        B, L, C_hidden = x.shape
-        x_2d = x.contiguous().view(B * L, C_hidden)
-        x_2d = triton_linear(x_2d, self.fc2.weight, self.fc2.bias)
-        x = x_2d.view(B, L, self.fc2.out_features)
-
+        x = triton_linear(x, self.fc2.weight, self.fc2.bias)
         x = self.drop(x)
         return x
 
 
-# -----------------------------
-# Swin MLP Block
-# -----------------------------
+class PatchMergingTriton(nn.Module):
+    r""" Patch Merging Layer with Triton Linear & LayerNorm. """
 
-class SwinMLPBlock(nn.Module):
-    r""" Swin MLP Block.
-
-    Args:
-        dim (int): Number of input channels.
-        input_resolution (tuple[int]): Input resolution.
-        num_heads (int): Number of attention heads.
-        window_size (int): Window size.
-        shift_size (int): Shift size for SW-MSA.
-        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim.
-        drop (float, optional): Dropout rate. Default: 0.0
-        drop_path (float, optional): Stochastic depth rate. Default: 0.0
-        act_layer (nn.Module, optional): Activation layer. Default: nn.GELU
-        norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
-    """
-
-    def __init__(self, dim, input_resolution, num_heads, window_size=7, shift_size=0,
-                 mlp_ratio=4., drop=0., drop_path=0.,
-                 act_layer=nn.GELU, norm_layer=nn.LayerNorm):
-        super().__init__()
-        self.dim = dim
-        self.input_resolution = input_resolution
-        self.num_heads = num_heads
-        self.window_size = window_size
-        self.shift_size = shift_size
-        self.mlp_ratio = mlp_ratio
-        if min(self.input_resolution) <= self.window_size:
-            # if window size is larger than input resolution, we don't partition windows
-            self.shift_size = 0
-            self.window_size = min(self.input_resolution)
-        assert 0 <= self.shift_size < self.window_size, "shift_size must in 0-window_size"
-
-        self.padding = [self.window_size - self.shift_size, self.shift_size,
-                        self.window_size - self.shift_size, self.shift_size]  # P_l,P_r,P_t,P_b
-
-        self.norm1 = norm_layer(dim)
-        # use group convolution to implement multi-head MLP
-        self.spatial_mlp = nn.Conv1d(
-            self.num_heads * self.window_size ** 2,
-            self.num_heads * self.window_size ** 2,
-            kernel_size=1,
-            groups=self.num_heads,
-        )
-
-        # drop_path kept as Identity here
-        self.drop_path = nn.Identity()
-        self.norm2 = norm_layer(dim)
-        mlp_hidden_dim = int(dim * mlp_ratio)
-        self.mlp = Mlp(
-            in_features=dim,
-            hidden_features=mlp_hidden_dim,
-            act_layer=act_layer,
-            drop=drop,
-        )
-
-    def forward(self, x):
-        H, W = self.input_resolution
-        B, L, C = x.shape
-        assert L == H * W, "input feature has wrong size"
-
-        shortcut = x
-        x = self.norm1(x)
-        x = x.view(B, H, W, C)
-
-        # shift
-        if self.shift_size > 0:
-            P_l, P_r, P_t, P_b = self.padding
-            shifted_x = F.pad(x, [0, 0, P_l, P_r, P_t, P_b], "constant", 0)
-        else:
-            shifted_x = x
-        _, _H, _W, _ = shifted_x.shape
-
-        # partition windows
-        x_windows = window_partition(shifted_x, self.window_size)  # nW*B, window_size, window_size, C
-        x_windows = x_windows.view(-1, self.window_size * self.window_size, C)  # nW*B, window_size*window_size, C
-
-        # Window/Shifted-Window Spatial MLP
-        x_windows_heads = x_windows.view(
-            -1,
-            self.window_size * self.window_size,
-            self.num_heads,
-            C // self.num_heads,
-        )
-        x_windows_heads = x_windows_heads.transpose(1, 2)  # nW*B, nH, window_size*window_size, C//nH
-        x_windows_heads = x_windows_heads.reshape(
-            -1,
-            self.num_heads * self.window_size * self.window_size,
-            C // self.num_heads,
-        )
-        spatial_mlp_windows = self.spatial_mlp(x_windows_heads)  # nW*B, nH*window_size*window_size, C//nH
-        spatial_mlp_windows = spatial_mlp_windows.view(
-            -1,
-            self.num_heads,
-            self.window_size * self.window_size,
-            C // self.num_heads,
-        ).transpose(1, 2)
-        spatial_mlp_windows = spatial_mlp_windows.reshape(
-            -1,
-            self.window_size * self.window_size,
-            C,
-        )
-
-        # merge windows
-        spatial_mlp_windows = spatial_mlp_windows.reshape(
-            -1,
-            self.window_size,
-            self.window_size,
-            C,
-        )
-        shifted_x = window_reverse(
-            spatial_mlp_windows,
-            self.window_size,
-            _H,
-            _W,
-        )  # B H' W' C
-
-        # reverse shift
-        if self.shift_size > 0:
-            P_l, P_r, P_t, P_b = self.padding
-            x = shifted_x[:, P_t:-P_b, P_l:-P_r, :].contiguous()
-        else:
-            x = shifted_x
-        x = x.view(B, H * W, C)
-
-        # FFN
-        x = shortcut + self.drop_path(x)
-        x = x + self.drop_path(self.mlp(self.norm2(x)))
-
-        return x
-
-
-# -----------------------------
-# Patch Merging (uses Triton-linear for reduction)
-# -----------------------------
-
-class PatchMerging(nn.Module):
-    r""" Patch Merging Layer.
-
-    Args:
-        input_resolution (tuple[int]): Resolution of input feature.
-        dim (int): Number of input channels.
-        norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
-    """
-
-    def __init__(self, input_resolution, dim, norm_layer=nn.LayerNorm):
+    def __init__(self, input_resolution, dim, norm_layer=LayerNormTriton):
         super().__init__()
         self.input_resolution = input_resolution
         self.dim = dim
@@ -441,47 +656,87 @@ class PatchMerging(nn.Module):
 
         x = x.view(B, H, W, C)
 
-        x0 = x[:, 0::2, 0::2, :]  # B H/2 W/2 C
-        x1 = x[:, 1::2, 0::2, :]  # B H/2 W/2 C
-        x2 = x[:, 0::2, 1::2, :]  # B H/2 W/2 C
-        x3 = x[:, 1::2, 1::2, :]  # B H/2 W/2 C
-        x = torch.cat([x0, x1, x2, x3], -1)  # B H/2 W/2 4*C
-        x = x.view(B, -1, 4 * C)  # B H/2*W/2 4*C
+        x0 = x[:, 0::2, 0::2, :]
+        x1 = x[:, 1::2, 0::2, :]
+        x2 = x[:, 0::2, 1::2, :]
+        x3 = x[:, 1::2, 1::2, :]
+        x = torch.cat([x0, x1, x2, x3], -1)
+        x = x.view(B, -1, 4 * C)
 
         x = self.norm(x)
-        B2, L2, C4 = x.shape
-        x_2d = x.contiguous().view(B2 * L2, C4)
-        # reduction has no bias
-        x_2d = triton_linear(x_2d, self.reduction.weight, None)
-        x = x_2d.view(B2, L2, 2 * self.dim)
-
+        x = triton_linear(x, self.reduction.weight, self.reduction.bias)
         return x
 
 
-# -----------------------------
-# Basic Swin MLP Layer
-# -----------------------------
+class SwinMLPBlockTriton(nn.Module):
+    r""" Swin MLP Block with Triton LayerNorm and fused Triton spatial MLP. """
 
-class BasicLayer(nn.Module):
-    """ A basic Swin MLP layer for one stage.
+    def __init__(self, dim, input_resolution, num_heads, window_size=7, shift_size=0,
+                 mlp_ratio=4., drop=0., drop_path=0.,
+                 act_layer=nn.GELU, norm_layer=LayerNormTriton):
+        super().__init__()
+        self.dim = dim
+        self.input_resolution = input_resolution
+        self.num_heads = num_heads
+        self.window_size = window_size
+        self.shift_size = shift_size
+        self.mlp_ratio = mlp_ratio
 
-    Args:
-        dim (int): Number of input channels.
-        input_resolution (tuple[int]): Input resolution.
-        depth (int): Number of blocks.
-        num_heads (int): Number of attention heads.
-        window_size (int): Local window size.
-        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim.
-        drop (float, optional): Dropout rate. Default: 0.0
-        drop_path (float | tuple[float], optional): Stochastic depth rate. Default: 0.0
-        norm_layer (nn.Module, optional): Normalization layer. Default: nn.LayerNorm
-        downsample (nn.Module | None, optional): Downsample layer at the end of the layer. Default: None
-        use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False.
-    """
+        if min(self.input_resolution) <= self.window_size:
+            self.shift_size = 0
+            self.window_size = min(self.input_resolution)
+        assert 0 <= self.shift_size < self.window_size, "shift_size must in 0-window_size"
+
+        self.padding = [self.window_size - self.shift_size, self.shift_size,
+                        self.window_size - self.shift_size, self.shift_size]  # P_l,P_r,P_t,P_b
+
+        self.norm1 = norm_layer(dim)
+        # same grouped Conv1d as reference; used only for weights/bias
+        self.spatial_mlp = nn.Conv1d(
+            self.num_heads * self.window_size ** 2,
+            self.num_heads * self.window_size ** 2,
+            kernel_size=1,
+            groups=self.num_heads,
+        )
+
+        self.drop_path = nn.Identity()
+        self.norm2 = norm_layer(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = MlpTriton(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+
+    def forward(self, x):
+        H, W = self.input_resolution
+        B, L, C = x.shape
+        assert L == H * W, "input feature has wrong size"
+
+        shortcut = x
+        x = self.norm1(x)
+        x = x.view(B, H, W, C).contiguous()
+
+        # Fused shifted-window spatial MLP (pad/partition/conv1d/reverse/crop)
+        x = spatial_mlp_fused_triton(
+            x,
+            self.spatial_mlp.weight.to(x.dtype),
+            self.spatial_mlp.bias.to(x.dtype) if self.spatial_mlp.bias is not None else None,
+            num_heads=self.num_heads,
+            window_size=self.window_size,
+            shift_size=self.shift_size,
+            padding=self.padding,
+        )
+
+        x = x.view(B, H * W, C)
+
+        x = shortcut + self.drop_path(x)
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        return x
+
+
+class BasicLayerTriton(nn.Module):
+    """ A basic Swin MLP layer for one stage. """
 
     def __init__(self, dim, input_resolution, depth, num_heads, window_size,
                  mlp_ratio=4., drop=0., drop_path=0.,
-                 norm_layer=nn.LayerNorm, downsample=None, use_checkpoint=False):
+                 norm_layer=LayerNormTriton, downsample=None, use_checkpoint=False):
 
         super().__init__()
         self.dim = dim
@@ -489,9 +744,13 @@ class BasicLayer(nn.Module):
         self.depth = depth
         self.use_checkpoint = use_checkpoint
 
-        # build blocks
+        if isinstance(drop_path, list):
+            drop_path_list = drop_path
+        else:
+            drop_path_list = [drop_path for _ in range(depth)]
+
         self.blocks = nn.ModuleList([
-            SwinMLPBlock(
+            SwinMLPBlockTriton(
                 dim=dim,
                 input_resolution=input_resolution,
                 num_heads=num_heads,
@@ -499,26 +758,21 @@ class BasicLayer(nn.Module):
                 shift_size=0 if (i % 2 == 0) else window_size // 2,
                 mlp_ratio=mlp_ratio,
                 drop=drop,
-                drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
+                drop_path=drop_path_list[i],
                 norm_layer=norm_layer,
             )
             for i in range(depth)
         ])
 
-        # patch merging layer
         if downsample is not None:
-            self.downsample = downsample(
-                input_resolution,
-                dim=dim,
-                norm_layer=norm_layer,
-            )
+            self.downsample = downsample(input_resolution, dim=dim, norm_layer=norm_layer)
         else:
             self.downsample = None
 
     def forward(self, x):
         for blk in self.blocks:
             if self.use_checkpoint:
-                x = checkpoint(blk, x)
+                x = torch.utils.checkpoint.checkpoint(blk, x)
             else:
                 x = blk(x)
         if self.downsample is not None:
@@ -526,30 +780,14 @@ class BasicLayer(nn.Module):
         return x
 
 
-# -----------------------------
-# Patch Embedding
-# -----------------------------
+class PatchEmbedTriton(nn.Module):
+    r""" Image to Patch Embedding (Conv2d kept, optional LN via Triton). """
 
-class PatchEmbed(nn.Module):
-    r""" Image to Patch Embedding
-
-    Args:
-        img_size (int): Image size.  Default: 224.
-        patch_size (int): Patch token size. Default: 4.
-        in_chans (int): Number of input image channels. Default: 3.
-        embed_dim (int): Number of linear projection output channels. Default: 96.
-        norm_layer (nn.Module, optional): Normalization layer. Default: None
-    """
-
-    def __init__(self, img_size=224, patch_size=4,
-                 in_chans=3, embed_dim=96, norm_layer=None):
+    def __init__(self, img_size=224, patch_size=4, in_chans=3, embed_dim=96, norm_layer=LayerNormTriton):
         super().__init__()
         img_size = to_2tuple(img_size)
         patch_size = to_2tuple(patch_size)
-        patches_resolution = [
-            img_size[0] // patch_size[0],
-            img_size[1] // patch_size[1],
-        ]
+        patches_resolution = [img_size[0] // patch_size[0], img_size[1] // patch_size[1]]
         self.img_size = img_size
         self.patch_size = patch_size
         self.patches_resolution = patches_resolution
@@ -558,12 +796,7 @@ class PatchEmbed(nn.Module):
         self.in_chans = in_chans
         self.embed_dim = embed_dim
 
-        self.proj = nn.Conv2d(
-            in_chans,
-            embed_dim,
-            kernel_size=patch_size,
-            stride=patch_size,
-        )
+        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
         if norm_layer is not None:
             self.norm = norm_layer(embed_dim)
         else:
@@ -571,58 +804,36 @@ class PatchEmbed(nn.Module):
 
     def forward(self, x):
         B, C, H, W = x.shape
-        # FIXME look at relaxing size constraints
-        assert H == self.img_size[0] and W == self.img_size[1], (
-            f"Input image size ({H}*{W}) doesn't match model "
-            f"({self.img_size[0]}*{self.img_size[1]})."
-        )
-        x = self.proj(x).flatten(2).transpose(1, 2)  # B Ph*Pw C
+        assert H == self.img_size[0] and W == self.img_size[1], \
+            f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
+        x = self.proj(x).flatten(2).transpose(1, 2)  # B, Ph*Pw, C
         if self.norm is not None:
             x = self.norm(x)
         return x
 
     def flops(self):
         Ho, Wo = self.patches_resolution
-        flops = (
-            Ho * Wo * self.embed_dim * self.in_chans *
-            (self.patch_size[0] * self.patch_size[1])
-        )
+        flops = Ho * Wo * self.embed_dim * self.in_chans * (self.patch_size[0] * self.patch_size[1])
         if self.norm is not None:
             flops += Ho * Wo * self.embed_dim
         return flops
 
 
-# -----------------------------
-# Full Model with Triton-fused linears
-# -----------------------------
+# ==============================
+# Top-level ModelNew
+# ==============================
 
 class ModelNew(nn.Module):
-    r""" Swin MLP (with Triton-fused linear layers in MLPs, patch merging, and head)
+    r""" Swin MLP with Triton-optimized MLP, LayerNorm, and fused spatial MLP. """
 
-    Args:
-        img_size (int | tuple(int)): Input image size. Default 224
-        patch_size (int | tuple(int)): Patch size. Default: 4
-        in_chans (int): Number of input image channels. Default: 3
-        num_classes (int): Number of classes for classification head. Default: 1000
-        embed_dim (int): Patch embedding dimension. Default: 96
-        depths (tuple(int)): Depth of each Swin MLP layer.
-        num_heads (tuple(int)): Number of attention heads in different layers.
-        window_size (int): Window size. Default: 7
-        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim. Default: 4
-        drop_rate (float): Dropout rate. Default: 0
-        drop_path_rate (float): Stochastic depth rate. Default: 0.1
-        norm_layer (nn.Module): Normalization layer. Default: nn.LayerNorm.
-        patch_norm (bool): If True, add normalization after patch embedding. Default: True
-        use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False
-    """
-
-    def __init__(self, img_size=224, patch_size=4, in_chans=3,
-                 num_classes=1000, embed_dim=96,
-                 depths=[2, 2, 6, 2], num_heads=[3, 6, 12, 24],
-                 window_size=7, mlp_ratio=4., drop_rate=0.,
-                 drop_path_rate=0.1, norm_layer=nn.LayerNorm,
-                 patch_norm=True, use_checkpoint=False, **kwargs):
+    def __init__(self, img_size=224, patch_size=4, in_chans=3, num_classes=1000,
+                 embed_dim=96, depths=[2, 2, 6, 2], num_heads=[3, 6, 12, 24],
+                 window_size=7, mlp_ratio=4., drop_rate=0., drop_path_rate=0.1,
+                 norm_layer=LayerNormTriton, patch_norm=True,
+                 use_checkpoint=False, **kwargs):
         super().__init__()
+
+        norm_layer = LayerNormTriton
 
         self.num_classes = num_classes
         self.num_layers = len(depths)
@@ -631,13 +842,9 @@ class ModelNew(nn.Module):
         self.num_features = int(embed_dim * 2 ** (self.num_layers - 1))
         self.mlp_ratio = mlp_ratio
 
-        # split image into non-overlapping patches
-        self.patch_embed = PatchEmbed(
-            img_size=img_size,
-            patch_size=patch_size,
-            in_chans=in_chans,
-            embed_dim=embed_dim,
-            norm_layer=norm_layer if self.patch_norm else None,
+        self.patch_embed = PatchEmbedTriton(
+            img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim,
+            norm_layer=norm_layer if self.patch_norm else None
         )
         num_patches = self.patch_embed.num_patches
         patches_resolution = self.patch_embed.patches_resolution
@@ -645,35 +852,28 @@ class ModelNew(nn.Module):
 
         self.pos_drop = nn.Dropout(p=drop_rate)
 
-        # stochastic depth
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
 
-        # build layers
         self.layers = nn.ModuleList()
         for i_layer in range(self.num_layers):
-            layer = BasicLayer(
+            layer = BasicLayerTriton(
                 dim=int(embed_dim * 2 ** i_layer),
-                input_resolution=(
-                    patches_resolution[0] // (2 ** i_layer),
-                    patches_resolution[1] // (2 ** i_layer),
-                ),
+                input_resolution=(patches_resolution[0] // (2 ** i_layer),
+                                  patches_resolution[1] // (2 ** i_layer)),
                 depth=depths[i_layer],
                 num_heads=num_heads[i_layer],
                 window_size=window_size,
                 mlp_ratio=self.mlp_ratio,
                 drop=drop_rate,
-                drop_path=dpr[
-                    sum(depths[:i_layer]):sum(depths[:i_layer + 1])
-                ],
+                drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
                 norm_layer=norm_layer,
-                downsample=PatchMerging if (i_layer < self.num_layers - 1) else None,
+                downsample=PatchMergingTriton if (i_layer < self.num_layers - 1) else None,
                 use_checkpoint=use_checkpoint,
             )
             self.layers.append(layer)
 
         self.norm = norm_layer(self.num_features)
         self.avgpool = nn.AdaptiveAvgPool1d(1)
-        # keep nn.Linear for parameters; forward will use Triton
         self.head = nn.Linear(self.num_features, num_classes) if num_classes > 0 else nn.Identity()
 
     def forward_features(self, x):
@@ -683,37 +883,44 @@ class ModelNew(nn.Module):
         for layer in self.layers:
             x = layer(x)
 
-        x = self.norm(x)  # B L C
-        x = self.avgpool(x.transpose(1, 2))  # B C 1
-        x = torch.flatten(x, 1)
+        x = self.norm(x)  # B, L, C
+        x = self.avgpool(x.transpose(1, 2))  # B, C, 1
+        x = torch.flatten(x, 1)  # B, C
         return x
 
     def forward(self, x):
         x = self.forward_features(x)
-        # Head projection via Triton linear if applicable
         if isinstance(self.head, nn.Linear):
-            x_2d = x
-            x = triton_linear(x_2d, self.head.weight, self.head.bias)
+            x = triton_linear(x, self.head.weight, self.head.bias)
         else:
             x = self.head(x)
         return x
 ```
 
 [NCU PROFILING METRICS]
-No NCU metrics available (skipped for network-level model)
+No NCU metrics available
 
 **Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
 
-TRITON API CONSTRAINTS (CRITICAL):
-- Triton has NO: tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+## CRITICAL — Code MUST compile and run:
+1. EVERY kernel function MUST have `@triton.jit` decorator
+2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+3. BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+4. `tl.program_id(axis)` only supports axis = 0, 1, 2
+5. No `continue`, `break`, `return` inside loops — use masking
+6. No tensor indexing with loop vars: `x[:, i]` is INVALID
+7. mask shape MUST match data shape in tl.load/tl.store
 
-OUTPUT RULES (STRICT):
-1. Follow this exact order:
-   1. Imports: torch, torch.nn, triton, triton.language as tl
-   2. @triton.jit decorated kernel function(s)
-   3. Wrapper function(s) for grid calculation and kernel launch
-   4. class ModelNew(nn.Module) that calls your kernels
-2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+## Missing Triton Functions (implement manually):
+- tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+## OUTPUT FORMAT (STRICT):
+1. Imports: torch, torch.nn, triton, triton.language as tl
+2. @triton.jit decorated kernel function(s)
+3. Wrapper function(s) for grid calculation and kernel launch
+4. class ModelNew(nn.Module) that calls your kernels
+
+Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
 
 ```python
 # <optimized Triton code>

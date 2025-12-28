@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The inter‑chunk recurrence is still executed as a Python loop over chunks, which becomes increasingly inefficient and launch‑bound as the number of chunks grows.",
+  "bottleneck": "In `ModelNew.forward`, the recurrence `for k in range(c): current_state = exp(A_last[..., k]) * current_state + states[:, k]` is a sequential host-side loop over time (chunks), performing many small pointwise ops and preventing the GPU from handling the time dimension efficiently in a single pass.",
+  "optimisation method": "Algorithm Replacement: move the inter‑chunk recurrence loop inside a single persistent Triton kernel that scans over chunks on the GPU (similar to the persistent RNN/GRU/LSTM pattern), so the time loop is on‑device instead of in Python.",
+  "modification plan": "Write a Triton kernel that takes `states` [b, c, h, p, n] and `A_last` [b, h, c] (plus optional `initial_states`) as input, flattens (b, h) into a group dimension, and tiles over (p, n). Inside the kernel, keep `current_state` in registers/shared memory and iterate over chunk index `k` from 0..c−1, loading `A_last[..., k]`, computing its exp once, and updating `current_state = exp(A_last[..., k]) * current_state + states[:, k]`. At the end of the loop, store `current_state` as the final state; this removes the Python loop and fuses the exp+mul+add recurrence into one GPU kernel.",
+  "expected_speedup": "20-30% for typical workloads with more than a few chunks (larger seq_length/block_len), with higher gains as the number of chunks grows."
+}
