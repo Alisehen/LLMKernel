@@ -1,0 +1,274 @@
+[Seed] Generating seed kernel...
+[Seed 1/2] Generating...
+[92mFinish reason: stop[0m
+Usage: In=1727, Out=12607, Total=14334
+[seed_0] score=1.2871 (baseline=6.9574ms)
+[seed_0] metrics saved to: /home/hyc/LLMKernel/run/20251228_161811_batch_range79to85_openai_deepseek/83_Conv3d_GroupNorm_Min_Clamp_Dropout/evaluation/eval_0036.json
+[Seed 1] Final score: 1.2871 ✓
+[Seed 2/2] Generating...
+[92mFinish reason: stop[0m
+Usage: In=1727, Out=14431, Total=16158
+[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 555, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251228_161811_batch_range79to85_openai_deepseek/83_Conv3d_GroupNorm_Min_Clamp_Dropout/code/kernel_20251228_171212.py", line 430, in forward
+    x = groupnorm_min_clamp_dropout_triton(
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251228_161811_batch_range79to85_openai_deepseek/83_Conv3d_GroupNorm_Min_Clamp_Dropout/code/kernel_20251228_171212.py", line 355, in groupnorm_min_clamp_dropout_triton
+    groupnorm_min_clamp_dropout_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 419, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 733, in run
+    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 861, in _do_compile
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 300, in compile
+    module = src.make_ir(target, options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 80, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 63:8:
+            + d_idx * stride_d
+            + h_idx * stride_h
+            + w_idx * stride_w
+        )
+
+        x = tl.load(x_ptrs, mask=mask, other=0.0)
+        x_f32 = x.to(tl.float32)
+
+        sum_val += tl.sum(x_f32, axis=0)
+        sum_sq += tl.sum(x_f32 * x_f32, axis=0)
+
+    m = tl.float32(group_size)
+        ^
+TypeError("'dtype' object is not callable")
+
+[seed_1] failed. See metrics.message for details.
+[seed_1] metrics saved to: /home/hyc/LLMKernel/run/20251228_161811_batch_range79to85_openai_deepseek/83_Conv3d_GroupNorm_Min_Clamp_Dropout/evaluation/eval_0037.json
+[Seed 2] Failed, attempting repair...
+[92mFinish reason: stop[0m
+Usage: In=4868, Out=5971, Total=10839
+[seed_1_repair_1] score=0.1756 (baseline=6.9574ms)
+[seed_1_repair_1] metrics saved to: /home/hyc/LLMKernel/run/20251228_161811_batch_range79to85_openai_deepseek/83_Conv3d_GroupNorm_Min_Clamp_Dropout/evaluation/eval_0038.json
+[Seed 2 Repair] Score: 0.1756 ✓
+[Seed 2] Final score: 0.1756 ✓
+
+================================================================================
+[Hybrid Strategy] Analyzing all seeds for algorithmic optimization...
+[Hybrid Strategy] - 1 seed(s) with score < 1.0 (rescue)
+[Hybrid Strategy] - 1 seed(s) with score >= 1.0 (further optimization)
+================================================================================
+
+[Hybrid] Seed 1: score=1.2871 >= 1.0
+[Hybrid] Attempting algorithm analysis for further optimization...
+[ncu] Using GPU device 7 (CUDA_VISIBLE_DEVICES=7)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_3267963.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_3267963.py /home/hyc/LLMKernel/KernelBench/tt/83_Conv3d_GroupNorm_Min_Clamp_Dropout.py /home/hyc/LLMKernel/run/20251228_161811_batch_range79to85_openai_deepseek/83_Conv3d_GroupNorm_Min_Clamp_Dropout/code/test_kernel_analysis_seed0.py --repeat 1
+[ncu] ⚠️ Command timed out after 300 seconds
+[93mWarning: NCU profiling failed: NCU CSV file is empty (benchmark script likely failed): /home/hyc/LLMKernel/ncu_temp_3267963.csv[0m
+[Hybrid] Requesting LLM analysis for seed 1...
+[92mFinish reason: stop[0m
+Usage: In=2247, Out=2536, Total=4783
+[Hybrid] Worth optimizing: yes
+[Hybrid] Reason: The post-GroupNorm elementwise math is algebraically redundant and collapses to a constant, so we are doing a full GroupNorm + affine compute for no effective contribution to the final output.
+[Hybrid] Analysis complete for seed 1, generating optimized kernel...
+[Hybrid] Bottleneck: The kernel spends time computing mean/variance, normalizing, and applying affine...
+[Hybrid] Optimization: Exploit the algebraic simplification of the activation sequence and replace the ...
+[Hybrid] Expected speedup: 20-30%
+[92mFinish reason: stop[0m
+Usage: In=2583, Out=4143, Total=6726
+[algorithm_optimized_seed0] score=1.7376 (baseline=6.9574ms)
+[algorithm_optimized_seed0] metrics saved to: /home/hyc/LLMKernel/run/20251228_161811_batch_range79to85_openai_deepseek/83_Conv3d_GroupNorm_Min_Clamp_Dropout/evaluation/eval_0039.json
+[Hybrid] ✓ Rescue successful: 1.2871 → 1.7376
+
+[Hybrid] Seed 2: score=0.1756 < 1.0
+[Hybrid] Attempting algorithm analysis rescue...
+[ncu] Using GPU device 7 (CUDA_VISIBLE_DEVICES=7)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_3267963.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_3267963.py /home/hyc/LLMKernel/KernelBench/tt/83_Conv3d_GroupNorm_Min_Clamp_Dropout.py /home/hyc/LLMKernel/run/20251228_161811_batch_range79to85_openai_deepseek/83_Conv3d_GroupNorm_Min_Clamp_Dropout/code/test_kernel_analysis_seed1.py --repeat 1
+[ncu stdout]: [bench] Completed 1 iterations successfully
+
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_3267963.csv
+[Hybrid] Requesting LLM analysis for seed 2...
+[92mFinish reason: stop[0m
+Usage: In=4624, Out=1176, Total=5800
+[Hybrid] Worth optimizing: yes
+[Hybrid] Reason: The custom Triton 3D convolution is much slower than PyTorch’s cuDNN-backed implementation and dominates the end-to-end latency.
+[Hybrid] Analysis complete for seed 2, generating optimized kernel...
+[Hybrid] Bottleneck: The conv3d_im2col_gemm_kernel implements 3D convolution via a generic im2col+GEM...
+[Hybrid] Optimization: Replace the Triton-based conv3d_im2col_gemm_kernel with PyTorch’s native torch.n...
+[Hybrid] Expected speedup: 4-6x vs the current Triton version (bringing performance back to around or slightly better than the PyTorch baseline).
+[92mFinish reason: stop[0m
+Usage: In=4978, Out=4807, Total=9785
+[algorithm_optimized_seed1] score=0.2069 (baseline=6.9574ms)
+[algorithm_optimized_seed1] metrics saved to: /home/hyc/LLMKernel/run/20251228_161811_batch_range79to85_openai_deepseek/83_Conv3d_GroupNorm_Min_Clamp_Dropout/evaluation/eval_0040.json
+[Hybrid] ✓ Rescue successful: 0.1756 → 0.2069
+
+================================================================================
+[Hybrid] Candidate Selection
+================================================================================
+[Hybrid] Total candidates: 4
+  [1] seed 1: 1.2871
+  [2] seed 2: 0.1756
+  [3] algo-optimized (from seed 1): 1.7376
+  [4] algo-optimized (from seed 2): 0.2069
+
+[Hybrid] ★ Selected best candidate: score=1.7376
+
+[Optimization] Starting 3-stage optimization...
+
+================================================================================
+[Stage 1/3] grid_and_parallel
+Description: Optimize grid layout and parallel work distribution across SMs.
+Current candidates: 1, best score: 1.7376
+================================================================================
+[Stage 1] Profiling best candidate...
+[ncu] Using GPU device 7 (CUDA_VISIBLE_DEVICES=7)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_3267963.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_3267963.py /home/hyc/LLMKernel/KernelBench/tt/83_Conv3d_GroupNorm_Min_Clamp_Dropout.py /home/hyc/LLMKernel/run/20251228_161811_batch_range79to85_openai_deepseek/83_Conv3d_GroupNorm_Min_Clamp_Dropout/code/test_kernel_analysis_seed1.py --repeat 1
+[ncu] ⚠️ Command timed out after 300 seconds
+[93mWarning: NCU profiling failed: NCU CSV file is empty (benchmark script likely failed): /home/hyc/LLMKernel/ncu_temp_3267963.csv[0m
+[Stage 1] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=1390, Out=3075, Total=4465
+[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 43, in wrapper
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 2192, in store
+    return _semantic.store(pointer, value, mask, boundary_check, cache_modifier, eviction_policy)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/semantic.py", line 1297, in store
+    return self._store_legacy(ptr, val, mask, boundary_check, cache, eviction)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/semantic.py", line 1273, in _store_legacy
+    val = self.cast(val, elt_ty)
+          ^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/semantic.py", line 899, in cast
+    assert False, f'cannot cast {input} to {dst_ty}'
+           ^^^^^
+AssertionError: cannot cast pointer<fp32>[constexpr[64]] to <['64'], fp32>
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 555, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251228_161811_batch_range79to85_openai_deepseek/83_Conv3d_GroupNorm_Min_Clamp_Dropout/code/kernel_20251228_172522.py", line 120, in forward
+    x = groupnorm_min_clamp(
+        ^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251228_161811_batch_range79to85_openai_deepseek/83_Conv3d_GroupNorm_Min_Clamp_Dropout/code/kernel_20251228_172522.py", line 73, in groupnorm_min_clamp
+    fill_min_value_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 419, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 238, in run
+    benchmark()
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 227, in benchmark
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 227, in <dictcomp>
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 162, in _bench
+    return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/testing.py", line 149, in do_bench
+    fn()
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 148, in kernel_call
+    self.fn.run(
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 733, in run
+    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 861, in _do_compile
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 300, in compile
+    module = src.make_ir(target, options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 80, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 20:4:
+
+    Grid & indexing:
+      - 1D grid over flattened output tensor
+      - offs: shared offsets for all fused ops (here only a constant store)
+      - mask: single boundary mask shared by all accesses
+    """
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < numel
+
+    # Single, coalesced, masked store of the constant value
+    tl.store(y_ptr + offs, min_value, mask=mask)
+    ^
+cannot cast pointer<fp32>[constexpr[64]] to <['64'], fp32>
+
+[stage1_grid_and_parallel] failed. See metrics.message for details.
+[stage1_grid_and_parallel] metrics saved to: /home/hyc/LLMKernel/run/20251228_161811_batch_range79to85_openai_deepseek/83_Conv3d_GroupNorm_Min_Clamp_Dropout/evaluation/eval_0041.json
+  Optimization failed, attempting repair...
+[92mFinish reason: stop[0m
+Usage: In=2937, Out=3296, Total=6233
+[stage1_grid_and_parallel_repair] score=1.7370 (baseline=6.9574ms)
+[stage1_grid_and_parallel_repair] metrics saved to: /home/hyc/LLMKernel/run/20251228_161811_batch_range79to85_openai_deepseek/83_Conv3d_GroupNorm_Min_Clamp_Dropout/evaluation/eval_0042.json
+  Optimized kernel score: 1.7370 ✓
+[Stage 1] Current: 1.7370 (global best: 1.7376)
+
+================================================================================
+[Stage 2/3] block_tiling
+Description: Tune BLOCK_M/N/K sizes for optimal register/memory balance.
+Current candidates: 1, best score: 1.7376
+================================================================================
+[Stage 2] Profiling best candidate...
+[ncu] Using GPU device 7 (CUDA_VISIBLE_DEVICES=7)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_3267963.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_3267963.py /home/hyc/LLMKernel/KernelBench/tt/83_Conv3d_GroupNorm_Min_Clamp_Dropout.py /home/hyc/LLMKernel/run/20251228_161811_batch_range79to85_openai_deepseek/83_Conv3d_GroupNorm_Min_Clamp_Dropout/code/test_kernel_analysis_seed1.py --repeat 1
+[ncu] ⚠️ Command timed out after 300 seconds
+[93mWarning: NCU profiling failed: NCU CSV file is empty (benchmark script likely failed): /home/hyc/LLMKernel/ncu_temp_3267963.csv[0m
+[Stage 2] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=1626, Out=2712, Total=4338
+[stage2_block_tiling] score=1.7376 (baseline=6.9574ms)
+[stage2_block_tiling] metrics saved to: /home/hyc/LLMKernel/run/20251228_161811_batch_range79to85_openai_deepseek/83_Conv3d_GroupNorm_Min_Clamp_Dropout/evaluation/eval_0043.json
+  Optimized kernel score: 1.7376 ✓
+[Stage 2] ★ New best score: 1.7376
+
+================================================================================
+[Stage 3/3] memory_and_tuning
+Description: Optimize memory access patterns and fine-tune num_stages/num_warps.
+Current candidates: 1, best score: 1.7376
+================================================================================
+[Stage 3] Profiling best candidate...
+[ncu] Using GPU device 7 (CUDA_VISIBLE_DEVICES=7)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_3267963.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_3267963.py /home/hyc/LLMKernel/KernelBench/tt/83_Conv3d_GroupNorm_Min_Clamp_Dropout.py /home/hyc/LLMKernel/run/20251228_161811_batch_range79to85_openai_deepseek/83_Conv3d_GroupNorm_Min_Clamp_Dropout/code/test_kernel_analysis_seed1.py --repeat 1
+[ncu] ⚠️ Command timed out after 300 seconds
+[93mWarning: NCU profiling failed: NCU CSV file is empty (benchmark script likely failed): /home/hyc/LLMKernel/ncu_temp_3267963.csv[0m
+[Stage 3] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=1616, Out=8384, Total=10000
+[stage3_memory_and_tuning] score=1.7317 (baseline=6.9574ms)
+[stage3_memory_and_tuning] metrics saved to: /home/hyc/LLMKernel/run/20251228_161811_batch_range79to85_openai_deepseek/83_Conv3d_GroupNorm_Min_Clamp_Dropout/evaluation/eval_0044.json
+  Optimized kernel score: 1.7317 ✓
+[Stage 3] Current: 1.7317 (global best: 1.7376)
+[83_Conv3d_GroupNorm_Min_Clamp_Dropout.py] Figure saved to: /home/hyc/LLMKernel/run/20251228_161811_batch_range79to85_openai_deepseek/83_Conv3d_GroupNorm_Min_Clamp_Dropout/figures/83_Conv3d_GroupNorm_Min_Clamp_Dropout_score.png

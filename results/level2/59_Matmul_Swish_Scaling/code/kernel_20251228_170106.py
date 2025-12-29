@@ -1,0 +1,170 @@
+import math
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def linear_swish_scale_kernel(
+    A_ptr,  # [M, K] input
+    B_ptr,  # [N, K] weight (will be treated as [K, N] via strides)
+    Bias_ptr,  # [N] bias
+    C_ptr,  # [M, N] output
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    scaling_factor,
+    BLOCK_M: tl.constexpr,  # power-of-2, e.g., 128
+    BLOCK_N: tl.constexpr,  # power-of-2, e.g., 128
+    BLOCK_K: tl.constexpr,  # power-of-2, e.g., 32
+):
+    # 2D grid: pid_m over rows (M), pid_n over cols (N)
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    # Boundary masks derived from the SAME offsets for all epilogue ops
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+
+    # Accumulator in FP32 for better precision and tensor-core friendly
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Main K loop
+    k = 0
+    while k < K:
+        offs_k = k + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < K
+
+        # A tile: [BLOCK_M, BLOCK_K]
+        a_ptrs = A_ptr + (
+            offs_m[:, None] * stride_am
+            + offs_k[None, :] * stride_ak
+        )
+        a_mask = mask_m[:, None] & mask_k[None, :]
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+
+        # B tile: treat weight as [K, N] via strides
+        # B[k, n] = weight[n, k]
+        b_ptrs = B_ptr + (
+            offs_k[:, None] * stride_bk
+            + offs_n[None, :] * stride_bn
+        )
+        b_mask = mask_k[:, None] & mask_n[None, :]
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+        # Matrix multiply accumulate
+        acc += tl.dot(a, b)
+
+        k += BLOCK_K
+
+    # ---- FUSED EPILOGUE (bias + swish + scaling) ----
+    # All fused ops share the SAME (offs_m, offs_n) & mask
+    c_mask = mask_m[:, None] & mask_n[None, :]
+
+    # Bias: [N], broadcast across M using explicit [None, :]
+    bias = tl.load(Bias_ptr + offs_n, mask=mask_n, other=0.0)
+    acc = acc + bias[None, :]  # broadcast over rows
+
+    # Swish: x * sigmoid(x) in FP32
+    x_f = acc
+    sig = 1.0 / (1.0 + tl.exp(-x_f))
+    y = x_f * sig * scaling_factor
+
+    # Store result, single store with shared mask
+    c_ptrs = C_ptr + (
+        offs_m[:, None] * stride_cm
+        + offs_n[None, :] * stride_cn
+    )
+    tl.store(c_ptrs, y, mask=c_mask)
+
+
+def fused_linear_swish_scale(x, weight, bias, scaling_factor: float):
+    """
+    Fused Triton implementation of:
+        y = x @ weight.T + bias
+        y = y * sigmoid(y)   # Swish
+        y = y * scaling_factor
+
+    x:       [M, K]
+    weight:  [N, K]  (same as nn.Linear.weight)
+    bias:    [N]
+    output:  [M, N]
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+    assert x.dtype == weight.dtype == bias.dtype
+
+    # Ensure good memory layout (row-major) for high performance
+    x = x.contiguous()
+    weight = weight.contiguous()
+    bias = bias.contiguous()
+
+    M, K = x.shape
+    N = weight.shape[0]
+    assert weight.shape[1] == K
+    assert bias.shape[0] == N
+
+    # Allocate output
+    y = torch.empty((M, N), device=x.device, dtype=x.dtype)
+
+    # Strides
+    stride_am, stride_ak = x.stride()           # [M, K]
+    # Treat weight as B = weight^T with shape [K, N]
+    stride_bk = weight.stride(1)               # along K in original
+    stride_bn = weight.stride(0)               # along N in original
+    stride_cm, stride_cn = y.stride()          # [M, N]
+
+    BLOCK_M = 128
+    BLOCK_N = 128
+    BLOCK_K = 32
+
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta["BLOCK_M"]),
+            triton.cdiv(N, meta["BLOCK_N"]),
+        )
+
+    linear_swish_scale_kernel[grid](
+        x, weight, bias, y,
+        M, N, K,
+        stride_am, stride_ak,
+        stride_bk, stride_bn,
+        stride_cm, stride_cn,
+        float(scaling_factor),
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        num_warps=8,
+        num_stages=4,
+    )
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-accelerated version of:
+        y = Linear(x)
+        y = y * sigmoid(y)   # Swish
+        y = y * scaling_factor
+
+    Implemented as a single fused Triton GEMM + epilogue kernel.
+    """
+    def __init__(self, in_features, out_features, scaling_factor):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias = nn.Parameter(torch.empty(out_features))
+        self.scaling_factor = float(scaling_factor)
+
+        # Initialize like nn.Linear
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+        bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+        nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Shape: [B, in_features] -> [B, out_features]
+        return fused_linear_swish_scale(x, self.weight, self.bias, self.scaling_factor)

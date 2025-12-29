@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "Two back‑to‑back, clearly memory‑bound kernels (groupnorm_scale and maxpool_clamp) are spending most time on DRAM traffic to move an intermediate tensor that is not needed outside this block.",
+  "bottleneck": "groupnorm_scale_kernel and maxpool_clamp_kernel both show very high DRAM utilization (≈76% and ≈94% of peak) and low L2 hit rates, and they exchange a full (N, C, H, W) normalized tensor via global memory between them, making the pipeline strongly memory‑bandwidth bound after the convolution.",
+  "optimisation method": "Operator fusion: fuse GroupNorm+scale and MaxPool+clamp into a single Triton kernel that reads the conv output, computes group statistics, normalizes and scales values, directly accumulates max values per pooling window, applies clamp, and writes only the pooled output, avoiding materializing the full normalized tensor in global memory.",
+  "modification plan": "Replace the separate groupnorm_scale_triton and maxpool_clamp_triton with a fused kernel launched over (N, groups, H_out, W_out) that: (1) in a first pass over each (n, group) computes mean/variance from the conv output; (2) in a second pass re‑reads the same conv output, computes normalized+scaled values, and immediately updates per‑window max accumulators for the corresponding pooled index, finally applying clamp and storing only the pooled output. This removes the global write of the normalized feature map and its subsequent read by maxpool_clamp, substantially cutting DRAM traffic for the memory‑bound post‑conv stage.",
+  "expected_speedup": "25-40% reduction in time for the GroupNorm+scale+MaxPool+clamp portion (roughly 15-30% end-to-end, depending on how dominant the post-conv stage is)."
+}

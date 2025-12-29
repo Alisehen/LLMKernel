@@ -1,0 +1,342 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def pooled_conv_transpose3d_leaky_relu_mul_max_kernel(
+    x_ptr,          # float32*  [N, C_in, D_in, H_in, W_in]
+    w_ptr,          # float32*  [C_in, C_out, Kd, Kh, Kw]
+    b_ptr,          # float32*  [C_out]
+    mul_ptr,        # float32*  [C_out]
+    y_ptr,          # float32*  [N, C_out, D_out, H_out, W_out] (pooled output)
+    #
+    N, C_OUT,
+    D_IN, H_IN, W_IN,
+    D_OUT, H_OUT, W_OUT,         # pooled output sizes
+    STRIDE_D, STRIDE_H, STRIDE_W,
+    PAD_D, PAD_H, PAD_W,
+    #
+    stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
+    stride_wn, stride_wc, stride_wd, stride_wh, stride_ww,
+    stride_yn, stride_yc, stride_yd, stride_yh, stride_yw,
+    total_elems,
+    negative_slope,
+    #
+    C_IN: tl.constexpr,
+    K_D: tl.constexpr,
+    K_H: tl.constexpr,
+    K_W: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """
+    For each pooled output voxel (n, co, dp, hp, wp), compute the 2x2x2 window
+    of ConvTranspose3d outputs on the fly, apply:
+        y = LeakyReLU( LeakyReLU(convT) * multiplier[co] )
+    and take max over the 8 positions, directly writing the pooled result.
+
+    ConvTranspose3d semantics (no groups):
+      x: [N, C_in, D_in, H_in, W_in]
+      w: [C_in, C_out, Kd, Kh, Kw]
+      out_d = (d_in - 1) * S - 2P + K + output_padding
+      For each output position od:
+        sum over ic,kd: if od + P - kd == id * S then contributes x[n, ic, id] * w[ic, oc, kd]
+    """
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < total_elems
+
+    # Unravel linear index -> (n, co, d_out, h_out, w_out)
+    w_out_idx = offs % W_OUT
+    tmp = offs // W_OUT
+
+    h_out_idx = tmp % H_OUT
+    tmp = tmp // H_OUT
+
+    d_out_idx = tmp % D_OUT
+    tmp = tmp // D_OUT
+
+    co_idx = tmp % C_OUT
+    n_idx = tmp // C_OUT
+
+    # Load per-channel bias and multiplier
+    b = tl.load(b_ptr + co_idx, mask=mask, other=0.0)
+    m = tl.load(mul_ptr + co_idx, mask=mask, other=0.0)
+
+    # Initialize running max over 2x2x2 window
+    max_val = tl.full(offs.shape, -1e30, dtype=tl.float32)
+
+    # Base conv-transposed indices for the 2x2x2 window
+    d_base = d_out_idx * 2
+    h_base = h_out_idx * 2
+    w_base = w_out_idx * 2
+
+    for dd in range(2):
+        d_conv = d_base + dd  # convT output depth index
+        for hh in range(2):
+            h_conv = h_base + hh  # convT output height index
+            for ww in range(2):
+                w_conv = w_base + ww  # convT output width index
+
+                # Accumulator for this convT output position
+                conv_val = tl.zeros(offs.shape, dtype=tl.float32)
+
+                # Sum over input channels and kernel elements
+                for ic in range(C_IN):
+                    for kd in range(K_D):
+                        # depth mapping: d_conv + PAD_D - kd == id * STRIDE_D
+                        val_d = d_conv + PAD_D - kd
+                        id_ = val_d // STRIDE_D
+                        cond_d = (
+                            (id_ >= 0)
+                            & (id_ < D_IN)
+                            & (id_ * STRIDE_D == val_d)
+                        )
+
+                        for kh in range(K_H):
+                            val_h = h_conv + PAD_H - kh
+                            ih = val_h // STRIDE_H
+                            cond_h = (
+                                (ih >= 0)
+                                & (ih < H_IN)
+                                & (ih * STRIDE_H == val_h)
+                            )
+
+                            for kw in range(K_W):
+                                val_w = w_conv + PAD_W - kw
+                                iw = val_w // STRIDE_W
+                                cond_w = (
+                                    (iw >= 0)
+                                    & (iw < W_IN)
+                                    & (iw * STRIDE_W == val_w)
+                                )
+
+                                active = mask & cond_d & cond_h & cond_w
+
+                                # Only load when all index conditions are valid
+                                x_offs = (
+                                    n_idx * stride_xn
+                                    + ic * stride_xc
+                                    + id_ * stride_xd
+                                    + ih * stride_xh
+                                    + iw * stride_xw
+                                )
+                                x_vals = tl.load(
+                                    x_ptr + x_offs,
+                                    mask=active,
+                                    other=0.0,
+                                )
+
+                                w_offs = (
+                                    ic * stride_wn
+                                    + co_idx * stride_wc
+                                    + kd * stride_wd
+                                    + kh * stride_wh
+                                    + kw * stride_ww
+                                )
+                                w_vals = tl.load(
+                                    w_ptr + w_offs,
+                                    mask=mask,
+                                    other=0.0,
+                                )
+
+                                conv_val += x_vals * w_vals
+
+                # Add bias
+                conv_val = conv_val + b
+
+                # First LeakyReLU
+                conv_val = tl.where(
+                    conv_val >= 0, conv_val, negative_slope * conv_val
+                )
+                # Multiply by per-channel multiplier
+                conv_val = conv_val * m
+                # Second LeakyReLU
+                conv_val = tl.where(
+                    conv_val >= 0, conv_val, negative_slope * conv_val
+                )
+
+                # Max over the 2x2x2 window
+                max_val = tl.maximum(max_val, conv_val)
+
+    # Store pooled result
+    y_offs = (
+        n_idx * stride_yn
+        + co_idx * stride_yc
+        + d_out_idx * stride_yd
+        + h_out_idx * stride_yh
+        + w_out_idx * stride_yw
+    )
+    tl.store(y_ptr + y_offs, max_val, mask=mask)
+
+
+def pooled_conv_transpose3d_leaky_relu_mul_maxpool(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    multiplier: torch.Tensor,
+    stride,
+    padding,
+    output_padding,
+    negative_slope: float = 0.2,
+):
+    """
+    Fused operation implementing:
+
+        y = MaxPool3d(
+                LeakyReLU(
+                    LeakyReLU( ConvTranspose3d(x, weight, bias) ) * multiplier
+                ),
+                kernel_size=2, stride=2, padding=0
+            )
+
+    Args:
+      x:           [N, C_in, D_in, H_in, W_in], CUDA contiguous
+      weight:      [C_in, C_out, Kd, Kh, Kw], from nn.ConvTranspose3d.weight
+      bias:        [C_out], from nn.ConvTranspose3d.bias
+      multiplier:  [C_out, 1, 1, 1] or [C_out]
+      stride:      int or 3-tuple (stride_d, stride_h, stride_w)
+      padding:     int or 3-tuple (pad_d, pad_h, pad_w)
+      output_padding: (not used directly in mapping, only in size check)
+      negative_slope: LeakyReLU slope (0.2 in reference)
+
+    Returns:
+      y: [N, C_out, D_out, H_out, W_out] after pooling
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda and multiplier.is_cuda
+    assert x.ndim == 5 and weight.ndim == 5
+    assert x.dtype == weight.dtype == bias.dtype == multiplier.dtype
+
+    x = x.contiguous()
+    weight = weight.contiguous()
+    multiplier = multiplier.view(-1).contiguous()
+    bias = bias.contiguous()
+
+    N, C_in, D_in, H_in, W_in = x.shape
+    C_in_w, C_out, Kd, Kh, Kw = weight.shape
+    assert C_in_w == C_in, "weight C_in must match x C_in"
+
+    if isinstance(stride, int):
+        stride_d = stride_h = stride_w = stride
+    else:
+        stride_d, stride_h, stride_w = stride
+
+    if isinstance(padding, int):
+        pad_d = pad_h = pad_w = padding
+    else:
+        pad_d, pad_h, pad_w = padding
+
+    if isinstance(output_padding, int):
+        out_pad_d = out_pad_h = out_pad_w = output_padding
+    else:
+        out_pad_d, out_pad_h, out_pad_w = output_padding
+
+    # ConvTranspose3d output sizes (before pooling)
+    D_mid = (D_in - 1) * stride_d - 2 * pad_d + Kd + out_pad_d
+    H_mid = (H_in - 1) * stride_h - 2 * pad_h + Kh + out_pad_h
+    W_mid = (W_in - 1) * stride_w - 2 * pad_w + Kw + out_pad_w
+
+    # MaxPool3d with kernel=2, stride=2, padding=0
+    D_out = D_mid // 2
+    H_out = H_mid // 2
+    W_out = W_mid // 2
+
+    y = torch.empty(
+        (N, C_out, D_out, H_out, W_out),
+        device=x.device,
+        dtype=x.dtype,
+    )
+
+    total_elems = N * C_out * D_out * H_out * W_out
+    BLOCK = 64  # tile size (power-of-two)
+
+    grid = lambda META: (max(1, triton.cdiv(total_elems, META["BLOCK"])),)
+
+    pooled_conv_transpose3d_leaky_relu_mul_max_kernel[grid](
+        x, weight, bias, multiplier, y,
+        #
+        N, C_out,
+        D_in, H_in, W_in,
+        D_out, H_out, W_out,
+        stride_d, stride_h, stride_w,
+        pad_d, pad_h, pad_w,
+        #
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
+        weight.stride(0), weight.stride(1), weight.stride(2), weight.stride(3), weight.stride(4),
+        y.stride(0), y.stride(1), y.stride(2), y.stride(3), y.stride(4),
+        total_elems,
+        negative_slope,
+        #
+        C_IN=C_in,
+        K_D=Kd,
+        K_H=Kh,
+        K_W=Kw,
+        BLOCK=BLOCK,
+        num_warps=4,
+    )
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Model that performs a 3D transposed convolution, applies LeakyReLU,
+    multiplies by a learnable per-channel parameter, applies LeakyReLU again,
+    and performs max pooling with kernel_size=stride=2.
+
+    All of ConvTranspose3d -> LeakyReLU -> mul -> LeakyReLU -> MaxPool3d
+    is fused into a single custom Triton kernel that directly computes the
+    pooled transposed-convolution outputs.
+    """
+
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size,
+        stride,
+        padding,
+        output_padding,
+        multiplier_shape,
+    ):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            output_padding=output_padding,
+        )
+        self.multiplier = nn.Parameter(torch.randn(multiplier_shape))
+        self.negative_slope = 0.2
+
+        # Cache parameters in standardized 3-tuples
+        if isinstance(stride, int):
+            self.stride = (stride, stride, stride)
+        else:
+            self.stride = tuple(stride)
+
+        if isinstance(padding, int):
+            self.padding = (padding, padding, padding)
+        else:
+            self.padding = tuple(padding)
+
+        if isinstance(output_padding, int):
+            self.output_padding = (output_padding, output_padding, output_padding)
+        else:
+            self.output_padding = tuple(output_padding)
+
+    def forward(self, x):
+        # Use the conv_transpose's weights & bias, but compute the whole
+        # pipeline with a single fused Triton kernel.
+        return pooled_conv_transpose3d_leaky_relu_mul_maxpool(
+            x,
+            self.conv_transpose.weight,
+            self.conv_transpose.bias,
+            self.multiplier,
+            self.stride,
+            self.padding,
+            self.output_padding,
+            negative_slope=self.negative_slope,
+        )

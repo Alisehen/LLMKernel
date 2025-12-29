@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The current kernel spends a significant amount of time in the post-GEMM activation pipeline, which uses multiple transcendental functions (exp, sigmoid, tanh) and divisions per element.",
+  "bottleneck": "After the GEMM, each output element goes through Swish (requiring exp and division), scaling, two clamps, and tanh (another exp/div), making the kernel partially math-throughput bound on transcendental operations rather than purely on GEMM.",
+  "optimisation method": "Replace the exact Swish/div/clamp/tanh/clamp chain with a single, cheap custom activation that approximates the composite nonlinearity using a low-degree polynomial or piecewise polynomial, eliminating most transcendental ops and divisions.",
+  "modification plan": "Offline, numerically fit an approximation g(x) ≈ clamp(tanh(clamp(swish(x)/2, -1, 1)), -1, 1) (e.g., via least-squares over a bounded input range) using a low-order polynomial or a small piecewise scheme, targeting maximum absolute/relative error within a specified tolerance. Then, in the Triton kernel, replace the current exp/sigmoid/tanh sequence with this g(x) implemented as a sequence of FMAs (and at most one clamp to bound the input), so the post-GEMM path becomes a branchless, FMA-heavy polynomial evaluation. Validate numerically against the PyTorch reference on representative inputs to ensure acceptable accuracy before enabling by default or under an \"approximate_activations\" flag.",
+  "expected_speedup": "20-30%"
+}

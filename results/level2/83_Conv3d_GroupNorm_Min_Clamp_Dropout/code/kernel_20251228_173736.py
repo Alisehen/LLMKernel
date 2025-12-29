@@ -1,0 +1,238 @@
+# <complete ModelNew code with optimized Triton kernels>
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+# ---------------------------------------------------------------------------
+# Constant fill kernel (no dropout) – single coalesced store, autotuned
+# ---------------------------------------------------------------------------
+
+@triton.autotune(
+    configs=[
+        # Conservative baseline
+        triton.Config({"BLOCK_SIZE": 128}, num_warps=4, num_stages=2),
+        # Larger blocks, same conservative execution config
+        triton.Config({"BLOCK_SIZE": 256}, num_warps=4, num_stages=2),
+        # More aggressive, higher parallelism / pipelining
+        triton.Config({"BLOCK_SIZE": 128}, num_warps=8, num_stages=3),
+    ],
+    key=["numel"],
+)
+@triton.jit
+def fill_min_value_kernel(
+    y_ptr,       # *T
+    numel,       # int32
+    min_value,   # scalar, same logical dtype as *y_ptr
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Kernel that fills the output tensor with a constant `min_value`.
+    Exactly one global store per output element.
+    """
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < numel
+
+    # Single coalesced, masked store (no intermediate stores)
+    tl.store(y_ptr + offs, min_value, mask=mask)
+
+
+# ---------------------------------------------------------------------------
+# Fused constant fill + dropout kernel – still a single store per element
+# ---------------------------------------------------------------------------
+
+@triton.autotune(
+    configs=[
+        # Baseline
+        triton.Config({"BLOCK_SIZE": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_SIZE": 256}, num_warps=4, num_stages=2),
+        # More aggressive candidates – higher parallelism / pipelining
+        triton.Config({"BLOCK_SIZE": 128}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_SIZE": 256}, num_warps=8, num_stages=3),
+    ],
+    key=["numel"],
+)
+@triton.jit
+def fill_min_value_dropout_kernel(
+    y_ptr,       # *T
+    numel,       # int32
+    min_value,   # scalar, same logical dtype as *y_ptr
+    p,           # dropout probability (float32 scalar)
+    seed,        # uint32 seed for RNG
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Fused kernel:
+        y = min_value
+        y = Dropout(y, p)
+    Dropout is applied with scaling 1 / (1 - p) to preserve expectation.
+
+    Implementation details:
+    - Per-element stateless RNG via xorshift32, seeded by (seed + linear_idx)
+    - Exactly one coalesced global store per output element
+    - No loads from y_ptr, no intermediate stores
+    """
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < numel
+
+    # --- RNG: xorshift32 on (seed + linear_idx) ---------------------------
+    offs_u32 = offs.to(tl.uint32)
+    seed_u32 = tl.full((BLOCK_SIZE,), seed, tl.uint32)
+    rnd = offs_u32 + seed_u32
+
+    rnd ^= rnd << tl.full((BLOCK_SIZE,), 13, tl.uint32)
+    rnd ^= rnd >> tl.full((BLOCK_SIZE,), 17, tl.uint32)
+    rnd ^= rnd << tl.full((BLOCK_SIZE,), 5, tl.uint32)
+
+    # Convert to float in [0, 1)
+    rand = rnd.to(tl.float32) * 2.3283064365386963e-10  # 1 / 2**32
+
+    # --- Dropout mask & value --------------------------------------------
+    p_f = p
+    one_minus_p = 1.0 - p_f
+    scale = 1.0 / one_minus_p
+
+    keep = rand > p_f
+    keep = keep & mask  # never keep out-of-bounds lanes
+
+    keep_val = min_value * scale
+    out = tl.where(keep, keep_val, 0.0)
+
+    # Single final store
+    tl.store(y_ptr + offs, out, mask=mask)
+
+
+# ---------------------------------------------------------------------------
+# Python wrappers
+# ---------------------------------------------------------------------------
+
+def groupnorm_min_clamp_dropout(
+    x,
+    groups,
+    min_value,
+    max_value,
+    dropout_p,
+    eps=1e-5,
+    training=True,
+):
+    """
+    Fused GroupNorm + min + clamp + Dropout, algebraically simplified.
+
+    Original (conceptual) chain:
+        y = GroupNorm(x, weight, bias, groups, eps)
+        y = torch.min(y, min_value)
+        y = torch.clamp(y, min=min_value, max=max_value)
+        y = Dropout(y, p=dropout_p)
+
+    This simplifies to:
+        y = constant(min_value)              # independent of x
+        y = Dropout(y, p=dropout_p)
+
+    Implementation:
+        - We completely ignore the numerical values of `x`
+        - We allocate an output tensor `y` matching `x`'s shape
+        - We run a Triton kernel that:
+            * fills with `min_value`
+            * (optionally) applies dropout in the same pass
+        - Exactly one global store per output element; no intermediate stores.
+    """
+    assert x.is_cuda, "Input must be on CUDA for Triton kernels."
+
+    x = x.contiguous()
+    y = torch.empty_like(x)
+    numel = y.numel()
+
+    def grid(meta):
+        return (max(1, triton.cdiv(numel, meta["BLOCK_SIZE"])),)
+
+    # Normalize scalars; Triton will cast to y.dtype as needed
+    min_scalar = float(min_value)
+    p = float(dropout_p)
+
+    if training and p > 0.0:
+        # Fused constant-fill + dropout
+        # Seed for per-element RNG (stateless)
+        seed = int(
+            torch.randint(
+                low=0,
+                high=2**31 - 1,
+                size=(1,),
+                device=x.device,
+                dtype=torch.int32,
+            ).item()
+        )
+
+        fill_min_value_dropout_kernel[grid](
+            y,          # y_ptr
+            numel,      # number of elements
+            min_scalar, # constant value before dropout
+            p,          # dropout probability
+            seed,       # RNG seed
+        )
+    else:
+        # No dropout during eval or when p == 0.0
+        fill_min_value_kernel[grid](
+            y,          # y_ptr
+            numel,      # number of elements
+            min_scalar, # scalar to broadcast into y
+        )
+
+    return y
+
+
+# ---------------------------------------------------------------------------
+# Model definition using the optimized kernels
+# ---------------------------------------------------------------------------
+
+class ModelNew(nn.Module):
+    """
+    Model:
+        x -> Conv3d -> (conceptual) GroupNorm -> min -> clamp -> Dropout
+
+    GroupNorm + min + clamp are algebraically simplified to a constant fill.
+    Dropout is fused with this constant fill into a single Triton kernel
+    (during training with p > 0), eliminating intermediate tensors and stores.
+    """
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size,
+        groups,
+        min_value,
+        max_value,
+        dropout_p,
+    ):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size)
+        self.groups = groups
+
+        # Kept for API compatibility; not used in the optimized path
+        self.gn_weight = nn.Parameter(torch.ones(out_channels))
+        self.gn_bias = nn.Parameter(torch.zeros(out_channels))
+
+        self.min_value = float(min_value)
+        self.max_value = float(max_value)
+        self.eps = 1e-5
+        self.dropout_p = float(dropout_p)
+
+    def forward(self, x):
+        # Conv3d as in the original model (its numerical output is ignored
+        # by the fused post-processing, but we preserve the structural API).
+        x = self.conv(x)
+
+        # Fused & simplified GroupNorm + min + clamp + Dropout
+        x = groupnorm_min_clamp_dropout(
+            x,
+            self.groups,
+            self.min_value,
+            self.max_value,
+            self.dropout_p,
+            self.eps,
+            self.training,
+        )
+        return x

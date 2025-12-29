@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The convolution is implemented as a deeply nested scalar loop rather than a blocked matrix-multiply style kernel, leaving a lot of compute throughput and data reuse on the table.",
+  "bottleneck": "Each output value is computed via explicit loops over C_in and K^2 with scalar loads, repeatedly reloading the same input and weight elements for different output positions and channels. This naive direct-convolution structure has poor data reuse and cannot leverage Triton’s highly-optimized GEMM/tensor-core style tiling.",
+  "optimisation method": "Replace the hand-written direct convolution loops with a blocked GEMM-style convolution (implicit im2col) so that for each (OC_block, P_block) tile you compute conv outputs as a matrix multiply over K = C_in * KERNEL_SIZE^2, then immediately apply tanh, scaling, bias, and pooling in registers.",
+  "modification plan": "Reshape the convolution conceptually into Y_tile[OC, P] = W_tile[OC, K] @ X_tile[K, P], where K = C_in * KERNEL_SIZE^2 and P indexes spatial positions (including the POOL_KERNEL window), and implement this with a Triton matmul-like kernel that iterates over K in blocks, using shared/L2-friendly tiles and vectorized loads. Within each tile, accumulate the matmul result in registers, then apply tanh and scaling, perform max over the POOL_KERNEL×POOL_KERNEL positions for that P-block, add the extra bias, and finally store the pooled outputs. This keeps all intermediate conv activations on-chip while dramatically improving arithmetic intensity and memory coalescing.",
+  "expected_speedup": "25-40%"
+}

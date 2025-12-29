@@ -1,0 +1,411 @@
+import torch, torch.nn as nn, triton, triton.language as tl
+
+
+@triton.jit
+def conv_transpose3d_leaky_mul_leaky_maxpool3d_kernel(
+    inp_ptr,        # [N, C_in, D_in, H_in, W_in]
+    weight_ptr,     # [C_in, C_out, Kd, Kh, Kw]
+    bias_ptr,       # [C_out]
+    multiplier_ptr, # [C_out, 1, 1, 1]
+    out_ptr,        # [N, C_out, D_p, H_p, W_p] (pooled output)
+    N, C_in, C_out,
+    D_in, H_in, W_in,
+    D_out, H_out, W_out,
+    D_p, H_p, W_p,
+    stride_d, stride_h, stride_w,
+    padding_d, padding_h, padding_w,
+    pool_stride_d, pool_stride_h, pool_stride_w,
+    negative_slope,
+    stride_in_n, stride_in_c, stride_in_d, stride_in_h, stride_in_w,
+    stride_w_ci, stride_w_co, stride_w_kd, stride_w_kh, stride_w_kw,
+    stride_m_c,
+    stride_out_n, stride_out_c, stride_out_d, stride_out_h, stride_out_w,
+    Kd: tl.constexpr, Kh: tl.constexpr, Kw: tl.constexpr,
+    POOL_Kd: tl.constexpr, POOL_Kh: tl.constexpr, POOL_Kw: tl.constexpr,
+    BLOCK_P: tl.constexpr, BLOCK_CO: tl.constexpr, BLOCK_CI: tl.constexpr,
+):
+    # -------------------------------------------------------------------------
+    # Program IDs: unified grid over (N, pooled_positions, C_out)
+    # -------------------------------------------------------------------------
+    pid_n = tl.program_id(0)
+    pid_p = tl.program_id(1)
+    pid_co = tl.program_id(2)
+
+    # -------------------------------------------------------------------------
+    # Offsets in pooled spatial positions and output channels
+    # These offsets are SHARED by all fused ops (bias, mul, activations, maxpool)
+    # -------------------------------------------------------------------------
+    offs_p = pid_p * BLOCK_P + tl.arange(0, BLOCK_P)
+    P_pool = D_p * H_p * W_p
+    mask_p = offs_p < P_pool
+
+    offs_co = pid_co * BLOCK_CO + tl.arange(0, BLOCK_CO)
+    mask_co = offs_co < C_out
+
+    # -------------------------------------------------------------------------
+    # Decode pooled spatial indices from linear pooled index
+    # -------------------------------------------------------------------------
+    HW_p = H_p * W_p
+    zp = offs_p // HW_p
+    rem = offs_p - zp * HW_p
+    yp = rem // W_p
+    xp = rem - yp * W_p
+
+    # Base indices in ConvTranspose3d output corresponding
+    # to the start of each pool window (same for all fused ops)
+    base_z = zp * pool_stride_d
+    base_y = yp * pool_stride_h
+    base_x = xp * pool_stride_w
+
+    # -------------------------------------------------------------------------
+    # Preload bias and multiplier (shared by all fused ops)
+    # -------------------------------------------------------------------------
+    bias = tl.load(bias_ptr + offs_co, mask=mask_co, other=0.0).to(tl.float32)
+    mult = tl.load(
+        multiplier_ptr + offs_co * stride_m_c,
+        mask=mask_co,
+        other=0.0,
+    ).to(tl.float32)
+
+    # -------------------------------------------------------------------------
+    # Accumulator for pooled max values (MaxPool3d output in pooled space)
+    # -------------------------------------------------------------------------
+    max_val = tl.full((BLOCK_P, BLOCK_CO), -float("inf"), dtype=tl.float32)
+
+    # Precompute per-program base pointers
+    inp_n_ptr = inp_ptr + pid_n * stride_in_n
+    out_n_ptr = out_ptr + pid_n * stride_out_n
+
+    # -------------------------------------------------------------------------
+    # Iterate over pooling kernel window (fused MaxPool3d)
+    # All fused ops (bias, both LeakyReLUs, multiplier, max) use SAME (offs_p, offs_co)
+    # -------------------------------------------------------------------------
+    for pd in range(0, POOL_Kd):
+        z = base_z + pd
+
+        # ConvTranspose: compute valid input z indices for this output z
+        in_z_num = z + padding_d - 0  # kd added inside kd-loop
+        # NOTE: we keep z as int32 vectors; operations are vectorized across BLOCK_P
+
+        for ph in range(0, POOL_Kh):
+            y = base_y + ph
+            in_y_num = y + padding_h - 0  # kh added inside kh-loop
+
+            for pw in range(0, POOL_Kw):
+                x = base_x + pw
+                in_x_num = x + padding_w - 0  # kw added inside kw-loop
+
+                # -----------------------------------------------------------------
+                # ConvTranspose3d accumulation at each (z,y,x) in the pool window
+                # -----------------------------------------------------------------
+                acc = tl.zeros((BLOCK_P, BLOCK_CO), dtype=tl.float32)
+
+                # Reduction over ConvTranspose3d kernel and input channels
+                for kd in range(0, Kd):
+                    # in_z_num = z + padding_d - kd
+                    cur_in_z_num = in_z_num - kd
+                    in_z_mod = cur_in_z_num % stride_d
+                    in_z_div = cur_in_z_num // stride_d
+                    mask_z = (in_z_mod == 0) & (in_z_div >= 0) & (in_z_div < D_in)
+
+                    for kh in range(0, Kh):
+                        cur_in_y_num = in_y_num - kh
+                        in_y_mod = cur_in_y_num % stride_h
+                        in_y_div = cur_in_y_num // stride_h
+                        mask_y = (in_y_mod == 0) & (in_y_div >= 0) & (in_y_div < H_in)
+
+                        # Combine masks that are independent of kw
+                        mask_zy = mask_p & mask_z & mask_y
+
+                        for kw in range(0, Kw):
+                            cur_in_x_num = in_x_num - kw
+                            in_x_mod = cur_in_x_num % stride_w
+                            in_x_div = cur_in_x_num // stride_w
+                            mask_x = (in_x_mod == 0) & (in_x_div >= 0) & (in_x_div < W_in)
+
+                            # Final spatial mask for this (kd,kh,kw) contribution
+                            mask_xyz = mask_zy & mask_x
+
+                            ci = 0
+                            while ci < C_in:
+                                offs_ci = ci + tl.arange(0, BLOCK_CI)
+                                mask_ci = offs_ci < C_in
+
+                                # Input block [BLOCK_P, BLOCK_CI]
+                                a_ptrs = (
+                                    inp_n_ptr
+                                    + offs_ci[None, :] * stride_in_c
+                                    + in_z_div[:, None] * stride_in_d
+                                    + in_y_div[:, None] * stride_in_h
+                                    + in_x_div[:, None] * stride_in_w
+                                )
+                                a_mask = mask_xyz[:, None] & mask_ci[None, :]
+                                a = tl.load(a_ptrs, mask=a_mask, other=0.0).to(tl.float32)
+
+                                # Weight block [BLOCK_CI, BLOCK_CO]
+                                w_ptrs = (
+                                    weight_ptr
+                                    + offs_ci[:, None] * stride_w_ci
+                                    + offs_co[None, :] * stride_w_co
+                                    + kd * stride_w_kd
+                                    + kh * stride_w_kh
+                                    + kw * stride_w_kw
+                                )
+                                w_mask = mask_ci[:, None] & mask_co[None, :]
+                                w = tl.load(w_ptrs, mask=w_mask, other=0.0).to(tl.float32)
+
+                                # GEMM-style accumulation using Tensor Cores (TF32 where available)
+                                acc += tl.dot(a, w, allow_tf32=True)
+                                ci += BLOCK_CI
+
+                # -----------------------------------------------------------------
+                # FUSED elementwise ops on the ConvTranspose3d output at (z,y,x)
+                # IMPORTANT: all use SAME (offs_p, offs_co) / mask_p / mask_co
+                # -----------------------------------------------------------------
+                # Add bias
+                acc = acc + bias[None, :]
+
+                # First LeakyReLU
+                acc = tl.where(acc >= 0.0, acc, acc * negative_slope)
+
+                # Channel-wise multiplier
+                acc = acc * mult[None, :]
+
+                # Second LeakyReLU
+                acc = tl.where(acc >= 0.0, acc, acc * negative_slope)
+
+                # MaxPool3d: update pooled max
+                max_val = tl.maximum(max_val, acc)
+
+    # -------------------------------------------------------------------------
+    # Write pooled output: indices derived solely from shared (offs_p, offs_co)
+    # -------------------------------------------------------------------------
+    out_ptrs = (
+        out_n_ptr
+        + offs_co[None, :] * stride_out_c
+        + zp[:, None] * stride_out_d
+        + yp[:, None] * stride_out_h
+        + xp[:, None] * stride_out_w
+    )
+    out_mask = mask_p[:, None] & mask_co[None, :]
+    tl.store(out_ptrs, max_val, mask=out_mask)
+
+
+def conv_transpose3d_leaky_mul_leaky_maxpool3d(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    multiplier: torch.Tensor,
+    kernel_size,
+    stride,
+    padding,
+    output_padding,
+    pool_kernel_size=2,
+    pool_stride=None,
+    negative_slope: float = 0.2,
+):
+    """
+    Fused:
+      ConvTranspose3d + LeakyReLU + channel-wise multiply + LeakyReLU + MaxPool3d
+
+    x: [N, C_in, D_in, H_in, W_in]
+    weight: [C_in, C_out, Kd, Kh, Kw] (ConvTranspose3d layout)
+    bias: [C_out]
+    multiplier: [C_out, 1, 1, 1]
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda and multiplier.is_cuda
+
+    N, C_in, D_in, H_in, W_in = x.shape
+    C_in_w, C_out, Kd_w, Kh_w, Kw_w = weight.shape
+    assert C_in_w == C_in, "weight C_in mismatch"
+
+    # ConvTranspose kernel sizes
+    if isinstance(kernel_size, int):
+        Kd = Kh = Kw = kernel_size
+    else:
+        Kd, Kh, Kw = kernel_size
+    assert (Kd, Kh, Kw) == (Kd_w, Kh_w, Kw_w)
+
+    # ConvTranspose strides
+    if isinstance(stride, int):
+        stride_d = stride_h = stride_w = stride
+    else:
+        stride_d, stride_h, stride_w = stride
+
+    # ConvTranspose paddings
+    if isinstance(padding, int):
+        padding_d = padding_h = padding_w = padding
+    else:
+        padding_d, padding_h, padding_w = padding
+
+    # Output padding
+    if isinstance(output_padding, int):
+        out_pad_d = out_pad_h = out_pad_w = output_padding
+    else:
+        out_pad_d, out_pad_h, out_pad_w = output_padding
+
+    # ConvTranspose3d output sizes
+    D_out = (D_in - 1) * stride_d - 2 * padding_d + Kd + out_pad_d
+    H_out = (H_in - 1) * stride_h - 2 * padding_h + Kh + out_pad_h
+    W_out = (W_in - 1) * stride_w - 2 * padding_w + Kw + out_pad_w
+
+    # MaxPool3d params
+    if isinstance(pool_kernel_size, int):
+        Pkd = Pkh = Pkw = pool_kernel_size
+    else:
+        Pkd, Pkh, Pkw = pool_kernel_size
+
+    if pool_stride is None:
+        pool_stride_d = Pkd
+        pool_stride_h = Pkh
+        pool_stride_w = Pkw
+    else:
+        if isinstance(pool_stride, int):
+            pool_stride_d = pool_stride_h = pool_stride_w = pool_stride
+        else:
+            pool_stride_d, pool_stride_h, pool_stride_w = pool_stride
+
+    # Pooled output sizes (no padding, dilation=1)
+    D_p = (D_out - Pkd) // pool_stride_d + 1
+    H_p = (H_out - Pkh) // pool_stride_h + 1
+    W_p = (W_out - Pkw) // pool_stride_w + 1
+
+    # Output tensor of pooled shape
+    out = torch.empty(
+        (N, C_out, D_p, H_p, W_p),
+        device=x.device,
+        dtype=x.dtype,
+    )
+
+    x_contig = x.contiguous()
+    w_contig = weight.contiguous()
+    mult_contig = multiplier.contiguous()
+    bias_contig = bias.contiguous()
+
+    P_pool = D_p * H_p * W_p
+
+    # -------------------------------------------------------------------------
+    # Grid: unified over (N, pooled_positions, C_out)
+    # -------------------------------------------------------------------------
+    def grid(meta):
+        return (
+            N,
+            triton.cdiv(P_pool, meta["BLOCK_P"]),
+            triton.cdiv(C_out, meta["BLOCK_CO"]),
+        )
+
+    # Tuned for RTX 4090: higher parallelism and Tensor Core-friendly tiling
+    conv_transpose3d_leaky_mul_leaky_maxpool3d_kernel[grid](
+        x_contig,
+        w_contig,
+        bias_contig,
+        mult_contig,
+        out,
+        N,
+        C_in,
+        C_out,
+        D_in,
+        H_in,
+        W_in,
+        D_out,
+        H_out,
+        W_out,
+        D_p,
+        H_p,
+        W_p,
+        stride_d,
+        stride_h,
+        stride_w,
+        padding_d,
+        padding_h,
+        padding_w,
+        pool_stride_d,
+        pool_stride_h,
+        pool_stride_w,
+        negative_slope,
+        x_contig.stride(0),
+        x_contig.stride(1),
+        x_contig.stride(2),
+        x_contig.stride(3),
+        x_contig.stride(4),
+        w_contig.stride(0),
+        w_contig.stride(1),
+        w_contig.stride(2),
+        w_contig.stride(3),
+        w_contig.stride(4),
+        mult_contig.stride(0),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        out.stride(3),
+        out.stride(4),
+        Kd=Kd,
+        Kh=Kh,
+        Kw=Kw,
+        POOL_Kd=Pkd,
+        POOL_Kh=Pkh,
+        POOL_Kw=Pkw,
+        # BLOCK sizes are powers of two as required
+        BLOCK_P=32,   # pooled spatial tile
+        BLOCK_CO=64,  # output channel tile
+        BLOCK_CI=32,  # input channel tile (K dimension of GEMM)
+        num_warps=8,  # more warps -> higher SM occupancy on 4090
+        num_stages=3,
+    )
+
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    ConvTranspose3d + LeakyReLU + channel-wise multiply + LeakyReLU + MaxPool3d,
+    all fused into a single high-performance Triton kernel.
+    """
+
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size,
+        stride,
+        padding,
+        output_padding,
+        multiplier_shape,
+    ):
+        super(ModelNew, self).__init__()
+        # ConvTranspose3d-style parameters
+        if isinstance(kernel_size, int):
+            Kd = Kh = Kw = kernel_size
+        else:
+            Kd, Kh, Kw = kernel_size
+
+        self.weight = nn.Parameter(
+            torch.randn(in_channels, out_channels, Kd, Kh, Kw)
+        )
+        self.bias = nn.Parameter(torch.randn(out_channels))
+        self.multiplier = nn.Parameter(torch.randn(multiplier_shape))
+
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.output_padding = output_padding
+        self.negative_slope = 0.2
+
+        # MaxPool3d configuration (kernel_size = stride = 2 by default)
+        self.pool_kernel_size = 2
+
+    def forward(self, x):
+        x = conv_transpose3d_leaky_mul_leaky_maxpool3d(
+            x,
+            self.weight,
+            self.bias,
+            self.multiplier,
+            self.kernel_size,
+            self.stride,
+            self.padding,
+            self.output_padding,
+            pool_kernel_size=self.pool_kernel_size,
+            pool_stride=self.pool_kernel_size,
+            negative_slope=self.negative_slope,
+        )
+        return x

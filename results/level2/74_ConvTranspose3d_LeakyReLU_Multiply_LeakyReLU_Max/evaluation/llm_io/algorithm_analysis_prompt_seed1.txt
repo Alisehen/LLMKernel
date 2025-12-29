@@ -1,0 +1,549 @@
+You are a GPU kernel optimization architect. Analyze the kernel and identify **ONE high-level algorithmic optimization**.
+
+# PyTorch Reference
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs a 3D transposed convolution, applies LeakyReLU, multiplies by a learnable parameter, 
+    applies LeakyReLU again, and performs a max pooling operation.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, multiplier_shape):
+        super(Model, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, output_padding=output_padding)
+        self.multiplier = nn.Parameter(torch.randn(multiplier_shape))
+        self.leaky_relu = nn.LeakyReLU(negative_slope=0.2)
+        self.max_pool = nn.MaxPool3d(kernel_size=2)
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = self.leaky_relu(x)
+        x = x * self.multiplier
+        x = self.leaky_relu(x)
+        x = self.max_pool(x)
+        return x
+
+batch_size = 16
+in_channels = 16
+out_channels = 32
+depth, height, width = 16, 32, 32
+kernel_size = 3
+stride = 2
+padding = 1
+output_padding = 1
+multiplier_shape = (out_channels, 1, 1, 1)
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, depth, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, stride, padding, output_padding, multiplier_shape]
+```
+
+# Current Triton Kernel
+```python
+import torch, torch.nn as nn, triton, triton.language as tl
+
+
+@triton.jit
+def conv_transpose3d_leaky_mul_leaky_kernel(
+    inp_ptr,        # [N, C_in, D_in, H_in, W_in]
+    weight_ptr,     # [C_in, C_out, Kd, Kh, Kw]
+    bias_ptr,       # [C_out]
+    multiplier_ptr, # [C_out, 1, 1, 1]
+    out_ptr,        # [N, C_out, D_out, H_out, W_out]
+    N, C_in, C_out,
+    D_in, H_in, W_in,
+    D_out, H_out, W_out,
+    stride_d, stride_h, stride_w,
+    padding_d, padding_h, padding_w,
+    negative_slope,
+    stride_in_n, stride_in_c, stride_in_d, stride_in_h, stride_in_w,
+    stride_w_ci, stride_w_co, stride_w_kd, stride_w_kh, stride_w_kw,
+    stride_m_c,
+    stride_out_n, stride_out_c, stride_out_d, stride_out_h, stride_out_w,
+    Kd: tl.constexpr, Kh: tl.constexpr, Kw: tl.constexpr,
+    BLOCK_P: tl.constexpr, BLOCK_CO: tl.constexpr, BLOCK_CI: tl.constexpr,
+):
+    # program ids
+    pid_n = tl.program_id(0)
+    pid_p = tl.program_id(1)
+    pid_co = tl.program_id(2)
+
+    # tile offsets
+    offs_p = pid_p * BLOCK_P + tl.arange(0, BLOCK_P)
+    offs_co = pid_co * BLOCK_CO + tl.arange(0, BLOCK_CO)
+
+    P_out = D_out * H_out * W_out
+    mask_p = offs_p < P_out
+    mask_co = offs_co < C_out
+
+    # spatial indices from flattened index
+    HW_out = H_out * W_out
+    z = offs_p // HW_out
+    rem = offs_p % HW_out
+    y = rem // W_out
+    x = rem % W_out
+
+    # accumulator in fp32
+    acc = tl.zeros((BLOCK_P, BLOCK_CO), dtype=tl.float32)
+
+    # reduction over kernel and input channels
+    for kd in range(0, Kd):
+        in_z_num = z + padding_d - kd
+        in_z_mod = in_z_num % stride_d
+        in_z_div = in_z_num // stride_d
+        mask_z = (in_z_mod == 0) & (in_z_div >= 0) & (in_z_div < D_in)
+
+        for kh in range(0, Kh):
+            in_y_num = y + padding_h - kh
+            in_y_mod = in_y_num % stride_h
+            in_y_div = in_y_num // stride_h
+            mask_y = (in_y_mod == 0) & (in_y_div >= 0) & (in_y_div < H_in)
+
+            for kw in range(0, Kw):
+                in_x_num = x + padding_w - kw
+                in_x_mod = in_x_num % stride_w
+                in_x_div = in_x_num // stride_w
+                mask_x = (in_x_mod == 0) & (in_x_div >= 0) & (in_x_div < W_in)
+
+                mask_xyz = mask_p & mask_z & mask_y & mask_x
+
+                for ci in range(0, C_in, BLOCK_CI):
+                    offs_ci = ci + tl.arange(0, BLOCK_CI)
+                    mask_ci = offs_ci < C_in
+
+                    # input block [BLOCK_P, BLOCK_CI]
+                    a_ptrs = (
+                        inp_ptr
+                        + pid_n * stride_in_n
+                        + offs_ci[None, :] * stride_in_c
+                        + in_z_div[:, None] * stride_in_d
+                        + in_y_div[:, None] * stride_in_h
+                        + in_x_div[:, None] * stride_in_w
+                    )
+                    a_mask = mask_xyz[:, None] & mask_ci[None, :]
+                    a = tl.load(a_ptrs, mask=a_mask, other=0.0).to(tl.float32)
+
+                    # weight block [BLOCK_CI, BLOCK_CO]
+                    w_ptrs = (
+                        weight_ptr
+                        + offs_ci[:, None] * stride_w_ci
+                        + offs_co[None, :] * stride_w_co
+                        + kd * stride_w_kd
+                        + kh * stride_w_kh
+                        + kw * stride_w_kw
+                    )
+                    w_mask = mask_ci[:, None] & mask_co[None, :]
+                    w = tl.load(w_ptrs, mask=w_mask, other=0.0).to(tl.float32)
+
+                    acc += tl.dot(a, w, allow_tf32=True)
+
+    # add bias
+    bias = tl.load(bias_ptr + offs_co, mask=mask_co, other=0.0)
+    acc = acc + bias[None, :]
+
+    # first LeakyReLU
+    acc = tl.where(acc >= 0, acc, acc * negative_slope)
+
+    # channel-wise multiplier
+    mult = tl.load(multiplier_ptr + offs_co * stride_m_c, mask=mask_co, other=0.0)
+    acc = acc * mult[None, :]
+
+    # second LeakyReLU
+    acc = tl.where(acc >= 0, acc, acc * negative_slope)
+
+    # store to output
+    out_ptrs = (
+        out_ptr
+        + pid_n * stride_out_n
+        + offs_co[None, :] * stride_out_c
+        + z[:, None] * stride_out_d
+        + y[:, None] * stride_out_h
+        + x[:, None] * stride_out_w
+    )
+    out_mask = mask_p[:, None] & mask_co[None, :]
+    tl.store(out_ptrs, acc, mask=out_mask)
+
+
+@triton.jit
+def maxpool3d_kernel(
+    inp_ptr,  # [N, C, D_in, H_in, W_in]
+    out_ptr,  # [N, C, D_out, H_out, W_out]
+    N, C,
+    D_in, H_in, W_in,
+    D_out, H_out, W_out,
+    stride_d, stride_h, stride_w,
+    Kd: tl.constexpr, Kh: tl.constexpr, Kw: tl.constexpr,
+    stride_in_n, stride_in_c, stride_in_d, stride_in_h, stride_in_w,
+    stride_out_n, stride_out_c, stride_out_d, stride_out_h, stride_out_w,
+    BLOCK_P: tl.constexpr,
+):
+    pid_nc = tl.program_id(0)
+    pid_p = tl.program_id(1)
+
+    offs_p = pid_p * BLOCK_P + tl.arange(0, BLOCK_P)
+    P_out = D_out * H_out * W_out
+    mask_p = offs_p < P_out
+
+    # decode n, c
+    n = pid_nc // C
+    c = pid_nc % C
+
+    # spatial indices in pooled output
+    HW_out = H_out * W_out
+    z = offs_p // HW_out
+    rem = offs_p % HW_out
+    y = rem // W_out
+    x = rem % W_out
+
+    base_z = z * stride_d
+    base_y = y * stride_h
+    base_x = x * stride_w
+
+    max_val = tl.full((BLOCK_P,), -float("inf"), dtype=tl.float32)
+
+    for kd in range(0, Kd):
+        in_z = base_z + kd
+        mask_z = in_z < D_in
+        for kh in range(0, Kh):
+            in_y = base_y + kh
+            mask_y = in_y < H_in
+            for kw in range(0, Kw):
+                in_x = base_x + kw
+                mask_x = in_x < W_in
+
+                valid = mask_p & mask_z & mask_y & mask_x
+
+                in_ptrs = (
+                    inp_ptr
+                    + n * stride_in_n
+                    + c * stride_in_c
+                    + in_z * stride_in_d
+                    + in_y * stride_in_h
+                    + in_x * stride_in_w
+                )
+                vals = tl.load(in_ptrs, mask=valid, other=-float("inf")).to(tl.float32)
+                max_val = tl.maximum(max_val, vals)
+
+    out_ptrs = (
+        out_ptr
+        + n * stride_out_n
+        + c * stride_out_c
+        + z * stride_out_d
+        + y * stride_out_h
+        + x * stride_out_w
+    )
+    tl.store(out_ptrs, max_val, mask=mask_p)
+
+
+def conv_transpose3d_leaky_mul_leaky(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    multiplier: torch.Tensor,
+    kernel_size,
+    stride,
+    padding,
+    output_padding,
+    negative_slope: float = 0.2,
+):
+    """
+    x: [N, C_in, D_in, H_in, W_in]
+    weight: [C_in, C_out, Kd, Kh, Kw] (ConvTranspose3d layout)
+    bias: [C_out]
+    multiplier: [C_out, 1, 1, 1]
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda and multiplier.is_cuda
+
+    N, C_in, D_in, H_in, W_in = x.shape
+    C_in_w, C_out, Kd, Kh, Kw = weight.shape
+    assert C_in_w == C_in, "weight C_in mismatch"
+
+    if isinstance(kernel_size, int):
+        assert Kd == Kh == Kw == kernel_size
+    else:
+        Kd, Kh, Kw = kernel_size
+
+    if isinstance(stride, int):
+        stride_d = stride_h = stride_w = stride
+    else:
+        stride_d, stride_h, stride_w = stride
+
+    if isinstance(padding, int):
+        padding_d = padding_h = padding_w = padding
+    else:
+        padding_d, padding_h, padding_w = padding
+
+    if isinstance(output_padding, int):
+        out_pad_d = out_pad_h = out_pad_w = output_padding
+    else:
+        out_pad_d, out_pad_h, out_pad_w = output_padding
+
+    D_out = (D_in - 1) * stride_d - 2 * padding_d + Kd + out_pad_d
+    H_out = (H_in - 1) * stride_h - 2 * padding_h + Kh + out_pad_h
+    W_out = (W_in - 1) * stride_w - 2 * padding_w + Kw + out_pad_w
+
+    out = torch.empty(
+        (N, C_out, D_out, H_out, W_out),
+        device=x.device,
+        dtype=x.dtype,
+    )
+
+    x_contig = x.contiguous()
+    w_contig = weight.contiguous()
+    mult_contig = multiplier.contiguous()
+    bias_contig = bias.contiguous()
+
+    P_out = D_out * H_out * W_out
+
+    def grid(meta):
+        return (
+            N,
+            triton.cdiv(P_out, meta["BLOCK_P"]),
+            triton.cdiv(C_out, meta["BLOCK_CO"]),
+        )
+
+    conv_transpose3d_leaky_mul_leaky_kernel[grid](
+        x_contig,
+        w_contig,
+        bias_contig,
+        mult_contig,
+        out,
+        N,
+        C_in,
+        C_out,
+        D_in,
+        H_in,
+        W_in,
+        D_out,
+        H_out,
+        W_out,
+        stride_d,
+        stride_h,
+        stride_w,
+        padding_d,
+        padding_h,
+        padding_w,
+        negative_slope,
+        x_contig.stride(0),
+        x_contig.stride(1),
+        x_contig.stride(2),
+        x_contig.stride(3),
+        x_contig.stride(4),
+        w_contig.stride(0),
+        w_contig.stride(1),
+        w_contig.stride(2),
+        w_contig.stride(3),
+        w_contig.stride(4),
+        mult_contig.stride(0),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        out.stride(3),
+        out.stride(4),
+        Kd=Kd,
+        Kh=Kh,
+        Kw=Kw,
+        BLOCK_P=64,
+        BLOCK_CO=32,
+        BLOCK_CI=16,
+        num_warps=4,
+        num_stages=2,
+    )
+
+    return out
+
+
+def max_pool3d_triton(x: torch.Tensor, kernel_size=2, stride=None):
+    """
+    x: [N, C, D_in, H_in, W_in]
+    MaxPool3d with kernel_size and stride (no padding).
+    """
+    assert x.is_cuda
+
+    N, C, D_in, H_in, W_in = x.shape
+
+    if isinstance(kernel_size, int):
+        Kd = Kh = Kw = kernel_size
+    else:
+        Kd, Kh, Kw = kernel_size
+
+    if stride is None:
+        stride_d = Kd
+        stride_h = Kh
+        stride_w = Kw
+    else:
+        if isinstance(stride, int):
+            stride_d = stride_h = stride_w = stride
+        else:
+            stride_d, stride_h, stride_w = stride
+
+    D_out = (D_in - Kd) // stride_d + 1
+    H_out = (H_in - Kh) // stride_h + 1
+    W_out = (W_in - Kw) // stride_w + 1
+
+    out = torch.empty(
+        (N, C, D_out, H_out, W_out),
+        device=x.device,
+        dtype=x.dtype,
+    )
+
+    x_contig = x.contiguous()
+    P_out = D_out * H_out * W_out
+    NC = N * C
+
+    def grid(meta):
+        return (
+            NC,
+            triton.cdiv(P_out, meta["BLOCK_P"]),
+        )
+
+    maxpool3d_kernel[grid](
+        x_contig,
+        out,
+        N,
+        C,
+        D_in,
+        H_in,
+        W_in,
+        D_out,
+        H_out,
+        W_out,
+        stride_d,
+        stride_h,
+        stride_w,
+        Kd=Kd,
+        Kh=Kh,
+        Kw=Kw,
+        stride_in_n=x_contig.stride(0),
+        stride_in_c=x_contig.stride(1),
+        stride_in_d=x_contig.stride(2),
+        stride_in_h=x_contig.stride(3),
+        stride_in_w=x_contig.stride(4),
+        stride_out_n=out.stride(0),
+        stride_out_c=out.stride(1),
+        stride_out_d=out.stride(2),
+        stride_out_h=out.stride(3),
+        stride_out_w=out.stride(4),
+        BLOCK_P=128,
+        num_warps=4,
+        num_stages=2,
+    )
+
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    ConvTranspose3d + LeakyReLU + channel-wise multiply + LeakyReLU + MaxPool3d,
+    all implemented with high-performance Triton kernels.
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, multiplier_shape):
+        super(ModelNew, self).__init__()
+        # ConvTranspose3d-style parameters
+        if isinstance(kernel_size, int):
+            Kd = Kh = Kw = kernel_size
+        else:
+            Kd, Kh, Kw = kernel_size
+        self.weight = nn.Parameter(
+            torch.randn(in_channels, out_channels, Kd, Kh, Kw)
+        )
+        self.bias = nn.Parameter(torch.randn(out_channels))
+        self.multiplier = nn.Parameter(torch.randn(multiplier_shape))
+
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.output_padding = output_padding
+        self.negative_slope = 0.2
+        self.pool_kernel_size = 2
+
+    def forward(self, x):
+        x = conv_transpose3d_leaky_mul_leaky(
+            x,
+            self.weight,
+            self.bias,
+            self.multiplier,
+            self.kernel_size,
+            self.stride,
+            self.padding,
+            self.output_padding,
+            self.negative_slope,
+        )
+        x = max_pool3d_triton(
+            x,
+            kernel_size=self.pool_kernel_size,
+            stride=self.pool_kernel_size,
+        )
+        return x
+```
+
+# Performance
+- **PyTorch baseline**: 4.49 ms
+- **Current Triton**: 6.30 ms
+- **Current speedup**: 0.71x (-40.2% vs baseline)
+
+
+---
+
+## Analysis Steps
+
+1. **Code Analysis**: Count kernels, identify operations, check for inefficiencies
+2. **Performance Diagnosis**: Use metrics/latency to identify bottleneck type
+3. **Root Cause**: Combine code + performance to find the core issue
+
+## Optimization Categories (pick ONE if worth optimizing):
+
+### 1. Operator Fusion
+Fuse consecutive ops into fewer kernels to reduce memory traffic and launch overhead.
+
+### 2. Algorithm Replacement
+Replace naive algorithm with optimized variant.
+- For Attention: Flash Attention, online softmax
+- For Convolution: Winograd, im2col
+- **For RNN/GRU/LSTM**: Persistent kernel with HYBRID computation
+  - **CRITICAL**: Use hybrid approach for best performance:
+    * Precompute input-side gates ONCE (outside kernel): `gates_x = (T*B, In) @ W_ih`
+    * Persistent kernel (inside): only recurrent-side: `for t: gates_h = h @ W_hh`
+  - Time loop `for t in range(T)` must be inside kernel, NOT in Python
+  - Launch kernel once per layer, not once per timestep
+  - Expected speedup: 10-100x (vs per-timestep launches)
+
+### 3. Kernel Launch Reduction
+Combine multiple small kernels to reduce overhead.
+- **For RNN/GRU/LSTM**: See "Algorithm Replacement" above for persistent kernel approach
+
+### 4. Memory Layout Optimization
+Use in-place operations, buffer reuse, or better layouts.
+
+## Should We Optimize?
+
+Before proposing optimization, determine if it's worthwhile:
+- **Not worth optimizing** if:
+  - Code is already near-optimal (expected speedup < 10%)
+  - Bottleneck cannot be addressed (hardware limited, already optimal algorithm)
+  - Optimization would add significant complexity with minimal gain
+
+- **Worth optimizing** if:
+  - Clear algorithmic inefficiency exists (multiple kernels, suboptimal algorithm)
+  - Expected speedup >= 20%
+  - Concrete optimization path available
+
+## Output (JSON)
+
+```json
+{
+  "worth_optimizing": "yes/no",
+  "reason": "<Why worth or not worth optimizing, 1 sentence>",
+  "bottleneck": "<Root cause in 1-2 sentences, empty if not worth optimizing>",
+  "optimisation method": "<Specific optimization in 1-2 sentences, empty if not worth optimizing>",
+  "modification plan": "<Implementation steps in 2-3 sentences, empty if not worth optimizing>",
+  "expected_speedup": "<e.g., '30-40%', empty if not worth optimizing>"
+}
+```
+
+Return JSON only.

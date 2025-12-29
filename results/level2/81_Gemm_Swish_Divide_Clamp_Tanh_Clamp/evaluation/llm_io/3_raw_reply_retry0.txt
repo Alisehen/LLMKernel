@@ -1,0 +1,212 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        # High-throughput config for large, well-behaved GEMMs (compute-bound, high K)
+        triton.Config(
+            {'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32},
+            num_warps=8,
+            num_stages=3,
+        ),
+        # Slightly narrower N – often better when N is smaller / tall skinny
+        triton.Config(
+            {'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_warps=8,
+            num_stages=3,
+        ),
+        # Multi-input–friendly config (lower register pressure)
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+        # Conservative baseline (required): low register pressure / edge cases
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+    ],
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def fused_linear_swish_div_clamp_tanh_clamp_kernel(
+    a_ptr, w_ptr, bias_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_wk, stride_wn,
+    stride_cm, stride_cn,
+    HAS_BIAS: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    # 2D program id for output tile [M, N]
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    # Offsets for this program's tile
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    mask_m = offs_m < M  # [BLOCK_M]
+    mask_n = offs_n < N  # [BLOCK_N]
+
+    # Base pointers for A and W tiles
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    w_ptrs = w_ptr + offs_k[:, None] * stride_wk + offs_n[None, :] * stride_wn
+
+    # Accumulator in FP32
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # K loop
+    for k in range(0, K, BLOCK_K):
+        k_mask = offs_k < (K - k)
+
+        a = tl.load(
+            a_ptrs,
+            mask=mask_m[:, None] & k_mask[None, :],
+            other=0.0,
+        )
+        w = tl.load(
+            w_ptrs,
+            mask=k_mask[:, None] & mask_n[None, :],
+            other=0.0,
+        )
+
+        # Tensor-core friendly dot product
+        acc += tl.dot(a, w, allow_tf32=True)
+
+        a_ptrs += BLOCK_K * stride_ak
+        w_ptrs += BLOCK_K * stride_wk
+
+    # Optional bias add (broadcast along M)
+    if HAS_BIAS:
+        bias = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0)  # [BLOCK_N]
+        acc += bias[None, :]
+
+    # ---- Fused elementwise pipeline on acc (all in registers) ----
+    # Swish: x * sigmoid(x); sigmoid(x) = 1 / (1 + exp(-x))
+    s = tl.exp(-acc)
+    s = 1.0 / (1.0 + s)
+    acc = acc * s
+
+    # Divide by 2
+    acc = acc * 0.5
+
+    # Clamp to [-1, 1]
+    acc = tl.minimum(acc, 1.0)
+    acc = tl.maximum(acc, -1.0)
+
+    # Tanh via exponentials: tanh(x) = (exp(2x) - 1) / (exp(2x) + 1)
+    s = 2.0 * acc
+    s = tl.exp(s)
+    acc = (s - 1.0) / (s + 1.0)
+
+    # Final clamp to [-1, 1]
+    acc = tl.minimum(acc, 1.0)
+    acc = tl.maximum(acc, -1.0)
+
+    # Single final store (no intermediate stores anywhere above)
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    out_mask = mask_m[:, None] & mask_n[None, :]
+    tl.store(c_ptrs, acc, mask=out_mask)
+
+
+def fused_linear_swish_div_clamp_tanh_clamp(x: torch.Tensor,
+                                            weight: torch.Tensor,
+                                            bias: torch.Tensor | None):
+    """
+    x:      [M, K]
+    weight: [K, N]
+    bias:   [N] or None
+    Returns: [M, N]
+    """
+    assert x.is_cuda and weight.is_cuda, "Inputs must be CUDA tensors for Triton kernel"
+    # Enforce contiguous layout for predictable, fast memory access
+    if not x.is_contiguous():
+        x = x.contiguous()
+    if not weight.is_contiguous():
+        weight = weight.contiguous()
+    if bias is not None and not bias.is_contiguous():
+        bias = bias.contiguous()
+
+    M, K = x.shape
+    K_w, N = weight.shape
+    assert K_w == K, "Incompatible shapes for matmul"
+
+    # Output tensor
+    y = torch.empty((M, N), device=x.device, dtype=x.dtype)
+
+    has_bias = bias is not None
+    # Dummy pointer if no bias; it will be unused when HAS_BIAS=False
+    bias_ptr = bias if has_bias else weight
+
+    def grid(meta):
+        return (
+            max(1, triton.cdiv(M, meta['BLOCK_M'])),
+            max(1, triton.cdiv(N, meta['BLOCK_N'])),
+        )
+
+    fused_linear_swish_div_clamp_tanh_clamp_kernel[grid](
+        x, weight, bias_ptr, y,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        weight.stride(0), weight.stride(1),
+        y.stride(0), y.stride(1),
+        HAS_BIAS=has_bias,
+    )
+
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized version of:
+        Linear -> Swish -> divide by 2 -> clamp -> tanh -> clamp
+    """
+    def __init__(self, in_features, out_features, bias=True):
+        super(ModelNew, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+
+        # Store weight as [in_features, out_features] for fast x @ W layout
+        self.weight = nn.Parameter(torch.empty(in_features, out_features))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_features))
+        else:
+            self.bias = None
+
+        # Simple initialization (similar scale to nn.Linear default)
+        bound = 1.0 / (in_features ** 0.5)
+        with torch.no_grad():
+            self.weight.uniform_(-bound, bound)
+            if self.bias is not None:
+                self.bias.uniform_(-bound, bound)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Fast Triton path on CUDA
+        if x.is_cuda:
+            return fused_linear_swish_div_clamp_tanh_clamp(x, self.weight, self.bias)
+
+        # Fallback PyTorch implementation on CPU
+        y = x @ self.weight
+        if self.bias is not None:
+            y = y + self.bias
+
+        # Swish
+        y = y * torch.sigmoid(y)
+        # Divide
+        y = y / 2.0
+        # Clamp [-1, 1]
+        y = torch.clamp(y, min=-1.0, max=1.0)
+        # Tanh
+        y = torch.tanh(y)
+        # Clamp again
+        y = torch.clamp(y, min=-1.0, max=1.0)
+        return y
+```

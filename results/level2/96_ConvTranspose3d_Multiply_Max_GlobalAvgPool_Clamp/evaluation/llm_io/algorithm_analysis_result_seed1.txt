@@ -1,0 +1,10 @@
+```json
+{
+  "worth_optimizing": "yes",
+  "reason": "The pipeline materializes two large intermediate 5D tensors and launches three separate kernels for what is ultimately a tiny (N,C,1,1,1) result.",
+  "bottleneck": "The workload is dominated by memory traffic from writing and rereading the full ConvTranspose3d output and the MaxPool3d output, plus the overhead of three kernel launches. The math for conv, pooling, and global average is relatively small compared to the cost of moving hundreds of millions of elements to/from DRAM.",
+  "optimisation method": "Fuse ConvTranspose3d+scale, MaxPool3d, and global average pooling + clamp into a single Triton kernel that directly produces the (N, C, 1, 1, 1) output, computing pooled maxima and accumulating channel sums on the fly without ever materializing the conv-transpose or maxpooled tensors in global memory.",
+  "modification plan": "Design a fused kernel indexed by (n, co) where each program iterates over all maxpool output positions, and for each position computes the max over the corresponding ConvTranspose3d window by looping over the pool window and deconv kernel positions, applying bias and scale inside the loop. Instead of storing the maxpooled feature map, directly accumulate these per-position maxima into a running sum per (n, co), then at the end divide by the number of pooled positions to form the global average, apply clamp_min/clamp_max, and write a single scalar result to y. Replace the three current Triton calls in ModelNew.forward with one call to this fused kernel, reusing the existing shape/stride calculations but eliminating the large intermediate allocations.",
+  "expected_speedup": "30-40%"
+}
+```

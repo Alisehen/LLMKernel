@@ -1,0 +1,441 @@
+import torch, torch.nn as nn, triton, triton.language as tl
+import math
+
+
+# ---------------------------------------------------------------
+# 3D Convolution (NCDHW) as im2col + GEMM in a single Triton kernel
+# ---------------------------------------------------------------
+
+@triton.jit
+def conv3d_im2col_gemm_kernel(
+    x_ptr,          # *f16/f32, [N, C_in, D_in, H_in, W_in]
+    w_ptr,          # *f16/f32, [K, C_out]  (K = C_in * kD * kH * kW)
+    b_ptr,          # *f16/f32, [C_out]
+    y_ptr,          # *f16/f32, [N, C_out, D_out, H_out, W_out]
+    N, C_in,
+    D_in, H_in, W_in,
+    C_out,
+    kD, kH, kW,
+    D_out, H_out, W_out,
+    stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
+    stride_wk, stride_wo,
+    stride_yn, stride_yc, stride_yd, stride_yh, stride_yw,
+    BLOCK_M: tl.constexpr,   # tile in P (N * D_out * H_out * W_out)
+    BLOCK_N: tl.constexpr,   # tile in C_out
+    BLOCK_K: tl.constexpr,   # tile in K = C_in*kD*kH*kW
+):
+    pid_m = tl.program_id(0)  # along flattened spatial positions P
+    pid_n = tl.program_id(1)  # along output channels C_out
+
+    M = N * D_out * H_out * W_out
+    K = C_in * kD * kH * kW
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # [BM]
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # [BN]
+
+    mask_m = offs_m < M
+    mask_n = offs_n < C_out
+
+    # Decode flattened output position index -> (n, od, oh, ow)
+    tmp = offs_m
+    ow = tmp % W_out
+    tmp = tmp // W_out
+    oh = tmp % H_out
+    tmp = tmp // H_out
+    od = tmp % D_out
+    tmp = tmp // D_out
+    n  = tmp  # batch index
+
+    # Base input pointer for each (n, od, oh, ow); independent of k
+    base_in = (
+        n * stride_xn
+        + od * stride_xd
+        + oh * stride_xh
+        + ow * stride_xw
+    )  # [BM]
+
+    # Base output pointer for each (n, od, oh, ow); independent of output channel
+    base_out = (
+        n * stride_yn
+        + od * stride_yd
+        + oh * stride_yh
+        + ow * stride_yw
+    )  # [BM]
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Reduction over K dimension in BLOCK_K chunks
+    for k_start in range(0, K, BLOCK_K):
+        offs_k = k_start + tl.arange(0, BLOCK_K)  # [BK]
+        k_mask = offs_k < K
+
+        # Decode K index -> (ic, kd, kh, kw)
+        KDH = kD * kH * kW
+        KH = kH * kW
+
+        tmpk = offs_k
+        ic = tmpk // KDH
+        tmpk = tmpk % KDH
+        kd = tmpk // KH
+        tmpk = tmpk % KH
+        kh = tmpk // kW
+        kw = tmpk % kW
+
+        kernel_offset = (
+            ic * stride_xc
+            + kd * stride_xd
+            + kh * stride_xh
+            + kw * stride_xw
+        )  # [BK]
+
+        # A tile: from input x, shape [BM, BK]
+        a_ptrs = x_ptr + base_in[:, None] + kernel_offset[None, :]
+        a = tl.load(
+            a_ptrs,
+            mask=mask_m[:, None] & k_mask[None, :],
+            other=0.0,
+        )
+        a = a.to(tl.float32)
+
+        # B tile: from weight matrix [K, C_out], shape [BK, BN]
+        w_ptrs = w_ptr + offs_k[:, None] * stride_wk + offs_n[None, :] * stride_wo
+        b = tl.load(
+            w_ptrs,
+            mask=k_mask[:, None] & mask_n[None, :],
+            other=0.0,
+        )
+        b = b.to(tl.float32)
+
+        acc += tl.dot(a, b, allow_tf32=True)
+
+    # Add bias
+    bias = tl.load(b_ptr + offs_n, mask=mask_n, other=0.0)
+    bias = bias.to(tl.float32)
+    acc = acc + bias[None, :]
+
+    # Store result
+    y_ptrs = y_ptr + base_out[:, None] + offs_n[None, :] * stride_yc
+    tl.store(
+        y_ptrs,
+        acc,
+        mask=mask_m[:, None] & mask_n[None, :],
+    )
+
+
+def conv3d_triton(x, weight, bias):
+    """
+    x:      [N, C_in, D_in, H_in, W_in]
+    weight: [C_out, C_in, kD, kH, kW]
+    bias:   [C_out]
+    Stride=1, padding=0, dilation=1 (same as default Conv3d).
+    """
+    assert x.ndim == 5
+    assert weight.ndim == 5
+    N, C_in, D_in, H_in, W_in = x.shape
+    C_out, Cw_in, kD, kH, kW = weight.shape
+    assert Cw_in == C_in
+
+    D_out = D_in - kD + 1
+    H_out = H_in - kH + 1
+    W_out = W_in - kW + 1
+    assert D_out > 0 and H_out > 0 and W_out > 0
+
+    # Flatten weight to [K, C_out], with K contiguous
+    K = C_in * kD * kH * kW
+    w_mat = weight.contiguous().view(C_out, K).t().contiguous()
+
+    y = torch.empty(
+        (N, C_out, D_out, H_out, W_out),
+        device=x.device,
+        dtype=x.dtype,
+    )
+
+    x_strides = x.stride()
+    y_strides = y.stride()
+    w_strides = w_mat.stride()
+
+    BLOCK_M = 32
+    BLOCK_N = 64
+    BLOCK_K = 32
+
+    M = N * D_out * H_out * W_out
+
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_M"]),
+        triton.cdiv(C_out, META["BLOCK_N"]),
+    )
+
+    conv3d_im2col_gemm_kernel[grid](
+        x, w_mat, bias, y,
+        N, C_in,
+        D_in, H_in, W_in,
+        C_out,
+        kD, kH, kW,
+        D_out, H_out, W_out,
+        x_strides[0], x_strides[1], x_strides[2], x_strides[3], x_strides[4],
+        w_strides[0], w_strides[1],
+        y_strides[0], y_strides[1], y_strides[2], y_strides[3], y_strides[4],
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+    )
+    return y
+
+
+# ---------------------------------------------------------------
+# GroupNorm + min + clamp + dropout fused kernel
+# ---------------------------------------------------------------
+
+@triton.jit
+def groupnorm_min_clamp_dropout_kernel(
+    x_ptr,        # *f16/f32, [N, C, D, H, W]
+    gamma_ptr,    # *f16/f32, [C]
+    beta_ptr,     # *f16/f32, [C]
+    y_ptr,        # *f16/f32, [N, C, D, H, W]
+    N, C, D, H, W,
+    groups,
+    channels_per_group,
+    group_size,   # channels_per_group * D * H * W
+    stride_n, stride_c, stride_d, stride_h, stride_w,
+    eps, min_value, max_value,
+    p,            # dropout probability
+    seed,         # int32
+    IS_TRAINING: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    total_groups = N * groups
+    if pid >= total_groups:
+        return
+
+    # Map pid -> (n, g)
+    n = pid // groups
+    g = pid % groups
+
+    c_start = g * channels_per_group
+
+    # First pass: compute mean and variance over the group
+    sum_val = tl.zeros((), dtype=tl.float32)
+    sum_sq = tl.zeros((), dtype=tl.float32)
+
+    offs_vec = tl.arange(0, BLOCK_SIZE)
+
+    for offset in range(0, group_size, BLOCK_SIZE):
+        idx = offset + offs_vec  # [BLOCK_SIZE]
+        mask = idx < group_size
+
+        cur = idx
+        w_idx = cur % W
+        cur = cur // W
+        h_idx = cur % H
+        cur = cur // H
+        d_idx = cur % D
+        cur = cur // D
+        c_local = cur
+        c = c_start + c_local  # [BLOCK_SIZE]
+
+        x_ptrs = (
+            x_ptr
+            + n * stride_n
+            + c * stride_c
+            + d_idx * stride_d
+            + h_idx * stride_h
+            + w_idx * stride_w
+        )
+
+        x = tl.load(x_ptrs, mask=mask, other=0.0)
+        x_f32 = x.to(tl.float32)
+
+        sum_val += tl.sum(x_f32, axis=0)
+        sum_sq += tl.sum(x_f32 * x_f32, axis=0)
+
+    m = tl.float32(group_size)
+    mean = sum_val / m
+    var = sum_sq / m - mean * mean
+    rstd = 1.0 / tl.sqrt(var + eps)
+
+    # Second pass: normalize, affine, min, clamp, dropout, and store
+    for offset in range(0, group_size, BLOCK_SIZE):
+        idx = offset + offs_vec
+        mask = idx < group_size
+
+        cur = idx
+        w_idx = cur % W
+        cur = cur // W
+        h_idx = cur % H
+        cur = cur // H
+        d_idx = cur % D
+        cur = cur // D
+        c_local = cur
+        c = c_start + c_local
+
+        x_ptrs = (
+            x_ptr
+            + n * stride_n
+            + c * stride_c
+            + d_idx * stride_d
+            + h_idx * stride_h
+            + w_idx * stride_w
+        )
+
+        x = tl.load(x_ptrs, mask=mask, other=0.0)
+        x_f32 = x.to(tl.float32)
+
+        gamma = tl.load(gamma_ptr + c, mask=mask, other=1.0).to(tl.float32)
+        beta = tl.load(beta_ptr + c, mask=mask, other=0.0).to(tl.float32)
+
+        # GroupNorm
+        x_hat = (x_f32 - mean) * rstd
+        y = x_hat * gamma + beta
+
+        # torch.min(x, min_value)
+        y = tl.minimum(y, min_value)
+        # torch.clamp(y, min=min_value, max=max_value)
+        y = tl.maximum(y, min_value)
+        y = tl.minimum(y, max_value)
+
+        if IS_TRAINING:
+            # Dropout: per-element random
+            # Linear index in the whole tensor to seed RNG
+            lin = (((n * C + c) * D + d_idx) * H + h_idx) * W + w_idx
+            lin = lin.to(tl.int32)
+            rnd = tl.rand(seed, lin)
+            keep = rnd > p
+            scale = 1.0 / (1.0 - p)
+            y = tl.where(keep, y * scale, 0.0)
+
+        y_cast = y.to(x.dtype)
+
+        y_ptrs = (
+            y_ptr
+            + n * stride_n
+            + c * stride_c
+            + d_idx * stride_d
+            + h_idx * stride_h
+            + w_idx * stride_w
+        )
+        tl.store(y_ptrs, y_cast, mask=mask)
+
+
+def groupnorm_min_clamp_dropout_triton(
+    x,
+    gamma,
+    beta,
+    groups,
+    eps,
+    min_value,
+    max_value,
+    p,
+    training: bool,
+):
+    """
+    x:     [N, C, D, H, W]
+    gamma: [C]
+    beta:  [C]
+    """
+    N, C, D, H, W = x.shape
+    assert C % groups == 0
+    channels_per_group = C // groups
+    group_size = channels_per_group * D * H * W
+    total_groups = N * groups
+
+    y = torch.empty_like(x)
+
+    strides = x.stride()
+
+    BLOCK_SIZE = 128
+
+    grid = lambda META: (triton.cdiv(total_groups, 1),)
+
+    # Simple random seed; not synchronized with PyTorch RNG, but sufficient
+    seed = int(torch.randint(0, 2**31 - 1, (1,), device=x.device).item())
+
+    IS_TRAINING = bool(training and (p > 0.0))
+
+    groupnorm_min_clamp_dropout_kernel[grid](
+        x, gamma, beta, y,
+        N, C, D, H, W,
+        groups,
+        channels_per_group,
+        group_size,
+        strides[0], strides[1], strides[2], strides[3], strides[4],
+        float(eps), float(min_value), float(max_value),
+        float(p),
+        seed,
+        IS_TRAINING=IS_TRAINING,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    return y
+
+
+# ---------------------------------------------------------------
+# PyTorch Module using Triton kernels
+# ---------------------------------------------------------------
+
+class ModelNew(nn.Module):
+    """
+    Model that performs:
+      - 3D convolution (stride=1, padding=0, dilation=1),
+      - Group Normalization,
+      - torch.min with scalar,
+      - torch.clamp with scalar min/max,
+      - Dropout.
+
+    All heavy ops are implemented with high-performance Triton kernels.
+    """
+
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size,
+        groups,
+        min_value,
+        max_value,
+        dropout_p,
+    ):
+        super(ModelNew, self).__init__()
+        if isinstance(kernel_size, int):
+            kD = kH = kW = kernel_size
+        else:
+            assert len(kernel_size) == 3
+            kD, kH, kW = kernel_size
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = (kD, kH, kW)
+
+        # Conv3d parameters (no padding, stride=1)
+        self.weight = nn.Parameter(
+            torch.randn(out_channels, in_channels, kD, kH, kW)
+        )
+        self.bias = nn.Parameter(torch.zeros(out_channels))
+
+        # GroupNorm parameters
+        assert out_channels % groups == 0
+        self.groups = groups
+        self.gn_weight = nn.Parameter(torch.ones(out_channels))
+        self.gn_bias = nn.Parameter(torch.zeros(out_channels))
+        self.eps = 1e-5
+
+        # Min / clamp / dropout parameters
+        self.min_value = float(min_value)
+        self.max_value = float(max_value)
+        self.dropout_p = float(dropout_p)
+
+    def forward(self, x):
+        # 3D convolution
+        x = conv3d_triton(x, self.weight, self.bias)
+        # GroupNorm + min + clamp + dropout fused
+        x = groupnorm_min_clamp_dropout_triton(
+            x,
+            self.gn_weight,
+            self.gn_bias,
+            self.groups,
+            self.eps,
+            self.min_value,
+            self.max_value,
+            self.dropout_p,
+            self.training,
+        )
+        return x

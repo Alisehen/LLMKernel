@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "There is still a full extra global read+write of the conv output tensor just to perform max-pooling, which is a classic candidate for fusion.",
+  "bottleneck": "The current implementation writes the full (N, OC, OH, OW) activation to DRAM after conv+tanh+scale+bias, then immediately reads it back for max-pooling, doubling memory traffic on a large tensor and paying an extra kernel launch.",
+  "optimisation method": "Fuse max-pooling into the conv kernel epilogue so that each thread block computes the convolution, applies tanh/scale/bias, performs the max-pool reduction over its pooling window in registers/shared memory, and only writes the pooled output to global memory.",
+  "modification plan": "Redefine the conv kernel’s M-dimension to iterate over pooled output positions (N * H_pool * W_pool) instead of raw conv positions, and inside each program compute all conv outputs that fall into the corresponding pooling window, applying tanh/scale/bias and tracking the running maximum per output channel. This requires adjusting the spatial indexing (mapping from pooled (ph, pw) to the underlying conv (oh, ow) window) and replacing the separate max_pool kernel with an in-kernel reduction over that window before the final store. Carefully tune BLOCK_M/BLOCK_N so that each tile covers one or more pooled positions and channels while maintaining coalesced access and sufficient parallelism.",
+  "expected_speedup": "20-30%"
+}

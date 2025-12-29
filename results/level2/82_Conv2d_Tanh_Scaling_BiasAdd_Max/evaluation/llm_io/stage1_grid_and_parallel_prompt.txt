@@ -1,259 +1,301 @@
 You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
 
-# Target GPU
-GPU Name: 4090
-Architecture: Ada Lovelace
-• Compute Capability: 8.9
-• Number of SMs: 128
-• Memory Bandwidth: 1008 GB/s
-• TF32 Tensor Core TFLOPS: 82.6 with dense
-• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
-• FP16 Tensor Core TFLOPS: 165.2 with dense
-• Maximum number of registers per thread: 255
-• Maximum threads per block: 1024
-• Maximum threads per SM: 1536
-• Warp size: 32
-• Maximum concurrent warps per SM: 48
-• Shared memory capacity per SM: 100 KB
-• Maximum shared memory per thread block: 99 KB
-• L2 cache (global, all SM shared): 72 MB
+# Target GPU: 4090
 
 [OPTIMIZATION STAGE]
 
 ## Current Optimization Stage
 
-Focus: Grid layout & parallelism.
+Focus: Grid layout & indexing for FUSED operations.
 
-Metrics:
-- sm__throughput.avg.pct_of_peak_sustained_elapsed (>60%)
-- launch__grid_size
+Key Principle:
+- All fused ops share the SAME grid AND the SAME (offsets, mask) tuple
+- Grid covers OUTPUT tensor dimensions
 
-Rules:
-- 1D: (cdiv(N, BLOCK))
-- 2D: (cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))
-- 3D: (batch, cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))
-- >3D: flatten ONLY independent dims
-- Prefer batch / head / expert parallelism before shrinking BLOCK
-- Change grid only if SM utilization is clearly low
+Hard Rules:
+- Every fused op MUST use identical offset calculation
+- Every fused op MUST use identical boundary mask
+- If broadcast needed: explicit `[None, :]` or `[:, None]`, NOT different offsets
+- Element-wise: 1D grid, single `offs = pid * BLOCK + tl.arange(0, BLOCK)`
+- Matmul fusion: 2D grid, `offs_m/offs_n` shared by bias add & activation
 
-Safety:
-- Max 3 grid dims, static rank
-- grid=(G0,G1,G2) must match tl.program_id(0/1/2)
-- If unsure about correctness, do NOT change grid
-
-Autotune:
-- Autotune either BLOCK_* OR (num_warps, num_stages)
-- If autotuning BLOCK_*, use grid=lambda META: (...)
-- Never redefine BLOCK_* in both kernel and launch
+Verification:
+- Check: all tl.load/tl.store use same `offsets` variable
+- Check: all masks derived from same boundary condition
+- If ANY op needs different indexing → do NOT fuse, split kernel
 
 
 
 [CURRENT CODE]
 ```python
-import torch
-import torch.nn as nn
-import triton
-import triton.language as tl
-from typing import Tuple
+import torch, torch.nn as nn, triton, triton.language as tl
 
 
 @triton.jit
-def fused_activation_kernel(
-    x_ptr,
-    bias_ptr,
-    output_ptr,
+def conv2d_tanh_scale_bias_maxpool_kernel(
+    x_ptr, w_ptr, conv_bias_ptr, extra_bias_ptr, y_ptr,
+    M_pooled, N_out, K,                     # M_pooled = N * H_pool * W_pool
+    N_batch, C, H, W,
+    OH, OW,
+    KH, KW,                                 # conv kernel size
+    pool_kh, pool_kw,                       # pooling kernel size
+    pool_stride_h, pool_stride_w,           # pooling stride
+    H_pool, W_pool,                         # pooled spatial dims
     scaling_factor,
-    n_elements,
-    C: tl.constexpr,
-    H: tl.constexpr,
-    W: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_wn, stride_wc, stride_wkh, stride_wkw,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
-    pid = tl.program_id(axis=0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-    
-    x = tl.load(x_ptr + offsets, mask=mask)
-    
-    # Compute channel index for bias broadcasting: (offsets // (H*W)) % C
-    HW = H * W
-    c_idx = (offsets // HW) % C
-    bias = tl.load(bias_ptr + c_idx)
-    
-    # tanh using exponential form with scalar operations (no full_like)
-    exp_2x = tl.exp(2.0 * x)
-    tanh_x = (exp_2x - 1.0) / (exp_2x + 1.0)
-    
-    activated = tanh_x * scaling_factor + bias
-    tl.store(output_ptr + offsets, activated, mask=mask)
+    # program ids
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    # tile offsets
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    m_mask = offs_m < M_pooled
+    n_mask = offs_n < N_out
+
+    # Decode (n, ph, pw) from pooled index
+    P = H_pool * W_pool
+    n_idx = offs_m // P
+    rem = offs_m - n_idx * P
+    ph = rem // W_pool
+    pw = rem - ph * W_pool
+
+    # Top-left conv coordinates for this pooled position
+    oh0 = ph * pool_stride_h
+    ow0 = pw * pool_stride_w
+
+    # Base pointer for input for each pooled (n, ph, pw) at its top-left conv position
+    base_in0 = n_idx * stride_xn + oh0 * stride_xh + ow0 * stride_xw
+
+    # Base pointer for output pooled tensor
+    base_out = n_idx * stride_yn + ph * stride_yh + pw * stride_yw
+
+    # Preload biases per output channel
+    conv_b = tl.load(conv_bias_ptr + offs_n, mask=n_mask, other=0.0)
+    extra_b = tl.load(extra_bias_ptr + offs_n, mask=n_mask, other=0.0)
+
+    # Initialize max accumulator for pooled output
+    max_acc = tl.full((BLOCK_M, BLOCK_N), -float("inf"), dtype=tl.float32)
+
+    # Iterate over pooling window
+    for pkh in range(0, pool_kh):
+        for pkw in range(0, pool_kw):
+            # Conv output position inside this pooling window
+            base_in = base_in0 + pkh * stride_xh + pkw * stride_xw
+
+            # Convolution accumulation for this (oh, ow)
+            acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+            # K-loop over C * KH * KW
+            for k0 in range(0, K, BLOCK_K):
+                offs_k = k0 + tl.arange(0, BLOCK_K)
+                k_mask = offs_k < K
+
+                kk = offs_k
+                k_per_c = KH * KW
+                ci = kk // k_per_c
+                remk = kk - ci * k_per_c
+                kh = remk // KW
+                kw = remk - kh * KW
+
+                # Offsets for input and weight for each k
+                offset_x_k = ci * stride_xc + kh * stride_xh + kw * stride_xw
+                offset_w_k = ci * stride_wc + kh * stride_wkh + kw * stride_wkw
+
+                # A (input) tile: (BLOCK_M, BLOCK_K)
+                a_ptrs = x_ptr + base_in[:, None] + offset_x_k[None, :]
+                a_mask = m_mask[:, None] & k_mask[None, :]
+                a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+
+                # B (weights) tile: (BLOCK_K, BLOCK_N)
+                b_ptrs = w_ptr + offset_w_k[:, None] + offs_n[None, :] * stride_wn
+                b_mask = k_mask[:, None] & n_mask[None, :]
+                b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+                acc += tl.dot(a, b, allow_tf32=True)
+
+            # Add convolution bias
+            acc = acc + conv_b[None, :]
+
+            # Tanh activation (same formulation as reference)
+            two_x = acc * 2.0
+            e = tl.exp(two_x)
+            acc = (e - 1.0) / (e + 1.0)
+
+            # Scaling
+            acc = acc * scaling_factor
+
+            # Extra bias
+            acc = acc + extra_b[None, :]
+
+            # Max-pooling reduction
+            max_acc = tl.maximum(max_acc, acc)
+
+    # Store pooled result: (N, OC, H_pool, W_pool)
+    y_ptrs = y_ptr + base_out[:, None] + offs_n[None, :] * stride_yc
+    y_mask = m_mask[:, None] & n_mask[None, :]
+    tl.store(y_ptrs, max_acc, mask=y_mask)
 
 
-@triton.jit
-def max_pool_2d_kernel(
-    input_ptr,
-    output_ptr,
-    B, C, H, W,
-    pool_h, pool_w,
-    stride_h, stride_w,
-    output_h, output_w,
-    BLOCK_SIZE: tl.constexpr,
+def fused_conv2d_tanh_scale_bias_maxpool(
+    x, weight, conv_bias, extra_bias, scaling_factor,
+    pool_kernel_size, pool_stride=None,
 ):
-    pid = tl.program_id(axis=0)
-    num_programs = tl.num_programs(axis=0)
-    
-    output_size = B * C * output_h * output_w
-    positions_per_program = tl.cdiv(output_size, num_programs)
-    start_pos = pid * positions_per_program
-    end_pos = min(start_pos + positions_per_program, output_size)
-    
-    for pos in range(start_pos, end_pos, BLOCK_SIZE):
-        offsets = pos + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < end_pos
-        
-        # Compute output indices
-        w_idx = offsets % output_w
-        h_idx = (offsets // output_w) % output_h
-        c_idx = (offsets // (output_w * output_h)) % C
-        b_idx = offsets // (output_w * output_h * C)
-        
-        # Input window indices
-        h_start = h_idx * stride_h
-        w_start = w_idx * stride_w
-        h_end = min(h_start + pool_h, H)
-        w_end = min(w_start + pool_w, W)
-        
-        # Initialize with minimum float value
-        min_val = -3.4028235e38
-        max_val = tl.full((BLOCK_SIZE,), min_val, dtype=tl.float32)
-        
-        # Pooling window
-        for ph in range(pool_h):
-            ph_actual = h_start + ph
-            for pw in range(pool_w):
-                pw_actual = w_start + pw
-                
-                # Calculate input index
-                input_idx = (b_idx * C * H * W + 
-                            c_idx * H * W + 
-                            ph_actual * W + 
-                            pw_actual)
-                
-                # Load with bounds checking
-                h_in_bounds = (ph_actual < h_end) & (ph_actual >= 0)
-                w_in_bounds = (pw_actual < w_end) & (pw_actual >= 0)
-                load_mask = mask & h_in_bounds & w_in_bounds
-                val = tl.load(input_ptr + input_idx, mask=load_mask, other=min_val)
-                
-                # Vectorized max
-                max_val = tl.where(val > max_val, val, max_val)
-        
-        # Calculate output index and store
-        output_idx = (b_idx * C * output_h * output_w + 
-                     c_idx * output_h * output_w + 
-                     h_idx * output_w + 
-                     w_idx)
-        tl.store(output_ptr + output_idx, max_val, mask=mask)
+    """
+    x:            (N, C, H, W)
+    weight:       (OC, C, KH, KW)
+    conv_bias:    (OC,)
+    extra_bias:   (OC,)  -- bias_shape (OC,1,1) flattened
+    scaling_factor: float
+    pool_kernel_size: int
+    pool_stride: int or None (defaults to pool_kernel_size)
+    """
+    assert x.is_cuda and weight.is_cuda and conv_bias.is_cuda and extra_bias.is_cuda
+    x = x.contiguous()
+    weight = weight.contiguous()
 
+    if pool_stride is None:
+        pool_stride = pool_kernel_size
 
-def triton_fused_activation(x: torch.Tensor, scaling_factor: float, bias: torch.Tensor) -> torch.Tensor:
-    # Flatten bias to (C,) for proper broadcasting
-    if bias.dim() > 1:
-        bias = bias.view(-1)
-    
-    output = torch.empty_like(x)
-    n_elements = output.numel()
-    B, C, H, W = x.shape
-    
-    # Optimize BLOCK_SIZE for elementwise operations
-    BLOCK_SIZE = min(1024, triton.next_power_of_2(H * W))
-    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
-    
-    fused_activation_kernel[grid](
-        x, bias, output, scaling_factor, n_elements,
-        C, H, W,
-        BLOCK_SIZE=BLOCK_SIZE
+    N, C, H, W = x.shape
+    OC, Cw, KH, KW = weight.shape
+    assert C == Cw, "Inconsistent in_channels between input and weight"
+    assert pool_kernel_size > 0
+    assert pool_stride > 0
+
+    # Valid conv: stride=1, padding=0, dilation=1
+    OH = H - KH + 1
+    OW = W - KW + 1
+    assert OH > 0 and OW > 0
+
+    # MaxPool2d output size (no padding, no dilation)
+    H_pool = (OH - pool_kernel_size) // pool_stride + 1
+    W_pool = (OW - pool_kernel_size) // pool_stride + 1
+    assert H_pool > 0 and W_pool > 0
+
+    M_pooled = N * H_pool * W_pool
+    N_out = OC
+    K_dim = C * KH * KW
+
+    y = torch.empty((N, OC, H_pool, W_pool), device=x.device, dtype=x.dtype)
+
+    stride_xn, stride_xc, stride_xh, stride_xw = x.stride()
+    stride_wn, stride_wc, stride_wkh, stride_wkw = weight.stride()
+    stride_yn, stride_yc, stride_yh, stride_yw = y.stride()
+
+    BLOCK_M = 64
+    BLOCK_N = 64
+    BLOCK_K = 32
+
+    grid = lambda META: (
+        triton.cdiv(M_pooled, META["BLOCK_M"]),
+        triton.cdiv(N_out, META["BLOCK_N"]),
     )
-    return output
 
-
-def triton_max_pool2d(x: torch.Tensor, kernel_size: int) -> torch.Tensor:
-    B, C, H, W = x.shape
-    stride = kernel_size
-    pool_h = pool_w = kernel_size
-    
-    output_h = H // stride
-    output_w = W // stride
-    output = torch.empty((B, C, output_h, output_w), device=x.device, dtype=x.dtype)
-    
-    if output_h <= 0 or output_w <= 0:
-        raise ValueError(f"Invalid output dimensions: {output_h}x{output_w}")
-    
-    # Use 1D grid with optimized block size
-    BLOCK_SIZE = min(256, triton.next_power_of_2(output_h * output_w))
-    output_size = B * C * output_h * output_w
-    grid_size = min(65535, triton.cdiv(output_size, BLOCK_SIZE))
-    grid = (max(1, grid_size),)
-    
-    max_pool_2d_kernel[grid](
-        x, output,
-        B, C, H, W,
-        pool_h, pool_w,
-        stride, stride,
-        output_h, output_w,
-        BLOCK_SIZE=BLOCK_SIZE
+    conv2d_tanh_scale_bias_maxpool_kernel[grid](
+        x, weight, conv_bias, extra_bias, y,
+        M_pooled, N_out, K_dim,
+        N, C, H, W,
+        OH, OW,
+        KH, KW,
+        pool_kernel_size, pool_kernel_size,
+        pool_stride, pool_stride,
+        H_pool, W_pool,
+        float(scaling_factor),
+        stride_xn, stride_xc, stride_xh, stride_xw,
+        stride_wn, stride_wc, stride_wkh, stride_wkw,
+        stride_yn, stride_yc, stride_yh, stride_yw,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
     )
-    return output
+
+    return y
 
 
 class ModelNew(nn.Module):
+    """
+    Optimized model using a single Triton kernel that fuses:
+    Conv2d + tanh + scaling + bias addition + MaxPool2d.
+    """
     def __init__(self, in_channels, out_channels, kernel_size, scaling_factor, bias_shape, pool_kernel_size):
-        super().__init__()
+        super(ModelNew, self).__init__()
+        # Conv2d parameters (weights & bias) reused by Triton kernel
         self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
-        self.scaling_factor = scaling_factor
+        self.scaling_factor = float(scaling_factor)
         self.bias = nn.Parameter(torch.randn(bias_shape))
-        self.pool_kernel_size = pool_kernel_size
-        
+        self.max_pool = nn.MaxPool2d(pool_kernel_size)
+
     def forward(self, x):
-        # Use PyTorch convolution for stability
-        x = self.conv(x)
-        
-        # Fused activation (tanh + scaling + bias)
-        x = triton_fused_activation(x, self.scaling_factor, self.bias)
-        
-        # Max pooling
-        x = triton_max_pool2d(x, self.pool_kernel_size)
-        
+        # Ensure NCHW contiguous layout
+        x = x.contiguous()
+
+        weight = self.conv.weight
+        conv_bias = self.conv.bias
+        extra_bias = self.bias.view(-1)
+
+        # Extract pooling params (square kernel/stride as in reference)
+        k = self.max_pool.kernel_size
+        if isinstance(k, tuple):
+            assert k[0] == k[1], "Only square pooling kernels are supported"
+            k = k[0]
+
+        s = self.max_pool.stride
+        if s is None:
+            s = k
+        if isinstance(s, tuple):
+            assert s[0] == s[1], "Only square pooling strides are supported"
+            s = s[0]
+
+        x = fused_conv2d_tanh_scale_bias_maxpool(
+            x,
+            weight,
+            conv_bias,
+            extra_bias,
+            self.scaling_factor,
+            pool_kernel_size=k,
+            pool_stride=s,
+        )
         return x
 ```
 
 [NCU PROFILING METRICS]
 {
-  "fused_activation_kernel": {
-    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 6.03,
-    "launch__grid_size": 516128,
-    "sm__warps_active.avg.pct_of_peak_sustained_active": 82.51,
-    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 93.03,
-    "lts__t_sector_hit_rate.pct": 50.01
-  },
-  "max_pool_2d_kernel": {
-    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 14.91,
-    "launch__grid_size": 65535,
-    "sm__warps_active.avg.pct_of_peak_sustained_active": 93.89,
-    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 93.09,
-    "lts__t_sector_hit_rate.pct": 8.53
+  "conv2d_tanh_scale_bias_maxpool_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 36.31,
+    "launch__grid_size": 7938,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 16.58,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 6.6,
+    "lts__t_sector_hit_rate.pct": 97.41
   }
 }
 
 **Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
 
-OUTPUT RULES (STRICT):
-1. Follow this exact order:
-   1. Imports: torch, torch.nn, triton, triton.language as tl
-   2. @triton.jit decorated kernel function(s)
-   3. Wrapper function(s) for grid calculation and kernel launch
-   4. class ModelNew(nn.Module) that calls your kernels
-2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+## CRITICAL — Code MUST compile and run:
+1. EVERY kernel function MUST have `@triton.jit` decorator
+2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+3. BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+4. `tl.program_id(axis)` only supports axis = 0, 1, 2
+5. No `continue`, `break`, `return` inside loops — use masking
+6. No tensor indexing with loop vars: `x[:, i]` is INVALID
+7. mask shape MUST match data shape in tl.load/tl.store
+
+## Missing Triton Functions (implement manually):
+- tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+## OUTPUT FORMAT (STRICT):
+1. Imports: torch, torch.nn, triton, triton.language as tl
+2. @triton.jit decorated kernel function(s)
+3. Wrapper function(s) for grid calculation and kernel launch
+4. class ModelNew(nn.Module) that calls your kernels
+
+Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
 
 ```python
 # <optimized Triton code>

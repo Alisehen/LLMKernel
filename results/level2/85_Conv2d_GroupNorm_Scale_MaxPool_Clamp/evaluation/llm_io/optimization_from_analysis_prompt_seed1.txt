@@ -1,0 +1,502 @@
+You are optimizing a Triton kernel based on algorithmic analysis.
+
+# PyTorch Reference (Target Behavior)
+
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs convolution, group normalization, scaling, max pooling, and clamping.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, num_groups, scale_shape, maxpool_kernel_size, clamp_min, clamp_max):
+        super(Model, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.group_norm = nn.GroupNorm(num_groups, out_channels)
+        self.scale = nn.Parameter(torch.ones(scale_shape))
+        self.maxpool = nn.MaxPool2d(kernel_size=maxpool_kernel_size)
+        self.clamp_min = clamp_min
+        self.clamp_max = clamp_max
+
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor of shape (batch_size, in_channels, height, width).
+        Returns:
+            Output tensor of shape (batch_size, out_channels, height', width').
+        """
+        x = self.conv(x)
+        x = self.group_norm(x)
+        x = x * self.scale
+        x = self.maxpool(x)
+        x = torch.clamp(x, self.clamp_min, self.clamp_max)
+        return x
+
+batch_size = 128
+in_channels = 8
+out_channels = 64
+height, width = 128, 128 
+kernel_size = 3
+num_groups = 16
+scale_shape = (out_channels, 1, 1)
+maxpool_kernel_size = 4
+clamp_min = 0.0
+clamp_max = 1.0
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, num_groups, scale_shape, maxpool_kernel_size, clamp_min, clamp_max]
+```
+
+**CRITICAL**: Study the PyTorch code carefully to understand:
+- What does `forward()` return? (full output sequence vs final hidden state only)
+- What is the computational pattern?
+- What are the input/output shapes?
+
+Your optimized kernel MUST match this exact behavior.
+
+---
+
+# Analysis Results
+
+**Bottleneck**: GroupNorm is done in two passes: one kernel streams the entire conv output to compute mean/var, writes them to global memory, and a second kernel rereads the same activations plus mean/var to normalize, scale, maxpool, and clamp, leading to very high DRAM throughput and almost no L2 reuse.
+
+**Optimization Strategy**: Fuse `groupnorm_stats_kernel` and `groupnorm_scale_maxpool_clamp_kernel` into a single persistent per-(batch,group) kernel that computes GroupNorm statistics and then immediately performs normalization+scale+maxpool+clamp, keeping mean/var in registers and eliminating the intermediate mean/var tensors and one full kernel launch.
+
+**Implementation Plan**: Redesign the GroupNorm path as one Triton kernel with `program_id` over (B,G): in phase 1, loop over the group’s (C_group,H,W) elements to compute mean/var (e.g., via Welford) and keep them in registers; in phase 2, loop again over the same elements to apply normalization, affine, extra scale, and 4×4 maxpool+clamp, writing only the pooled outputs to global memory. Remove the global `mean`/`var` buffers and their loads/stores, adjust indexing so the second pass can reuse L2/L1 locality as much as possible, and call this fused kernel once instead of launching two separate kernels.
+
+**Expected Speedup**: 20-30%
+
+---
+
+# Current Kernel (needs optimization)
+
+```python
+# <complete ModelNew code with optimized Triton kernels>
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def conv2d_forward_kernel(
+    x_ptr, w_ptr, b_ptr, y_ptr,
+    B, Cin, H, W, Cout, Ho, Wo, Kh, Kw, Ktotal: tl.constexpr, P,
+    stride_xb, stride_xc, stride_xh, stride_xw,
+    stride_wco, stride_wci, stride_wkh, stride_wkw,
+    stride_yb, stride_yc, stride_yh, stride_yw,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    mask_m = offs_m < P
+    mask_n = offs_n < Cout
+
+    # Map flattened M index -> (b, ho, wo)
+    HoWo = Ho * Wo
+    offs_m_b = offs_m // HoWo
+    rem_m = offs_m - offs_m_b * HoWo
+    offs_m_ho = rem_m // Wo
+    offs_m_wo = rem_m - offs_m_ho * Wo
+
+    # Make them 2D [BM,1]
+    b = offs_m_b[:, None]
+    ho = offs_m_ho[:, None]
+    wo = offs_m_wo[:, None]
+
+    # N indices [1, BN]
+    n = offs_n[None, :]
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Ktotal is constexpr -> static unrolling over K tiles
+    for k0 in range(0, Ktotal, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < Ktotal
+
+        # Map K index -> (cin, kh, kw)
+        KhKw = Kh * Kw
+        cin = offs_k // KhKw
+        rem_k = offs_k - cin * KhKw
+        kh = rem_k // Kw
+        kw = rem_k - kh * Kw
+
+        # shapes: cin,kh,kw -> [BK]; broadcast later
+        cin_b = cin[None, :]       # [1, BK]
+        kh_b = kh[None, :]
+        kw_b = kw[None, :]
+
+        # Input pointers [BM, BK]
+        x_ptrs = (
+            x_ptr
+            + b * stride_xb
+            + cin_b * stride_xc
+            + (ho + kh_b) * stride_xh
+            + (wo + kw_b) * stride_xw
+        )
+
+        mask_a = mask_m[:, None] & mask_k[None, :]
+        a = tl.load(x_ptrs, mask=mask_a, other=0.0)
+
+        # Weight pointers [BK, BN]
+        w_ptrs = (
+            w_ptr
+            + cin[:, None] * stride_wci
+            + kh[:, None] * stride_wkh
+            + kw[:, None] * stride_wkw
+            + n * stride_wco
+        )
+
+        mask_b = mask_k[:, None] & mask_n[None, :]
+        b_mat = tl.load(w_ptrs, mask=mask_b, other=0.0)
+
+        acc += tl.dot(a, b_mat, allow_tf32=True)
+
+    # Add bias
+    bias = tl.load(b_ptr + offs_n, mask=mask_n, other=0.0)
+    acc += bias[None, :]
+
+    # Store output
+    y_ptrs = (
+        y_ptr
+        + b * stride_yb
+        + n * stride_yc
+        + ho * stride_yh
+        + wo * stride_yw
+    )
+    mask_out = mask_m[:, None] & mask_n[None, :]
+    tl.store(y_ptrs, acc, mask=mask_out)
+
+
+def conv2d_triton(x, weight, bias):
+    """
+    x: (B, Cin, H, W)
+    weight: (Cout, Cin, Kh, Kw)
+    bias: (Cout,)
+    Returns: (B, Cout, Ho, Wo) with stride=1, padding=0
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+    B, Cin, H, W = x.shape
+    Cout, Cin_w, Kh, Kw = weight.shape
+    assert Cin == Cin_w
+    Ho = H - Kh + 1
+    Wo = W - Kw + 1
+    Ktotal = Cin * Kh * Kw
+    P = B * Ho * Wo
+
+    y = torch.empty((B, Cout, Ho, Wo), device=x.device, dtype=x.dtype)
+
+    BLOCK_M = 64
+    BLOCK_N = 64
+    BLOCK_K = 32
+
+    grid = lambda META: (
+        triton.cdiv(P, META["BLOCK_M"]),
+        triton.cdiv(Cout, META["BLOCK_N"]),
+    )
+
+    conv2d_forward_kernel[grid](
+        x, weight, bias, y,
+        B, Cin, H, W, Cout, Ho, Wo, Kh, Kw, Ktotal, P,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        weight.stride(0), weight.stride(1), weight.stride(2), weight.stride(3),
+        y.stride(0), y.stride(1), y.stride(2), y.stride(3),
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        num_warps=4, num_stages=2,
+    )
+    return y
+
+
+@triton.jit
+def groupnorm_stats_kernel(
+    x_ptr, mean_ptr, var_ptr,
+    B, C, H, W, G, channels_per_group, M: tl.constexpr,
+    stride_xb, stride_xc, stride_xh, stride_xw,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)  # 0 .. B*G-1
+    b = pid // G
+    g = pid - b * G
+
+    # total elements per group = M = channels_per_group * H * W
+    sum_val = tl.zeros((), dtype=tl.float32)
+    sum_sq_val = tl.zeros((), dtype=tl.float32)
+
+    HW = H * W
+
+    # M is constexpr, so loop bounds are static
+    for offset in range(0, M, BLOCK_SIZE):
+        offs = offset + tl.arange(0, BLOCK_SIZE)
+        mask = offs < M
+
+        ch_idx = offs // HW
+        sp_idx = offs - ch_idx * HW
+        h_idx = sp_idx // W
+        w_idx = sp_idx - h_idx * W
+
+        c = g * channels_per_group + ch_idx
+
+        x_ptrs = (
+            x_ptr
+            + b * stride_xb
+            + c * stride_xc
+            + h_idx * stride_xh
+            + w_idx * stride_xw
+        )
+
+        x = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
+        sum_val += tl.sum(x, axis=0)
+        sum_sq_val += tl.sum(x * x, axis=0)
+
+    # Convert M to float32 inside Triton
+    M_f = tl.full((), M, tl.float32)
+    mean = sum_val / M_f
+    var = sum_sq_val / M_f - mean * mean
+
+    tl.store(mean_ptr + pid, mean)
+    tl.store(var_ptr + pid, var)
+
+
+def groupnorm_stats_triton(x, num_groups):
+    """
+    x: (B, C, H, W)
+    Returns:
+        mean: (B*num_groups,) float32
+        var:  (B*num_groups,) float32
+    """
+    assert x.is_cuda
+    B, C, H, W = x.shape
+    G = num_groups
+    assert C % G == 0
+    channels_per_group = C // G
+    M = channels_per_group * H * W
+
+    mean = torch.empty(B * G, device=x.device, dtype=torch.float32)
+    var = torch.empty_like(mean)
+
+    BLOCK_SIZE = 256
+    grid = lambda META: (max(1, B * G),)
+
+    groupnorm_stats_kernel[grid](
+        x, mean, var,
+        B, C, H, W, G, channels_per_group, M,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=4, num_stages=2,
+    )
+    return mean, var
+
+
+@triton.jit
+def groupnorm_scale_maxpool_clamp_kernel(
+    x_ptr, mean_ptr, var_ptr, weight_ptr, bias_ptr, scale_ptr, y_ptr,
+    B, C, H, W, G, channels_per_group,
+    Hpo, Wpo, Kp: tl.constexpr, stride_p, Nout,
+    eps, clamp_min, clamp_max,
+    stride_xb, stride_xc, stride_xh, stride_xw,
+    stride_yb, stride_yc, stride_yh, stride_yw,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < Nout
+
+    HWpo = Hpo * Wpo
+    per_batch = C * HWpo
+
+    b = offs // per_batch
+    rem1 = offs - b * per_batch
+    c = rem1 // HWpo
+    rem2 = rem1 - c * HWpo
+    ho_p = rem2 // Wpo
+    wo_p = rem2 - ho_p * Wpo
+
+    group = c // channels_per_group
+    mean_idx = b * G + group
+
+    mean = tl.load(mean_ptr + mean_idx, mask=mask, other=0.0)
+    var = tl.load(var_ptr + mean_idx, mask=mask, other=0.0)
+
+    rstd = 1.0 / tl.sqrt(var + eps)
+
+    gamma = tl.load(weight_ptr + c, mask=mask, other=1.0)
+    beta = tl.load(bias_ptr + c, mask=mask, other=0.0)
+    scale_v = tl.load(scale_ptr + c, mask=mask, other=1.0)
+
+    max_val = tl.zeros((BLOCK,), dtype=tl.float32) + (-1.0e30)
+
+    for kh in range(0, Kp):
+        for kw in range(0, Kp):
+            h_in = ho_p * stride_p + kh
+            w_in = wo_p * stride_p + kw
+
+            x_ptrs = (
+                x_ptr
+                + b * stride_xb
+                + c * stride_xc
+                + h_in * stride_xh
+                + w_in * stride_xw
+            )
+
+            x = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+            xn = (x - mean) * rstd
+            xn = xn * gamma + beta
+            xn = xn * scale_v
+
+            max_val = tl.maximum(max_val, xn)
+
+    max_val = tl.maximum(max_val, clamp_min)
+    max_val = tl.minimum(max_val, clamp_max)
+
+    y_ptrs = (
+        y_ptr
+        + b * stride_yb
+        + c * stride_yc
+        + ho_p * stride_yh
+        + wo_p * stride_yw
+    )
+    tl.store(y_ptrs, max_val, mask=mask)
+
+
+def groupnorm_scale_maxpool_clamp_triton(
+    x, mean, var, weight, bias, scale,
+    num_groups, pool_ks, clamp_min, clamp_max, eps,
+):
+    """
+    x: (B, C, H, W) conv output
+    mean, var: (B*num_groups,) from groupnorm_stats_triton
+    weight, bias: GroupNorm affine params, shape (C,)
+    scale: (C, 1, 1) or (C,)
+    """
+    assert x.is_cuda
+    B, C, H, W = x.shape
+    G = num_groups
+    assert C % G == 0
+    channels_per_group = C // G
+
+    stride_p = pool_ks
+    Hpo = (H - pool_ks) // stride_p + 1
+    Wpo = (W - pool_ks) // stride_p + 1
+    Nout = B * C * Hpo * Wpo
+
+    y = torch.empty((B, C, Hpo, Wpo), device=x.device, dtype=x.dtype)
+
+    # Ensure 1D views for these parameters
+    mean_flat = mean
+    var_flat = var
+    weight_flat = weight.view(-1)
+    bias_flat = bias.view(-1)
+    scale_flat = scale.view(-1)
+
+    BLOCK = 256
+    grid = lambda META: (triton.cdiv(Nout, META["BLOCK"]),)
+
+    groupnorm_scale_maxpool_clamp_kernel[grid](
+        x, mean_flat, var_flat, weight_flat, bias_flat, scale_flat, y,
+        B, C, H, W, G, channels_per_group,
+        Hpo, Wpo, pool_ks, stride_p, Nout,
+        eps, clamp_min, clamp_max,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        y.stride(0), y.stride(1), y.stride(2), y.stride(3),
+        BLOCK=BLOCK,
+        num_warps=4, num_stages=2,
+    )
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized version of the original model:
+    Conv2d -> GroupNorm -> scale -> MaxPool2d -> clamp
+    """
+    def __init__(self, in_channels, out_channels, kernel_size,
+                 num_groups, scale_shape, maxpool_kernel_size,
+                 clamp_min, clamp_max):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.group_norm = nn.GroupNorm(num_groups, out_channels)
+        self.scale = nn.Parameter(torch.ones(scale_shape))
+        self.maxpool_kernel_size = maxpool_kernel_size
+        self.clamp_min = clamp_min
+        self.clamp_max = clamp_max
+
+    def forward(self, x):
+        # Conv via Triton
+        x = conv2d_triton(x, self.conv.weight, self.conv.bias)
+
+        # GroupNorm statistics via Triton
+        mean, var = groupnorm_stats_triton(x, self.group_norm.num_groups)
+
+        # GroupNorm + scale + maxpool + clamp fused via Triton
+        x = groupnorm_scale_maxpool_clamp_triton(
+            x,
+            mean,
+            var,
+            self.group_norm.weight,
+            self.group_norm.bias,
+            self.scale,
+            self.group_norm.num_groups,
+            self.maxpool_kernel_size,
+            self.clamp_min,
+            self.clamp_max,
+            self.group_norm.eps,
+        )
+        return x
+```
+
+---
+
+# Your Task
+
+Implement the optimization strategy above. Focus on the specific bottleneck identified.
+
+## Key Requirements
+
+1. **Preserve correctness**: Maintain the same input/output behavior
+2. **Apply the optimization**: Follow the implementation plan exactly
+3. **Use valid Triton syntax**:
+   - Every kernel MUST have `@triton.jit` decorator
+   - Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+   - BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+   - No `continue`, `break`, `return` inside kernels (use masking)
+   - Prefer `tl.dot(a, b, allow_tf32=True)` for matmul operations
+
+4. **CRITICAL for RNN/GRU/LSTM Persistent Kernels**:
+   - Time loop MUST be inside @triton.jit kernel, NOT in Python forward()
+   - **HYBRID computation strategy** (CRITICAL for performance):
+     * Precompute input-side gates OUTSIDE kernel: `gates_x = (T*B, In) @ W_ih` (ONE large GEMM)
+     * INSIDE kernel: only recurrent-side: `for t: gates_h = h @ W_hh` (T small GEMMs)
+   - CORRECT (FAST - use this):
+     ```python
+     # Python forward():
+     gates_x_all = x.reshape(T*B, In) @ W_ih + b_ih  # ONE large GEMM
+     gates_x_all = gates_x_all.view(T, B, 3*H)
+     gru_persistent_kernel[grid](gates_x_all, h0, W_hh, ...)  # Launch ONCE
+
+     @triton.jit
+     def gru_persistent_kernel(gates_x_ptr, h_ptr, W_hh_ptr, ...):
+         for t in range(T):  # Inside kernel
+             gates_x_t = tl.load(gates_x_ptr + t*...)  # Precomputed
+             gates_h = h @ W_hh  # Only recurrent GEMM
+             h = (1-z)*n + z*h   # Fuse and update
+     ```
+
+5. **Output format**:
+   - Imports: `import torch, torch.nn as nn, triton, triton.language as tl`
+   - `@triton.jit` kernel(s)
+   - Wrapper function(s)
+   - `class ModelNew(nn.Module)` — REQUIRED
+   - NO testing code, NO `if __name__ == "__main__"`
+
+---
+
+Generate the optimized kernel now. Output ONLY the complete Python code.

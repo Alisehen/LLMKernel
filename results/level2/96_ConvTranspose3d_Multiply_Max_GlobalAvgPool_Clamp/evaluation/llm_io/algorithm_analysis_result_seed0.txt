@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The current pipeline materializes the full maxpooled tensor then immediately re-reads it for global average + clamp, causing extra global memory traffic and an additional kernel launch that can be algorithmically eliminated.",
+  "bottleneck": "After fused_scale_maxpool3d writes the (N, C, D_out, H_out, W_out) result to memory, global_avg_clamp3d re-reads the entire tensor just to produce a single scalar per (n, c). This redundant write+read of a large intermediate tensor plus an extra kernel launch is a dominant memory and overhead cost for the post-conv portion.",
+  "optimisation method": "Fuse scale * maxpool3d * global average * clamp into a single Triton kernel that directly computes the per-(n, c) mean of the maxpooled outputs and writes only (N, C, 1, 1, 1), never materializing the intermediate maxpooled volume in global memory.",
+  "modification plan": "Redesign the fused kernel so each program instance handles one (n, c) and iterates over its pooling windows: for every pooled output position, compute the window max of scaled inputs, add it to a running sum accumulator for that (n, c), but do not store the pooled value. After all positions are processed, divide the accumulator by the number of pooled elements to get the global average, apply clamp_min/clamp_max, and store directly to the (N, C, 1, 1, 1) output. Remove the separate global_avg_pool3d_clamp call and the allocation of the intermediate maxpooled tensor, wiring ModelNew.forward to call only this new single fused Triton kernel after ConvTranspose3d.",
+  "expected_speedup": "20-30%"
+}

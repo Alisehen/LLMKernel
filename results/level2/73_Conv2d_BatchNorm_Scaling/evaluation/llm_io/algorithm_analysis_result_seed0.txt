@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The 3x3 stride-1 convolution is currently implemented as a generic implicit-im2col GEMM, which does more FLOPs than necessary and is likely compute-bound, leaving room for an algorithmic improvement.",
+  "bottleneck": "The kernel performs a full Cin*K*K MAC per output element using a direct GEMM-style convolution, which for fixed 3x3 kernels does not exploit the reduced arithmetic complexity possible with specialized convolution algorithms (e.g., Winograd) and repeatedly processes overlapping receptive fields.",
+  "optimisation method": "Replace the current implicit-im2col GEMM convolution with a Winograd-based 3x3 convolution (e.g., F(2x2,3x3) or F(4x4,3x3)), still fusing BatchNorm and scaling in the Winograd output domain.",
+  "modification plan": "Precompute and cache the Winograd-transformed weights once per layer (offline or at first use). In the Triton kernel, tile the output into small spatial tiles (e.g., 2x2), load the minimal corresponding input patch, apply the Winograd input transform, perform the reduced-size batched matrix multiplications in the Winograd domain, then do the inverse Winograd transform to obtain the spatial outputs and immediately apply the fused BatchNorm+scaling before writing to global memory. Adjust tiling parameters (BLOCK_M/BLOCK_N) to match the new tile structure and ensure coalesced loads/stores for both transformed inputs and outputs.",
+  "expected_speedup": "30-50%"
+}

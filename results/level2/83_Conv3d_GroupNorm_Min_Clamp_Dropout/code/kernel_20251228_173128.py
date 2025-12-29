@@ -1,0 +1,115 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        # Smaller fallback for any potential register / occupancy issues
+        triton.Config({"BLOCK_SIZE": 64}, num_warps=2),
+        triton.Config({"BLOCK_SIZE": 128}, num_warps=4),
+        # Highest-throughput candidate on 4090 for this trivial kernel
+        triton.Config({"BLOCK_SIZE": 256}, num_warps=8),
+    ],
+    key=["numel"],
+)
+@triton.jit
+def fill_min_value_kernel(
+    y_ptr,       # *T
+    numel,       # int32
+    min_value,   # scalar, same "logical" dtype as *y_ptr
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Kernel that fills the output tensor with a constant `min_value`.
+    """
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < numel
+
+    # Single coalesced, masked store
+    tl.store(y_ptr + offs, min_value, mask=mask)
+
+
+def groupnorm_min_clamp(x, weight, bias, groups, min_value, max_value, eps=1e-5):
+    """
+    Fused GroupNorm + min + clamp, simplified to a constant fill:
+        y = GroupNorm(...)
+        y = torch.min(y, min_value)
+        y = torch.clamp(y, min=min_value, max=max_value)
+    This is identically `min_value`, independent of x.
+    """
+    assert x.is_cuda, "Input must be on CUDA for Triton kernels."
+
+    # Conv3d output is contiguous in practice, but make it explicit and cheap
+    x = x.contiguous()
+    y = torch.empty_like(x)
+    numel = y.numel()
+
+    # 1D grid; guarantee grid size > 0
+    def grid(meta):
+        return (max(1, triton.cdiv(numel, meta["BLOCK_SIZE"])),)
+
+    # Normalize min_value to a host scalar; Triton will cast to y.dtype
+    if isinstance(min_value, torch.Tensor):
+        min_scalar = float(min_value.item())
+    else:
+        min_scalar = float(min_value)
+
+    fill_min_value_kernel[grid](
+        y,          # y_ptr
+        numel,      # number of elements
+        min_scalar, # scalar to broadcast into y
+    )
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Model:
+        x -> Conv3d -> (conceptual) GroupNorm -> min -> clamp -> Dropout
+
+    GroupNorm + min + clamp are algebraically simplified to a constant fill
+    implemented by an optimized Triton kernel; only Dropout remains non-trivial.
+    """
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size,
+        groups,
+        min_value,
+        max_value,
+        dropout_p,
+    ):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size)
+        self.groups = groups
+
+        # Kept for API compatibility; not used in the optimized path
+        self.gn_weight = nn.Parameter(torch.ones(out_channels))
+        self.gn_bias = nn.Parameter(torch.zeros(out_channels))
+
+        self.min_value = float(min_value)
+        self.max_value = float(max_value)
+        self.eps = 1e-5
+        self.dropout = nn.Dropout(dropout_p)
+
+    def forward(self, x):
+        x = self.conv(x)
+
+        # Fused & simplified GroupNorm + min + clamp -> constant fill
+        x = groupnorm_min_clamp(
+            x,
+            self.gn_weight,
+            self.gn_bias,
+            self.groups,
+            self.min_value,
+            self.max_value,
+            self.eps,
+        )
+
+        # Dropout applied after the constant activation
+        x = self.dropout(x)
+        return x

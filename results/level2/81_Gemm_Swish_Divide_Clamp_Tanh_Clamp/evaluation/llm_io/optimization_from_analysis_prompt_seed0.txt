@@ -1,0 +1,273 @@
+You are optimizing a Triton kernel based on algorithmic analysis.
+
+# PyTorch Reference (Target Behavior)
+
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs a gemm, swish, divide, clamp, tanh, and clamp operations.
+    """
+    def __init__(self, in_features, out_features, bias=True):
+        super(Model, self).__init__()
+        self.gemm = nn.Linear(in_features, out_features, bias=bias)
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_features).
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_features).
+        """
+        x = self.gemm(x)
+        x = x * torch.sigmoid(x)  # Swish activation
+        x = x / 2.0
+        x = torch.clamp(x, min=-1.0, max=1.0)  # Clamp between -1 and 1
+        x = torch.tanh(x)  # Tanh activation
+        x = torch.clamp(x, min=-1.0, max=1.0)  # Clamp between -1 and 1
+        return x
+
+batch_size = 1024
+in_features = 8192
+out_features = 8192
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features)]
+
+def get_init_inputs():
+    return [in_features, out_features]
+```
+
+**CRITICAL**: Study the PyTorch code carefully to understand:
+- What does `forward()` return? (full output sequence vs final hidden state only)
+- What is the computational pattern?
+- What are the input/output shapes?
+
+Your optimized kernel MUST match this exact behavior.
+
+---
+
+# Analysis Results
+
+**Bottleneck**: After the GEMM, each output element goes through Swish (requiring exp and division), scaling, two clamps, and tanh (another exp/div), making the kernel partially math-throughput bound on transcendental operations rather than purely on GEMM.
+
+**Optimization Strategy**: Replace the exact Swish/div/clamp/tanh/clamp chain with a single, cheap custom activation that approximates the composite nonlinearity using a low-degree polynomial or piecewise polynomial, eliminating most transcendental ops and divisions.
+
+**Implementation Plan**: Offline, numerically fit an approximation g(x) ≈ clamp(tanh(clamp(swish(x)/2, -1, 1)), -1, 1) (e.g., via least-squares over a bounded input range) using a low-order polynomial or a small piecewise scheme, targeting maximum absolute/relative error within a specified tolerance. Then, in the Triton kernel, replace the current exp/sigmoid/tanh sequence with this g(x) implemented as a sequence of FMAs (and at most one clamp to bound the input), so the post-GEMM path becomes a branchless, FMA-heavy polynomial evaluation. Validate numerically against the PyTorch reference on representative inputs to ensure acceptable accuracy before enabling by default or under an "approximate_activations" flag.
+
+**Expected Speedup**: 20-30%
+
+---
+
+# Current Kernel (needs optimization)
+
+```python
+import torch, torch.nn as nn, triton, triton.language as tl
+import math
+
+
+@triton.jit
+def fused_linear_swish_div_clamp_tanh_clamp_kernel(
+    a_ptr, w_ptr, bias_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_wk, stride_wn,
+    stride_cm, stride_cn,
+    HAS_BIAS: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    # Program IDs for 2D tiling over M and N dimensions
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Pointers for A (M x K) and W (K x N)
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    w_ptrs = w_ptr + offs_k[:, None] * stride_wk + offs_n[None, :] * stride_wn
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Matmul loop over K
+    for k in range(0, K, BLOCK_K):
+        a_mask = (offs_m[:, None] < M) & (offs_k[None, :] < (K - k))
+        w_mask = (offs_k[:, None] < (K - k)) & (offs_n[None, :] < N)
+
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        w = tl.load(w_ptrs, mask=w_mask, other=0.0)
+
+        acc += tl.dot(a, w, allow_tf32=True)
+
+        a_ptrs += BLOCK_K * stride_ak
+        w_ptrs += BLOCK_K * stride_wk
+
+    # Optional bias add
+    if HAS_BIAS:
+        bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+        acc += bias[None, :]
+
+    # Fused activation pipeline:
+    # 1) Swish: x * sigmoid(x)
+    #    sigmoid(x) = 1 / (1 + exp(-x))
+    x = acc
+    sig = 1.0 / (1.0 + tl.exp(-x))
+    x = x * sig
+
+    # 2) Divide by 2.0
+    x = x * 0.5
+
+    # 3) Clamp between -1 and 1
+    x = tl.maximum(tl.minimum(x, 1.0), -1.0)
+
+    # 4) Tanh activation:
+    #    tanh(x) = (exp(2x) - 1) / (exp(2x) + 1)
+    e = tl.exp(2.0 * x)
+    x = (e - 1.0) / (e + 1.0)
+
+    # 5) Clamp between -1 and 1 again
+    x = tl.maximum(tl.minimum(x, 1.0), -1.0)
+
+    # Store result
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    out_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, x, mask=out_mask)
+
+
+def fused_linear_swish_div_clamp_tanh_clamp(x: torch.Tensor,
+                                            weight: torch.Tensor,
+                                            bias: torch.Tensor | None):
+    """
+    x:      [M, K]
+    weight: [K, N]
+    bias:   [N] or None
+    Returns: [M, N]
+    """
+    assert x.is_cuda and weight.is_cuda, "Inputs must be CUDA tensors for Triton kernel"
+    M, K = x.shape
+    K_w, N = weight.shape
+    assert K_w == K, "Incompatible shapes for matmul"
+
+    y = torch.empty((M, N), device=x.device, dtype=x.dtype)
+
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta["BLOCK_M"]),
+            triton.cdiv(N, meta["BLOCK_N"]),
+        )
+
+    has_bias = bias is not None
+    # Dummy pointer if no bias; it will not be used when HAS_BIAS=False
+    bias_ptr = bias if has_bias else weight
+
+    fused_linear_swish_div_clamp_tanh_clamp_kernel[grid](
+        x, weight, bias_ptr, y,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        weight.stride(0), weight.stride(1),
+        y.stride(0), y.stride(1),
+        HAS_BIAS=has_bias,
+        BLOCK_M=128, BLOCK_N=128, BLOCK_K=32,
+        num_warps=4, num_stages=3,
+    )
+
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized version of:
+        Linear -> Swish -> divide by 2 -> clamp -> tanh -> clamp
+    """
+    def __init__(self, in_features, out_features, bias=True):
+        super(ModelNew, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+
+        # Store weight as [in_features, out_features] for fast x @ W layout
+        self.weight = nn.Parameter(torch.empty(in_features, out_features))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_features))
+        else:
+            self.bias = None
+
+        # Simple initialization (similar scale to nn.Linear default)
+        bound = 1 / math.sqrt(in_features)
+        with torch.no_grad():
+            self.weight.uniform_(-bound, bound)
+            if self.bias is not None:
+                self.bias.uniform_(-bound, bound)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Fast Triton path on CUDA
+        if x.is_cuda:
+            return fused_linear_swish_div_clamp_tanh_clamp(x, self.weight, self.bias)
+
+        # Fallback PyTorch implementation on CPU
+        y = x @ self.weight
+        if self.bias is not None:
+            y = y + self.bias
+
+        # Swish
+        y = y * torch.sigmoid(y)
+        # Divide
+        y = y / 2.0
+        # Clamp [-1, 1]
+        y = torch.clamp(y, min=-1.0, max=1.0)
+        # Tanh
+        y = torch.tanh(y)
+        # Clamp again
+        y = torch.clamp(y, min=-1.0, max=1.0)
+        return y
+```
+
+---
+
+# Your Task
+
+Implement the optimization strategy above. Focus on the specific bottleneck identified.
+
+## Key Requirements
+
+1. **Preserve correctness**: Maintain the same input/output behavior
+2. **Apply the optimization**: Follow the implementation plan exactly
+3. **Use valid Triton syntax**:
+   - Every kernel MUST have `@triton.jit` decorator
+   - Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+   - BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+   - No `continue`, `break`, `return` inside kernels (use masking)
+   - Prefer `tl.dot(a, b, allow_tf32=True)` for matmul operations
+
+4. **CRITICAL for RNN/GRU/LSTM Persistent Kernels**:
+   - Time loop MUST be inside @triton.jit kernel, NOT in Python forward()
+   - **HYBRID computation strategy** (CRITICAL for performance):
+     * Precompute input-side gates OUTSIDE kernel: `gates_x = (T*B, In) @ W_ih` (ONE large GEMM)
+     * INSIDE kernel: only recurrent-side: `for t: gates_h = h @ W_hh` (T small GEMMs)
+   - CORRECT (FAST - use this):
+     ```python
+     # Python forward():
+     gates_x_all = x.reshape(T*B, In) @ W_ih + b_ih  # ONE large GEMM
+     gates_x_all = gates_x_all.view(T, B, 3*H)
+     gru_persistent_kernel[grid](gates_x_all, h0, W_hh, ...)  # Launch ONCE
+
+     @triton.jit
+     def gru_persistent_kernel(gates_x_ptr, h_ptr, W_hh_ptr, ...):
+         for t in range(T):  # Inside kernel
+             gates_x_t = tl.load(gates_x_ptr + t*...)  # Precomputed
+             gates_h = h @ W_hh  # Only recurrent GEMM
+             h = (1-z)*n + z*h   # Fuse and update
+     ```
+
+5. **Output format**:
+   - Imports: `import torch, torch.nn as nn, triton, triton.language as tl`
+   - `@triton.jit` kernel(s)
+   - Wrapper function(s)
+   - `class ModelNew(nn.Module)` — REQUIRED
+   - NO testing code, NO `if __name__ == "__main__"`
+
+---
+
+Generate the optimized kernel now. Output ONLY the complete Python code.

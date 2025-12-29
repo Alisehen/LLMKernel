@@ -1,178 +1,249 @@
 ```python
+# <optimized Triton code>
+
 import torch
 import torch.nn as nn
 import triton
 import triton.language as tl
 
 
+# ---------------------------------------------------------------------------
+# Helper implementations for missing Triton functions
+# ---------------------------------------------------------------------------
+
 @triton.jit
-def fused_scale_maxpool_avg_clamp_kernel(
-    x_ptr,                 # Input tensor pointer
-    out_ptr,              # Output tensor pointer [N, C, 1, 1, 1]
-    N, C, D, H, W,        # Input dimensions
-    scale,                # Scalar multiplier
-    K,                    # MaxPool kernel size
-    stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
-    stride_on, stride_oc, stride_od, stride_oh, stride_ow,
-    BLOCK_C: tl.constexpr,
-    BLOCK_W: tl.constexpr,  # Spatial tiles per thread
-    num_warps: tl.constexpr,
+def tl_sigmoid(x):
+    return 1.0 / (1.0 + tl.exp(-x))
+
+
+@triton.jit
+def tl_tanh(x):
+    e_pos = tl.exp(x)
+    e_neg = tl.exp(-x)
+    return (e_pos - e_neg) / (e_pos + e_neg)
+
+
+@triton.jit
+def tl_silu(x):
+    return x * tl_sigmoid(x)
+
+
+@triton.jit
+def tl_gelu(x):
+    # Approximate GELU
+    k = 0.7978845608028654  # sqrt(2/pi)
+    c = 0.044715
+    return 0.5 * x * (1.0 + tl_tanh(k * (x + c * x * x * x)))
+
+
+@triton.jit
+def tl_mish(x):
+    # mish(x) = x * tanh(softplus(x))
+    sp = tl.log(1.0 + tl.exp(x))
+    return x * tl_tanh(sp)
+
+
+# ---------------------------------------------------------------------------
+# Autotuned Triton kernel (aggressively optimized for 4090)
+# ---------------------------------------------------------------------------
+
+@triton.autotune(
+    configs=[
+        # Conservative baseline (required)
+        triton.Config({'BLOCK_W': 64},  num_warps=4, num_stages=2),
+        # Slightly larger tile, still conservative
+        triton.Config({'BLOCK_W': 128}, num_warps=4, num_stages=2),
+        # High-parallelism, latency-hiding config (favored on 4090 if regs allow)
+        triton.Config({'BLOCK_W': 128}, num_warps=8, num_stages=3),
+        # Large tile for wide W, high BW utilization
+        triton.Config({'BLOCK_W': 256}, num_warps=8, num_stages=2),
+    ],
+    key=['W_pool'],  # tune per effective pooled width
+)
+@triton.jit
+def scale_maxpool3d_globalavg_clamp_kernel(
+    x_ptr, o_ptr,
+    N, C,
+    D_pool: tl.constexpr, H_pool: tl.constexpr, W_pool: tl.constexpr,
+    stride_p_d, stride_p_h, stride_p_w,
+    stride_n_in, stride_c_in, stride_d_in, stride_h_in, stride_w_in,
+    stride_n_out, stride_c_out,
+    scale, inv_S_pool,
+    clamp_min, clamp_max,
+    K_D: tl.constexpr,
+    K_H: tl.constexpr,
+    K_W: tl.constexpr,
+    BLOCK_W: tl.constexpr,
 ):
     """
-    Fused kernel: Scale + MaxPool3d + GlobalAvgPool + Clamp
-    - No intermediate stores
-    - Direct accumulation in registers
+    Fused operation per (n, c) slice:
+
+      y[n, c] = clamp(
+                    mean_{d2,h2,w2} max_{kd,kh,kw} ( x_scaled[...] ),
+                    clamp_min, clamp_max
+                )
+
+    - No intermediate global stores: only a single final store to o_ptr.
+    - All intermediate values (max, partial sums) stay in registers.
     """
-    pid_n = tl.program_id(0)
-    pid_c = tl.program_id(1)
-    
-    if pid_n >= N:
-        return
-    
-    # Channel block processing
-    channel_base = pid_c * BLOCK_C
-    channel_offsets = tl.arange(0, BLOCK_C)
-    channel_mask = channel_base + channel_offsets < C
-    
-    # Output dimensions for maxpool
-    D_out = D // K
-    H_out = H // K
-    W_out = W // K
-    total_windows = D_out * H_out * W_out
-    
-    # Initialize accumulators in registers
-    sum_acc = tl.zeros((BLOCK_C,), dtype=tl.float32)
-    count_acc = tl.zeros((BLOCK_C,), dtype=tl.float32)
-    
-    # Process spatial windows in tiles
-    for window_start in range(0, total_windows, BLOCK_W):
-        window_offsets = window_start + tl.arange(0, BLOCK_W)
-        window_mask = window_offsets < total_windows
-        
-        if tl.sum(window_mask) > 0:
-            # Convert linear window index to 3D indices
-            d_out = window_offsets // (H_out * W_out)
-            h_out = (window_offsets % (H_out * W_out)) // W_out
-            w_out = window_offsets % W_out
-            
-            # Initialize max values for this window tile
-            window_max = tl.full((BLOCK_C, BLOCK_W), -float('inf'), dtype=tl.float32)
-            
-            # Compute max over K³ window for each spatial position
-            for kd in range(K):
-                d_in = d_out * K + kd
-                d_in_valid = d_in < D
-                d_offset = d_in * stride_xd
-                
-                for kh in range(K):
-                    h_in = h_out * K + kh
-                    h_in_valid = h_in < H
-                    h_offset = h_in * stride_xh
-                    
-                    for kw in range(K):
-                        w_in = w_out * K + kw
-                        w_in_valid = w_in < W
-                        w_offset = w_in * stride_xw
-                        
-                        # Compute load pointers with broadcasting
-                        base_ptr = (
-                            x_ptr + 
-                            pid_n * stride_xn + 
-                            channel_base * stride_xc
-                        )
-                        
-                        ptr_offsets = (
-                            channel_offsets[:, None] * stride_xc +
-                            d_offset[None, :] +
-                            h_offset[None, :] +
-                            w_offset[None, :]
-                        )
-                        
-                        x_ptrs = base_ptr + ptr_offsets
-                        
-                        # Combined mask: channel, window, and spatial validity
-                        load_mask = (
-                            channel_mask[:, None] & 
-                            window_mask[None, :] &
-                            d_in_valid[None, :] &
-                            h_in_valid[None, :] &
-                            w_in_valid[None, :]
-                        )
-                        
-                        # Load and scale
-                        vals = tl.load(x_ptrs, mask=load_mask, other=-float('inf'))
-                        vals = vals * scale
-                        
-                        # Update max
-                        window_max = tl.where(load_mask, tl.maximum(window_max, vals), window_max)
-            
-            # Accumulate max values for average
-            valid_mask = channel_mask[:, None] & window_mask[None, :]
-            window_max_valid = tl.where(valid_mask, window_max, 0.0)
-            
-            # Reduce over spatial dimension
-            sum_acc += tl.sum(window_max_valid, axis=1)
-            count_acc += tl.sum(valid_mask.to(tl.float32), axis=1)
-    
-    # Compute average and clamp
-    avg_vals = tl.where(count_acc > 0, sum_acc / count_acc, 0.0)
-    avg_vals = tl.minimum(tl.maximum(avg_vals, 0.0), 1.0)
-    
-    # Store final result
-    out_ptrs = (
-        out_ptr + 
-        pid_n * stride_on + 
-        (channel_base + channel_offsets) * stride_oc
-    )
-    tl.store(out_ptrs, avg_vals, mask=channel_mask)
+
+    # Program id -> (n, c) pair
+    pid = tl.program_id(0)
+    n = pid // C
+    c = pid % C
+
+    # Base pointer for this (n, c) slice
+    base_nc = x_ptr + n * stride_n_in + c * stride_c_in
+
+    # Precompute pooled -> input strides (fewer integer ops in inner loops)
+    step_pd = stride_p_d * stride_d_in  # advance d2 by one pooled step
+    step_ph = stride_p_h * stride_h_in  # advance h2 by one pooled step
+    step_pw = stride_p_w * stride_w_in  # advance w2 by one pooled step
+
+    # Offsets along W for this program's vector of BLOCK_W lanes
+    offs_w = tl.arange(0, BLOCK_W)
+
+    # Scalar accumulator over entire pooled volume
+    total = 0.0
+
+    # Iterate over pooled spatial positions
+    # (kept as runtime loops; work is dominated by K_D*K_H*K_W inner loops)
+    for d2 in range(0, D_pool):
+        d_base = base_nc + d2 * step_pd
+
+        for h2 in range(0, H_pool):
+            dh_base = d_base + h2 * step_ph
+
+            # Vectorized traversal along pooled W
+            for w_start in range(0, W_pool, BLOCK_W):
+                pw = w_start + offs_w
+                mask_w = pw < W_pool  # shared mask for all fused ops in this block
+
+                # Pointer to the first element of each pooled output position
+                base = dh_base + pw * step_pw
+
+                # Max accumulator over pooling window for each lane
+                max_val = tl.full((BLOCK_W,), -float("inf"), dtype=tl.float32)
+
+                # Pooling window loops: fully unrolled via tl.static_range
+                for kd in tl.static_range(0, K_D):
+                    dd = kd * stride_d_in
+                    for kh in tl.static_range(0, K_H):
+                        hh = kh * stride_h_in
+                        base_kdh = base + dd + hh
+                        for kw in tl.static_range(0, K_W):
+                            ptr = base_kdh + kw * stride_w_in
+                            v = tl.load(ptr, mask=mask_w, other=-float("inf"))
+                            v = v * scale
+                            max_val = tl.maximum(max_val, v)
+
+                # Zero out masked lanes (tail handling) before reduction
+                max_val = tl.where(mask_w, max_val, 0.0)
+
+                # Accumulate block sum into scalar total
+                block_sum = tl.sum(max_val, axis=0)
+                total += block_sum
+
+    # Global average pooling over all pooled positions
+    mean = total * inv_S_pool
+
+    # Clamp to [clamp_min, clamp_max]
+    mean = tl.minimum(mean, clamp_max)
+    mean = tl.maximum(mean, clamp_min)
+
+    # Output layout: (N, C, 1, 1, 1); single global store per output element
+    out_ptr = o_ptr + n * stride_n_out + c * stride_c_out
+    tl.store(out_ptr, mean)
 
 
-def fused_post_convtranspose(x, scale, maxpool_kernel_size):
+# ---------------------------------------------------------------------------
+# Python wrapper
+# ---------------------------------------------------------------------------
+
+def fused_scale_maxpool3d_globalavg_clamp(
+    x: torch.Tensor,
+    scale: float,
+    kernel_size,
+    clamp_min: float,
+    clamp_max: float,
+):
     """
-    Optimized fused operations using a single kernel:
-    1. Scale + MaxPool3d
-    2. GlobalAvgPool + Clamp
-    
-    Eliminates intermediate tensor stores completely.
+    Fused operation:
+      y = clamp( GlobalAvgPool3d( MaxPool3d( x * scale ) ), clamp_min, clamp_max )
+
+    Args:
+        x: (N, C, D, H, W), float32, CUDA, contiguous
+        scale: scalar multiplier
+        kernel_size: int or (k_d, k_h, k_w) for MaxPool3d
+        clamp_min, clamp_max: scalar clamp bounds
+
+    Returns:
+        out: (N, C, 1, 1, 1), float32, CUDA
     """
-    N, C, D, H, W = x.shape
-    K = maxpool_kernel_size
-    
-    # Validate dimensions
-    assert D % K == 0 and H % K == 0 and W % K == 0, \
-        f"Input dimensions must be divisible by K={K}"
-    
-    # Output tensor
+    x = x.contiguous()
+    assert x.is_cuda, "Input must be on CUDA device"
+    assert x.dtype == torch.float32, "Kernel expects float32 tensor"
+
+    if isinstance(kernel_size, int):
+        k_d = k_h = k_w = kernel_size
+    else:
+        k_d, k_h, k_w = kernel_size
+
+    # MaxPool3d defaults: stride = kernel_size, padding = 0, dilation = 1, ceil_mode = False
+    stride_p_d = k_d
+    stride_p_h = k_h
+    stride_p_w = k_w
+    pad_d = pad_h = pad_w = 0
+    dilation_d = dilation_h = dilation_w = 1
+
+    N, C, D_in, H_in, W_in = x.shape
+
+    def _out_dim(L_in, k, s, p, d):
+        # PyTorch pooling formula (ceil_mode=False)
+        return (L_in + 2 * p - d * (k - 1) - 1) // s + 1
+
+    D_pool = _out_dim(D_in, k_d, stride_p_d, pad_d, dilation_d)
+    H_pool = _out_dim(H_in, k_h, stride_p_h, pad_h, dilation_h)
+    W_pool = _out_dim(W_in, k_w, stride_p_w, pad_w, dilation_w)
+    S_pool = D_pool * H_pool * W_pool
+
+    # Output of global average pooling: (N, C, 1, 1, 1)
     out = torch.empty((N, C, 1, 1, 1), device=x.device, dtype=x.dtype)
-    
-    # Tuning parameters optimized for Ada Lovelace
-    # - BLOCK_C: Maximize channel parallelism within register limits
-    # - BLOCK_W: Balance spatial parallelism and register usage
-    # - num_warps: Match SM occupancy (1536 threads/SM ÷ 32 threads/warp = 48 warps max)
-    BLOCK_C = 64  # Increased for better SM occupancy
-    BLOCK_W = 64  # Optimized for spatial parallelism
-    num_warps = 8  # 256 threads, leaves room for concurrent warps on SM
-    
-    grid = (N, triton.cdiv(C, BLOCK_C))
-    
-    fused_scale_maxpool_avg_clamp_kernel[grid](
+
+    stride_n_in, stride_c_in, stride_d_in, stride_h_in, stride_w_in = x.stride()
+    stride_n_out, stride_c_out, _, _, _ = out.stride()
+
+    # Precompute reciprocal of S_pool to avoid division in kernel
+    inv_S_pool = 1.0 / float(S_pool)
+
+    # 1D grid over (N * C), covering output tensor dims
+    grid = lambda META: (max(1, N * C),)
+
+    scale_maxpool3d_globalavg_clamp_kernel[grid](
         x, out,
-        N, C, D, H, W,
-        scale, K,
-        x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
-        out.stride(0), out.stride(1), out.stride(2), out.stride(3), out.stride(4),
-        BLOCK_C=BLOCK_C,
-        BLOCK_W=BLOCK_W,
-        num_warps=num_warps,
+        N, C,
+        D_pool, H_pool, W_pool,
+        stride_p_d, stride_p_h, stride_p_w,
+        stride_n_in, stride_c_in, stride_d_in, stride_h_in, stride_w_in,
+        stride_n_out, stride_c_out,
+        float(scale), float(inv_S_pool),
+        float(clamp_min), float(clamp_max),
+        K_D=k_d,
+        K_H=k_h,
+        K_W=k_w,
     )
-    
     return out
 
 
+# ---------------------------------------------------------------------------
+# Model using the fused Triton kernel
+# ---------------------------------------------------------------------------
+
 class ModelNew(nn.Module):
     """
-    ConvTranspose3d (PyTorch native) + Optimized fused post-ops (Triton)
-    Uses a single fused kernel to eliminate all intermediate stores
+    Replacement model using Triton kernel for:
+      - scalar multiply + MaxPool3d + global average pooling + clamp
+    ConvTranspose3d is kept from PyTorch for correctness and simplicity.
     """
     def __init__(self, in_channels, out_channels, kernel_size, stride, padding, scale, maxpool_kernel_size):
         super(ModelNew, self).__init__()
@@ -180,41 +251,21 @@ class ModelNew(nn.Module):
             in_channels, out_channels, kernel_size,
             stride=stride, padding=padding
         )
-        self.scale = scale
+        self.scale = float(scale)
         self.maxpool_kernel_size = maxpool_kernel_size
-        
+        self.clamp_min = 0.0
+        self.clamp_max = 1.0
+
     def forward(self, x):
-        # Step 1: PyTorch native ConvTranspose3d
-        x = self.conv_transpose(x)
-        # Step 2: Optimized fused post-ops in Triton (single kernel)
-        x = fused_post_convtranspose(x, self.scale, self.maxpool_kernel_size)
+        # x: (N, C_in, D, H, W)
+        x = self.conv_transpose(x)  # (N, C_out, D1, H1, W1)
+        # Fused: scale -> MaxPool3d -> global average -> clamp
+        x = fused_scale_maxpool3d_globalavg_clamp(
+            x,
+            self.scale,
+            self.maxpool_kernel_size,
+            self.clamp_min,
+            self.clamp_max,
+        )
         return x
 ```
-
-**Key Optimizations:**
-
-1. **Complete Fusion**: Eliminated all intermediate stores by fusing all operations into a single kernel.
-
-2. **Register-based Accumulation**: 
-   - All intermediate values (`window_max`, `sum_acc`, `count_acc`) stay in registers
-   - Only one `tl.store()` at the end for final output
-
-3. **Spatial Tiling**:
-   - Processes spatial windows in tiles of size `BLOCK_W`
-   - Reduces register pressure while maintaining parallelism
-
-4. **Optimized Parallelism**:
-   - Increased `BLOCK_C` to 64 for better channel parallelism
-   - `BLOCK_W = 64` balances spatial parallelism and register usage
-   - `num_warps = 8` (256 threads) leaves room for concurrent warps on SM
-
-5. **Efficient Memory Access**:
-   - Combined validity masks (channel, window, spatial) reduce conditionals
-   - Broadcasted pointer computations minimize arithmetic
-
-6. **Ada Lovelace Optimizations**:
-   - 8 warps per block allows up to 6 concurrent blocks per SM (48 warps max)
-   - Register usage optimized to stay within 255 limit
-   - No shared memory usage (register-based approach)
-
-This single-kernel approach should eliminate the memory bottleneck from the intermediate tensor and achieve near-peak SM utilization.

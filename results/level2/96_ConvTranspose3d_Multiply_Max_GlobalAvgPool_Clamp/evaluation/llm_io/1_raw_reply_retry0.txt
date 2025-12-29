@@ -1,4 +1,6 @@
 ```python
+# <optimized Triton code>
+
 import torch
 import torch.nn as nn
 import triton
@@ -6,213 +8,178 @@ import triton.language as tl
 
 
 @triton.jit
-def scale_maxpool3d_kernel(
-    x_ptr,                 # Input tensor pointer
-    out_ptr,              # Output tensor pointer (maxpooled)
-    N, C, D, H, W,        # Input dimensions
-    D_out, H_out, W_out,  # Output dimensions
-    scale,                # Scalar multiplier
-    K,                    # MaxPool kernel size
-    stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
-    stride_on, stride_oc, stride_od, stride_oh, stride_ow,
-    BLOCK_C: tl.constexpr,
+def scale_maxpool3d_globalavg_clamp_kernel(
+    x_ptr, o_ptr,
+    N, C,
+    D_pool, H_pool, W_pool,
+    stride_p_d, stride_p_h, stride_p_w,
+    stride_n_in, stride_c_in, stride_d_in, stride_h_in, stride_w_in,
+    stride_n_out, stride_c_out,
+    scale, inv_S_pool,
+    clamp_min, clamp_max,
+    BLOCK_W: tl.constexpr,
+    K_D: tl.constexpr,
+    K_H: tl.constexpr,
+    K_W: tl.constexpr,
 ):
-    """Scale + MaxPool3d: Output shape [N, C, D_out, H_out, W_out]"""
-    pid_n = tl.program_id(0)
-    pid_c = tl.program_id(1)
-    pid_w = tl.program_id(2)
-    
-    if pid_n >= N:
-        return
-    
-    # Reconstruct 3D window index from linearized pid_w
-    total_windows = D_out * H_out * W_out
-    if pid_w >= total_windows:
-        return
-    
-    d_out = pid_w // (H_out * W_out)
-    h_out = (pid_w % (H_out * W_out)) // W_out
-    w_out = pid_w % W_out
-    
-    # Channel block processing
-    channel_base = pid_c * BLOCK_C
-    channel_offsets = tl.arange(0, BLOCK_C)
-    channel_mask = channel_base + channel_offsets < C
-    
-    # Initialize max values for all channels in block
-    max_vals = tl.full((BLOCK_C,), -float('inf'), dtype=tl.float32)
-    
-    # Compute max over K³ window (unrolled loops for better performance)
-    # Precompute base strides to avoid repeated computation
-    base_n_offset = pid_n * stride_xn
-    base_d_offset = d_out * K * stride_xd
-    base_h_offset = h_out * K * stride_xh
-    base_w_offset = w_out * K * stride_xw
-    
-    # Unroll the innermost loops for better performance
-    for kd in range(K):
-        d_in_offset = base_d_offset + kd * stride_xd
-        for kh in range(K):
-            h_in_offset = base_h_offset + kh * stride_xh
-            for kw in range(K):
-                w_in_offset = base_w_offset + kw * stride_xw
-                
-                # Load input values for all channels in block
-                c_indices = channel_base + channel_offsets
-                x_ptrs = (
-                    x_ptr + base_n_offset + 
-                    c_indices * stride_xc + 
-                    d_in_offset + h_in_offset + w_in_offset
-                )
-                x_vals = tl.load(x_ptrs, mask=channel_mask, other=-float('inf'))
-                x_vals = x_vals * scale  # Apply scaling
-                max_vals = tl.maximum(max_vals, x_vals)
-    
-    # Store max values to intermediate tensor
-    c_indices = channel_base + channel_offsets
-    out_ptrs = (
-        out_ptr + pid_n * stride_on + 
-        c_indices * stride_oc + 
-        d_out * stride_od + h_out * stride_oh + w_out * stride_ow
-    )
-    tl.store(out_ptrs, max_vals, mask=channel_mask)
+    # One program instance per (n, c) pair (grid covers output tensor dims)
+    pid = tl.program_id(0)
+    n = pid // C
+    c = pid % C
+
+    # Base pointer for this (n, c) slice in the input
+    base_nc = x_ptr + n * stride_n_in + c * stride_c_in
+
+    # Accumulator for global sum over all pooled positions (scalar)
+    total = tl.zeros((), dtype=tl.float32)
+
+    # Iterate over pooled output spatial positions
+    for d2 in range(0, D_pool):
+        d0 = d2 * stride_p_d
+        d_base = base_nc + d0 * stride_d_in
+
+        for h2 in range(0, H_pool):
+            h0 = h2 * stride_p_h
+            dh_base = d_base + h0 * stride_h_in
+
+            # Process W dimension in vectorized blocks of BLOCK_W
+            for w_start in range(0, W_pool, BLOCK_W):
+                offs_w = w_start + tl.arange(0, BLOCK_W)
+                mask_w = offs_w < W_pool  # single boundary mask for all fused ops
+
+                w0 = offs_w * stride_p_w
+                base_in = dh_base + w0 * stride_w_in
+
+                # Max over pooling window for each output position in this block
+                max_val = tl.full((BLOCK_W,), -float("inf"), dtype=tl.float32)
+
+                # Pooling window loops (unrolled via constexpr K_D/K_H/K_W)
+                for kd in range(0, K_D):
+                    dd = kd * stride_d_in
+                    for kh in range(0, K_H):
+                        hh = kh * stride_h_in
+                        base_kdh = base_in + dd + hh
+                        for kw in range(0, K_W):
+                            ptr = base_kdh + kw * stride_w_in
+                            # All fused ops (scale, max) use same ptr and same mask_w
+                            v = tl.load(ptr, mask=mask_w, other=-float("inf"))
+                            v = v * scale
+                            max_val = tl.maximum(max_val, v)
+
+                # Zero-out lanes that were masked (tail of W_pool)
+                max_val = tl.where(mask_w, max_val, 0.0)
+
+                # Accumulate sum over this block into scalar total
+                block_sum = tl.sum(max_val, axis=0)
+                total += block_sum
+
+    # Global average pooling
+    mean = total * inv_S_pool
+
+    # Clamp to [clamp_min, clamp_max]
+    mean = tl.minimum(mean, clamp_max)
+    mean = tl.maximum(mean, clamp_min)
+
+    # Output layout: (N, C, 1, 1, 1), contiguous along last dims
+    out_ptr = o_ptr + n * stride_n_out + c * stride_c_out
+    tl.store(out_ptr, mean)
 
 
-@triton.jit
-def global_avg_pool_clamp_kernel(
-    x_ptr,                 # Input tensor pointer (maxpooled output)
-    out_ptr,              # Output tensor pointer
-    N, C, D, H, W,        # Input dimensions (maxpooled tensor)
-    stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
-    stride_on, stride_oc, stride_od, stride_oh, stride_ow,
-    BLOCK_C: tl.constexpr,
-    BLOCK_W: tl.constexpr,  # Number of windows per thread
+def fused_scale_maxpool3d_globalavg_clamp(
+    x: torch.Tensor,
+    scale: float,
+    kernel_size,
+    clamp_min: float,
+    clamp_max: float,
 ):
-    """GlobalAvgPool + Clamp: Output shape [N, C, 1, 1, 1]"""
-    pid_n = tl.program_id(0)
-    pid_c = tl.program_id(1)
-    
-    if pid_n >= N:
-        return
-    
-    # Channel block processing
-    channel_base = pid_c * BLOCK_C
-    channel_offsets = tl.arange(0, BLOCK_C)
-    channel_mask = channel_base + channel_offsets < C
-    
-    # Initialize accumulators
-    sum_acc = tl.zeros((BLOCK_C,), dtype=tl.float32)
-    count_acc = tl.zeros((BLOCK_C,), dtype=tl.float32)
-    
-    # Total number of elements to reduce (spatial dimensions)
-    total_elements = D * H * W
-    
-    # Each program processes BLOCK_W elements
-    for block_start in range(0, total_elements, BLOCK_W):
-        elem_offsets = block_start + tl.arange(0, BLOCK_W)
-        elem_mask = elem_offsets < total_elements
-        
-        if tl.sum(elem_mask) > 0:
-            # Convert linear index to 3D indices
-            d_idx = elem_offsets // (H * W)
-            h_idx = (elem_offsets % (H * W)) // W
-            w_idx = elem_offsets % W
-            
-            # Load input values for all channels and current batch of elements
-            # We use broadcasting: [BLOCK_C, 1] * [1, BLOCK_W] -> [BLOCK_C, BLOCK_W]
-            c_indices = channel_base + channel_offsets[:, None]
-            d_indices = d_idx[None, :]
-            h_indices = h_idx[None, :]
-            w_indices = w_idx[None, :]
-            
-            # Compute pointer offsets using broadcasting
-            ptr_offsets = (
-                pid_n * stride_xn +
-                c_indices * stride_xc +
-                d_indices * stride_xd +
-                h_indices * stride_xh +
-                w_indices * stride_xw
-            )
-            
-            x_ptrs = x_ptr + ptr_offsets
-            # Load with combined mask (channel AND element)
-            load_mask = channel_mask[:, None] & elem_mask[None, :]
-            x_vals = tl.load(x_ptrs, mask=load_mask, other=0.0)
-            
-            # Accumulate sum and count
-            sum_acc += tl.sum(x_vals, axis=1)
-            count_acc += tl.sum(load_mask.to(tl.float32), axis=1)
-    
-    # Compute average and clamp
-    avg_vals = tl.where(count_acc > 0, sum_acc / count_acc, 0.0)
-    avg_vals = tl.minimum(tl.maximum(avg_vals, 0.0), 1.0)
-    
-    # Store results
-    c_indices = channel_base + channel_offsets
-    out_ptrs = (
-        out_ptr + pid_n * stride_on + 
-        c_indices * stride_oc
-    )
-    tl.store(out_ptrs, avg_vals, mask=channel_mask)
-
-
-def fused_post_convtranspose(x, scale, maxpool_kernel_size):
     """
-    Optimized fused operations using two kernels:
-    1. Scale + MaxPool3d
-    2. GlobalAvgPool + Clamp
+    Fused operation:
+      y = clamp( GlobalAvgPool3d( MaxPool3d( x * scale ) ), clamp_min, clamp_max )
+
+    Args:
+        x: (N, C, D, H, W), float32, CUDA, contiguous
+        scale: scalar multiplier
+        kernel_size: int or (k_d, k_h, k_w) for MaxPool3d
+        clamp_min, clamp_max: scalar clamp bounds
+
+    Returns:
+        out: (N, C, 1, 1, 1), float32, CUDA
     """
-    N, C, D, H, W = x.shape
-    K = maxpool_kernel_size
-    
-    # MaxPool3d output dimensions
-    D_out = D // K
-    H_out = H // K
-    W_out = W // K
-    
-    # Intermediate tensor for maxpool output
-    maxpool_out = torch.empty((N, C, D_out, H_out, W_out), 
-                              device=x.device, dtype=x.dtype)
-    
-    # Kernel 1: Scale + MaxPool3d
-    BLOCK_C1 = min(triton.next_power_of_2(C), 64)  # Increased for better utilization
-    total_windows = D_out * H_out * W_out
-    
-    grid1 = (N, triton.cdiv(C, BLOCK_C1), total_windows)
-    scale_maxpool3d_kernel[grid1](
-        x, maxpool_out,
-        N, C, D, H, W,
-        D_out, H_out, W_out,
-        scale, K,
-        x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
-        maxpool_out.stride(0), maxpool_out.stride(1), maxpool_out.stride(2),
-        maxpool_out.stride(3), maxpool_out.stride(4),
-        BLOCK_C=BLOCK_C1,
-    )
-    
-    # Kernel 2: GlobalAvgPool + Clamp
+    x = x.contiguous()
+    assert x.is_cuda, "Input must be on CUDA device"
+    assert x.dtype == torch.float32, "Kernel expects float32 tensor"
+
+    if isinstance(kernel_size, int):
+        k_d = k_h = k_w = kernel_size
+    else:
+        k_d, k_h, k_w = kernel_size
+
+    # MaxPool3d defaults: stride = kernel_size, padding = 0, dilation = 1, ceil_mode = False
+    stride_p_d = k_d
+    stride_p_h = k_h
+    stride_p_w = k_w
+    pad_d = pad_h = pad_w = 0
+    dilation_d = dilation_h = dilation_w = 1
+
+    N, C, D_in, H_in, W_in = x.shape
+
+    def _out_dim(L_in, k, s, p, d):
+        # PyTorch pooling formula (ceil_mode=False)
+        return (L_in + 2 * p - d * (k - 1) - 1) // s + 1
+
+    D_pool = _out_dim(D_in, k_d, stride_p_d, pad_d, dilation_d)
+    H_pool = _out_dim(H_in, k_h, stride_p_h, pad_h, dilation_h)
+    W_pool = _out_dim(W_in, k_w, stride_p_w, pad_w, dilation_w)
+    S_pool = D_pool * H_pool * W_pool
+
+    # Output of global average pooling: (N, C, 1, 1, 1)
     out = torch.empty((N, C, 1, 1, 1), device=x.device, dtype=x.dtype)
-    BLOCK_C2 = min(triton.next_power_of_2(C), 32)
-    BLOCK_W = 128  # Elements per thread
-    
-    grid2 = (N, triton.cdiv(C, BLOCK_C2))
-    global_avg_pool_clamp_kernel[grid2](
-        maxpool_out, out,
-        N, C, D_out, H_out, W_out,
-        maxpool_out.stride(0), maxpool_out.stride(1), maxpool_out.stride(2),
-        maxpool_out.stride(3), maxpool_out.stride(4),
-        out.stride(0), out.stride(1), out.stride(2), out.stride(3), out.stride(4),
-        BLOCK_C=BLOCK_C2,
+
+    stride_n_in, stride_c_in, stride_d_in, stride_h_in, stride_w_in = x.stride()
+    stride_n_out, stride_c_out, _, _, _ = out.stride()
+
+    # Precompute reciprocal of S_pool to avoid division in kernel
+    inv_S_pool = 1.0 / float(S_pool)
+
+    # Choose BLOCK_W as a power-of-two tuned to W_pool for good utilization
+    if W_pool >= 256:
+        BLOCK_W = 256
+    elif W_pool >= 128:
+        BLOCK_W = 128
+    elif W_pool >= 64:
+        BLOCK_W = 64
+    elif W_pool >= 32:
+        BLOCK_W = 32
+    else:
+        BLOCK_W = 16
+
+    # 1D grid over (N * C), covering output tensor dims
+    grid = lambda META: (N * C,)
+
+    scale_maxpool3d_globalavg_clamp_kernel[grid](
+        x, out,
+        N, C,
+        D_pool, H_pool, W_pool,
+        stride_p_d, stride_p_h, stride_p_w,
+        stride_n_in, stride_c_in, stride_d_in, stride_h_in, stride_w_in,
+        stride_n_out, stride_c_out,
+        float(scale), float(inv_S_pool),
+        float(clamp_min), float(clamp_max),
         BLOCK_W=BLOCK_W,
+        K_D=k_d,
+        K_H=k_h,
+        K_W=k_w,
+        num_warps=4,
+        num_stages=2,
     )
-    
     return out
 
 
 class ModelNew(nn.Module):
     """
-    ConvTranspose3d (PyTorch native) + Optimized fused post-ops (Triton)
-    Uses two optimized kernels for better parallelism and memory access patterns
+    Replacement model using Triton kernel for:
+      - scalar multiply + MaxPool3d + global average pooling + clamp
+    ConvTranspose3d is kept from PyTorch for correctness and simplicity.
     """
     def __init__(self, in_channels, out_channels, kernel_size, stride, padding, scale, maxpool_kernel_size):
         super(ModelNew, self).__init__()
@@ -220,13 +187,21 @@ class ModelNew(nn.Module):
             in_channels, out_channels, kernel_size,
             stride=stride, padding=padding
         )
-        self.scale = scale
+        self.scale = float(scale)
         self.maxpool_kernel_size = maxpool_kernel_size
-        
+        self.clamp_min = 0.0
+        self.clamp_max = 1.0
+
     def forward(self, x):
-        # Step 1: PyTorch native ConvTranspose3d
-        x = self.conv_transpose(x)
-        # Step 2: Optimized fused post-ops in Triton (two kernels)
-        x = fused_post_convtranspose(x, self.scale, self.maxpool_kernel_size)
+        # x: (N, C_in, D, H, W)
+        x = self.conv_transpose(x)  # (N, C_out, D1, H1, W1)
+        # Fused: scale -> MaxPool3d -> global average -> clamp
+        x = fused_scale_maxpool3d_globalavg_clamp(
+            x,
+            self.scale,
+            self.maxpool_kernel_size,
+            self.clamp_min,
+            self.clamp_max,
+        )
         return x
 ```

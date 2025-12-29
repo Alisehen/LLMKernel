@@ -1,0 +1,10 @@
+```json
+{
+  "worth_optimizing": "yes",
+  "reason": "The current pipeline needlessly rereads the full convolution output once just to compute GroupNorm statistics, which is expensive at this tensor size and likely memory-bandwidth bound.",
+  "bottleneck": "After conv2d, the groupnorm_stats_triton kernel performs a full pass over x_conv to compute per-(N, group) mean and variance, and then fused_groupnorm_act_res_lse_triton performs another full pass over x_conv. This double read of the large conv output (≈500MB per pass) is a major source of global memory traffic and kernel launch overhead.",
+  "optimisation method": "Fuse the convolution and GroupNorm statistics computation into a single conv+stats kernel that, while producing each y[n, c, h, w], also accumulates per-(n, g) sums and squared sums (where g = c // group_size), thereby eliminating the separate groupnorm_stats_triton kernel and one full read of x_conv.",
+  "modification plan": "Extend conv2d_nchw_kernel so that each program, after computing its accumulator tile acc for y[n, co, h, w], computes the corresponding group index for each output channel and accumulates partial sum and sum of squares into per-(n, g) buffers in shared registers, then performs a small reduction and emits a single atomic add per (n, g) per tile to global sum and sum_sq arrays. After the conv+stats kernel completes, launch a tiny follow-up kernel (or reuse the existing fused kernel with a fast pre-pass) that divides sum and sum_sq by group_elems to form mean and rstd, and then directly applies GroupNorm+Tanh+HardSwish+Residual+LSE using the already materialized x_conv; this removes the entire groupnorm_stats_triton kernel and its global read traffic.",
+  "expected_speedup": "20-30%"
+}
+```

@@ -1,0 +1,10 @@
+```json
+{
+  "worth_optimizing": "yes",
+  "reason": "The post-GroupNorm elementwise math is algebraically redundant and collapses to a constant, so we are doing a full GroupNorm + affine compute for no effective contribution to the final output.",
+  "bottleneck": "The kernel spends time computing mean/variance, normalizing, and applying affine parameters, even though `torch.min(x, min_value)` followed by `torch.clamp(x, min=min_value, max=max_value)` guarantees that every output element becomes exactly `min_value` (since it must be simultaneously ≤ min_value and ≥ min_value). Thus all GroupNorm work is wasted for this specific composition.",
+  "optimisation method": "Exploit the algebraic simplification of the activation sequence and replace the whole GroupNorm + min + clamp pipeline with a constant write of `min_value`, letting only dropout act afterwards (or equivalently, replace the fused kernel with a trivial kernel that ignores its input and just fills the output with `min_value`).",
+  "modification plan": "In the fused Triton kernel, detect the pattern where the same `min_value` is used for both `torch.min` and the lower bound of `torch.clamp`, and directly write `min_value` to `y_ptr` without reading `x_ptr` or computing GroupNorm statistics/affine transforms. At the PyTorch level, you can even bypass the Triton kernel entirely for this configuration, replacing `groupnorm_min_clamp(x, ...)` with `torch.full_like(x, min_value)` so that only dropout runs on the constant tensor, preserving mathematical behavior while eliminating all GroupNorm work.",
+  "expected_speedup": "20-30%"
+}
+```

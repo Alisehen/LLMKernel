@@ -1,0 +1,10 @@
+```json
+{
+  "worth_optimizing": "yes",
+  "reason": "There is an extra full read/write of the convolution output tensor before Mish+stats, which is a large, clearly avoidable source of global memory traffic.",
+  "bottleneck": "The pipeline computes Conv -> writes conv_out -> reads conv_out in a separate Mish+stats kernel -> writes mish_out -> then reads mish_out in BatchNorm, so the conv output is written and read once solely to feed Mish+stats.",
+  "optimisation method": "Fuse the convolution and Mish+stats into a single Triton kernel so that the conv kernel directly applies Mish to its accumulator and atomically accumulates per-channel sums/sumsqs, writing only the Mish-activated output (no conv_out buffer).",
+  "modification plan": "Extend conv2d_nchw_kernel with sum/sumsq buffers and Mish computation: after finishing the K loop and adding bias, compute Mish(acc) in-register, perform a tl.sum over the BLOCK_M axis to get per-channel partial sums/sumsqs, tl.atomic_add into global sum_ptr/sumsq_ptr, and store Mish results to y_ptr. Replace the conv2d_triton + mish_with_stats_triton calls in ModelNew.forward with a single conv2d_mish_with_stats_triton wrapper that returns Mish outputs and the per-channel stats for the existing BatchNorm kernel.",
+  "expected_speedup": "20-30%"
+}
+```

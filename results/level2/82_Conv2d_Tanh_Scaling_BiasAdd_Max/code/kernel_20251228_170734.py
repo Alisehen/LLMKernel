@@ -1,0 +1,296 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        # High-throughput config (may use more registers)
+        triton.Config(
+            {'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=3,
+        ),
+        # More conservative N tile to reduce register pressure
+        triton.Config(
+            {'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=3,
+        ),
+        # Smallest, register-friendly fallback
+        triton.Config(
+            {'BLOCK_M': 16, 'BLOCK_N': 32, 'BLOCK_K': 32},
+            num_warps=2,
+            num_stages=2,
+        ),
+    ],
+    key=['M_pooled', 'N_out'],
+)
+@triton.jit
+def conv2d_tanh_scale_bias_maxpool_kernel(
+    x_ptr,                    # [N, C, H, W]
+    w_flat_ptr,               # [K_dim, OC] with OC contiguous
+    conv_bias_ptr,            # [OC]
+    extra_bias_ptr,           # [OC]
+    y_ptr,                    # [N, OC, H_pool, W_pool]
+
+    M_pooled,                 # = N * H_pool * W_pool
+    N_out,                    # = OC
+    K,                        # = C * KH * KW
+
+    KH, KW,
+    pool_kh, pool_kw,
+    pool_stride_h, pool_stride_w,
+    W_pool,
+    P,                        # = H_pool * W_pool
+
+    scaling_factor,           # float32
+
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+
+    BLOCK_M: tl.constexpr,    # along M_pooled
+    BLOCK_N: tl.constexpr,    # along N_out
+    BLOCK_K: tl.constexpr,    # reduction over K
+):
+    # -------------------------
+    # Program IDs
+    # -------------------------
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    # Offsets in pooled-M dimension and output-channel dimension
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    m_mask = offs_m < M_pooled
+    n_mask = offs_n < N_out
+
+    # -------------------------
+    # Decode (n_idx, ph, pw) from flattened pooled index offs_m
+    # offs_m = n_idx * (H_pool * W_pool) + ph * W_pool + pw
+    # -------------------------
+    n_idx = offs_m // P
+    rem = offs_m - n_idx * P
+    ph = rem // W_pool
+    pw = rem - ph * W_pool
+
+    # Top-left conv coordinates for this pooled position
+    oh0 = ph * pool_stride_h
+    ow0 = pw * pool_stride_w
+
+    # Base pointer for input (per pooled element) at its top-left conv position
+    base_in0 = n_idx * stride_xn + oh0 * stride_xh + ow0 * stride_xw
+
+    # Base pointer for output pooled tensor
+    base_out = n_idx * stride_yn + ph * stride_yh + pw * stride_yw
+
+    # -------------------------
+    # Load per-output-channel biases (kept in registers across pooling window)
+    # -------------------------
+    conv_b = tl.load(conv_bias_ptr + offs_n, mask=n_mask, other=0.0).to(tl.float32)
+    extra_b = tl.load(extra_bias_ptr + offs_n, mask=n_mask, other=0.0).to(tl.float32)
+
+    # -------------------------
+    # Max accumulator for pooled output
+    # -------------------------
+    max_acc = tl.full((BLOCK_M, BLOCK_N), -float("inf"), dtype=tl.float32)
+
+    k_per_c = KH * KW
+
+    # -------------------------
+    # Iterate over pooling window
+    # -------------------------
+    for pkh in range(0, pool_kh):
+        for pkw in range(0, pool_kw):
+            # Conv output position inside this pooling window
+            base_in = base_in0 + pkh * stride_xh + pkw * stride_xw
+
+            # Convolution accumulator for this (oh, ow)
+            acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+            # Reduction over K = C * KH * KW
+            for k0 in range(0, K, BLOCK_K):
+                offs_k = k0 + tl.arange(0, BLOCK_K)
+                k_mask = offs_k < K
+
+                kk = offs_k
+                ci = kk // k_per_c
+                remk = kk - ci * k_per_c
+                kh = remk // KW
+                kw = remk - kh * KW
+
+                # Offsets for input for each k
+                offset_x_k = ci * stride_xc + kh * stride_xh + kw * stride_xw
+
+                # A (input) tile: shape (BLOCK_M, BLOCK_K)
+                a_ptrs = x_ptr + base_in[:, None] + offset_x_k[None, :]
+                a_mask = m_mask[:, None] & k_mask[None, :]
+                a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+
+                # B (weights) tile: w_flat has shape [K_dim, OC] with OC contiguous
+                # Pointer for B: (BLOCK_K, BLOCK_N)
+                b_ptrs = w_flat_ptr + offs_k[:, None] * N_out + offs_n[None, :]
+                b_mask = k_mask[:, None] & n_mask[None, :]
+                b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+                acc += tl.dot(a, b, allow_tf32=True)
+
+            # -------------------------
+            # Fused epilogue: bias + tanh + scale + extra bias + max pool
+            # -------------------------
+            # Add convolution bias
+            acc = acc + conv_b[None, :]
+
+            # tanh(x) = (e^{2x} - 1) / (e^{2x} + 1), done in-place to reduce registers
+            acc = acc * 2.0
+            acc = tl.exp(acc)
+            acc = (acc - 1.0) / (acc + 1.0)
+
+            # Scaling
+            acc = acc * scaling_factor
+
+            # Extra bias
+            acc = acc + extra_b[None, :]
+
+            # Max-pooling reduction
+            max_acc = tl.maximum(max_acc, acc)
+
+    # -------------------------
+    # Store pooled result: (N, OC, H_pool, W_pool)
+    # -------------------------
+    y_ptrs = y_ptr + base_out[:, None] + offs_n[None, :] * stride_yc
+    y_mask = m_mask[:, None] & n_mask[None, :]
+    tl.store(y_ptrs, max_acc, mask=y_mask)
+
+
+def fused_conv2d_tanh_scale_bias_maxpool(
+    x, weight, conv_bias, extra_bias, scaling_factor,
+    pool_kernel_size, pool_stride=None,
+):
+    """
+    Fused:
+      Conv2d (valid, stride=1, no padding) +
+      tanh +
+      scaling +
+      extra bias +
+      MaxPool2d.
+
+    x:            (N, C, H, W)
+    weight:       (OC, C, KH, KW)
+    conv_bias:    (OC,)
+    extra_bias:   (OC,)  -- e.g., from shape (OC,1,1) flattened
+    scaling_factor: float
+    pool_kernel_size: int
+    pool_stride: int or None (defaults to pool_kernel_size)
+    """
+    assert x.is_cuda and weight.is_cuda and conv_bias.is_cuda and extra_bias.is_cuda
+    x = x.contiguous()
+    weight = weight.contiguous()
+    conv_bias = conv_bias.contiguous()
+    extra_bias = extra_bias.contiguous()
+
+    if pool_stride is None:
+        pool_stride = pool_kernel_size
+
+    N, C, H, W = x.shape
+    OC, Cw, KH, KW = weight.shape
+    assert C == Cw, "Inconsistent in_channels between input and weight"
+    assert pool_kernel_size > 0
+    assert pool_stride > 0
+
+    # Valid conv: stride=1, padding=0, dilation=1
+    OH = H - KH + 1
+    OW = W - KW + 1
+    assert OH > 0 and OW > 0
+
+    # MaxPool2d output size (no padding, no dilation)
+    H_pool = (OH - pool_kernel_size) // pool_stride + 1
+    W_pool = (OW - pool_kernel_size) // pool_stride + 1
+    assert H_pool > 0 and W_pool > 0
+
+    M_pooled = N * H_pool * W_pool
+    N_out = OC
+    K_dim = C * KH * KW
+    P = H_pool * W_pool
+
+    # Output tensor: (N, OC, H_pool, W_pool)
+    y = torch.empty((N, OC, H_pool, W_pool), device=x.device, dtype=x.dtype)
+
+    # Strides for NCHW & NCHW output
+    stride_xn, stride_xc, stride_xh, stride_xw = x.stride()
+    stride_yn, stride_yc, stride_yh, stride_yw = y.stride()
+
+    # Reorder weights for better memory access:
+    # (OC, C, KH, KW) -> (C, KH, KW, OC) -> flatten to (K_dim, OC)
+    # so that OC is contiguous and K is the leading dimension.
+    weight_reordered = weight.permute(1, 2, 3, 0).contiguous()
+    w_flat = weight_reordered.view(-1, OC)  # (K_dim, OC)
+
+    def grid(meta):
+        return (
+            triton.cdiv(M_pooled, meta['BLOCK_M']),
+            triton.cdiv(N_out, meta['BLOCK_N']),
+        )
+
+    conv2d_tanh_scale_bias_maxpool_kernel[grid](
+        x, w_flat, conv_bias, extra_bias, y,
+        M_pooled, N_out, K_dim,
+        KH, KW,
+        pool_kernel_size, pool_kernel_size,
+        pool_stride, pool_stride,
+        W_pool,
+        P,
+        float(scaling_factor),
+        stride_xn, stride_xc, stride_xh, stride_xw,
+        stride_yn, stride_yc, stride_yh, stride_yw,
+    )
+
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model using a single Triton kernel that fuses:
+    Conv2d + tanh + scaling + bias addition + MaxPool2d.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, scaling_factor, bias_shape, pool_kernel_size):
+        super(ModelNew, self).__init__()
+        # Conv2d parameters (weights & bias) reused by Triton kernel
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.scaling_factor = float(scaling_factor)
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.max_pool = nn.MaxPool2d(pool_kernel_size)
+
+    def forward(self, x):
+        # Ensure NCHW contiguous layout
+        x = x.contiguous()
+
+        weight = self.conv.weight
+        conv_bias = self.conv.bias
+        extra_bias = self.bias.view(-1)
+
+        # Extract pooling params (square kernel/stride as in reference)
+        k = self.max_pool.kernel_size
+        if isinstance(k, tuple):
+            assert k[0] == k[1], "Only square pooling kernels are supported"
+            k = k[0]
+
+        s = self.max_pool.stride
+        if s is None:
+            s = k
+        if isinstance(s, tuple):
+            assert s[0] == s[1], "Only square pooling strides are supported"
+            s = s[0]
+
+        x = fused_conv2d_tanh_scale_bias_maxpool(
+            x,
+            weight,
+            conv_bias,
+            extra_bias,
+            self.scaling_factor,
+            pool_kernel_size=k,
+            pool_stride=s,
+        )
+        return x

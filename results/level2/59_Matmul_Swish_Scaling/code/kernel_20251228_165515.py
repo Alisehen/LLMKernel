@@ -1,0 +1,141 @@
+# <complete ModelNew code with optimized Triton kernels>
+
+import torch, torch.nn as nn, triton, triton.language as tl
+
+
+@triton.jit
+def matmul_swish_scale_kernel(
+    a_ptr, b_ptr, bias_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    scaling_factor,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    # Program IDs for 2D tiling over M and N
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    # Offsets for this block
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    tl.multiple_of(offs_m, BLOCK_M)
+    tl.multiple_of(offs_n, BLOCK_N)
+
+    # Pointers to tiles in A and B
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    # Accumulator in FP32 for better precision
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # K-loop
+    for k in range(0, K, BLOCK_K):
+        k_mask_a = (offs_k[None, :] + k) < K
+        k_mask_b = (offs_k[:, None] + k) < K
+
+        a = tl.load(
+            a_ptrs,
+            mask=(offs_m[:, None] < M) & k_mask_a,
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptrs,
+            mask=k_mask_b & (offs_n[None, :] < N),
+            other=0.0,
+        )
+
+        # Matrix multiply
+        acc += tl.dot(a, b, allow_tf32=True)
+
+        # Advance pointers along K dimension
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Add bias (broadcast over rows)
+    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc += bias[None, :]
+
+    # Swish activation: x * sigmoid(x), sigmoid(x) = 1 / (1 + exp(-x))
+    sig = 1.0 / (1.0 + tl.exp(-acc))
+    acc = acc * sig
+
+    # Scale
+    acc = acc * scaling_factor
+
+    # Store result
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    mask_c = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, acc, mask=mask_c)
+
+
+def fused_linear_swish_scale(x, weight, bias, scaling_factor: float):
+    """
+    x:      [M, K]
+    weight: [N, K]  (same layout as nn.Linear.weight)
+    bias:   [N]
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+
+    # Shapes
+    M, K = x.shape
+    N = weight.shape[0]
+    assert weight.shape[1] == K
+    assert bias.shape[0] == N
+
+    # Ensure contiguous for best performance
+    x_contig = x.contiguous()
+    # Convert weight to [K, N] for GEMM (A @ B)
+    w_t = weight.t().contiguous()  # [K, N]
+
+    # Output
+    c = torch.empty((M, N), device=x.device, dtype=x.dtype)
+
+    # Grid: one program instance per BLOCK_M x BLOCK_N tile of C
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta["BLOCK_M"]),
+            triton.cdiv(N, meta["BLOCK_N"]),
+        )
+
+    matmul_swish_scale_kernel[grid](
+        x_contig, w_t, bias, c,
+        M, N, K,
+        x_contig.stride(0), x_contig.stride(1),
+        w_t.stride(0), w_t.stride(1),
+        c.stride(0), c.stride(1),
+        scaling_factor,
+        BLOCK_M=128,
+        BLOCK_N=128,
+        BLOCK_K=32,
+        num_warps=8,
+        num_stages=4,
+    )
+
+    return c
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized replacement for:
+        Linear -> Swish (x * sigmoid(x)) -> scale
+    """
+
+    def __init__(self, in_features, out_features, scaling_factor):
+        super(ModelNew, self).__init__()
+        # Match nn.Linear weight layout: [out_features, in_features]
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias = nn.Parameter(torch.empty(out_features))
+        self.scaling_factor = float(scaling_factor)
+
+        # Initialize similar to nn.Linear
+        bound = 1.0 / in_features**0.5
+        nn.init.uniform_(self.weight, -bound, bound)
+        nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x):
+        # x: [batch_size, in_features]
+        return fused_linear_swish_scale(x, self.weight, self.bias, self.scaling_factor)

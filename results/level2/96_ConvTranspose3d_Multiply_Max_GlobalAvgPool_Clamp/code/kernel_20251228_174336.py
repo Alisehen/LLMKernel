@@ -1,0 +1,298 @@
+import torch, torch.nn as nn, triton, triton.language as tl
+
+
+@triton.jit
+def fused_conv_transpose3d_maxpool_globalavg_clamp_kernel(
+    x_ptr, w_ptr, b_ptr, y_ptr,
+    N, C_out,
+    stride_x_n, stride_x_c, stride_x_d, stride_x_h, stride_x_w,
+    stride_w_ci, stride_w_co, stride_w_kd, stride_w_kh, stride_w_kw,
+    stride_y_n, stride_y_c,
+    D_in: tl.constexpr, H_in: tl.constexpr, W_in: tl.constexpr,
+    C_IN: tl.constexpr,
+    KD: tl.constexpr, KH: tl.constexpr, KW: tl.constexpr,
+    stride_d, stride_h, stride_w,
+    pad_d, pad_h, pad_w,
+    D_ct, H_ct, W_ct,
+    MP_KD: tl.constexpr, MP_KH: tl.constexpr, MP_KW: tl.constexpr,
+    mp_stride_d, mp_stride_h, mp_stride_w,
+    mp_pad_d, mp_pad_h, mp_pad_w,
+    D_mp: tl.constexpr, H_mp: tl.constexpr, W_mp: tl.constexpr,
+    scale, clamp_min, clamp_max,
+    BLOCK_CO: tl.constexpr, BLOCK_P: tl.constexpr,
+):
+    """
+    Fused kernel computing:
+      ConvTranspose3d -> scale -> MaxPool3d -> global average -> clamp
+    Produces output of shape [N, C_out, 1, 1, 1].
+    """
+
+    pid_n = tl.program_id(0)
+    pid_co_blk = tl.program_id(1)
+
+    co_offsets = pid_co_blk * BLOCK_CO + tl.arange(0, BLOCK_CO)
+    mask_co = co_offsets < C_out
+
+    # Base pointers for this batch element
+    base_x_n = x_ptr + pid_n * stride_x_n
+    base_y_n = y_ptr + pid_n * stride_y_n
+
+    # Load bias for this channel block
+    bias_vals = tl.load(b_ptr + co_offsets, mask=mask_co, other=0.0)
+
+    # Accumulator for global sum over pooled outputs for each output channel
+    sum_vals = tl.zeros((BLOCK_CO,), dtype=tl.float32)
+
+    HW_mp = H_mp * W_mp
+    P_mp = D_mp * H_mp * W_mp
+
+    # Loop over pooled positions in tiles of BLOCK_P
+    NUM_TILES = (P_mp + BLOCK_P - 1) // BLOCK_P
+
+    for tile_idx in range(0, NUM_TILES):
+        p_offsets = tile_idx * BLOCK_P + tl.arange(0, BLOCK_P)
+        mask_p = p_offsets < P_mp
+
+        dp = p_offsets // HW_mp
+        rem = p_offsets % HW_mp
+        hp = rem // W_mp
+        wp = rem % W_mp
+
+        # Max over pooling window, initialized to -inf
+        max_vals = tl.full((BLOCK_CO, BLOCK_P), -float("inf"), dtype=tl.float32)
+
+        # Iterate over 3D maxpool kernel window
+        for kd_p in range(0, MP_KD):
+            z_ct = dp * mp_stride_d - mp_pad_d + kd_p
+            mask_z_ct = (z_ct >= 0) & (z_ct < D_ct)
+
+            for kh_p in range(0, MP_KH):
+                y_ct = hp * mp_stride_h - mp_pad_h + kh_p
+                mask_y_ct = (y_ct >= 0) & (y_ct < H_ct)
+
+                for kw_p in range(0, MP_KW):
+                    x_ct = wp * mp_stride_w - mp_pad_w + kw_p
+                    mask_x_ct = (x_ct >= 0) & (x_ct < W_ct)
+
+                    # Positions that are inside the conv-transpose output
+                    mask_pool = mask_p & mask_z_ct & mask_y_ct & mask_x_ct
+
+                    # Accumulator for conv-transpose output at these positions
+                    acc_conv = tl.zeros((BLOCK_CO, BLOCK_P), dtype=tl.float32)
+
+                    # Compute ConvTranspose3d(n, co, z_ct, y_ct, x_ct) for all valid positions
+                    for ci in range(0, C_IN):
+                        base_x_nc = base_x_n + ci * stride_x_c
+                        base_w_ci = w_ptr + ci * stride_w_ci
+
+                        for kd in range(0, KD):
+                            z_in_nom = z_ct + pad_d - kd
+                            z_div = z_in_nom // stride_d
+                            z_mod = z_in_nom % stride_d
+                            mask_z_in = (z_mod == 0) & (z_div >= 0) & (z_div < D_in)
+
+                            for kh in range(0, KH):
+                                y_in_nom = y_ct + pad_h - kh
+                                y_div = y_in_nom // stride_h
+                                y_mod = y_in_nom % stride_h
+                                mask_y_in = (y_mod == 0) & (y_div >= 0) & (y_div < H_in)
+
+                                for kw in range(0, KW):
+                                    x_in_nom = x_ct + pad_w - kw
+                                    x_div = x_in_nom // stride_w
+                                    x_mod = x_in_nom % stride_w
+                                    mask_x_in = (x_mod == 0) & (x_div >= 0) & (x_div < W_in)
+
+                                    mask_xyz = mask_pool & mask_z_in & mask_y_in & mask_x_in
+
+                                    x_ptrs = base_x_nc + (
+                                        z_div * stride_x_d +
+                                        y_div * stride_x_h +
+                                        x_div * stride_x_w
+                                    )
+                                    x_vals = tl.load(x_ptrs, mask=mask_xyz, other=0.0)
+
+                                    base_w_ck = (
+                                        base_w_ci
+                                        + kd * stride_w_kd
+                                        + kh * stride_w_kh
+                                        + kw * stride_w_kw
+                                    )
+                                    w_ptrs = base_w_ck + co_offsets * stride_w_co
+                                    w_vals = tl.load(w_ptrs, mask=mask_co, other=0.0)
+
+                                    acc_conv += w_vals[:, None] * x_vals[None, :]
+
+                    # Add bias and apply scale (must be inside pooling for correct sign behavior)
+                    conv_vals = acc_conv + bias_vals[:, None]
+                    conv_vals = conv_vals * scale
+
+                    # For invalid pool positions, set candidate to -inf so they don't affect max
+                    conv_vals = tl.where(mask_pool[None, :], conv_vals, -float("inf"))
+
+                    # Max over pooling window
+                    max_vals = tl.maximum(max_vals, conv_vals)
+
+        # Exclude p_offsets outside P_mp and channels outside C_out from the sum
+        max_vals = tl.where(mask_p[None, :] & mask_co[:, None], max_vals, 0.0)
+
+        # Accumulate sum over pooled positions
+        sum_vals += tl.sum(max_vals, axis=1)
+
+    # Global average over pooled positions
+    mean_vals = sum_vals / P_mp
+
+    # Clamp
+    mean_vals = tl.maximum(mean_vals, clamp_min)
+    mean_vals = tl.minimum(mean_vals, clamp_max)
+
+    # Store [N, C_out, 1, 1, 1]
+    out_ptrs = base_y_n + co_offsets * stride_y_c
+    tl.store(out_ptrs, mean_vals, mask=mask_co)
+
+
+def fused_conv_transpose3d_maxpool_globalavg_clamp_triton(
+    x, weight, bias, stride, padding, scale, maxpool_kernel_size, clamp_min, clamp_max
+):
+    """
+    x:       [N, C_in, D_in, H_in, W_in]
+    weight:  [C_in, C_out, Kd, Kh, Kw]  (ConvTranspose3d layout)
+    bias:    [C_out]
+    Returns: [N, C_out, 1, 1, 1]
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+    N, C_in, D_in, H_in, W_in = x.shape
+    C_in_w, C_out, Kd, Kh, Kw = weight.shape
+    assert C_in_w == C_in, "Input channels mismatch between x and weight"
+
+    # Normalize conv-transpose stride and padding
+    if isinstance(stride, int):
+        stride_d = stride_h = stride_w = stride
+    else:
+        stride_d, stride_h, stride_w = stride
+
+    if isinstance(padding, int):
+        pad_d = pad_h = pad_w = padding
+    else:
+        pad_d, pad_h, pad_w = padding
+
+    # ConvTranspose3d output size (same formula as PyTorch)
+    D_ct = (D_in - 1) * stride_d - 2 * pad_d + Kd
+    H_ct = (H_in - 1) * stride_h - 2 * pad_h + Kh
+    W_ct = (W_in - 1) * stride_w - 2 * pad_w + Kw
+
+    # MaxPool3d params: kernel_size, stride defaults to kernel_size, padding=0, dilation=1
+    if isinstance(maxpool_kernel_size, int):
+        mp_kD = mp_kH = mp_kW = maxpool_kernel_size
+    else:
+        mp_kD, mp_kH, mp_kW = maxpool_kernel_size
+
+    mp_stride_d = mp_kD
+    mp_stride_h = mp_kH
+    mp_stride_w = mp_kW
+    mp_pad_d = mp_pad_h = mp_pad_w = 0
+
+    # MaxPool3d output size (same formula as PyTorch)
+    D_mp = (D_ct + 2 * mp_pad_d - (mp_kD - 1) - 1) // mp_stride_d + 1
+    H_mp = (H_ct + 2 * mp_pad_h - (mp_kH - 1) - 1) // mp_stride_h + 1
+    W_mp = (W_ct + 2 * mp_pad_w - (mp_kW - 1) - 1) // mp_stride_w + 1
+
+    # Final output is global average pooled: [N, C_out, 1, 1, 1]
+    y = torch.empty((N, C_out, 1, 1, 1), device=x.device, dtype=x.dtype)
+
+    # Strides
+    stride_x_n, stride_x_c, stride_x_d, stride_x_h, stride_x_w = x.stride()
+    stride_w_ci, stride_w_co, stride_w_kd, stride_w_kh, stride_w_kw = weight.stride()
+    stride_y_n, stride_y_c = y.stride()[0], y.stride()[1]
+
+    BLOCK_CO = 16
+    BLOCK_P = 32
+
+    grid = lambda META: (
+        N,
+        triton.cdiv(C_out, META["BLOCK_CO"]),
+    )
+
+    fused_conv_transpose3d_maxpool_globalavg_clamp_kernel[grid](
+        x, weight, bias, y,
+        N, C_out,
+        stride_x_n, stride_x_c, stride_x_d, stride_x_h, stride_x_w,
+        stride_w_ci, stride_w_co, stride_w_kd, stride_w_kh, stride_w_kw,
+        stride_y_n, stride_y_c,
+        D_in, H_in, W_in,
+        C_IN=C_in,
+        KD=Kd, KH=Kh, KW=Kw,
+        stride_d=stride_d, stride_h=stride_h, stride_w=stride_w,
+        pad_d=pad_d, pad_h=pad_h, pad_w=pad_w,
+        D_ct=D_ct, H_ct=H_ct, W_ct=W_ct,
+        MP_KD=mp_kD, MP_KH=mp_kH, MP_KW=mp_kW,
+        mp_stride_d=mp_stride_d, mp_stride_h=mp_stride_h, mp_stride_w=mp_stride_w,
+        mp_pad_d=mp_pad_d, mp_pad_h=mp_pad_h, mp_pad_w=mp_pad_w,
+        D_mp=D_mp, H_mp=H_mp, W_mp=W_mp,
+        scale=scale, clamp_min=clamp_min, clamp_max=clamp_max,
+        BLOCK_CO=BLOCK_CO, BLOCK_P=BLOCK_P,
+        num_warps=4, num_stages=2,
+    )
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Transposed 3D convolution implemented with a fused Triton kernel:
+    ConvTranspose3d + scale + MaxPool3d + global average pooling + clamp.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, scale, maxpool_kernel_size):
+        super(ModelNew, self).__init__()
+
+        # Normalize hyperparameters to 3D tuples
+        if isinstance(kernel_size, int):
+            kD = kH = kW = kernel_size
+        else:
+            kD, kH, kW = kernel_size
+
+        if isinstance(stride, int):
+            sD = sH = sW = stride
+        else:
+            sD, sH, sW = stride
+
+        if isinstance(padding, int):
+            pD = pH = pW = padding
+        else:
+            pD, pH, pW = padding
+
+        if isinstance(maxpool_kernel_size, int):
+            mp_kD = mp_kH = mp_kW = maxpool_kernel_size
+        else:
+            mp_kD, mp_kH, mp_kW = maxpool_kernel_size
+
+        # ConvTranspose3d params: [C_in, C_out, kD, kH, kW]
+        self.weight = nn.Parameter(
+            torch.randn(in_channels, out_channels, kD, kH, kW)
+        )
+        self.bias = nn.Parameter(torch.randn(out_channels))
+
+        self.stride = (sD, sH, sW)
+        self.padding = (pD, pH, pW)
+        self.scale = float(scale)
+        self.maxpool_kernel_size = (mp_kD, mp_kH, mp_kW)
+
+        self.clamp_min = 0.0
+        self.clamp_max = 1.0
+
+    def forward(self, x):
+        x = x.cuda()
+        w = self.weight.cuda()
+        b = self.bias.cuda()
+
+        x = fused_conv_transpose3d_maxpool_globalavg_clamp_triton(
+            x,
+            w,
+            b,
+            self.stride,
+            self.padding,
+            self.scale,
+            self.maxpool_kernel_size,
+            self.clamp_min,
+            self.clamp_max,
+        )
+        return x

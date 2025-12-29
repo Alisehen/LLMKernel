@@ -1,34 +1,12 @@
 You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
 
-# Target GPU
-GPU Name: 4090
-Architecture: Ada Lovelace
-• Compute Capability: 8.9
-• Number of SMs: 128
-• Memory Bandwidth: 1008 GB/s
-• TF32 Tensor Core TFLOPS: 82.6 with dense
-• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
-• FP16 Tensor Core TFLOPS: 165.2 with dense
-• Maximum number of registers per thread: 255
-• Maximum threads per block: 1024
-• Maximum threads per SM: 1536
-• Warp size: 32
-• Maximum concurrent warps per SM: 48
-• Shared memory capacity per SM: 100 KB
-• Maximum shared memory per thread block: 99 KB
-• L2 cache (global, all SM shared): 72 MB
+# Target GPU: 4090
 
 [OPTIMIZATION STAGE]
 
 ## Current Optimization Stage
 
 Focus: Grid layout & indexing for FUSED operations.
-
-⚠️ FUSION EXCLUSIONS (do NOT apply fusion rules to these):
-- Reduction ops (sum, mean, softmax along axis)
-- Atomic operations
-- Irregular/data-dependent access patterns
-- Cross-block dependencies
 
 Key Principle:
 - All fused ops share the SAME grid AND the SAME (offsets, mask) tuple
@@ -57,320 +35,125 @@ import triton.language as tl
 
 
 @triton.jit
-def conv3d_forward_kernel(
-    x_ptr, w_ptr, b_ptr, y_ptr,
-    N, C_in, D_in, H_in, W_in,
-    C_out, K_D, K_H, K_W,
-    D_out, H_out, W_out,
-    stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
-    stride_wo, stride_wc, stride_wd, stride_wh, stride_ww,
-    stride_yn, stride_yc, stride_yd, stride_yh, stride_yw,
-    BLOCK_M: tl.constexpr,  # flattened (N, D_out, H_out, W_out)
-    BLOCK_N: tl.constexpr,  # output channels
+def fill_min_value_kernel(
+    y_ptr,
+    numel,
+    min_value,
+    BLOCK_SIZE: tl.constexpr,
 ):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    """
+    Kernel that fills the output tensor with a constant min_value.
 
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-
-    P = N * D_out * H_out * W_out
-    mask_m = offs_m < P
-    mask_n = offs_n < C_out
-
-    # Decode flattened output index -> (n, od, oh, ow)
-    DHW_out = D_out * H_out * W_out
-    HW_out = H_out * W_out
-
-    n_idx = offs_m // DHW_out
-    rem = offs_m % DHW_out
-    od_idx = rem // HW_out
-    rem2 = rem % HW_out
-    oh_idx = rem2 // W_out
-    ow_idx = rem2 % W_out
-
-    # Accumulator
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-
-    # Convolution: stride=1, padding=0, dilation=1 (as in nn.Conv3d defaults)
-    for c in range(0, C_in):
-        for kd in range(0, K_D):
-            for kh in range(0, K_H):
-                for kw in range(0, K_W):
-                    id_idx = od_idx + kd
-                    ih_idx = oh_idx + kh
-                    iw_idx = ow_idx + kw
-
-                    x_ptrs = (
-                        x_ptr
-                        + n_idx[:, None] * stride_xn
-                        + c * stride_xc
-                        + id_idx[:, None] * stride_xd
-                        + ih_idx[:, None] * stride_xh
-                        + iw_idx[:, None] * stride_xw
-                    )
-                    mask_x = (
-                        mask_m[:, None]
-                        & (n_idx[:, None] < N)
-                        & (id_idx[:, None] < D_in)
-                        & (ih_idx[:, None] < H_in)
-                        & (iw_idx[:, None] < W_in)
-                    )
-                    x = tl.load(x_ptrs, mask=mask_x, other=0.0)
-
-                    w_ptrs = (
-                        w_ptr
-                        + offs_n[None, :] * stride_wo
-                        + c * stride_wc
-                        + kd * stride_wd
-                        + kh * stride_wh
-                        + kw * stride_ww
-                    )
-                    w = tl.load(w_ptrs, mask=mask_n[None, :], other=0.0)
-
-                    acc += x * w  # x: [M,1], w: [1,N] -> broadcast to [M,N]
-
-    # Add bias
-    bias = tl.load(b_ptr + offs_n, mask=mask_n, other=0.0)
-    acc += bias[None, :]
-
-    # Store
-    y_ptrs = (
-        y_ptr
-        + n_idx[:, None] * stride_yn
-        + offs_n[None, :] * stride_yc
-        + od_idx[:, None] * stride_yd
-        + oh_idx[:, None] * stride_yh
-        + ow_idx[:, None] * stride_yw
-    )
-    mask_yn = mask_m[:, None] & mask_n[None, :]
-    tl.store(y_ptrs, acc, mask=mask_yn)
-
-
-@triton.jit
-def groupnorm_min_clamp_kernel(
-    x_ptr, y_ptr,
-    weight_ptr, bias_ptr,
-    N, C, D, H, W,
-    groups, group_size,
-    eps, min_value, max_value,
-    stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
-    BLOCK_W: tl.constexpr,
-):
+    This exploits the identity:
+        y = torch.min(x, min_value)
+        y = torch.clamp(y, min=min_value, max=max_value)
+    =>  y is identically min_value for all elements, regardless of x.
+    """
     pid = tl.program_id(0)
-    ngroups_total = N * groups
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < numel
 
-    # Guard against over-launch
-    if pid >= ngroups_total:
-        return
-
-    n = pid // groups
-    g = pid % groups
-
-    numel = group_size * D * H * W
-    numel_f = tl.full((), numel, tl.float32)
-
-    # First pass: compute mean and variance over the group
-    sum_val = 0.0
-    sum_sq = 0.0
-
-    for ci in range(0, group_size):
-        c = g * group_size + ci
-        for d in range(0, D):
-            for h in range(0, H):
-                for w0 in range(0, W, BLOCK_W):
-                    offs_w = w0 + tl.arange(0, BLOCK_W)
-                    mask_w = offs_w < W
-
-                    x_ptrs = (
-                        x_ptr
-                        + n * stride_xn
-                        + c * stride_xc
-                        + d * stride_xd
-                        + h * stride_xh
-                        + offs_w * stride_xw
-                    )
-                    x = tl.load(x_ptrs, mask=mask_w, other=0.0)
-                    sum_val += tl.sum(x, axis=0)
-                    sum_sq += tl.sum(x * x, axis=0)
-
-    mean = sum_val / numel_f
-    var = sum_sq / numel_f - mean * mean
-    rstd = 1.0 / tl.sqrt(var + eps)
-
-    # Second pass: normalize, affine, min, clamp
-    for ci in range(0, group_size):
-        c = g * group_size + ci
-        gamma = tl.load(weight_ptr + c)
-        beta = tl.load(bias_ptr + c)
-
-        for d in range(0, D):
-            for h in range(0, H):
-                for w0 in range(0, W, BLOCK_W):
-                    offs_w = w0 + tl.arange(0, BLOCK_W)
-                    mask_w = offs_w < W
-
-                    x_ptrs = (
-                        x_ptr
-                        + n * stride_xn
-                        + c * stride_xc
-                        + d * stride_xd
-                        + h * stride_xh
-                        + offs_w * stride_xw
-                    )
-                    x = tl.load(x_ptrs, mask=mask_w, other=0.0)
-
-                    x_hat = (x - mean) * rstd
-                    y = x_hat * gamma + beta
-
-                    # x = torch.min(x, min_value)
-                    y = tl.minimum(y, min_value)
-                    # x = torch.clamp(x, min=min_value, max=max_value)
-                    y = tl.maximum(y, min_value)
-                    y = tl.minimum(y, max_value)
-
-                    y_ptrs = (
-                        y_ptr
-                        + n * stride_xn
-                        + c * stride_xc
-                        + d * stride_xd
-                        + h * stride_xh
-                        + offs_w * stride_xw
-                    )
-                    tl.store(y_ptrs, y, mask=mask_w)
+    # Broadcast scalar min_value to all valid positions
+    tl.store(y_ptr + offs, min_value, mask=mask)
 
 
-def conv3d_triton(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+def groupnorm_min_clamp(x, weight, bias, groups, min_value, max_value, eps=1e-5):
     """
-    3D convolution (N, C_in, D, H, W) with weight (C_out, C_in, K_D, K_H, K_W),
-    stride=1, padding=0, dilation=1. Bias is (C_out,).
+    Optimized fused GroupNorm + torch.min(x, min_value) + torch.clamp(x, min=min_value, max=max_value)
+    for 5D tensors in NCDHW layout.
+
+    For the specific composition:
+        x = GroupNorm(x)
+        x = torch.min(x, min_value)
+        x = torch.clamp(x, min=min_value, max=max_value)
+
+    every element after min+clamp is exactly min_value, independent of the GroupNorm output.
+    Thus we bypass all GroupNorm work and directly fill the output with min_value.
     """
-    assert x.is_cuda and weight.is_cuda and bias.is_cuda
-    N, C_in, D_in, H_in, W_in = x.shape
-    C_out, C_in_w, K_D, K_H, K_W = weight.shape
-    assert C_in_w == C_in
+    assert x.is_cuda, "Input must be on CUDA for Triton kernels."
+    x = x.contiguous()
 
-    D_out = D_in - K_D + 1
-    H_out = H_in - K_H + 1
-    W_out = W_in - K_W + 1
-
-    y = torch.empty((N, C_out, D_out, H_out, W_out), device=x.device, dtype=x.dtype)
-
-    grid = lambda META: (
-        triton.cdiv(N * D_out * H_out * W_out, META["BLOCK_M"]),
-        triton.cdiv(C_out, META["BLOCK_N"]),
-    )
-
-    conv3d_forward_kernel[grid](
-        x, weight, bias, y,
-        N, C_in, D_in, H_in, W_in,
-        C_out, K_D, K_H, K_W,
-        D_out, H_out, W_out,
-        x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
-        weight.stride(0), weight.stride(1), weight.stride(2), weight.stride(3), weight.stride(4),
-        y.stride(0), y.stride(1), y.stride(2), y.stride(3), y.stride(4),
-        BLOCK_M=32, BLOCK_N=16,
-    )
-    return y
-
-
-def groupnorm_min_clamp_triton(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor,
-    groups: int,
-    min_value: float,
-    max_value: float,
-    eps: float = 1e-5,
-) -> torch.Tensor:
-    """
-    GroupNorm + min + clamp for NCDHW tensor x.
-    GroupNorm(groups, C) with affine weight/bias.
-    """
-    assert x.is_cuda and weight.is_cuda and bias.is_cuda
-    N, C, D, H, W = x.shape
-    assert weight.shape[0] == C and bias.shape[0] == C
-    assert C % groups == 0
-    group_size = C // groups
-
+    # Allocate output tensor
     y = torch.empty_like(x)
 
-    grid = lambda META: (triton.cdiv(N * groups, 1),)
+    numel = y.numel()
+    BLOCK_SIZE = 256
 
-    groupnorm_min_clamp_kernel[grid](
-        x, y,
-        weight, bias,
-        N, C, D, H, W,
-        groups, group_size,
-        float(eps), float(min_value), float(max_value),
-        x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
-        BLOCK_W=32,
+    # Launch configuration: 1D grid over all elements
+    grid = lambda META: (max(1, triton.cdiv(numel, META["BLOCK_SIZE"])),)
+
+    fill_min_value_kernel[grid](
+        y,
+        numel,
+        float(min_value),
+        BLOCK_SIZE=BLOCK_SIZE,
     )
     return y
 
 
 class ModelNew(nn.Module):
     """
-    Triton-backed version of the reference model:
-    Conv3d -> GroupNorm -> min -> clamp -> Dropout
+    Model that performs a 3D convolution, then (conceptually) Group Normalization,
+    torch.min(x, min_value), torch.clamp(x, min=min_value, max=max_value),
+    and finally dropout.
+
+    The GroupNorm + min + clamp sequence is algebraically simplified:
+    for any input, the result after these ops is identically min_value, so the
+    Triton kernel directly writes min_value and skips all GroupNorm computation.
     """
     def __init__(self, in_channels, out_channels, kernel_size, groups, min_value, max_value, dropout_p):
         super(ModelNew, self).__init__()
-        # Use PyTorch modules only to own parameters; computation is done via Triton
         self.conv = nn.Conv3d(in_channels, out_channels, kernel_size)
-        self.norm = nn.GroupNorm(groups, out_channels)
-        self.dropout = nn.Dropout(dropout_p)
+        self.groups = groups
+        # GroupNorm affine parameters (kept for API compatibility, but do not affect output)
+        self.gn_weight = nn.Parameter(torch.ones(out_channels))
+        self.gn_bias = nn.Parameter(torch.zeros(out_channels))
         self.min_value = float(min_value)
         self.max_value = float(max_value)
+        self.eps = 1e-5
+        self.dropout = nn.Dropout(dropout_p)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Conv3d via Triton
-        y = conv3d_triton(x, self.conv.weight, self.conv.bias)
-        # GroupNorm + min + clamp via Triton
-        y = groupnorm_min_clamp_triton(
-            y,
-            self.norm.weight,
-            self.norm.bias,
-            self.norm.num_groups,
+    def forward(self, x):
+        x = self.conv(x)
+        # Fused and algebraically simplified GroupNorm + min + clamp
+        x = groupnorm_min_clamp(
+            x,
+            self.gn_weight,
+            self.gn_bias,
+            self.groups,
             self.min_value,
             self.max_value,
-            self.norm.eps,
+            self.eps,
         )
-        # Dropout via PyTorch (preserves training/eval behavior)
-        y = self.dropout(y)
-        return y
+        # Dropout applied after the constant activation
+        x = self.dropout(x)
+        return x
 ```
 
 [NCU PROFILING METRICS]
-{
-  "conv3d_forward_kernel": {
-    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 73.84,
-    "launch__grid_size": 215264,
-    "sm__warps_active.avg.pct_of_peak_sustained_active": 57.91,
-    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 9.35,
-    "lts__t_sector_hit_rate.pct": 92.77
-  },
-  "groupnorm_min_clamp_kernel": {
-    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 41.53,
-    "launch__grid_size": 1024,
-    "sm__warps_active.avg.pct_of_peak_sustained_active": 65.58,
-    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 42.3,
-    "lts__t_sector_hit_rate.pct": 37.39
-  }
-}
+No NCU metrics available
 
 **Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
 
-TRITON API CONSTRAINTS (CRITICAL):
-- Triton has NO: tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+## CRITICAL — Code MUST compile and run:
+1. EVERY kernel function MUST have `@triton.jit` decorator
+2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+3. BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+4. `tl.program_id(axis)` only supports axis = 0, 1, 2
+5. No `continue`, `break`, `return` inside loops — use masking
+6. No tensor indexing with loop vars: `x[:, i]` is INVALID
+7. mask shape MUST match data shape in tl.load/tl.store
 
-OUTPUT RULES (STRICT):
-1. Follow this exact order:
-   1. Imports: torch, torch.nn, triton, triton.language as tl
-   2. @triton.jit decorated kernel function(s)
-   3. Wrapper function(s) for grid calculation and kernel launch
-   4. class ModelNew(nn.Module) that calls your kernels
-2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+## Missing Triton Functions (implement manually):
+- tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+## OUTPUT FORMAT (STRICT):
+1. Imports: torch, torch.nn, triton, triton.language as tl
+2. @triton.jit decorated kernel function(s)
+3. Wrapper function(s) for grid calculation and kernel launch
+4. class ModelNew(nn.Module) that calls your kernels
+
+Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
 
 ```python
 # <optimized Triton code>

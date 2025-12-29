@@ -1,0 +1,81 @@
+import math
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def swish_scale_inplace_kernel(
+    x_ptr,
+    n_elements,
+    scaling_factor,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < n_elements
+
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+    x_f = x.to(tl.float32)
+
+    # Swish: x * sigmoid(x)
+    sig = 1.0 / (1.0 + tl.exp(-x_f))
+    y = (x_f * sig * scaling_factor).to(x.dtype)
+
+    tl.store(x_ptr + offs, y, mask=mask)
+
+
+def fused_linear_swish_scale(x, weight, bias, scaling_factor: float):
+    """
+    x:       [M, K]
+    weight:  [N, K]  (same as nn.Linear.weight)
+    bias:    [N]
+    output:  [M, N] = Swish(x @ weight.T + bias) * scaling_factor
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+    assert x.dtype == weight.dtype == bias.dtype
+
+    # Delegate GEMM + bias to cuBLAS via PyTorch's highly-optimized Linear
+    y = torch.nn.functional.linear(x, weight, bias)  # [M, N], contiguous
+
+    # Fused Swish + scaling epilogue in Triton (in-place)
+    n_elements = y.numel()
+    BLOCK_SIZE = 1024
+
+    def grid(meta):
+        return (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+
+    swish_scale_inplace_kernel[grid](
+        y,
+        n_elements,
+        float(scaling_factor),
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=4,
+        num_stages=2,
+    )
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-accelerated version of:
+        y = Linear(x)
+        y = y * sigmoid(y)   # Swish
+        y = y * scaling_factor
+    """
+    def __init__(self, in_features, out_features, scaling_factor):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias = nn.Parameter(torch.empty(out_features))
+        self.scaling_factor = float(scaling_factor)
+
+        # Initialize like nn.Linear
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+        bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+        nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Shape-preserving: input [B, in_features] -> output [B, out_features]
+        return fused_linear_swish_scale(x, self.weight, self.bias, self.scaling_factor)

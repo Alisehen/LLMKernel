@@ -1,0 +1,247 @@
+Fix the Triton kernel errors. Generate correct code.
+
+## ERROR LOG
+```
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 644, in compare_and_bench
+    raise ValueError(
+ValueError: Outputs are not close (atol=1, rtol=1). max_abs_err=3.593e+00, mean_abs_err=1.744e+00
+```
+
+## Previous Failed Attempts (DO NOT repeat these mistakes):
+[Attempt 1] File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 644, in compare_and_bench | raise ValueError( | ValueError: Outputs are not close (atol=1, rtol=1). max_abs_err=3.595e+00, mean_abs_err=1.744e
+[Attempt 2] File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 644, in compare_and_bench | raise ValueError( | ValueError: Outputs are not close (atol=1, rtol=1). max_abs_err=3.593e+00, mean_abs_err=1.744e
+[Attempt 3] File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 644, in compare_and_bench | raise ValueError( | ValueError: Outputs are not close (atol=1, rtol=1). max_abs_err=3.593e+00, mean_abs_err=1.744e
+
+
+## Broken Code
+```python
+import torch, torch.nn as nn, triton, triton.language as tl
+
+
+@triton.jit
+def conv2d_kernel(
+    x_ptr, w_ptr, bias_ptr, y_ptr,
+    N, C_out,
+    H_in, W_in,
+    H_out, W_out,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_wn, stride_wc, stride_wh, stride_ww,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    C_in: tl.constexpr,  # reduction over input channels
+    K_h: tl.constexpr,   # kernel height
+    K_w: tl.constexpr,   # kernel width
+    BLOCK_M: tl.constexpr,  # tiles over N * H_out * W_out
+    BLOCK_N: tl.constexpr,  # tiles over C_out
+):
+    # Program IDs
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    # Offsets in flattened output M-dimension: (n, h_out, w_out)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    M = N * H_out * W_out
+    HW_out = H_out * W_out
+
+    mask_m = offs_m < M
+    mask_n = offs_n < C_out
+
+    # Map M index -> (n, h_out, w_out)
+    n = (offs_m // HW_out)[:, None]        # (BM, 1)
+    rem = (offs_m % HW_out)[:, None]       # (BM, 1)
+    h_out_idx = rem // W_out               # (BM, 1)
+    w_out_idx = rem % W_out                # (BM, 1)
+
+    # Accumulator in fp32
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Output channel indices
+    co = offs_n[None, :]                   # (1, BN)
+
+    # Explicit reduction over C_in, K_h, K_w
+    for c in tl.static_range(0, C_in):
+        for kh in tl.static_range(0, K_h):
+            # input h index for all rows in this block
+            h_in_idx = h_out_idx + kh      # (BM, 1)
+
+            for kw in tl.static_range(0, K_w):
+                # input w index
+                w_in_idx = w_out_idx + kw  # (BM, 1)
+
+                # Input pointers: x[n, c, h_in_idx, w_in_idx]
+                x_ptrs = (
+                    x_ptr
+                    + n * stride_xn
+                    + c * stride_xc
+                    + h_in_idx * stride_xh
+                    + w_in_idx * stride_xw
+                )
+                mask_x = mask_m[:, None]
+                x_vals = tl.load(x_ptrs, mask=mask_x, other=0.0).to(tl.float32)
+
+                # Weight pointers: w[co, c, kh, kw]
+                w_ptrs = (
+                    w_ptr
+                    + co * stride_wn
+                    + c * stride_wc
+                    + kh * stride_wh
+                    + kw * stride_ww
+                )
+                mask_w = mask_n[None, :]
+                w_vals = tl.load(w_ptrs, mask=mask_w, other=0.0).to(tl.float32)
+
+                # Outer-product accumulate
+                acc += x_vals * w_vals
+
+    # Add bias per output channel (broadcast over M)
+    bias = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0).to(tl.float32)  # (BN,)
+    acc = acc + bias[None, :]
+
+    # Store result to y: [N, C_out, H_out, W_out]
+    y_ptrs = (
+        y_ptr
+        + n * stride_yn
+        + co * stride_yc
+        + h_out_idx * stride_yh
+        + w_out_idx * stride_yw
+    )
+    mask_y = mask_m[:, None] & mask_n[None, :]
+    tl.store(y_ptrs, acc, mask=mask_y)
+
+
+def fused_conv_bn_scale(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    bn_weight: torch.Tensor,
+    bn_bias: torch.Tensor,
+    running_mean: torch.Tensor,
+    running_var: torch.Tensor,
+    eps: float,
+    scaling_factor: float,
+):
+    # x: [N, C_in, H_in, W_in]
+    x = x.contiguous()
+    weight = weight.contiguous()
+    if bias is not None:
+        bias = bias.contiguous()
+    else:
+        bias = torch.zeros(weight.size(0), device=x.device, dtype=x.dtype)
+
+    N, C_in, H_in, W_in = x.shape
+    C_out, C_w_in, K_h, K_w = weight.shape
+    assert C_w_in == C_in, "Conv weight in_channels mismatch"
+
+    # Valid convolution: padding=0, stride=1, dilation=1
+    H_out = H_in - K_h + 1
+    W_out = W_in - K_w + 1
+
+    # Allocate output for conv(x) + bias
+    z = torch.empty((N, C_out, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    # Launch Triton conv2d kernel
+    grid = lambda META: (
+        triton.cdiv(N * H_out * W_out, META["BLOCK_M"]),
+        triton.cdiv(C_out, META["BLOCK_N"]),
+    )
+
+    conv2d_kernel[grid](
+        x, weight, bias, z,
+        N, C_out,
+        H_in, W_in,
+        H_out, W_out,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        weight.stride(0), weight.stride(1), weight.stride(2), weight.stride(3),
+        z.stride(0), z.stride(1), z.stride(2), z.stride(3),
+        C_in=C_in,
+        K_h=K_h,
+        K_w=K_w,
+        BLOCK_M=64,
+        BLOCK_N=64,
+        num_warps=4,
+        num_stages=2,
+    )
+
+    # BatchNorm (inference-style) + global scaling:
+    # y = scaling_factor * [ bn_weight * (z - running_mean) / sqrt(running_var + eps) + bn_bias ]
+    inv_std = torch.rsqrt(running_var + eps)  # [C_out]
+
+    # Reshape for broadcasting over N, H_out, W_out
+    bn_w = bn_weight.view(1, -1, 1, 1)
+    bn_b = bn_bias.view(1, -1, 1, 1)
+    mean = running_mean.view(1, -1, 1, 1)
+    inv_std_b = inv_std.view(1, -1, 1, 1)
+
+    y = scaling_factor * (bn_w * (z - mean) * inv_std_b + bn_b)
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-accelerated model:
+    Conv2d + BatchNorm2d (inference-style) + scaling.
+    Convolution is computed in a Triton kernel; BN + scale in PyTorch for
+    numerical correctness matching nn.Conv2d + nn.BatchNorm2d + scalar multiply.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, scaling_factor):
+        super(ModelNew, self).__init__()
+        if isinstance(kernel_size, int):
+            k_h = k_w = kernel_size
+        else:
+            k_h, k_w = kernel_size
+
+        # Conv parameters
+        self.weight = nn.Parameter(
+            torch.randn(out_channels, in_channels, k_h, k_w)
+        )
+        self.bias = nn.Parameter(torch.randn(out_channels))
+
+        # BatchNorm-like parameters (inference behavior)
+        self.bn_weight = nn.Parameter(torch.ones(out_channels))
+        self.bn_bias = nn.Parameter(torch.zeros(out_channels))
+        self.register_buffer("running_mean", torch.zeros(out_channels))
+        self.register_buffer("running_var", torch.ones(out_channels))
+        self.bn_eps = 1e-5
+
+        # Final scaling factor
+        self.scaling_factor = float(scaling_factor)
+
+    def forward(self, x):
+        return fused_conv_bn_scale(
+            x,
+            self.weight,
+            self.bias,
+            self.bn_weight,
+            self.bn_bias,
+            self.running_mean,
+            self.running_var,
+            self.bn_eps,
+            self.scaling_factor,
+        )
+```
+
+## CRITICAL — These cause 60%+ of failures:
+1. EVERY kernel function MUST have `@triton.jit` decorator — MANDATORY
+2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+3. BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+4. `tl.program_id(axis)` only supports axis = 0, 1, 2
+5. No `continue`, `break`, `return` inside loops — use masking
+6. No tensor indexing with loop vars: `x[:, i]` is INVALID
+7. mask shape MUST match data shape in tl.load/tl.store
+
+## Missing Triton Functions (implement manually):
+- tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+## OUTPUT FORMAT (STRICT):
+1. Imports: torch, torch.nn, triton, triton.language as tl (and math if needed)
+2. @triton.jit decorated kernel function(s)
+3. Wrapper function(s) for grid calculation and kernel launch
+4. class ModelNew(nn.Module) — REQUIRED
+
+Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <corrected code>
+```

@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The pipeline still materializes and processes a large upsampled feature map before pooling, which is a clear bandwidth-heavy inefficiency.",
+  "bottleneck": "ConvTranspose3d writes a 2× upsampled 3D volume in each spatial dimension, and the fused Triton kernel then reads this large tensor only to immediately downsample it with non‑overlapping MaxPool3d; this redundant IO dominates memory traffic and latency.",
+  "optimisation method": "Replace the current sequence ConvTranspose3d → LeakyReLU → channel-wise multiply → LeakyReLU → MaxPool3d(stride=2,kernel=2) with a single custom Triton kernel that performs a ‘pooled transposed convolution’: it computes, for each pooled output voxel, the 2×2×2 transposed‑conv outputs on the fly, applies the two LeakyReLUs and multiplier inline, and directly takes the max without ever materializing the high‑resolution intermediate.",
+  "modification plan": "Implement a Triton kernel that iterates over input (N, C_in, D, H, W) and weights to accumulate the eight transposed‑conv contributions corresponding to each 2×2×2 pooling window, applying the two LeakyReLUs and per‑channel scalar multiplier inside the accumulation loop and keeping only the running max per output voxel. Wire this kernel into ModelNew to replace both the PyTorch ConvTranspose3d and the current fused post‑conv Triton kernel, ensuring the output layout and numerical behavior remain identical. Once correct, tune block sizes/tiling for (N, C_out, D, H, W) to maximize cache reuse over input tiles and filters.",
+  "expected_speedup": "20-30%"
+}

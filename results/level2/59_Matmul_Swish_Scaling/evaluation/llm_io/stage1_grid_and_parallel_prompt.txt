@@ -28,86 +28,59 @@ Verification:
 
 [CURRENT CODE]
 ```python
-import torch, torch.nn as nn, triton, triton.language as tl
+import math
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
 
 
 @triton.jit
-def swish_scale_bias_kernel(
-    y_ptr,       # [M, N] GEMM output, row-major
-    bias_ptr,    # [N]
-    M, N,
-    stride_y0, stride_y1,
-    scale,       # scalar float
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
+def swish_scale_inplace_kernel(
+    x_ptr,
+    n_elements,
+    scaling_factor,
+    BLOCK_SIZE: tl.constexpr,
 ):
-    # 2D program ids
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < n_elements
 
-    # Offsets
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-
-    mask_m = offs_m < M
-    mask_n = offs_n < N
-    mask = mask_m[:, None] & mask_n[None, :]
-
-    # Pointers into y
-    y_ptrs = y_ptr + offs_m[:, None] * stride_y0 + offs_n[None, :] * stride_y1
-    y = tl.load(y_ptrs, mask=mask, other=0.0)
-
-    # Load bias for columns in this tile and broadcast along rows
-    bias = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0)  # [BLOCK_N]
-    x = y + bias[None, :]
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+    x_f = x.to(tl.float32)
 
     # Swish: x * sigmoid(x)
-    sig = 1.0 / (1.0 + tl.exp(-x))
-    out = x * sig * scale
+    sig = 1.0 / (1.0 + tl.exp(-x_f))
+    y = (x_f * sig * scaling_factor).to(x.dtype)
 
-    # Store result back to y (in-place epilogue)
-    tl.store(y_ptrs, out, mask=mask)
+    tl.store(x_ptr + offs, y, mask=mask)
 
 
-def linear_swish_scale(x: torch.Tensor,
-                       weight: torch.Tensor,
-                       bias: torch.Tensor,
-                       scale: float) -> torch.Tensor:
+def fused_linear_swish_scale(x, weight, bias, scaling_factor: float):
     """
-    x:      [M, K]
-    weight: [N, K]  (nn.Linear.weight, out_features x in_features)
-    bias:   [N]
-    scale:  scalar float
-
-    Returns:
-        y: [M, N] = (x @ weight.T + bias) * sigmoid(x @ weight.T + bias) * scale
+    x:       [M, K]
+    weight:  [N, K]  (same as nn.Linear.weight)
+    bias:    [N]
+    output:  [M, N] = Swish(x @ weight.T + bias) * scaling_factor
     """
-    assert x.is_cuda and weight.is_cuda and bias.is_cuda, "All tensors must be on CUDA"
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+    assert x.dtype == weight.dtype == bias.dtype
 
-    # GEMM using cuBLAS / PyTorch (highly optimized)
-    # x: [M, K], weight.t(): [K, N] -> y: [M, N]
-    y = torch.matmul(x, weight.t())  # same as nn.functional.linear(x, weight, None)
+    # Delegate GEMM + bias to cuBLAS via PyTorch's highly-optimized Linear
+    y = torch.nn.functional.linear(x, weight, bias)  # [M, N], contiguous
 
-    M, N = y.shape
-    # Ensure contiguous memory for best Triton access pattern
-    y = y.contiguous()
+    # Fused Swish + scaling epilogue in Triton (in-place)
+    n_elements = y.numel()
+    BLOCK_SIZE = 1024
 
-    # Launch Triton epilogue kernel: bias + Swish + scale
-    BLOCK_M = 64
-    BLOCK_N = 128
+    def grid(meta):
+        return (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
 
-    grid = (
-        triton.cdiv(M, BLOCK_M),
-        triton.cdiv(N, BLOCK_N),
-    )
-
-    swish_scale_bias_kernel[grid](
-        y, bias,
-        M, N,
-        y.stride(0), y.stride(1),
-        float(scale),
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
+    swish_scale_inplace_kernel[grid](
+        y,
+        n_elements,
+        float(scaling_factor),
+        BLOCK_SIZE=BLOCK_SIZE,
         num_warps=4,
         num_stages=2,
     )
@@ -116,36 +89,36 @@ def linear_swish_scale(x: torch.Tensor,
 
 class ModelNew(nn.Module):
     """
-    Optimized version of the model:
-
-    forward(x):
-        y = x @ W^T + b
-        y = y * sigmoid(y)    # Swish
+    Triton-accelerated version of:
+        y = Linear(x)
+        y = y * sigmoid(y)   # Swish
         y = y * scaling_factor
     """
     def __init__(self, in_features, out_features, scaling_factor):
         super(ModelNew, self).__init__()
-        # Use nn.Linear for parameter handling and initialization
-        self.linear = nn.Linear(in_features, out_features)
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias = nn.Parameter(torch.empty(out_features))
         self.scaling_factor = float(scaling_factor)
 
+        # Initialize like nn.Linear
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+        bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+        nn.init.uniform_(self.bias, -bound, bound)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return linear_swish_scale(
-            x,
-            self.linear.weight,
-            self.linear.bias,
-            self.scaling_factor,
-        )
+        # Shape-preserving: input [B, in_features] -> output [B, out_features]
+        return fused_linear_swish_scale(x, self.weight, self.bias, self.scaling_factor)
 ```
 
 [NCU PROFILING METRICS]
 {
-  "swish_scale_bias_kernel": {
-    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 8.54,
-    "launch__grid_size": 512,
-    "sm__warps_active.avg.pct_of_peak_sustained_active": 30.63,
-    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 68.15,
-    "lts__t_sector_hit_rate.pct": 50.42
+  "swish_scale_inplace_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 9.47,
+    "launch__grid_size": 4096,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 75.43,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 83.0,
+    "lts__t_sector_hit_rate.pct": 50.25
   }
 }
 

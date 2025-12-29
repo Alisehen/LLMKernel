@@ -1,0 +1,518 @@
+Fix the Triton kernel errors. Generate correct code.
+
+## ERROR LOG
+```
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 555, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251228_161811_batch_range79to85_openai_deepseek/85_Conv2d_GroupNorm_Scale_MaxPool_Clamp/code/kernel_20251228_174021.py", line 418, in forward
+    x = groupnorm_scale_triton(
+        ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251228_161811_batch_range79to85_openai_deepseek/85_Conv2d_GroupNorm_Scale_MaxPool_Clamp/code/kernel_20251228_174021.py", line 246, in groupnorm_scale_triton
+    groupnorm_scale_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 419, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 733, in run
+    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 861, in _do_compile
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 300, in compile
+    module = src.make_ir(target, options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 80, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 18:10:
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    stride_scale_c,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_SIZE)
+
+    n = pid // num_groups
+    g = pid - n * num_groups
+
+    S = group_size * H * W  # elements per group
+    S_f = tl.astype(S, tl.float32)
+          ^
+AttributeError("module 'triton.language' has no attribute 'astype'")
+```
+
+## Previous Failed Attempts (DO NOT repeat these mistakes):
+[Attempt 1] S_f = tl.float32(S) | ^ | TypeError("'dtype' object is not callable")
+
+
+## Broken Code
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+# ---------------------------------------------------------------------------
+# 2D Convolution kernel (NCHW, no padding, stride=1, dilation=1, groups=1)
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def conv2d_forward_kernel(
+    x_ptr, w_ptr, b_ptr, y_ptr,
+    N, C_in, H, W,
+    OC, K, H_out, W_out,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_wn, stride_wc, stride_wh, stride_ww,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    BLOCK_OC: tl.constexpr, BLOCK_W: tl.constexpr,
+):
+    pid_nh = tl.program_id(0)
+    pid_oc = tl.program_id(1)
+    pid_w = tl.program_id(2)
+
+    offs_oc = pid_oc * BLOCK_OC + tl.arange(0, BLOCK_OC)
+    offs_w = pid_w * BLOCK_W + tl.arange(0, BLOCK_W)
+
+    oc_mask = offs_oc < OC
+    w_mask = offs_w < W_out
+
+    # Decode (n, h_out) from pid_nh
+    n = pid_nh // H_out
+    h_out = pid_nh - n * H_out
+
+    acc = tl.zeros((BLOCK_OC, BLOCK_W), dtype=tl.float32)
+
+    # Convolution over input channels and kernel spatial dims
+    for c in range(0, C_in):
+        for kh in range(0, K):
+            h_in = h_out + kh
+            x_base = x_ptr + n * stride_xn + c * stride_xc + h_in * stride_xh
+            for kw in range(0, K):
+                w_in = offs_w + kw
+                x_ptrs = x_base + w_in * stride_xw
+                x = tl.load(x_ptrs, mask=w_mask, other=0.0).to(tl.float32)
+
+                w_base = (
+                    w_ptr
+                    + offs_oc * stride_wn
+                    + c * stride_wc
+                    + kh * stride_wh
+                    + kw * stride_ww
+                )
+                w = tl.load(w_base, mask=oc_mask, other=0.0).to(tl.float32)
+
+                acc += w[:, None] * x[None, :]
+
+    # Add bias
+    b = tl.load(b_ptr + offs_oc, mask=oc_mask, other=0.0).to(tl.float32)
+    acc += b[:, None]
+
+    y_ptrs = (
+        y_ptr
+        + n * stride_yn
+        + offs_oc[:, None] * stride_yc
+        + h_out * stride_yh
+        + offs_w[None, :] * stride_yw
+    )
+    tl.store(y_ptrs, acc.to(tl.float32), mask=oc_mask[:, None] & w_mask[None, :])
+
+
+def conv2d_triton(x, weight, bias):
+    """
+    x: (N, C_in, H, W)
+    weight: (OC, C_in, K, K)
+    bias: (OC,)
+    No padding, stride=1, dilation=1, groups=1.
+    """
+    x = x.contiguous()
+    weight = weight.contiguous()
+    bias = bias.contiguous()
+
+    N, C_in, H, W = x.shape
+    OC, C_w, K, K_w = weight.shape
+    assert C_w == C_in
+    assert K == K_w  # square kernel
+
+    H_out = H - K + 1
+    W_out = W - K + 1
+
+    y = torch.empty((N, OC, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    stride_xn, stride_xc, stride_xh, stride_xw = x.stride()
+    stride_wn, stride_wc, stride_wh, stride_ww = weight.stride()
+    stride_yn, stride_yc, stride_yh, stride_yw = y.stride()
+
+    BLOCK_OC = 32
+    BLOCK_W = 64
+
+    grid = lambda META: (
+        N * H_out,
+        triton.cdiv(OC, META["BLOCK_OC"]),
+        triton.cdiv(W_out, META["BLOCK_W"]),
+    )
+
+    conv2d_forward_kernel[grid](
+        x, weight, bias, y,
+        N, C_in, H, W,
+        OC, K, H_out, W_out,
+        stride_xn, stride_xc, stride_xh, stride_xw,
+        stride_wn, stride_wc, stride_wh, stride_ww,
+        stride_yn, stride_yc, stride_yh, stride_yw,
+        BLOCK_OC=BLOCK_OC,
+        BLOCK_W=BLOCK_W,
+        num_warps=4,
+        num_stages=2,
+    )
+    return y
+
+
+# ---------------------------------------------------------------------------
+# GroupNorm + scale kernel
+#   GroupNorm(num_groups, C) with affine (gamma, beta), then multiply by scale
+#   y = ((x - mean) / sqrt(var + eps) * gamma + beta) * scale
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def groupnorm_scale_kernel(
+    x_ptr, gamma_ptr, beta_ptr, scale_ptr, y_ptr,
+    N, C, H, W,
+    num_groups, group_size,
+    eps,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    stride_scale_c,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_SIZE)
+
+    n = pid // num_groups
+    g = pid - n * num_groups
+
+    S = group_size * H * W  # elements per group
+    S_f = tl.astype(S, tl.float32)
+
+    # First pass: compute mean and variance
+    sum_val = tl.zeros((), dtype=tl.float32)
+    sum_sq = tl.zeros((), dtype=tl.float32)
+
+    for offset in range(0, S, BLOCK_SIZE):
+        idx = offset + offs
+        mask = idx < S
+
+        c_local = idx // (H * W)
+        hw = idx - c_local * (H * W)
+        h = hw // W
+        w = hw - h * W
+
+        c_global = g * group_size + c_local
+
+        x_ptrs = (
+            x_ptr
+            + n * stride_xn
+            + c_global * stride_xc
+            + h * stride_xh
+            + w * stride_xw
+        )
+        x = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+        sum_val += tl.sum(x, axis=0)
+        sum_sq += tl.sum(x * x, axis=0)
+
+    mean = sum_val / S_f
+    var = sum_sq / S_f - mean * mean
+    rstd = 1.0 / tl.sqrt(var + eps)
+
+    # Second pass: normalize, apply affine (gamma, beta), then scale
+    for offset in range(0, S, BLOCK_SIZE):
+        idx = offset + offs
+        mask = idx < S
+
+        c_local = idx // (H * W)
+        hw = idx - c_local * (H * W)
+        h = hw // W
+        w = hw - h * W
+
+        c_global = g * group_size + c_local
+
+        x_ptrs = (
+            x_ptr
+            + n * stride_xn
+            + c_global * stride_xc
+            + h * stride_xh
+            + w * stride_xw
+        )
+        x = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+        gamma = tl.load(gamma_ptr + c_global, mask=c_global < C, other=1.0).to(tl.float32)
+        beta = tl.load(beta_ptr + c_global, mask=c_global < C, other=0.0).to(tl.float32)
+        scale = tl.load(
+            scale_ptr + c_global * stride_scale_c,
+            mask=c_global < C,
+            other=1.0,
+        ).to(tl.float32)
+
+        x_hat = (x - mean) * rstd
+        y = x_hat * gamma * scale + beta * scale
+
+        y_ptrs = (
+            y_ptr
+            + n * stride_yn
+            + c_global * stride_yc
+            + h * stride_yh
+            + w * stride_yw
+        )
+        tl.store(y_ptrs, y, mask=mask)
+
+
+def groupnorm_scale_triton(x, num_groups, weight, bias, scale, eps=1e-5):
+    """
+    x: (N, C, H, W)
+    weight: (C,) - GroupNorm gamma
+    bias: (C,)   - GroupNorm beta
+    scale: (C, 1, 1) or (C,) - per-channel scaling after GroupNorm
+    """
+    x = x.contiguous()
+    weight = weight.contiguous()
+    bias = bias.contiguous()
+    scale = scale.contiguous().view(-1)
+
+    N, C, H, W = x.shape
+    assert C % num_groups == 0
+    group_size = C // num_groups
+
+    y = torch.empty_like(x)
+
+    stride_xn, stride_xc, stride_xh, stride_xw = x.stride()
+    stride_yn, stride_yc, stride_yh, stride_yw = y.stride()
+
+    stride_scale_c = scale.stride(0)
+
+    BLOCK_SIZE = 256
+    grid = lambda META: (N * num_groups,)
+
+    groupnorm_scale_kernel[grid](
+        x, weight, bias, scale, y,
+        N, C, H, W,
+        num_groups, group_size,
+        eps,
+        stride_xn, stride_xc, stride_xh, stride_xw,
+        stride_yn, stride_yc, stride_yh, stride_yw,
+        stride_scale_c,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=4,
+        num_stages=2,
+    )
+    return y
+
+
+# ---------------------------------------------------------------------------
+# MaxPool2d + clamp kernel
+#   MaxPool2d(kernel_size=Kp, stride=stride, padding=0), then clamp
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def maxpool_clamp_kernel(
+    x_ptr, y_ptr,
+    N, C, H_in, W_in,
+    H_out, W_out,
+    kernel_size, stride,
+    clamp_min, clamp_max,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    BLOCK_W: tl.constexpr,
+):
+    pid_nch = tl.program_id(0)
+    pid_w = tl.program_id(1)
+
+    offs_w = pid_w * BLOCK_W + tl.arange(0, BLOCK_W)
+    w_out_mask = offs_w < W_out
+
+    # Decode (n, c, h_out) from pid_nch
+    nch = C * H_out
+    n = pid_nch // nch
+    rem = pid_nch - n * nch
+    c = rem // H_out
+    h_out = rem - c * H_out
+
+    h_start = h_out * stride
+    w_start = offs_w * stride
+
+    # Initialize max with very low value
+    neg_inf = tl.full((BLOCK_W,), -1.0e30, dtype=tl.float32)
+    max_val = neg_inf
+
+    for kh in range(0, kernel_size):
+        h_in = h_start + kh
+        h_mask = h_in < H_in
+        for kw in range(0, kernel_size):
+            w_in = w_start + kw
+            in_bounds = w_in < W_in
+            mask = w_out_mask & h_mask & in_bounds
+
+            x_ptrs = (
+                x_ptr
+                + n * stride_xn
+                + c * stride_xc
+                + h_in * stride_xh
+                + w_in * stride_xw
+            )
+            x = tl.load(x_ptrs, mask=mask, other=-1.0e30).to(tl.float32)
+            max_val = tl.maximum(max_val, x)
+
+    # Clamp
+    max_val = tl.minimum(tl.maximum(max_val, clamp_min), clamp_max)
+
+    y_ptrs = (
+        y_ptr
+        + n * stride_yn
+        + c * stride_yc
+        + h_out * stride_yh
+        + offs_w * stride_yw
+    )
+    tl.store(y_ptrs, max_val, mask=w_out_mask)
+
+
+def maxpool_clamp_triton(x, kernel_size, clamp_min, clamp_max, stride=None):
+    """
+    x: (N, C, H_in, W_in)
+    MaxPool2d(kernel_size=kernel_size, stride=stride or kernel_size, padding=0),
+    then clamp to [clamp_min, clamp_max].
+    """
+    x = x.contiguous()
+    if stride is None:
+        stride = kernel_size
+
+    N, C, H_in, W_in = x.shape
+
+    H_out = (H_in - kernel_size) // stride + 1
+    W_out = (W_in - kernel_size) // stride + 1
+
+    y = torch.empty((N, C, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    stride_xn, stride_xc, stride_xh, stride_xw = x.stride()
+    stride_yn, stride_yc, stride_yh, stride_yw = y.stride()
+
+    BLOCK_W = 64
+    grid = lambda META: (
+        N * C * H_out,
+        triton.cdiv(W_out, META["BLOCK_W"]),
+    )
+
+    maxpool_clamp_kernel[grid](
+        x, y,
+        N, C, H_in, W_in,
+        H_out, W_out,
+        kernel_size, stride,
+        clamp_min, clamp_max,
+        stride_xn, stride_xc, stride_xh, stride_xw,
+        stride_yn, stride_yc, stride_yh, stride_yw,
+        BLOCK_W=BLOCK_W,
+        num_warps=4,
+        num_stages=2,
+    )
+    return y
+
+
+# ---------------------------------------------------------------------------
+# Model using Triton kernels
+# ---------------------------------------------------------------------------
+
+class ModelNew(nn.Module):
+    """
+    Model that performs:
+      - 2D convolution (no padding, stride=1)
+      - Group Normalization (with affine)
+      - Per-channel scaling
+      - Max pooling
+      - Clamping
+    All heavy ops are implemented with Triton kernels.
+    """
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size,
+        num_groups,
+        scale_shape,
+        maxpool_kernel_size,
+        clamp_min,
+        clamp_max,
+    ):
+        super(ModelNew, self).__init__()
+        # Conv parameters
+        self.weight = nn.Parameter(
+            torch.randn(out_channels, in_channels, kernel_size, kernel_size)
+        )
+        self.bias = nn.Parameter(torch.randn(out_channels))
+
+        # GroupNorm parameters (affine)
+        self.num_groups = num_groups
+        self.gn_weight = nn.Parameter(torch.ones(out_channels))
+        self.gn_bias = nn.Parameter(torch.zeros(out_channels))
+
+        # Per-channel scale applied after GroupNorm
+        self.scale = nn.Parameter(torch.ones(scale_shape))
+
+        # MaxPool and clamp hyperparameters
+        self.maxpool_kernel_size = maxpool_kernel_size
+        self.clamp_min = clamp_min
+        self.clamp_max = clamp_max
+
+    def forward(self, x):
+        # Conv2d
+        x = conv2d_triton(x, self.weight, self.bias)
+        # GroupNorm + scale
+        x = groupnorm_scale_triton(
+            x,
+            self.num_groups,
+            self.gn_weight,
+            self.gn_bias,
+            self.scale,
+            eps=1e-5,
+        )
+        # MaxPool + clamp
+        x = maxpool_clamp_triton(
+            x,
+            self.maxpool_kernel_size,
+            self.clamp_min,
+            self.clamp_max,
+        )
+        return x
+```
+
+## CRITICAL — These cause 60%+ of failures:
+1. EVERY kernel function MUST have `@triton.jit` decorator — MANDATORY
+2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+3. BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+4. `tl.program_id(axis)` only supports axis = 0, 1, 2
+5. No `continue`, `break`, `return` inside loops — use masking
+6. No tensor indexing with loop vars: `x[:, i]` is INVALID
+7. mask shape MUST match data shape in tl.load/tl.store
+
+## Missing Triton Functions (implement manually):
+- tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+## OUTPUT FORMAT (STRICT):
+1. Imports: torch, torch.nn, triton, triton.language as tl (and math if needed)
+2. @triton.jit decorated kernel function(s)
+3. Wrapper function(s) for grid calculation and kernel launch
+4. class ModelNew(nn.Module) — REQUIRED
+
+Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <corrected code>
+```

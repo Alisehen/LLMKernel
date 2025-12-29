@@ -5,121 +5,191 @@ import triton
 import triton.language as tl
 
 
+@triton.autotune(
+    configs=[
+        # Main config: balanced tile, conservative for register pressure
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+        # Skinnier N for tall matrices / different register trade-off
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+        # Small fallback tile for high-occupancy / edge cases
+        triton.Config(
+            {'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 32},
+            num_warps=2,
+            num_stages=2,
+        ),
+    ],
+    key=['M', 'N', 'K'],
+)
 @triton.jit
-def fused_activation_kernel(
-    input_ptr,
-    output_ptr,
-    M, N,
-    stride_m, stride_n,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
+def fused_linear_swish_div_clamp_tanh_clamp_kernel(
+    a_ptr, w_ptr, bias_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_wk, stride_wn,
+    stride_cm, stride_cn,
+    HAS_BIAS: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
-    """Optimized fused activation kernel for 2D tensors."""
+    # 2D program id for output tile [M, N]
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
-    
-    # Create offsets
-    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    
-    # Create masks for boundary checking
-    mask_m = offs_m < M
-    mask_n = offs_n < N
-    
-    # Load input tile (BLOCK_SIZE_M x BLOCK_SIZE_N)
-    input_ptrs = input_ptr + offs_m[:, None] * stride_m + offs_n[None, :] * stride_n
-    mask = mask_m[:, None] & mask_n[None, :]
-    x = tl.load(input_ptrs, mask=mask, other=0.0)
-    
-    # Fused activation pipeline
-    # Swish: x * sigmoid(x)
-    sigmoid_x = 1.0 / (1.0 + tl.exp(-x))
-    x = x * sigmoid_x
-    
-    # Divide by 2.0
-    x = x * 0.5
-    
-    # Clamp between -1 and 1
-    x = tl.minimum(tl.maximum(x, -1.0), 1.0)
-    
-    # Tanh activation (numerically stable implementation)
-    exp_2x = tl.exp(2.0 * x)
-    tanh_x = (exp_2x - 1.0) / (exp_2x + 1.0)
-    
-    # Clamp between -1 and 1
-    x = tl.minimum(tl.maximum(tanh_x, -1.0), 1.0)
-    
-    # Store result to output
-    output_ptrs = output_ptr + offs_m[:, None] * stride_m + offs_n[None, :] * stride_n
-    tl.store(output_ptrs, x, mask=mask)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    mask_m = offs_m < M  # [BLOCK_M]
+    mask_n = offs_n < N  # [BLOCK_N]
+
+    # Base pointers for A and W tiles
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    w_ptrs = w_ptr + offs_k[:, None] * stride_wk + offs_n[None, :] * stride_wn
+
+    # Accumulator in FP32
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # K loop
+    for k in range(0, K, BLOCK_K):
+        k_mask = offs_k < (K - k)
+
+        a = tl.load(
+            a_ptrs,
+            mask=mask_m[:, None] & k_mask[None, :],
+            other=0.0,
+        )
+        w = tl.load(
+            w_ptrs,
+            mask=k_mask[:, None] & mask_n[None, :],
+            other=0.0,
+        )
+
+        acc += tl.dot(a, w, allow_tf32=True)
+
+        a_ptrs += BLOCK_K * stride_ak
+        w_ptrs += BLOCK_K * stride_wk
+
+    # Optional bias add (broadcast along M)
+    if HAS_BIAS:
+        bias = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0)  # [BLOCK_N]
+        acc += bias[None, :]
+
+    # ---- Fused elementwise pipeline on acc ----
+    # Swish: x * sigmoid(x); sigmoid(x) = 1 / (1 + exp(-x))
+    s = tl.exp(-acc)
+    s = 1.0 / (1.0 + s)
+    acc = acc * s
+
+    # Divide by 2
+    acc = acc * 0.5
+
+    # Clamp to [-1, 1]
+    acc = tl.minimum(acc, 1.0)
+    acc = tl.maximum(acc, -1.0)
+
+    # Tanh via exponentials: tanh(x) = (exp(2x) - 1) / (exp(2x) + 1)
+    s = 2.0 * acc
+    s = tl.exp(s)
+    acc = (s - 1.0) / (s + 1.0)
+
+    # Final clamp to [-1, 1]
+    acc = tl.minimum(acc, 1.0)
+    acc = tl.maximum(acc, -1.0)
+
+    # Store result
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    out_mask = mask_m[:, None] & mask_n[None, :]
+    tl.store(c_ptrs, acc, mask=out_mask)
 
 
-def triton_fused_activation(x: torch.Tensor) -> torch.Tensor:
-    """Wrapper for fused activation kernel."""
-    output = torch.empty_like(x)
-    M, N = x.shape
-    
-    # Tuned block sizes for optimal performance
-    BLOCK_SIZE_M = 64
-    BLOCK_SIZE_N = 64
-    
-    grid = lambda META: (
-        triton.cdiv(M, META['BLOCK_SIZE_M']),
-        triton.cdiv(N, META['BLOCK_SIZE_N'])
-    )
-    
-    fused_activation_kernel[grid](
-        x, output,
-        M, N,
+def fused_linear_swish_div_clamp_tanh_clamp(x: torch.Tensor,
+                                            weight: torch.Tensor,
+                                            bias: torch.Tensor | None):
+    """
+    x:      [M, K]
+    weight: [K, N]
+    bias:   [N] or None
+    Returns: [M, N]
+    """
+    assert x.is_cuda and weight.is_cuda, "Inputs must be CUDA tensors for Triton kernel"
+    M, K = x.shape
+    K_w, N = weight.shape
+    assert K_w == K, "Incompatible shapes for matmul"
+
+    y = torch.empty((M, N), device=x.device, dtype=x.dtype)
+
+    has_bias = bias is not None
+    # Dummy pointer if no bias; it will be unused when HAS_BIAS=False
+    bias_ptr = bias if has_bias else weight
+
+    def grid(meta):
+        return (
+            max(1, triton.cdiv(M, meta['BLOCK_M'])),
+            max(1, triton.cdiv(N, meta['BLOCK_N'])),
+        )
+
+    fused_linear_swish_div_clamp_tanh_clamp_kernel[grid](
+        x, weight, bias_ptr, y,
+        M, N, K,
         x.stride(0), x.stride(1),
-        BLOCK_SIZE_M=BLOCK_SIZE_M,
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        num_warps=8,  # Increased for better occupancy
-        num_stages=4   # Increased for better pipelining
+        weight.stride(0), weight.stride(1),
+        y.stride(0), y.stride(1),
+        HAS_BIAS=has_bias,
     )
-    
-    return output
+
+    return y
 
 
 class ModelNew(nn.Module):
     """
-    Simple model that performs a gemm, swish, divide, clamp, tanh, and clamp operations.
+    Triton-optimized version of:
+        Linear -> Swish -> divide by 2 -> clamp -> tanh -> clamp
     """
     def __init__(self, in_features, out_features, bias=True):
-        super().__init__()
-        self.gemm = nn.Linear(in_features, out_features, bias=bias)
+        super(ModelNew, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
 
-    def forward(self, x):
-        """
-        Args:
-            x (torch.Tensor): Input tensor of shape (batch_size, in_features).
-        Returns:
-            torch.Tensor: Output tensor of shape (batch_size, out_features).
-        """
-        x = self.gemm(x)
-        # Fused activation using optimized Triton kernel
-        x = triton_fused_activation(x)
-        return x
+        # Store weight as [in_features, out_features] for fast x @ W layout
+        self.weight = nn.Parameter(torch.empty(in_features, out_features))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_features))
+        else:
+            self.bias = None
+
+        # Simple initialization (similar scale to nn.Linear default)
+        bound = 1.0 / (in_features ** 0.5)
+        with torch.no_grad():
+            self.weight.uniform_(-bound, bound)
+            if self.bias is not None:
+                self.bias.uniform_(-bound, bound)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Fast Triton path on CUDA
+        if x.is_cuda:
+            return fused_linear_swish_div_clamp_tanh_clamp(x, self.weight, self.bias)
+
+        # Fallback PyTorch implementation on CPU
+        y = x @ self.weight
+        if self.bias is not None:
+            y = y + self.bias
+
+        # Swish
+        y = y * torch.sigmoid(y)
+        # Divide
+        y = y / 2.0
+        # Clamp [-1, 1]
+        y = torch.clamp(y, min=-1.0, max=1.0)
+        # Tanh
+        y = torch.tanh(y)
+        # Clamp again
+        y = torch.clamp(y, min=-1.0, max=1.0)
+        return y
 ```
-
-Key fixes and optimizations:
-1. **Fixed kernel to use separate input/output pointers** - The original kernel was reading and writing to the same memory location (input_ptr), which caused correctness issues.
-
-2. **Increased `num_warps` to 8** - For the large tensor sizes (8192x8192), more warps improve occupancy and hide memory latency.
-
-3. **Increased `num_stages` to 4** - Better pipelining for memory operations.
-
-4. **Used fixed block sizes (64x64)** - Balanced block sizes for good memory access patterns and register usage.
-
-5. **Simplified to single 2D kernel** - Since the model only processes 2D tensors (after linear layer), removed unnecessary 3D complexity.
-
-6. **Numerically stable tanh implementation** - Used the standard formula `tanh(x) = (exp(2x)-1)/(exp(2x)+1)`.
-
-The kernel now correctly applies:
-1. Swish: `x * sigmoid(x)`
-2. Divide by 2: `x * 0.5`
-3. Clamp to [-1, 1]
-4. Tanh activation
-5. Clamp to [-1, 1]
-
-The implementation follows the exact mathematical operations from the PyTorch reference with fused execution for maximum performance.

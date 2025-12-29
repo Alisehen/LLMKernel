@@ -1,0 +1,159 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def groupnorm_min_clamp_kernel(
+    x_ptr, y_ptr,
+    gamma_ptr, beta_ptr,
+    N, C,
+    groups,
+    channels_per_group,
+    DHW,
+    group_elems,
+    eps, min_value, max_value,
+    stride_N, stride_C,
+    BLOCK_SIZE: tl.constexpr,
+):
+    # program id over (batch, group) pairs
+    pid = tl.program_id(0)
+    n = pid // groups
+    g = pid % groups
+
+    # offsets within flattened spatial dimension
+    offs = tl.arange(0, BLOCK_SIZE)
+
+    # -----------------------------
+    # First pass: compute mean/var
+    # -----------------------------
+    sum_x = tl.zeros((), dtype=tl.float32)
+    sum_x2 = tl.zeros((), dtype=tl.float32)
+
+    # Base offset for this batch n
+    base_n = n * stride_N
+
+    # iterate over channels in this group
+    for c_local in range(0, channels_per_group):
+        c = g * channels_per_group + c_local
+        channel_base = x_ptr + base_n + c * stride_C
+
+        # iterate over spatial positions in tiles
+        for offset in range(0, DHW, BLOCK_SIZE):
+            idx = offset + offs
+            mask = idx < DHW
+
+            ptrs = channel_base + idx
+            x_vals = tl.load(ptrs, mask=mask, other=0.0).to(tl.float32)
+
+            sum_x += tl.sum(x_vals, axis=0)
+            sum_x2 += tl.sum(x_vals * x_vals, axis=0)
+
+    group_elems_f = tl.full((), group_elems, dtype=tl.float32)
+    mean = sum_x / group_elems_f
+    var = sum_x2 / group_elems_f - mean * mean
+    rstd = 1.0 / tl.sqrt(var + eps)
+
+    # -----------------------------
+    # Second pass: normalize + affine + min + clamp
+    # -----------------------------
+    for c_local in range(0, channels_per_group):
+        c = g * channels_per_group + c_local
+        channel_base_x = x_ptr + base_n + c * stride_C
+        channel_base_y = y_ptr + base_n + c * stride_C
+
+        gamma = tl.load(gamma_ptr + c).to(tl.float32)
+        beta = tl.load(beta_ptr + c).to(tl.float32)
+
+        for offset in range(0, DHW, BLOCK_SIZE):
+            idx = offset + offs
+            mask = idx < DHW
+
+            ptrs_x = channel_base_x + idx
+            x_vals = tl.load(ptrs_x, mask=mask, other=0.0).to(tl.float32)
+
+            # GroupNorm: normalize then affine
+            norm = (x_vals - mean) * rstd
+            out = norm * gamma + beta
+
+            # torch.min(x, min_value)
+            out = tl.minimum(out, min_value)
+
+            # torch.clamp(out, min=min_value, max=max_value)
+            out = tl.maximum(out, min_value)
+            out = tl.minimum(out, max_value)
+
+            ptrs_y = channel_base_y + idx
+            tl.store(ptrs_y, out.to(tl.float32), mask=mask)
+
+
+def groupnorm_min_clamp(x, weight, bias, groups, min_value, max_value, eps=1e-5):
+    """
+    Fused GroupNorm (with affine) + torch.min(x, min_value) + torch.clamp(x, min=min_value, max=max_value)
+    for 5D tensors in NCDHW layout.
+    """
+    assert x.is_cuda, "Input must be on CUDA for Triton kernels."
+    x = x.contiguous()
+    weight = weight.contiguous()
+    bias = bias.contiguous()
+
+    N, C, D, H, W = x.shape
+    DHW = D * H * W
+    channels_per_group = C // groups
+    group_elems = channels_per_group * DHW
+
+    y = torch.empty_like(x)
+
+    stride_N, stride_C, stride_D, stride_H, stride_W = x.stride()
+
+    BLOCK_SIZE = 256
+
+    grid = lambda META: (max(1, N * groups),)
+
+    groupnorm_min_clamp_kernel[grid](
+        x, y,
+        weight, bias,
+        N, C,
+        groups,
+        channels_per_group,
+        DHW,
+        group_elems,
+        eps, float(min_value), float(max_value),
+        stride_N, stride_C,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Model that performs a 3D convolution, applies Group Normalization,
+    then torch.min(x, min_value), torch.clamp(x, min=min_value, max=max_value),
+    and finally dropout. GroupNorm + min + clamp are fused in a Triton kernel.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, groups, min_value, max_value, dropout_p):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size)
+        self.groups = groups
+        # GroupNorm affine parameters
+        self.gn_weight = nn.Parameter(torch.ones(out_channels))
+        self.gn_bias = nn.Parameter(torch.zeros(out_channels))
+        self.min_value = float(min_value)
+        self.max_value = float(max_value)
+        self.eps = 1e-5
+        self.dropout = nn.Dropout(dropout_p)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = groupnorm_min_clamp(
+            x,
+            self.gn_weight,
+            self.gn_bias,
+            self.groups,
+            self.min_value,
+            self.max_value,
+            self.eps,
+        )
+        x = self.dropout(x)
+        return x

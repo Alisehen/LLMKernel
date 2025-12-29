@@ -1,0 +1,282 @@
+# Optimized Triton code for fused Conv2d + BatchNorm (inference) + scaling
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        # High-throughput, more warps (best if register pressure allows)
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32},
+            num_warps=8,
+            num_stages=2,
+        ),
+        # Latency-hiding variant for same tile shape
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32},
+            num_warps=4,
+            num_stages=3,
+        ),
+        # Conservative baseline (required)
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 32, "BLOCK_K": 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+        # Alternative M-tiling (helps when spatial size is large)
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 32, "BLOCK_K": 32},
+            num_warps=4,
+            num_stages=2,
+        ),
+    ],
+    key=["B", "Ho", "Wo", "Cout"],
+)
+@triton.jit
+def fused_conv_bn_scale_kernel(
+    x_ptr,            # *f32,   [B, Cin, H, W]
+    w_ptr,            # *f32,   [Cout, Cin, K, K]
+    bias_ptr,         # *f32,   [Cout]
+    bn_scale_ptr,     # *f32,   [Cout]
+    bn_shift_ptr,     # *f32,   [Cout]
+    out_ptr,          # *f32,   [B, Cout, Ho, Wo]
+    B, Ho, Wo,        # int32
+    Kdim,             # int32,  Kdim = Cin * K * K
+    Cout,             # int32
+    K,                # int32,  kernel size
+    stride_x_n, stride_x_c, stride_x_h, stride_x_w,
+    stride_w_oc, stride_w_ic, stride_w_kh, stride_w_kw,
+    stride_out_n, stride_out_c, stride_out_h, stride_out_w,
+    BLOCK_M: tl.constexpr,  # tile size in spatial dimension (Ho * Wo)
+    BLOCK_N: tl.constexpr,  # tile size in Cout
+    BLOCK_K: tl.constexpr,  # tile size in Kdim
+):
+    # -------------------------------------------------------------------------
+    # 3D grid:
+    #   pid_hw : tiles spatial positions [Ho * Wo]
+    #   pid_b  : batches [B]
+    #   pid_n  : output channels [Cout]
+    # This avoids expensive div/mod by (Ho*Wo) and keeps batching explicit.
+    # -------------------------------------------------------------------------
+    pid_hw = tl.program_id(0)
+    pid_b = tl.program_id(1)
+    pid_n = tl.program_id(2)
+
+    # Offsets along spatial (flattened H*W) and Cout
+    offs_hw = pid_hw * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    # Masks for valid indices
+    hw_size = Ho * Wo
+    mask_hw = offs_hw < hw_size
+    mask_n = offs_n < Cout
+
+    tl.multiple_of(offs_hw, BLOCK_M)
+    tl.multiple_of(offs_n, BLOCK_N)
+
+    # -------------------------------------------------------------------------
+    # Decompose spatial index: offs_hw -> (ho, wo)
+    # -------------------------------------------------------------------------
+    ho = offs_hw // Wo
+    wo = offs_hw - ho * Wo
+
+    # Shape them as [BM, 1] for broadcasting with K & N dimensions
+    ho = ho[:, None]  # [BM, 1]
+    wo = wo[:, None]  # [BM, 1]
+
+    # Base input pointer for this batch and spatial tile
+    x_base = (
+        x_ptr
+        + pid_b * stride_x_n
+        + ho * stride_x_h
+        + wo * stride_x_w
+    )  # [BM, 1]
+
+    # Base output pointer for this batch and spatial tile
+    out_base = (
+        out_ptr
+        + pid_b * stride_out_n
+        + ho * stride_out_h
+        + wo * stride_out_w
+    )  # [BM, 1]
+
+    # Base weight pointer for each output channel
+    w_oc_base = w_ptr + offs_n[None, :] * stride_w_oc  # [1, BN]
+
+    # -------------------------------------------------------------------------
+    # Main GEMM loop over Kdim (Cin * K * K)
+    # -------------------------------------------------------------------------
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    kk = K * K
+    offs_k_init = tl.arange(0, BLOCK_K)
+    tl.multiple_of(offs_k_init, BLOCK_K)
+
+    for k_start in range(0, Kdim, BLOCK_K):
+        offs_k = k_start + offs_k_init  # [BK]
+        mask_k = offs_k < Kdim          # [BK]
+
+        # Decompose K-dimension index into (cin, kh, kw)
+        cin_1d = offs_k // kk
+        rem_k = offs_k - cin_1d * kk
+        kh_1d = rem_k // K
+        kw_1d = rem_k - kh_1d * K
+
+        # ----- A tile: input im2col [BM, BK] -----
+        x_ptrs = (
+            x_base
+            + cin_1d[None, :] * stride_x_c
+            + kh_1d[None, :] * stride_x_h
+            + kw_1d[None, :] * stride_x_w
+        )  # [BM, BK]
+
+        a_mask = mask_hw[:, None] & mask_k[None, :]
+        a = tl.load(x_ptrs, mask=a_mask, other=0.0)
+
+        # ----- B tile: weights [BK, BN] -----
+        w_ptrs = (
+            w_oc_base
+            + cin_1d[:, None] * stride_w_ic
+            + kh_1d[:, None] * stride_w_kh
+            + kw_1d[:, None] * stride_w_kw
+        )  # [BK, BN]
+
+        b_mask = mask_k[:, None] & mask_n[None, :]
+        b = tl.load(w_ptrs, mask=b_mask, other=0.0)
+
+        # GEMM accumulate: [BM, BK] x [BK, BN] -> [BM, BN]
+        acc += tl.dot(a, b, allow_tf32=True)
+
+    # -------------------------------------------------------------------------
+    # Fused bias + BatchNorm (inference) + scaling
+    # -------------------------------------------------------------------------
+    bias = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0)         # [BN]
+    bn_scale = tl.load(bn_scale_ptr + offs_n, mask=mask_n, other=0.0) # [BN]
+    bn_shift = tl.load(bn_shift_ptr + offs_n, mask=mask_n, other=0.0) # [BN]
+
+    acc = acc + bias[None, :]
+    acc = acc * bn_scale[None, :] + bn_shift[None, :]
+
+    # -------------------------------------------------------------------------
+    # Store result to [B, Cout, Ho, Wo]
+    # Single store for final output; no intermediate stores.
+    # -------------------------------------------------------------------------
+    out_ptrs = out_base + offs_n[None, :] * stride_out_c  # [BM, BN]
+    out_mask = mask_hw[:, None] & mask_n[None, :]
+
+    tl.store(out_ptrs, acc, mask=out_mask)
+
+
+def fused_conv_bn_scale(x, weight, bias, bn_scale, bn_shift, scaling_factor):
+    # x:        [B, Cin, H, W]
+    # weight:   [Cout, Cin, K, K]
+    # bias:     [Cout]
+    # bn_scale: [Cout]
+    # bn_shift: [Cout]
+    assert x.is_cuda, "Input must be on CUDA for Triton kernels."
+    assert x.dtype == torch.float32, "This fused kernel currently supports float32."
+
+    B, Cin, H, W = x.shape
+    Cout, Cin_w, K, K_w = weight.shape
+    assert Cin == Cin_w and K == K_w, "Incompatible input/weight shapes."
+
+    # Only stride=1, padding=0, dilation=1, groups=1 are handled
+    Ho = H - K + 1
+    Wo = W - K + 1
+    assert Ho > 0 and Wo > 0, "Input too small for valid convolution with given kernel size."
+
+    x_c = x.contiguous()
+    w_c = weight.contiguous()
+    bias_c = bias.contiguous()
+    bn_scale_c = bn_scale.contiguous()
+    bn_shift_c = bn_shift.contiguous()
+
+    out = torch.empty((B, Cout, Ho, Wo), device=x.device, dtype=x.dtype)
+
+    Kdim = Cin * K * K
+
+    def grid(meta):
+        # 3D launch grid: spatial tiles, batch, channel tiles
+        return (
+            triton.cdiv(Ho * Wo, meta["BLOCK_M"]),
+            B,
+            triton.cdiv(Cout, meta["BLOCK_N"]),
+        )
+
+    fused_conv_bn_scale_kernel[grid](
+        x_c,
+        w_c,
+        bias_c,
+        bn_scale_c,
+        bn_shift_c,
+        out,
+        B,
+        Ho,
+        Wo,
+        Kdim,
+        Cout,
+        K,
+        x_c.stride(0),
+        x_c.stride(1),
+        x_c.stride(2),
+        x_c.stride(3),
+        w_c.stride(0),
+        w_c.stride(1),
+        w_c.stride(2),
+        w_c.stride(3),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        out.stride(3),
+    )
+
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    Fused Triton implementation of:
+      Conv2d -> BatchNorm2d (inference) -> scaling_factor
+    The BatchNorm is applied in inference mode using running_mean/var.
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size, scaling_factor):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.scaling_factor = float(scaling_factor)
+
+    def forward(self, x):
+        assert x.ndim == 4, "Input must be NCHW"
+        assert self.conv.stride == (1, 1), "Kernel only supports stride=1"
+        assert self.conv.padding == (0, 0), "Kernel only supports padding=0"
+        assert self.conv.dilation == (1, 1), "Kernel only supports dilation=1"
+        assert self.conv.groups == 1, "Kernel only supports groups=1"
+
+        weight = self.conv.weight
+        if self.conv.bias is None:
+            bias = torch.zeros(
+                weight.size(0),
+                device=weight.device,
+                dtype=weight.dtype,
+            )
+        else:
+            bias = self.conv.bias
+
+        bn = self.bn
+        running_mean = bn.running_mean.to(weight.device, dtype=weight.dtype)
+        running_var = bn.running_var.to(weight.device, dtype=weight.dtype)
+        gamma = bn.weight.to(weight.device, dtype=weight.dtype)
+        beta = bn.bias.to(weight.device, dtype=weight.dtype)
+        eps = bn.eps
+
+        # Precompute fused BatchNorm (inference) + scaling parameters
+        # out = scaling_factor * [ (x - mu)/sqrt(var+eps) * gamma + beta ]
+        inv_std = torch.rsqrt(running_var + eps)
+        bn_scale = gamma * inv_std * self.scaling_factor
+        bn_shift = (beta - running_mean * inv_std * gamma) * self.scaling_factor
+
+        return fused_conv_bn_scale(x, weight, bias, bn_scale, bn_shift, self.scaling_factor)

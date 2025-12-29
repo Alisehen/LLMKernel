@@ -1,0 +1,541 @@
+You are optimizing a Triton kernel based on algorithmic analysis.
+
+# PyTorch Reference (Target Behavior)
+
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs a transposed 3D convolution, multiplies by a scalar, applies max pooling, 
+    global average pooling, and clamps the output.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, scale, maxpool_kernel_size):
+        super(Model, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding)
+        self.scale = scale
+        self.maxpool = nn.MaxPool3d(kernel_size=maxpool_kernel_size)
+        self.global_avg_pool = nn.AdaptiveAvgPool3d((1, 1, 1))
+        self.clamp_min = 0
+        self.clamp_max = 1
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = x * self.scale
+        x = self.maxpool(x)
+        x = self.global_avg_pool(x)
+        x = torch.clamp(x, min=self.clamp_min, max=self.clamp_max)
+        return x
+
+batch_size = 128
+in_channels = 3
+out_channels = 16
+depth, height, width = 16, 32, 32
+kernel_size = 3
+stride = 2
+padding = 1
+scale = 0.5
+maxpool_kernel_size = 2
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, depth, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, stride, padding, scale, maxpool_kernel_size]
+```
+
+**CRITICAL**: Study the PyTorch code carefully to understand:
+- What does `forward()` return? (full output sequence vs final hidden state only)
+- What is the computational pattern?
+- What are the input/output shapes?
+
+Your optimized kernel MUST match this exact behavior.
+
+---
+
+# Analysis Results
+
+**Bottleneck**: The workload is dominated by memory traffic from writing and rereading the full ConvTranspose3d output and the MaxPool3d output, plus the overhead of three kernel launches. The math for conv, pooling, and global average is relatively small compared to the cost of moving hundreds of millions of elements to/from DRAM.
+
+**Optimization Strategy**: Fuse ConvTranspose3d+scale, MaxPool3d, and global average pooling + clamp into a single Triton kernel that directly produces the (N, C, 1, 1, 1) output, computing pooled maxima and accumulating channel sums on the fly without ever materializing the conv-transpose or maxpooled tensors in global memory.
+
+**Implementation Plan**: Design a fused kernel indexed by (n, co) where each program iterates over all maxpool output positions, and for each position computes the max over the corresponding ConvTranspose3d window by looping over the pool window and deconv kernel positions, applying bias and scale inside the loop. Instead of storing the maxpooled feature map, directly accumulate these per-position maxima into a running sum per (n, co), then at the end divide by the number of pooled positions to form the global average, apply clamp_min/clamp_max, and write a single scalar result to y. Replace the three current Triton calls in ModelNew.forward with one call to this fused kernel, reusing the existing shape/stride calculations but eliminating the large intermediate allocations.
+
+**Expected Speedup**: 30-40%
+
+---
+
+# Current Kernel (needs optimization)
+
+```python
+import torch, torch.nn as nn, triton, triton.language as tl
+
+
+@triton.jit
+def conv_transpose3d_scale_kernel(
+    x_ptr, w_ptr, b_ptr, y_ptr,
+    N, C_in, C_out,
+    D_in, H_in, W_in,
+    Kd, Kh, Kw,
+    stride_d, stride_h, stride_w,
+    pad_d, pad_h, pad_w,
+    D_out, H_out, W_out,
+    P,
+    stride_x_n, stride_x_c, stride_x_d, stride_x_h, stride_x_w,
+    stride_w_ci, stride_w_co, stride_w_kd, stride_w_kh, stride_w_kw,
+    stride_y_n, stride_y_c, stride_y_d, stride_y_h, stride_y_w,
+    scale,
+    BLOCK_CO: tl.constexpr, BLOCK_P: tl.constexpr,
+):
+    pid_n = tl.program_id(0)
+    pid_co_blk = tl.program_id(1)
+    pid_p_blk = tl.program_id(2)
+
+    co_offsets = pid_co_blk * BLOCK_CO + tl.arange(0, BLOCK_CO)
+    p_offsets = pid_p_blk * BLOCK_P + tl.arange(0, BLOCK_P)
+
+    mask_co = co_offsets < C_out
+    mask_p = p_offsets < P
+
+    HW = H_out * W_out
+    z_idx = p_offsets // HW
+    rem = p_offsets % HW
+    y_idx = rem // W_out
+    x_idx = rem % W_out
+
+    acc = tl.zeros((BLOCK_CO, BLOCK_P), dtype=tl.float32)
+
+    # Base pointers for this batch element
+    base_x_n = x_ptr + pid_n * stride_x_n
+    base_y_n = y_ptr + pid_n * stride_y_n
+
+    # Bias per output channel
+    bias_vals = tl.load(b_ptr + co_offsets, mask=mask_co, other=0.0)
+
+    for ci in range(0, C_in):
+        base_x_nc = base_x_n + ci * stride_x_c
+        base_w_ci = w_ptr + ci * stride_w_ci
+
+        for kd in range(0, Kd):
+            z_in_nom = z_idx + pad_d - kd
+            z_div = z_in_nom // stride_d
+            z_mod = z_in_nom % stride_d
+            mask_z = (z_mod == 0) & (z_div >= 0) & (z_div < D_in)
+
+            for kh in range(0, Kh):
+                y_in_nom = y_idx + pad_h - kh
+                y_div = y_in_nom // stride_h
+                y_mod = y_in_nom % stride_h
+                mask_y = (y_mod == 0) & (y_div >= 0) & (y_div < H_in)
+
+                for kw in range(0, Kw):
+                    x_in_nom = x_idx + pad_w - kw
+                    x_div = x_in_nom // stride_w
+                    x_mod = x_in_nom % stride_w
+                    mask_x = (x_mod == 0) & (x_div >= 0) & (x_div < W_in)
+
+                    mask_xyz = mask_p & mask_z & mask_y & mask_x
+
+                    # Input positions
+                    x_ptrs = base_x_nc + (
+                        z_div * stride_x_d +
+                        y_div * stride_x_h +
+                        x_div * stride_x_w
+                    )
+                    x_vals = tl.load(x_ptrs, mask=mask_xyz, other=0.0)
+
+                    # Weights for [ci, co, kd, kh, kw]
+                    base_w_ck = base_w_ci + kd * stride_w_kd + kh * stride_w_kh + kw * stride_w_kw
+                    w_ptrs = base_w_ck + co_offsets * stride_w_co
+                    w_vals = tl.load(w_ptrs, mask=mask_co, other=0.0)
+
+                    acc += w_vals[:, None] * x_vals[None, :]
+
+    # Add bias
+    acc += bias_vals[:, None]
+
+    # Apply scale
+    acc = acc * scale
+
+    # Store results
+    y_ptrs = base_y_n + (
+        co_offsets[:, None] * stride_y_c +
+        z_idx[None, :] * stride_y_d +
+        y_idx[None, :] * stride_y_h +
+        x_idx[None, :] * stride_y_w
+    )
+    mask_out = mask_co[:, None] & mask_p[None, :]
+    tl.store(y_ptrs, acc, mask=mask_out)
+
+
+def conv_transpose3d_scale_triton(x, weight, bias, stride, padding, scale):
+    # x: [N, C_in, D_in, H_in, W_in]
+    # weight: [C_in, C_out, Kd, Kh, Kw] (ConvTranspose3d layout)
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+    N, C_in, D_in, H_in, W_in = x.shape
+    C_in_w, C_out, Kd, Kh, Kw = weight.shape
+    assert C_in_w == C_in, "Input channels mismatch between x and weight"
+
+    if isinstance(stride, int):
+        stride_d = stride_h = stride_w = stride
+    else:
+        stride_d, stride_h, stride_w = stride
+    if isinstance(padding, int):
+        pad_d = pad_h = pad_w = padding
+    else:
+        pad_d, pad_h, pad_w = padding
+
+    D_out = (D_in - 1) * stride_d - 2 * pad_d + Kd
+    H_out = (H_in - 1) * stride_h - 2 * pad_h + Kh
+    W_out = (W_in - 1) * stride_w - 2 * pad_w + Kw
+    P = D_out * H_out * W_out
+
+    y = torch.empty((N, C_out, D_out, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    stride_x_n, stride_x_c, stride_x_d, stride_x_h, stride_x_w = x.stride()
+    stride_w_ci, stride_w_co, stride_w_kd, stride_w_kh, stride_w_kw = weight.stride()
+    stride_y_n, stride_y_c, stride_y_d, stride_y_h, stride_y_w = y.stride()
+
+    BLOCK_CO = 16
+    BLOCK_P = 128
+
+    grid = lambda META: (
+        N,
+        triton.cdiv(C_out, META['BLOCK_CO']),
+        triton.cdiv(P, META['BLOCK_P']),
+    )
+
+    conv_transpose3d_scale_kernel[grid](
+        x, weight, bias, y,
+        N, C_in, C_out,
+        D_in, H_in, W_in,
+        Kd, Kh, Kw,
+        stride_d, stride_h, stride_w,
+        pad_d, pad_h, pad_w,
+        D_out, H_out, W_out,
+        P,
+        stride_x_n, stride_x_c, stride_x_d, stride_x_h, stride_x_w,
+        stride_w_ci, stride_w_co, stride_w_kd, stride_w_kh, stride_w_kw,
+        stride_y_n, stride_y_c, stride_y_d, stride_y_h, stride_y_w,
+        scale,
+        BLOCK_CO=BLOCK_CO, BLOCK_P=BLOCK_P,
+        num_warps=4, num_stages=2,
+    )
+    return y
+
+
+@triton.jit
+def maxpool3d_kernel(
+    x_ptr, y_ptr,
+    N, C,
+    D_in, H_in, W_in,
+    D_out, H_out, W_out,
+    kD, kH, kW,
+    stride_d, stride_h, stride_w,
+    pad_d, pad_h, pad_w,
+    dilation_d, dilation_h, dilation_w,
+    P_out,
+    stride_x_n, stride_x_c, stride_x_d, stride_x_h, stride_x_w,
+    stride_y_n, stride_y_c, stride_y_d, stride_y_h, stride_y_w,
+    BLOCK_C: tl.constexpr, BLOCK_P: tl.constexpr,
+):
+    pid_n = tl.program_id(0)
+    pid_c_blk = tl.program_id(1)
+    pid_p_blk = tl.program_id(2)
+
+    c_offsets = pid_c_blk * BLOCK_C + tl.arange(0, BLOCK_C)
+    p_offsets = pid_p_blk * BLOCK_P + tl.arange(0, BLOCK_P)
+
+    mask_c = c_offsets < C
+    mask_p = p_offsets < P_out
+
+    HW_out = H_out * W_out
+    z2 = p_offsets // HW_out
+    rem = p_offsets % HW_out
+    y2 = rem // W_out
+    x2 = rem % W_out
+
+    max_vals = tl.full((BLOCK_C, BLOCK_P), -float("inf"), dtype=tl.float32)
+
+    base_x_n = x_ptr + pid_n * stride_x_n
+    base_y_n = y_ptr + pid_n * stride_y_n
+
+    for kd in range(0, kD):
+        z_in = z2 * stride_d - pad_d + kd * dilation_d
+        mask_z = (z_in >= 0) & (z_in < D_in)
+
+        for kh in range(0, kH):
+            y_in = y2 * stride_h - pad_h + kh * dilation_h
+            mask_y = (y_in >= 0) & (y_in < H_in)
+
+            for kw in range(0, kW):
+                x_in = x2 * stride_w - pad_w + kw * dilation_w
+                mask_x = (x_in >= 0) & (x_in < W_in)
+
+                valid = mask_p & mask_z & mask_y & mask_x
+
+                x_ptrs = base_x_n + (
+                    c_offsets[:, None] * stride_x_c +
+                    z_in[None, :] * stride_x_d +
+                    y_in[None, :] * stride_x_h +
+                    x_in[None, :] * stride_x_w
+                )
+                mask_total = mask_c[:, None] & valid[None, :]
+                vals = tl.load(x_ptrs, mask=mask_total, other=-float("inf"))
+                max_vals = tl.maximum(max_vals, vals)
+
+    y_ptrs = base_y_n + (
+        c_offsets[:, None] * stride_y_c +
+        z2[None, :] * stride_y_d +
+        y2[None, :] * stride_y_h +
+        x2[None, :] * stride_y_w
+    )
+    mask_out = mask_c[:, None] & mask_p[None, :]
+    tl.store(y_ptrs, max_vals, mask=mask_out)
+
+
+def maxpool3d_triton(x, kernel_size, stride=None, padding=0, dilation=1):
+    # x: [N, C, D, H, W]
+    assert x.is_cuda
+    N, C, D_in, H_in, W_in = x.shape
+
+    if isinstance(kernel_size, int):
+        kD = kH = kW = kernel_size
+    else:
+        kD, kH, kW = kernel_size
+
+    if stride is None:
+        stride_d, stride_h, stride_w = kD, kH, kW
+    elif isinstance(stride, int):
+        stride_d = stride_h = stride_w = stride
+    else:
+        stride_d, stride_h, stride_w = stride
+
+    if isinstance(padding, int):
+        pad_d = pad_h = pad_w = padding
+    else:
+        pad_d, pad_h, pad_w = padding
+
+    if isinstance(dilation, int):
+        dilation_d = dilation_h = dilation_w = dilation
+    else:
+        dilation_d, dilation_h, dilation_w = dilation
+
+    D_out = (D_in + 2 * pad_d - dilation_d * (kD - 1) - 1) // stride_d + 1
+    H_out = (H_in + 2 * pad_h - dilation_h * (kH - 1) - 1) // stride_h + 1
+    W_out = (W_in + 2 * pad_w - dilation_w * (kW - 1) - 1) // stride_w + 1
+
+    y = torch.empty((N, C, D_out, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    P_out = D_out * H_out * W_out
+
+    stride_x_n, stride_x_c, stride_x_d, stride_x_h, stride_x_w = x.stride()
+    stride_y_n, stride_y_c, stride_y_d, stride_y_h, stride_y_w = y.stride()
+
+    BLOCK_C = 16
+    BLOCK_P = 128
+
+    grid = lambda META: (
+        N,
+        triton.cdiv(C, META['BLOCK_C']),
+        triton.cdiv(P_out, META['BLOCK_P']),
+    )
+
+    maxpool3d_kernel[grid](
+        x, y,
+        N, C,
+        D_in, H_in, W_in,
+        D_out, H_out, W_out,
+        kD, kH, kW,
+        stride_d, stride_h, stride_w,
+        pad_d, pad_h, pad_w,
+        dilation_d, dilation_h, dilation_w,
+        P_out,
+        stride_x_n, stride_x_c, stride_x_d, stride_x_h, stride_x_w,
+        stride_y_n, stride_y_c, stride_y_d, stride_y_h, stride_y_w,
+        BLOCK_C=BLOCK_C, BLOCK_P=BLOCK_P,
+        num_warps=4, num_stages=2,
+    )
+    return y
+
+
+@triton.jit
+def global_avg_pool_clamp_kernel(
+    x_ptr, y_ptr,
+    N, C,
+    D, H, W,
+    P,
+    stride_x_n, stride_x_c, stride_x_d, stride_x_h, stride_x_w,
+    stride_y_n, stride_y_c,
+    clamp_min, clamp_max,
+    BLOCK_P: tl.constexpr,
+):
+    pid_n = tl.program_id(0)
+    pid_c = tl.program_id(1)
+
+    r = tl.arange(0, BLOCK_P)
+    sum_val = tl.zeros((), dtype=tl.float32)
+
+    HW = H * W
+
+    for p in range(0, P, BLOCK_P):
+        idx = p + r
+        mask = idx < P
+
+        z = idx // HW
+        rem = idx % HW
+        y = rem // W
+        x = rem % W
+
+        base_x = x_ptr + pid_n * stride_x_n + pid_c * stride_x_c
+        x_ptrs = base_x + (
+            z * stride_x_d +
+            y * stride_x_h +
+            x * stride_x_w
+        )
+
+        vals = tl.load(x_ptrs, mask=mask, other=0.0)
+        sum_val += tl.sum(vals, axis=0)
+
+    mean_val = sum_val / P
+    mean_val = tl.maximum(mean_val, clamp_min)
+    mean_val = tl.minimum(mean_val, clamp_max)
+
+    out_ptr = y_ptr + pid_n * stride_y_n + pid_c * stride_y_c
+    tl.store(out_ptr, mean_val)
+
+
+def global_avg_pool_clamp_triton(x, clamp_min, clamp_max):
+    # x: [N, C, D, H, W]
+    assert x.is_cuda
+    N, C, D, H, W = x.shape
+    P = D * H * W
+
+    y = torch.empty((N, C, 1, 1, 1), device=x.device, dtype=x.dtype)
+
+    stride_x_n, stride_x_c, stride_x_d, stride_x_h, stride_x_w = x.stride()
+    # For [N, C, 1, 1, 1] contiguous: strides are [C, 1, 1, 1, 1]
+    stride_y_n, stride_y_c = y.stride()[0], y.stride()[1]
+
+    BLOCK_P = 128
+    grid = lambda META: (N, C)
+
+    global_avg_pool_clamp_kernel[grid](
+        x, y,
+        N, C,
+        D, H, W,
+        P,
+        stride_x_n, stride_x_c, stride_x_d, stride_x_h, stride_x_w,
+        stride_y_n, stride_y_c,
+        clamp_min, clamp_max,
+        BLOCK_P=BLOCK_P,
+        num_warps=2, num_stages=2,
+    )
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Transposed 3D convolution implemented with Triton, followed by
+    scaling, MaxPool3d, global average pooling, and clamping.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, scale, maxpool_kernel_size):
+        super(ModelNew, self).__init__()
+
+        # Normalize hyperparameters to 3D tuples
+        if isinstance(kernel_size, int):
+            kD = kH = kW = kernel_size
+        else:
+            kD, kH, kW = kernel_size
+
+        if isinstance(stride, int):
+            sD = sH = sW = stride
+        else:
+            sD, sH, sW = stride
+
+        if isinstance(padding, int):
+            pD = pH = pW = padding
+        else:
+            pD, pH, pW = padding
+
+        if isinstance(maxpool_kernel_size, int):
+            mp_kD = mp_kH = mp_kW = maxpool_kernel_size
+        else:
+            mp_kD, mp_kH, mp_kW = maxpool_kernel_size
+
+        # ConvTranspose3d params: [C_in, C_out, kD, kH, kW]
+        self.weight = nn.Parameter(
+            torch.randn(in_channels, out_channels, kD, kH, kW)
+        )
+        self.bias = nn.Parameter(torch.randn(out_channels))
+
+        self.stride = (sD, sH, sW)
+        self.padding = (pD, pH, pW)
+        self.scale = float(scale)
+        self.maxpool_kernel_size = (mp_kD, mp_kH, mp_kW)
+
+        self.clamp_min = 0.0
+        self.clamp_max = 1.0
+
+    def forward(self, x):
+        x = x.cuda()
+        w = self.weight.cuda()
+        b = self.bias.cuda()
+
+        # ConvTranspose3d + scale
+        x = conv_transpose3d_scale_triton(x, w, b, self.stride, self.padding, self.scale)
+        # MaxPool3d
+        x = maxpool3d_triton(x, self.maxpool_kernel_size)
+        # Global average pooling + clamp
+        x = global_avg_pool_clamp_triton(x, self.clamp_min, self.clamp_max)
+        return x
+```
+
+---
+
+# Your Task
+
+Implement the optimization strategy above. Focus on the specific bottleneck identified.
+
+## Key Requirements
+
+1. **Preserve correctness**: Maintain the same input/output behavior
+2. **Apply the optimization**: Follow the implementation plan exactly
+3. **Use valid Triton syntax**:
+   - Every kernel MUST have `@triton.jit` decorator
+   - Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+   - BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+   - No `continue`, `break`, `return` inside kernels (use masking)
+   - Prefer `tl.dot(a, b, allow_tf32=True)` for matmul operations
+
+4. **CRITICAL for RNN/GRU/LSTM Persistent Kernels**:
+   - Time loop MUST be inside @triton.jit kernel, NOT in Python forward()
+   - **HYBRID computation strategy** (CRITICAL for performance):
+     * Precompute input-side gates OUTSIDE kernel: `gates_x = (T*B, In) @ W_ih` (ONE large GEMM)
+     * INSIDE kernel: only recurrent-side: `for t: gates_h = h @ W_hh` (T small GEMMs)
+   - CORRECT (FAST - use this):
+     ```python
+     # Python forward():
+     gates_x_all = x.reshape(T*B, In) @ W_ih + b_ih  # ONE large GEMM
+     gates_x_all = gates_x_all.view(T, B, 3*H)
+     gru_persistent_kernel[grid](gates_x_all, h0, W_hh, ...)  # Launch ONCE
+
+     @triton.jit
+     def gru_persistent_kernel(gates_x_ptr, h_ptr, W_hh_ptr, ...):
+         for t in range(T):  # Inside kernel
+             gates_x_t = tl.load(gates_x_ptr + t*...)  # Precomputed
+             gates_h = h @ W_hh  # Only recurrent GEMM
+             h = (1-z)*n + z*h   # Fuse and update
+     ```
+
+5. **Output format**:
+   - Imports: `import torch, torch.nn as nn, triton, triton.language as tl`
+   - `@triton.jit` kernel(s)
+   - Wrapper function(s)
+   - `class ModelNew(nn.Module)` — REQUIRED
+   - NO testing code, NO `if __name__ == "__main__"`
+
+---
+
+Generate the optimized kernel now. Output ONLY the complete Python code.

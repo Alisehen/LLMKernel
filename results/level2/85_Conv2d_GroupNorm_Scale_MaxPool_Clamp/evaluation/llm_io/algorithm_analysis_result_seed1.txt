@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The normalization+pooling path is clearly DRAM‑bound and currently implemented as two separate kernels with extra global memory traffic and launch overhead.",
+  "bottleneck": "GroupNorm is done in two passes: one kernel streams the entire conv output to compute mean/var, writes them to global memory, and a second kernel rereads the same activations plus mean/var to normalize, scale, maxpool, and clamp, leading to very high DRAM throughput and almost no L2 reuse.",
+  "optimisation method": "Fuse `groupnorm_stats_kernel` and `groupnorm_scale_maxpool_clamp_kernel` into a single persistent per-(batch,group) kernel that computes GroupNorm statistics and then immediately performs normalization+scale+maxpool+clamp, keeping mean/var in registers and eliminating the intermediate mean/var tensors and one full kernel launch.",
+  "modification plan": "Redesign the GroupNorm path as one Triton kernel with `program_id` over (B,G): in phase 1, loop over the group’s (C_group,H,W) elements to compute mean/var (e.g., via Welford) and keep them in registers; in phase 2, loop again over the same elements to apply normalization, affine, extra scale, and 4×4 maxpool+clamp, writing only the pooled outputs to global memory. Remove the global `mean`/`var` buffers and their loads/stores, adjust indexing so the second pass can reuse L2/L1 locality as much as possible, and call this fused kernel once instead of launching two separate kernels.",
+  "expected_speedup": "20-30%"
+}

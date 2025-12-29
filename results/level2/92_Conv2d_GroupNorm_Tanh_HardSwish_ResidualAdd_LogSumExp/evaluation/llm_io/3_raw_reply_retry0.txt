@@ -1,326 +1,457 @@
 ```python
-# <corrected code>
 import torch
 import torch.nn as nn
 import triton
 import triton.language as tl
 
 
-# ------------------------------------------------------------
-# Optimized NCHW Conv2D kernel (stride=1, padding=0, dilation=1)
-# ------------------------------------------------------------
+# -----------------------------
+# Optimized Conv2d (NCHW, stride=1, padding=0)
+# Target: Ada (RTX 4090)
+# Focus: higher occupancy (warps_active) + fewer pipeline stages
+# -----------------------------
 
-@triton.autotune(
-    configs=[
-        # Larger tile – best when register pressure allows
-        triton.Config(
-            {'BLOCK_M': 64, 'BLOCK_N': 32},
-            num_warps=4,
-            num_stages=2,
-        ),
-        # More conservative tile – reduces register pressure
-        triton.Config(
-            {'BLOCK_M': 32, 'BLOCK_N': 32},
-            num_warps=2,
-            num_stages=2,
-        ),
-        # Narrow OC tile – good when many output channels
-        triton.Config(
-            {'BLOCK_M': 64, 'BLOCK_N': 16},
-            num_warps=4,
-            num_stages=2,
-        ),
-    ],
-    key=['N', 'C_in', 'H_in', 'W_in', 'OC', 'KH', 'KW'],
-)
+conv2d_configs = [
+    # Aggressive, high-parallelism config for large tiles
+    triton.Config(
+        {'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32},
+        num_warps=8,
+        num_stages=3,
+    ),
+    # Balanced config
+    triton.Config(
+        {'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32},
+        num_warps=4,
+        num_stages=3,
+    ),
+    # Conservative baseline (smaller tile, fewer stages → lower register pressure)
+    triton.Config(
+        {'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32},
+        num_warps=4,
+        num_stages=2,
+    ),
+]
+
+
+@triton.autotune(configs=conv2d_configs, key=['M', 'C_out', 'K_total'])
 @triton.jit
 def conv2d_nchw_kernel(
-    x_ptr, w_ptr, b_ptr, y_ptr,
-    N, C_in, H_in, W_in,
-    OC, KH, KW,
-    H_out, W_out,
-    stride_xn, stride_xc, stride_xh, stride_xw,
-    stride_wo, stride_wc, stride_wkh, stride_wkw,
-    stride_yn, stride_yc, stride_yh, stride_yw,
-    BLOCK_M: tl.constexpr,  # flattened (N * H_out * W_out)
-    BLOCK_N: tl.constexpr,  # output channels (OC)
+    x_ptr, w_ptr, bias_ptr, y_ptr,
+    N, C_in, C_out,
+    H, W, H_out, W_out,
+    K_total, KH, KW,
+    stride_x_n, stride_x_c, stride_x_h, stride_x_w,
+    stride_w_co, stride_w_ci, stride_w_kh, stride_w_kw,
+    stride_y_n, stride_y_c, stride_y_h, stride_y_w,
+    M, HW_out,
+    BLOCK_M: tl.constexpr,  # tile size in M dimension (N * H_out * W_out)
+    BLOCK_N: tl.constexpr,  # tile size in output channels
+    BLOCK_K: tl.constexpr,  # reduction tile over K_total
 ):
+    # program ids for tiles
     pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    pid_co = tl.program_id(1)
 
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # [BLOCK_M]
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # [BLOCK_N]
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_co = pid_co * BLOCK_N + tl.arange(0, BLOCK_N)
 
-    P = N * H_out * W_out
-    mask_m = offs_m < P
-    mask_n = offs_n < OC
+    mask_m = offs_m < M
+    mask_co = offs_co < C_out
 
-    HW_out = H_out * W_out
-    n_idx = offs_m // HW_out
-    rem = offs_m % HW_out
-    oh_idx = rem // W_out
-    ow_idx = rem % W_out
+    # Decompose offs_m -> (n, h_out, w_out)
+    n = offs_m // HW_out
+    rem_m = offs_m % HW_out
+    h_out = rem_m // W_out
+    w_out = rem_m % W_out
 
-    # Accumulator: keep in fp32 for numerical stability
+    # Broadcasted indices
+    n_bc = n[:, None]
+    h_bc = h_out[:, None]
+    w_bc = w_out[:, None]
+    co_bc = offs_co[None, :]
+
+    # Accumulator in fp32
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    # Main convolution loop over (C_in, KH, KW)
-    for ic in range(0, C_in):
-        for kh in range(0, KH):
-            h_in = oh_idx + kh
-            for kw in range(0, KW):
-                w_in = ow_idx + kw
+    HW_k = KH * KW
 
-                # Input load (NCHW, stride=1,pad=0 so accesses are mostly contiguous in W)
-                x_ptrs = (
-                    x_ptr
-                    + n_idx * stride_xn
-                    + ic * stride_xc
-                    + h_in * stride_xh
-                    + w_in * stride_xw
-                )
-                x_vals = tl.load(x_ptrs, mask=mask_m, other=0.0)  # [BLOCK_M]
+    # K reduction
+    for k0 in range(0, K_total, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < K_total
 
-                # Weight load
-                w_ptrs = (
-                    w_ptr
-                    + offs_n * stride_wo
-                    + ic * stride_wc
-                    + kh * stride_wkh
-                    + kw * stride_wkw
-                )
-                w_vals = tl.load(w_ptrs, mask=mask_n, other=0.0)  # [BLOCK_N]
+        # Decompose offs_k -> (ci, kh, kw)
+        ci = offs_k // HW_k
+        rem_k = offs_k % HW_k
+        kh = rem_k // KW
+        kw = rem_k % KW
 
-                # Outer product accumulation
-                acc += x_vals[:, None] * w_vals[None, :]
+        ci_row = ci[None, :]
+        kh_row = kh[None, :]
+        kw_row = kw[None, :]
 
-    # Add bias
-    bias_vals = tl.load(b_ptr + offs_n, mask=mask_n, other=0.0)  # [BLOCK_N]
-    acc += bias_vals[None, :]
+        # A: input "im2col" tile, shape [BLOCK_M, BLOCK_K]
+        a_ptrs = (
+            x_ptr
+            + n_bc * stride_x_n
+            + ci_row * stride_x_c
+            + (h_bc + kh_row) * stride_x_h
+            + (w_bc + kw_row) * stride_x_w
+        )
+        a_mask = mask_m[:, None] & mask_k[None, :]
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
 
-    # Store output
+        # B: weight tile, shape [BLOCK_K, BLOCK_N]
+        ci_col = ci[:, None]
+        kh_col = kh[:, None]
+        kw_col = kw[:, None]
+
+        b_ptrs = (
+            w_ptr
+            + co_bc * stride_w_co
+            + ci_col * stride_w_ci
+            + kh_col * stride_w_kh
+            + kw_col * stride_w_kw
+        )
+        b_mask = mask_k[:, None] & mask_co[None, :]
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+        # Matrix multiply accumulate
+        acc += tl.dot(a, b, allow_tf32=True)
+
+    # Bias add (broadcast over spatial+batch)
+    bias = tl.load(bias_ptr + offs_co, mask=mask_co, other=0.0).to(tl.float32)
+    acc += bias[None, :]
+
+    # Store result (single final store; no intermediates)
     y_ptrs = (
         y_ptr
-        + n_idx[:, None] * stride_yn
-        + offs_n[None, :] * stride_yc
-        + oh_idx[:, None] * stride_yh
-        + ow_idx[:, None] * stride_yw
+        + n_bc * stride_y_n
+        + co_bc * stride_y_c
+        + h_bc * stride_y_h
+        + w_bc * stride_y_w
     )
-    tl.store(y_ptrs, acc, mask=mask_m[:, None] & mask_n[None, :])
+    out_mask = mask_m[:, None] & mask_co[None, :]
+    tl.store(y_ptrs, acc, mask=out_mask)
 
 
-def conv2d_triton_nchw(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
-    """
-    NCHW convolution with stride=1, padding=0, dilation=1 implemented in Triton.
-    x:      [N, C_in, H_in, W_in]
-    weight: [OC, C_in, KH, KW]
-    bias:   [OC]
-    """
-    assert x.is_cuda and weight.is_cuda and bias.is_cuda
-    assert x.ndim == 4 and weight.ndim == 4
-    N, C_in, H_in, W_in = x.shape
-    OC, C_in2, KH, KW = weight.shape
-    assert C_in == C_in2, "Input channel mismatch between x and weight"
+def triton_conv2d_nchw(x, weight, bias, kernel_size):
+    # x: (N, C_in, H, W), weight: (C_out, C_in, KH, KW)
+    N, C_in, H, W = x.shape
+    C_out, C_in_w, KH_w, KW_w = weight.shape
+    assert C_in_w == C_in
+    if isinstance(kernel_size, int):
+        KH = KW = kernel_size
+    else:
+        KH, KW = kernel_size
+    assert KH == KH_w and KW == KW_w
 
-    # stride=1, padding=0, dilation=1
-    H_out = H_in - KH + 1
-    W_out = W_in - KW + 1
-    assert H_out > 0 and W_out > 0
+    H_out = H - KH + 1
+    W_out = W - KW + 1
 
-    x_contig = x.contiguous()
-    w_contig = weight.contiguous()
-    b_contig = bias.contiguous()
+    y = torch.empty((N, C_out, H_out, W_out), device=x.device, dtype=x.dtype)
 
-    y = torch.empty((N, OC, H_out, W_out), device=x.device, dtype=torch.float32)
+    M = N * H_out * W_out
+    HW_out = H_out * W_out
+    K_total = C_in * KH * KW
 
-    P = N * H_out * W_out
-
-    # Grid is defined as a lambda so autotune configs can change BLOCK_M/BLOCK_N
-    def grid(meta):
-        return (
-            triton.cdiv(P, meta['BLOCK_M']),
-            triton.cdiv(OC, meta['BLOCK_N']),
-        )
+    grid = lambda META: (
+        triton.cdiv(M, META['BLOCK_M']),
+        triton.cdiv(C_out, META['BLOCK_N']),
+    )
 
     conv2d_nchw_kernel[grid](
-        x_contig, w_contig, b_contig, y,
-        N, C_in, H_in, W_in,
-        OC, KH, KW,
-        H_out, W_out,
-        x_contig.stride(0), x_contig.stride(1),
-        x_contig.stride(2), x_contig.stride(3),
-        w_contig.stride(0), w_contig.stride(1),
-        w_contig.stride(2), w_contig.stride(3),
-        y.stride(0), y.stride(1),
-        y.stride(2), y.stride(3),
+        x, weight, bias, y,
+        N, C_in, C_out,
+        H, W, H_out, W_out,
+        K_total, KH, KW,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        weight.stride(0), weight.stride(1), weight.stride(2), weight.stride(3),
+        y.stride(0), y.stride(1), y.stride(2), y.stride(3),
+        M, HW_out,
     )
-
     return y
 
 
-# ------------------------------------------------------------
-# Optimized LogSumExp over channel dim (NCHW, dim=1, keepdim=True)
-# Single-pass numerically stable algorithm to halve memory traffic.
-# ------------------------------------------------------------
+# -----------------------------
+# GroupNorm stats kernel
+# Memory-bound; tune num_warps, keep stages low
+# -----------------------------
 
-@triton.autotune(
-    configs=[
-        triton.Config(
-            {'BLOCK_M': 256},
-            num_warps=4,
-            num_stages=2,
-        ),
-        # Smaller tile as conservative fallback if registers get tight
-        triton.Config(
-            {'BLOCK_M': 128},
-            num_warps=2,
-            num_stages=2,
-        ),
-    ],
-    key=['N', 'C', 'H', 'W'],
-)
+groupnorm_stats_configs = [
+    triton.Config({'BLOCK': 256}, num_warps=8, num_stages=2),
+    triton.Config({'BLOCK': 128}, num_warps=4, num_stages=2),
+]
+
+
+@triton.autotune(configs=groupnorm_stats_configs, key=['group_elems'])
 @triton.jit
-def logsumexp_channel_kernel(
-    x_ptr, y_ptr,
+def groupnorm_stats_kernel(
+    x_ptr, mean_ptr, rstd_ptr,
     N, C, H, W,
-    stride_xn, stride_xc, stride_xh, stride_xw,
-    stride_yn, stride_yc, stride_yh, stride_yw,
-    BLOCK_M: tl.constexpr,  # flattened (N * H * W)
+    G, group_size, group_elems,
+    stride_x_n, stride_x_c, stride_x_h, stride_x_w,
+    stride_mean_n, stride_mean_g,
+    stride_rstd_n, stride_rstd_g,
+    eps,
+    BLOCK: tl.constexpr,
 ):
-    pid = tl.program_id(0)
+    pid_n = tl.program_id(0)
+    pid_g = tl.program_id(1)
 
-    offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
-    P = N * H * W
-    mask_m = offs_m < P
+    n = pid_n
+    g = pid_g
 
     HW = H * W
-    n_idx = offs_m // HW
-    rem = offs_m % HW
-    h_idx = rem // W
-    w_idx = rem % W
 
-    # Initialize with channel 0
-    c0 = 0
-    x_ptrs0 = (
-        x_ptr
-        + n_idx * stride_xn
-        + c0 * stride_xc
-        + h_idx * stride_xh
-        + w_idx * stride_xw
-    )
-    x0 = tl.load(x_ptrs0, mask=mask_m, other=-float("inf"))
+    # Accumulators in fp32
+    sum_val = 0.0
+    sum_sq = 0.0
 
-    # Running max (m) and running sum of exp shifted by m (s)
-    m = x0
-    # exp(x0 - m) = 1, keeps everything in-register without needing tl.ones_like
-    s = tl.exp(x0 - m)
+    for off in range(0, group_elems, BLOCK):
+        offs = off + tl.arange(0, BLOCK)
+        mask = offs < group_elems
 
-    # Single-pass numerically stable log-sum-exp
-    for c in range(1, C):
+        c_in_group = offs // HW
+        rem = offs % HW
+        h = rem // W
+        w = rem % W
+
+        c = g * group_size + c_in_group
+
         x_ptrs = (
             x_ptr
-            + n_idx * stride_xn
-            + c * stride_xc
-            + h_idx * stride_xh
-            + w_idx * stride_xw
+            + n * stride_x_n
+            + c * stride_x_c
+            + h * stride_x_h
+            + w * stride_x_w
         )
-        x_vals = tl.load(x_ptrs, mask=mask_m, other=-float("inf"))
+        vals = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
 
-        new_m = tl.maximum(m, x_vals)
-        # s_new = s * exp(m - new_m) + exp(x_vals - new_m)
-        s = s * tl.exp(m - new_m) + tl.exp(x_vals - new_m)
+        sum_val += tl.sum(vals, axis=0)
+        sum_sq += tl.sum(vals * vals, axis=0)
+
+    group_elems_f = group_elems * 1.0
+    mean = sum_val / group_elems_f
+    var = sum_sq / group_elems_f - mean * mean
+    rstd = 1.0 / tl.sqrt(var + eps)
+
+    mean_ptr_n = mean_ptr + n * stride_mean_n + g * stride_mean_g
+    rstd_ptr_n = rstd_ptr + n * stride_rstd_n + g * stride_rstd_g
+
+    # Two outputs → two final stores; no intermediates
+    tl.store(mean_ptr_n, mean)
+    tl.store(rstd_ptr_n, rstd)
+
+
+def groupnorm_stats_triton(x, groups, eps):
+    N, C, H, W = x.shape
+    assert C % groups == 0
+    group_size = C // groups
+    group_elems = group_size * H * W
+
+    mean = torch.empty((N, groups), device=x.device, dtype=torch.float32)
+    rstd = torch.empty_like(mean)
+
+    grid = lambda META: (N, groups)
+
+    groupnorm_stats_kernel[grid](
+        x, mean, rstd,
+        N, C, H, W,
+        groups, group_size, group_elems,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        mean.stride(0), mean.stride(1),
+        rstd.stride(0), rstd.stride(1),
+        eps,
+    )
+    return mean, rstd
+
+
+# -----------------------------
+# Fused GroupNorm + Act + Residual + LSE
+# Heavily fused, compute-bound; tune BLOCK_C, num_warps
+# -----------------------------
+
+fused_gn_configs = [
+    # Large channel tile, high-parallel config for big C
+    triton.Config({'BLOCK_C': 128}, num_warps=8, num_stages=2),
+    # Baseline for most shapes
+    triton.Config({'BLOCK_C': 64}, num_warps=4, num_stages=2),
+    # Small-tile fallback for small C
+    triton.Config({'BLOCK_C': 32}, num_warps=4, num_stages=2),
+]
+
+
+@triton.autotune(configs=fused_gn_configs, key=['C'])
+@triton.jit
+def fused_groupnorm_act_res_lse_kernel(
+    x_ptr, mean_ptr, rstd_ptr, gamma_ptr, beta_ptr, out_ptr,
+    N, C, H, W,
+    G, group_size,
+    stride_x_n, stride_x_c, stride_x_h, stride_x_w,
+    stride_mean_n, stride_mean_g,
+    stride_rstd_n, stride_rstd_g,
+    stride_gamma_c, stride_beta_c,
+    stride_out_n, stride_out_c, stride_out_h, stride_out_w,
+    BLOCK_C: tl.constexpr,
+):
+    """
+    Fused:
+      - GroupNorm (using precomputed mean/rstd)
+      - Affine (gamma/beta)
+      - tanh approximation via exp(2x)
+      - HardSwish on tanh(x)
+      - Residual add
+      - LogSumExp over channels
+
+    Memory rule: only a single tl.store for final LSE per (n, h, w).
+    """
+    pid_n = tl.program_id(0)
+    pid_s = tl.program_id(1)
+
+    n = pid_n
+    S = H * W
+    s = pid_s  # one spatial position per program in this dimension
+
+    if s >= S:
+        return  # grid is sized to avoid this, but keep for safety
+
+    # Decompose spatial index
+    h = s // W
+    w = s % W
+
+    # Online log-sum-exp accumulators (scalars per (n, h, w))
+    m = -float("inf")  # running max
+    s_exp = 0.0        # running sum of exp(x - m)
+
+    for c0 in range(0, C, BLOCK_C):
+        offs_c = c0 + tl.arange(0, BLOCK_C)
+        mask_c = offs_c < C
+
+        # Shared offsets for all fused ops (x, mean, rstd, gamma, beta)
+        x_ptrs = (
+            x_ptr
+            + n * stride_x_n
+            + offs_c * stride_x_c
+            + h * stride_x_h
+            + w * stride_x_w
+        )
+        x = tl.load(x_ptrs, mask=mask_c, other=0.0).to(tl.float32)
+
+        # Group index per channel
+        g = offs_c // group_size
+
+        mean_ptrs = mean_ptr + n * stride_mean_n + g * stride_mean_g
+        rstd_ptrs = rstd_ptr + n * stride_rstd_n + g * stride_rstd_g
+        mean = tl.load(mean_ptrs, mask=mask_c, other=0.0)
+        rstd = tl.load(rstd_ptrs, mask=mask_c, other=0.0)
+
+        gamma_ptrs = gamma_ptr + offs_c * stride_gamma_c
+        beta_ptrs = beta_ptr + offs_c * stride_beta_c
+        gamma = tl.load(gamma_ptrs, mask=mask_c, other=0.0).to(tl.float32)
+        beta = tl.load(beta_ptrs, mask=mask_c, other=0.0).to(tl.float32)
+
+        # GroupNorm + affine
+        x_norm = (x - mean) * rstd
+        x_aff = x_norm * gamma + beta
+
+        # tanh(x_aff) via exp(2x)
+        two_x = 2.0 * x_aff
+        exp2x = tl.exp(two_x)
+        tanh_x = (exp2x - 1.0) / (exp2x + 1.0)
+
+        # HardSwish(tanh_x) = tanh_x * clamp(tanh_x + 3, 0, 6) / 6
+        t = tanh_x + 3.0
+        t = tl.maximum(t, 0.0)
+        t = tl.minimum(t, 6.0)
+        x_hs = tanh_x * t * (1.0 / 6.0)
+
+        # Residual: x_aff + HardSwish(tanh(x_aff))
+        x_res = x_aff + x_hs
+        x_res = tl.where(mask_c, x_res, -float("inf"))
+
+        # Tile-wise max and sumexp for online LSE
+        tile_max = tl.max(x_res, axis=0)
+        expv = tl.exp(x_res - tile_max)
+        tile_sum = tl.sum(expv, axis=0)
+
+        new_m = tl.maximum(m, tile_max)
+        s_exp = s_exp * tl.exp(m - new_m) + tile_sum * tl.exp(tile_max - new_m)
         m = new_m
 
-    out = tl.log(s) + m
+    lse = tl.log(s_exp) + m
 
-    # Store result: y shape [N, 1, H, W], channel index is 0
-    y_ptrs = (
-        y_ptr
-        + n_idx * stride_yn
-        + h_idx * stride_yh
-        + w_idx * stride_yw
+    out_ptrs = (
+        out_ptr
+        + n * stride_out_n
+        + 0 * stride_out_c
+        + h * stride_out_h
+        + w * stride_out_w
     )
-    tl.store(y_ptrs, out, mask=mask_m)
+    # Single final store per output element
+    tl.store(out_ptrs, lse)
 
 
-def logsumexp_channel_triton(x: torch.Tensor) -> torch.Tensor:
-    """
-    Compute torch.logsumexp(x, dim=1, keepdim=True) for NCHW tensor x using Triton.
-    x: [N, C, H, W] -> returns [N, 1, H, W]
-    """
-    assert x.is_cuda
-    assert x.ndim == 4
+def fused_groupnorm_act_res_lse_triton(x, mean, rstd, gamma, beta, groups):
     N, C, H, W = x.shape
+    group_size = C // groups
 
-    x_contig = x.contiguous()
-    y = torch.empty((N, 1, H, W), device=x.device, dtype=torch.float32)
+    out = torch.empty((N, 1, H, W), device=x.device, dtype=x.dtype)
 
-    P = N * H * W
+    grid = lambda META: (N, max(1, H * W))
 
-    def grid(meta):
-        return (triton.cdiv(P, meta['BLOCK_M']),)
-
-    logsumexp_channel_kernel[grid](
-        x_contig, y,
+    fused_groupnorm_act_res_lse_kernel[grid](
+        x, mean, rstd, gamma, beta, out,
         N, C, H, W,
-        x_contig.stride(0), x_contig.stride(1),
-        x_contig.stride(2), x_contig.stride(3),
-        y.stride(0), y.stride(1),
-        y.stride(2), y.stride(3),
+        groups, group_size,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        mean.stride(0), mean.stride(1),
+        rstd.stride(0), rstd.stride(1),
+        gamma.stride(0), beta.stride(0),
+        out.stride(0), out.stride(1), out.stride(2), out.stride(3),
     )
+    return out
 
-    return y
 
-
-# ------------------------------------------------------------
-# ModelNew using optimized Triton kernels
-# ------------------------------------------------------------
+# -----------------------------
+# Model
+# -----------------------------
 
 class ModelNew(nn.Module):
     """
-    Triton-accelerated model:
-      Conv2d (NCHW, stride=1, padding=0) via Triton
-      GroupNorm (PyTorch)
-      Tanh (PyTorch)
-      HardSwish (PyTorch)
-      Residual Add (PyTorch)
-      LogSumExp over channels via Triton
+    Triton-optimized version of the model:
+    Conv2d -> GroupNorm -> Tanh -> HardSwish -> Residual Add -> LogSumExp
     """
 
     def __init__(self, in_channels, out_channels, kernel_size, groups, eps=1e-5):
         super(ModelNew, self).__init__()
-        self.conv = nn.Conv2d(
-            in_channels,
-            out_channels,
-            kernel_size,
-            stride=1,
-            padding=0,
-            bias=True,
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.groups = groups
+        self.eps = eps
+
+        if isinstance(kernel_size, int):
+            kh = kw = kernel_size
+        else:
+            kh, kw = kernel_size
+        self.weight = nn.Parameter(
+            torch.randn(out_channels, in_channels, kh, kw)
         )
-        self.group_norm = nn.GroupNorm(groups, out_channels, eps=eps)
-        self.tanh = nn.Tanh()
-        self.hard_swish = nn.Hardswish()
+        self.bias = nn.Parameter(torch.randn(out_channels))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # 1) Convolution via Triton
-        weight = self.conv.weight
-        bias = self.conv.bias
-        x_conv = conv2d_triton_nchw(x, weight, bias)
+        # GroupNorm affine parameters
+        self.gn_weight = nn.Parameter(torch.ones(out_channels))
+        self.gn_bias = nn.Parameter(torch.zeros(out_channels))
 
-        # 2) Group Normalization
-        x_norm = self.group_norm(x_conv)
-
-        # 3) Tanh
-        x_tanh = self.tanh(x_norm)
-
-        # 4) HardSwish
-        x_hard_swish = self.hard_swish(x_tanh)
-
-        # 5) Residual Addition
-        x_res = x_conv + x_hard_swish
-
-        # 6) LogSumExp over channels (dim=1, keepdim=True) via Triton
-        x_logsumexp = logsumexp_channel_triton(x_res)
-
+    def forward(self, x):
+        # Conv2d
+        x_conv = triton_conv2d_nchw(x, self.weight, self.bias, self.kernel_size)
+        # GroupNorm stats
+        mean, rstd = groupnorm_stats_triton(x_conv, self.groups, self.eps)
+        # GroupNorm + activation + residual + LogSumExp (fused)
+        x_logsumexp = fused_groupnorm_act_res_lse_triton(
+            x_conv, mean, rstd, self.gn_weight, self.gn_bias, self.groups
+        )
         return x_logsumexp
 ```

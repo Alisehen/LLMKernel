@@ -1,8 +1,10 @@
+```json
 {
   "worth_optimizing": "yes",
-  "reason": "The custom GEMM inside the Triton kernel is dramatically slower than cuBLAS for this very large 128×32768×32768 matmul, so replacing it with a more optimal algorithm can yield large gains.",
-  "bottleneck": "The kernel implements a naive tiled K-loop matmul instead of using a tensor-core-optimized GEMM like cuBLAS or Triton’s tuned matmul template; for these dimensions the GEMM dominates runtime, and the current implementation leaves huge hardware throughput on the table.",
-  "optimisation method": "Algorithm replacement: swap the hand-written matmul loop with a high-performance GEMM (e.g., Triton’s `matmul` template or a CUTLASS-style tensor-core kernel) and keep Swish+scale as a fused epilogue in the same kernel.",
-  "modification plan": "Refactor the kernel to use Triton’s standard matmul building block (from the matmul tutorial / `triton.ops.matmul`), which has proper tiling, double-buffering, and tensor-core utilization for large K. Integrate bias addition, Swish activation, and scaling into the epilogue of that matmul kernel so the output tiles are transformed in registers before the final store. Keep the weight in [K, N] layout (or pre-transpose once at initialization) so the GEMM is in the native [M,K]×[K,N] form without per-forward transposes.",
-  "expected_speedup": "80-90% (5-10x vs current Triton, bringing performance to at least parity with or better than the PyTorch baseline)"
+  "reason": "Each forward call does a full `weight.t().contiguous()` on a 32768x32768 matrix, which is an enormous extra memory movement and dominates runtime.",
+  "bottleneck": "The kernel is fed with a transposed-and-repacked copy of the weight on every forward; transposing a ~4.3 GB weight matrix (read + write) per iteration is a massive bandwidth cost completely absent from the PyTorch baseline, on top of a slower-than-cuBLAS GEMM.",
+  "optimisation method": "Eliminate the per-forward transpose by storing the weight parameter directly in the [K, N] layout expected by the Triton kernel (or precomputing and persisting the transposed form), so the matmul can use the weight without any layout conversion at runtime.",
+  "modification plan": "Redefine `ModelNew.weight` to have shape `[in_features, out_features]` (or maintain a persistent transposed buffer) and initialize it accordingly, then update `fused_linear_swish_scale` to pass this tensor directly as `b_ptr` without calling `weight.t().contiguous()`. Adjust the kernel’s B strides (`stride_bk`, `stride_bn`) to match the new layout; no other algorithmic changes are needed.",
+  "expected_speedup": "25-35%"
 }
+```

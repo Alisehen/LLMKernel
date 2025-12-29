@@ -1,185 +1,147 @@
 [Seed] Generating seed kernel...
 [Seed 1/2] Generating...
 [92mFinish reason: stop[0m
-Usage: In=1617, Out=3324, Total=4941
-[seed_0] score=0.1719 (baseline=6.0822ms)
-[seed_0] metrics saved to: /home/hyc/LLMKernel/run/20251223_085823_59_Matmul_Swish_Scaling_openai_deepseek/59_Matmul_Swish_Scaling/evaluation/eval_0000.json
-[Seed 1] Final score: 0.1719 ✓
+Usage: In=1617, Out=3298, Total=4915
+[seed_0] score=0.1632 (baseline=6.2116ms)
+[seed_0] metrics saved to: /home/hyc/LLMKernel/run/20251228_161703_batch_range47to66_openai_deepseek/59_Matmul_Swish_Scaling/evaluation/eval_0024.json
+[Seed 1] Final score: 0.1632 ✓
 [Seed 2/2] Generating...
 [92mFinish reason: stop[0m
-Usage: In=1617, Out=3598, Total=5215
-[seed_1] score=0.1709 (baseline=6.0822ms)
-[seed_1] metrics saved to: /home/hyc/LLMKernel/run/20251223_085823_59_Matmul_Swish_Scaling_openai_deepseek/59_Matmul_Swish_Scaling/evaluation/eval_0001.json
-[Seed 2] Final score: 0.1709 ✓
+Usage: In=1617, Out=5048, Total=6665
+[seed_1] score=0.1732 (baseline=6.2116ms)
+[seed_1] metrics saved to: /home/hyc/LLMKernel/run/20251228_161703_batch_range47to66_openai_deepseek/59_Matmul_Swish_Scaling/evaluation/eval_0025.json
+[Seed 2] Final score: 0.1732 ✓
 
 ================================================================================
 [Hybrid Strategy] Analyzing all seeds for algorithmic optimization...
 [Hybrid Strategy] - 2 seed(s) with score < 1.0 (rescue)
 ================================================================================
 
-[Hybrid] Seed 1: score=0.1719 < 1.0
+[Hybrid] Seed 1: score=0.1632 < 1.0
 [Hybrid] Attempting algorithm analysis rescue...
 [ncu] Using GPU device 6 (CUDA_VISIBLE_DEVICES=6)
-[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_953105.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_953105.py /home/hyc/LLMKernel/KernelBench/level2/59_Matmul_Swish_Scaling.py /home/hyc/LLMKernel/run/20251223_085823_59_Matmul_Swish_Scaling_openai_deepseek/59_Matmul_Swish_Scaling/code/test_kernel_analysis_seed0.py --repeat 1
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_3267303.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_3267303.py /home/hyc/LLMKernel/KernelBench/tt/59_Matmul_Swish_Scaling.py /home/hyc/LLMKernel/run/20251228_161703_batch_range47to66_openai_deepseek/59_Matmul_Swish_Scaling/code/test_kernel_analysis_seed0.py --repeat 1
 [ncu stdout]: [bench] Completed 1 iterations successfully
 
-[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_953105.csv
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_3267303.csv
 [Hybrid] Requesting LLM analysis for seed 1...
 [92mFinish reason: stop[0m
-Usage: In=1968, Out=833, Total=2801
+Usage: In=1972, Out=1649, Total=3621
 [Hybrid] Worth optimizing: yes
-[Hybrid] Reason: The custom Triton GEMM is much slower than PyTorch’s highly tuned matmul, indicating a major algorithmic inefficiency.
+[Hybrid] Reason: The kernel reimplements a large GEMM in Triton, which is significantly slower than vendor-optimized GEMM and dominates total runtime.
 [Hybrid] Analysis complete for seed 1, generating optimized kernel...
-[Hybrid] Bottleneck: The kernel reimplements matrix multiplication with a naive block–K loop and tl.d...
-[Hybrid] Optimization: Replace the hand-written matmul loop with a library-quality GEMM (e.g., PyTorch/...
-[Hybrid] Expected speedup: 400-600% vs current Triton kernel (bringing it near or above the PyTorch baseline)
+[Hybrid] Bottleneck: The custom block-GEMM loop inside `fused_linear_swish_scale_kernel` is far less ...
+[Hybrid] Optimization: Algorithm Replacement: delegate the GEMM (`x @ weight.T`) to a highly-optimized ...
+[Hybrid] Expected speedup: 3-6x relative to the current Triton implementation, bringing performance back to at least parity with the PyTorch baseline or better.
 [92mFinish reason: stop[0m
-Usage: In=2268, Out=2641, Total=4909
-[algorithm_optimized_seed0] score=0.8053 (baseline=6.0822ms)
-[algorithm_optimized_seed0] metrics saved to: /home/hyc/LLMKernel/run/20251223_085823_59_Matmul_Swish_Scaling_openai_deepseek/59_Matmul_Swish_Scaling/evaluation/eval_0002.json
-[Hybrid] ✓ Rescue successful: 0.1719 → 0.8053
+Usage: In=2305, Out=2884, Total=5189
+[algorithm_optimized_seed0] score=1.0062 (baseline=6.2116ms)
+[algorithm_optimized_seed0] metrics saved to: /home/hyc/LLMKernel/run/20251228_161703_batch_range47to66_openai_deepseek/59_Matmul_Swish_Scaling/evaluation/eval_0026.json
+[Hybrid] ✓ Rescue successful: 0.1632 → 1.0062
 
-[Hybrid] Seed 2: score=0.1709 < 1.0
+[Hybrid] Seed 2: score=0.1732 < 1.0
 [Hybrid] Attempting algorithm analysis rescue...
 [ncu] Using GPU device 6 (CUDA_VISIBLE_DEVICES=6)
-[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_953105.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_953105.py /home/hyc/LLMKernel/KernelBench/level2/59_Matmul_Swish_Scaling.py /home/hyc/LLMKernel/run/20251223_085823_59_Matmul_Swish_Scaling_openai_deepseek/59_Matmul_Swish_Scaling/code/test_kernel_analysis_seed1.py --repeat 1
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_3267303.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_3267303.py /home/hyc/LLMKernel/KernelBench/tt/59_Matmul_Swish_Scaling.py /home/hyc/LLMKernel/run/20251228_161703_batch_range47to66_openai_deepseek/59_Matmul_Swish_Scaling/code/test_kernel_analysis_seed1.py --repeat 1
 [ncu stdout]: [bench] Completed 1 iterations successfully
 
-[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_953105.csv
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_3267303.csv
 [Hybrid] Requesting LLM analysis for seed 2...
 [92mFinish reason: stop[0m
-Usage: In=2046, Out=1079, Total=3125
+Usage: In=2090, Out=2479, Total=4569
 [Hybrid] Worth optimizing: yes
-[Hybrid] Reason: The custom GEMM inside the Triton kernel is dramatically slower than cuBLAS for this very large 128×32768×32768 matmul, so replacing it with a more optimal algorithm can yield large gains.
+[Hybrid] Reason: Each forward call does a full `weight.t().contiguous()` on a 32768x32768 matrix, which is an enormous extra memory movement and dominates runtime.
 [Hybrid] Analysis complete for seed 2, generating optimized kernel...
-[Hybrid] Bottleneck: The kernel implements a naive tiled K-loop matmul instead of using a tensor-core...
-[Hybrid] Optimization: Algorithm replacement: swap the hand-written matmul loop with a high-performance...
-[Hybrid] Expected speedup: 80-90% (5-10x vs current Triton, bringing performance to at least parity with or better than the PyTorch baseline)
+[Hybrid] Bottleneck: The kernel is fed with a transposed-and-repacked copy of the weight on every for...
+[Hybrid] Optimization: Eliminate the per-forward transpose by storing the weight parameter directly in ...
+[Hybrid] Expected speedup: 25-35%
 [92mFinish reason: stop[0m
-Usage: In=2372, Out=5304, Total=7676
-[algorithm_optimized_seed1] score=0.1718 (baseline=6.0822ms)
-[algorithm_optimized_seed1] metrics saved to: /home/hyc/LLMKernel/run/20251223_085823_59_Matmul_Swish_Scaling_openai_deepseek/59_Matmul_Swish_Scaling/evaluation/eval_0003.json
-[Hybrid] ✓ Rescue successful: 0.1709 → 0.1718
+Usage: In=2366, Out=2604, Total=4970
+[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 644, in compare_and_bench
+    raise ValueError(
+ValueError: Outputs are not close (atol=1, rtol=1). max_abs_err=6.062e+01, mean_abs_err=3.785e-01
+
+[algorithm_optimized_seed1] failed. See metrics.message for details.
+[algorithm_optimized_seed1] metrics saved to: /home/hyc/LLMKernel/run/20251228_161703_batch_range47to66_openai_deepseek/59_Matmul_Swish_Scaling/evaluation/eval_0027.json
+[Hybrid] Algorithm-optimized kernel failed, attempting repair...
+[92mFinish reason: stop[0m
+Usage: In=1703, Out=11132, Total=12835
+[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 644, in compare_and_bench
+    raise ValueError(
+ValueError: Outputs are not close (atol=1, rtol=1). max_abs_err=6.062e+01, mean_abs_err=3.785e-01
+
+[algorithm_optimized_seed1_repair1] failed. See metrics.message for details.
+[algorithm_optimized_seed1_repair1] metrics saved to: /home/hyc/LLMKernel/run/20251228_161703_batch_range47to66_openai_deepseek/59_Matmul_Swish_Scaling/evaluation/eval_0028.json
+[Hybrid] ✗ Rescue failed, keeping original seed
 
 ================================================================================
 [Hybrid] Candidate Selection
 ================================================================================
-[Hybrid] Total candidates: 4
-  [1] seed 1: 0.1719
-  [2] seed 2: 0.1709
-  [3] algo-optimized (from seed 1): 0.8053
-  [4] algo-optimized (from seed 2): 0.1718
+[Hybrid] Total candidates: 3
+  [1] seed 1: 0.1632
+  [2] seed 2: 0.1732
+  [3] algo-optimized (from seed 1): 1.0062
 
-[Hybrid] ★ Selected best candidate: score=0.8053
+[Hybrid] ★ Selected best candidate: score=1.0062
 
 [Optimization] Starting 3-stage optimization...
 
 ================================================================================
 [Stage 1/3] grid_and_parallel
 Description: Optimize grid layout and parallel work distribution across SMs.
-Current candidates: 1, best score: 0.8053
+Current candidates: 1, best score: 1.0062
 ================================================================================
 [Stage 1] Profiling best candidate...
 [ncu] Using GPU device 6 (CUDA_VISIBLE_DEVICES=6)
-[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_953105.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_953105.py /home/hyc/LLMKernel/KernelBench/level2/59_Matmul_Swish_Scaling.py /home/hyc/LLMKernel/run/20251223_085823_59_Matmul_Swish_Scaling_openai_deepseek/59_Matmul_Swish_Scaling/code/test_kernel_analysis_seed1.py --repeat 1
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_3267303.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_3267303.py /home/hyc/LLMKernel/KernelBench/tt/59_Matmul_Swish_Scaling.py /home/hyc/LLMKernel/run/20251228_161703_batch_range47to66_openai_deepseek/59_Matmul_Swish_Scaling/code/test_kernel_analysis_seed1.py --repeat 1
 [ncu stdout]: [bench] Completed 1 iterations successfully
 
-[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_953105.csv
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_3267303.csv
 [Stage 1] Generating optimized kernel...
 [92mFinish reason: stop[0m
-Usage: In=1574, Out=3551, Total=5125
-[stage1_grid_and_parallel] score=0.8106 (baseline=6.0822ms)
-[stage1_grid_and_parallel] metrics saved to: /home/hyc/LLMKernel/run/20251223_085823_59_Matmul_Swish_Scaling_openai_deepseek/59_Matmul_Swish_Scaling/evaluation/eval_0004.json
-  Optimized kernel score: 0.8106 ✓
-[Stage 1] ★ New best score: 0.8106
+Usage: In=1371, Out=7888, Total=9259
+[stage1_grid_and_parallel] score=1.0712 (baseline=6.2116ms)
+[stage1_grid_and_parallel] metrics saved to: /home/hyc/LLMKernel/run/20251228_161703_batch_range47to66_openai_deepseek/59_Matmul_Swish_Scaling/evaluation/eval_0029.json
+  Optimized kernel score: 1.0712 ✓
+[Stage 1] ★ New best score: 1.0712
 
 ================================================================================
 [Stage 2/3] block_tiling
 Description: Tune BLOCK_M/N/K sizes for optimal register/memory balance.
-Current candidates: 1, best score: 0.8106
+Current candidates: 1, best score: 1.0712
 ================================================================================
 [Stage 2] Profiling best candidate...
 [ncu] Using GPU device 6 (CUDA_VISIBLE_DEVICES=6)
-[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_953105.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_953105.py /home/hyc/LLMKernel/KernelBench/level2/59_Matmul_Swish_Scaling.py /home/hyc/LLMKernel/run/20251223_085823_59_Matmul_Swish_Scaling_openai_deepseek/59_Matmul_Swish_Scaling/code/test_kernel_analysis_seed1.py --repeat 1
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_3267303.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_3267303.py /home/hyc/LLMKernel/KernelBench/tt/59_Matmul_Swish_Scaling.py /home/hyc/LLMKernel/run/20251228_161703_batch_range47to66_openai_deepseek/59_Matmul_Swish_Scaling/code/test_kernel_analysis_seed1.py --repeat 1
 [ncu stdout]: [bench] Completed 1 iterations successfully
 
-[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_953105.csv
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_3267303.csv
 [Stage 2] Generating optimized kernel...
 [92mFinish reason: stop[0m
-Usage: In=1617, Out=3949, Total=5566
-[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
-  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 554, in compare_and_bench
-    test_out, _ = _run_once(test_model, inp, dev)
-                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
-    out = model(*inp)
-          ^^^^^^^^^^^
-  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
-    return self._call_impl(*args, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
-    return forward_call(*args, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/hyc/LLMKernel/run/20251223_085823_59_Matmul_Swish_Scaling_openai_deepseek/59_Matmul_Swish_Scaling/code/kernel_20251223_090527.py", line 112, in forward
-    return linear_swish_scale(
-           ^^^^^^^^^^^^^^^^^^^
-  File "/home/hyc/LLMKernel/run/20251223_085823_59_Matmul_Swish_Scaling_openai_deepseek/59_Matmul_Swish_Scaling/code/kernel_20251223_090527.py", line 84, in linear_swish_scale
-    swish_scale_bias_kernel_2d[grid](
-  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 419, in <lambda>
-    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
-                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 238, in run
-    benchmark()
-  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 227, in benchmark
-    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
-              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 227, in <dictcomp>
-    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
-                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 137, in _bench
-    raise ValueError(f"Conflicting meta-parameters: {', '.join(conflicts)}."
-ValueError: Conflicting meta-parameters: BLOCK_N. Make sure that you don't re-define auto-tuned symbols.
-
-[stage2_block_tiling] failed. See metrics.message for details.
-[stage2_block_tiling] metrics saved to: /home/hyc/LLMKernel/run/20251223_085823_59_Matmul_Swish_Scaling_openai_deepseek/59_Matmul_Swish_Scaling/evaluation/eval_0005.json
-  Optimization failed, attempting repair...
-[92mFinish reason: stop[0m
-Usage: In=2012, Out=2415, Total=4427
-[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
-  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 644, in compare_and_bench
-    raise ValueError(
-ValueError: Outputs are not close (atol=1, rtol=1). max_abs_err=inf, mean_abs_err=inf
-
-[stage2_block_tiling_repair] failed. See metrics.message for details.
-[stage2_block_tiling_repair] metrics saved to: /home/hyc/LLMKernel/run/20251223_085823_59_Matmul_Swish_Scaling_openai_deepseek/59_Matmul_Swish_Scaling/evaluation/eval_0006.json
-  Optimization failed, keeping previous candidate ✗
-[Stage 2] Current: 0.8106 (global best: 0.8106)
+Usage: In=2293, Out=3875, Total=6168
+[stage2_block_tiling] score=1.1162 (baseline=6.2116ms)
+[stage2_block_tiling] metrics saved to: /home/hyc/LLMKernel/run/20251228_161703_batch_range47to66_openai_deepseek/59_Matmul_Swish_Scaling/evaluation/eval_0030.json
+  Optimized kernel score: 1.1162 ✓
+[Stage 2] ★ New best score: 1.1162
 
 ================================================================================
 [Stage 3/3] memory_and_tuning
 Description: Optimize memory access patterns and fine-tune num_stages/num_warps.
-Current candidates: 1, best score: 0.8106
+Current candidates: 1, best score: 1.1162
 ================================================================================
+[Stage 3] Profiling best candidate...
+[ncu] Using GPU device 6 (CUDA_VISIBLE_DEVICES=6)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_3267303.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_3267303.py /home/hyc/LLMKernel/KernelBench/tt/59_Matmul_Swish_Scaling.py /home/hyc/LLMKernel/run/20251228_161703_batch_range47to66_openai_deepseek/59_Matmul_Swish_Scaling/code/test_kernel_analysis_seed1.py --repeat 1
+[ncu stdout]: [bench] Completed 1 iterations successfully
+
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_3267303.csv
 [Stage 3] Generating optimized kernel...
 [92mFinish reason: stop[0m
-Usage: In=1711, Out=4258, Total=5969
-[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
-  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 644, in compare_and_bench
-    raise ValueError(
-ValueError: Outputs are not close (atol=1, rtol=1). max_abs_err=inf, mean_abs_err=inf
-
-[stage3_memory_and_tuning] failed. See metrics.message for details.
-[stage3_memory_and_tuning] metrics saved to: /home/hyc/LLMKernel/run/20251223_085823_59_Matmul_Swish_Scaling_openai_deepseek/59_Matmul_Swish_Scaling/evaluation/eval_0007.json
-  Optimization failed, attempting repair...
-[92mFinish reason: stop[0m
-Usage: In=1613, Out=6001, Total=7614
-[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
-  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 644, in compare_and_bench
-    raise ValueError(
-ValueError: Outputs are not close (atol=1, rtol=1). max_abs_err=inf, mean_abs_err=inf
-
-[stage3_memory_and_tuning_repair] failed. See metrics.message for details.
-[stage3_memory_and_tuning_repair] metrics saved to: /home/hyc/LLMKernel/run/20251223_085823_59_Matmul_Swish_Scaling_openai_deepseek/59_Matmul_Swish_Scaling/evaluation/eval_0008.json
-  Optimization failed, keeping previous candidate ✗
-[Stage 3] Current: 0.8106 (global best: 0.8106)
-[59_Matmul_Swish_Scaling.py] Figure saved to: /home/hyc/LLMKernel/run/20251223_085823_59_Matmul_Swish_Scaling_openai_deepseek/59_Matmul_Swish_Scaling/figures/59_Matmul_Swish_Scaling_score.png
+Usage: In=2463, Out=5683, Total=8146
+[stage3_memory_and_tuning] score=1.1189 (baseline=6.2116ms)
+[stage3_memory_and_tuning] metrics saved to: /home/hyc/LLMKernel/run/20251228_161703_batch_range47to66_openai_deepseek/59_Matmul_Swish_Scaling/evaluation/eval_0031.json
+  Optimized kernel score: 1.1189 ✓
+[Stage 3] ★ New best score: 1.1189
+[59_Matmul_Swish_Scaling.py] Figure saved to: /home/hyc/LLMKernel/run/20251228_161703_batch_range47to66_openai_deepseek/59_Matmul_Swish_Scaling/figures/59_Matmul_Swish_Scaling_score.png

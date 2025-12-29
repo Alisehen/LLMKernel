@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The custom GEMM inside the Triton kernel is significantly slower than cuBLAS, dominating runtime and negating the benefit of epilogue fusion.",
+  "bottleneck": "The kernel reimplements a large GEMM (1024x8192x8192) in Triton with a simple tiling scheme that underutilizes tensor cores and lacks the extensive optimizations present in cuBLAS, so compute throughput is far below what the hardware can deliver.",
+  "optimisation method": "Algorithm replacement: delegate the GEMM to a vendor-optimized library (PyTorch/ cuBLAS/cuBLASLt) and restrict Triton to a single fused epilogue kernel that applies swish, divide, clamps, and tanh on the GEMM output in one pass.",
+  "modification plan": "On the forward path, first compute y = F.linear(x, weight, bias) using PyTorch (which invokes cuBLAS/cuBLASLt). Then write a separate Triton kernel that takes y as input and fuses swish, division by 2, clamp, tanh, and final clamp into a single pass over y, storing the result in-place or into an output buffer. Replace the current monolithic Triton matmul+epilogue kernel with this two-stage pipeline (cuBLAS GEMM + Triton epilogue), preserving the CPU fallback logic for non-CUDA tensors.",
+  "expected_speedup": "30-50% vs the current Triton kernel (and likely reach or modestly beat the PyTorch baseline) due to recovering cuBLAS GEMM performance while still reducing elementwise kernel launches and memory traffic."
+}

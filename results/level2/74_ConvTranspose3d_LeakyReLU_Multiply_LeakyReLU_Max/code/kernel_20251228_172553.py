@@ -1,0 +1,146 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def fused_leaky_relu_mul_maxpool3d_kernel(
+    x_ptr, mul_ptr, y_ptr,
+    N, C, D_out, H_out, W_out,
+    stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
+    stride_yn, stride_yc, stride_yd, stride_yh, stride_yw,
+    total_elems,
+    negative_slope,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < total_elems
+
+    # Unravel linear index -> (n, c, d_out, h_out, w_out)
+    w_out_idx = offs % W_out
+    tmp = offs // W_out
+
+    h_out_idx = tmp % H_out
+    tmp = tmp // H_out
+
+    d_out_idx = tmp % D_out
+    nc_idx = tmp // D_out
+
+    c_idx = nc_idx % C
+    n_idx = nc_idx // C
+
+    # MaxPool3d with kernel_size = stride = 2
+    d0 = d_out_idx * 2
+    h0 = h_out_idx * 2
+    w0 = w_out_idx * 2
+
+    # Base offset for the (0,0,0) corner of the pooling window
+    base_offset = (
+        n_idx * stride_xn
+        + c_idx * stride_xc
+        + d0 * stride_xd
+        + h0 * stride_xh
+        + w0 * stride_xw
+    )
+
+    # Load per-channel multiplier: mul_ptr has shape [C]
+    m = tl.load(mul_ptr + c_idx, mask=mask, other=0.0)
+
+    # Initialize max_val with a very small value of the correct shape and dtype
+    max_val = tl.full(offs.shape, -1e30, m.dtype)
+
+    # Iterate over the 2x2x2 pooling window
+    for dd in range(2):
+        d_off = base_offset + dd * stride_xd
+        for hh in range(2):
+            dh_off = d_off + hh * stride_xh
+            for ww in range(2):
+                offset = dh_off + ww * stride_xw
+                x_vals = tl.load(x_ptr + offset, mask=mask, other=0.0)
+
+                # First LeakyReLU
+                x_vals = tl.where(x_vals >= 0, x_vals, negative_slope * x_vals)
+                # Multiply by learnable parameter
+                x_vals = x_vals * m
+                # Second LeakyReLU
+                x_vals = tl.where(x_vals >= 0, x_vals, negative_slope * x_vals)
+
+                # Max over window
+                max_val = tl.maximum(max_val, x_vals)
+
+    # Store pooled result
+    y_offset = (
+        n_idx * stride_yn
+        + c_idx * stride_yc
+        + d_out_idx * stride_yd
+        + h_out_idx * stride_yh
+        + w_out_idx * stride_yw
+    )
+    tl.store(y_ptr + y_offset, max_val, mask=mask)
+
+
+def fused_leaky_relu_mul_maxpool3d(x, multiplier, negative_slope=0.2):
+    """
+    Fuses:
+      y = MaxPool3d( LeakyReLU( LeakyReLU(x) * multiplier ) )
+    where:
+      x: [N, C, D, H, W]
+      multiplier: [C, 1, 1, 1] (broadcast over N, D, H, W)
+      MaxPool3d: kernel_size=2, stride=2, padding=0
+    """
+    assert x.is_cuda and multiplier.is_cuda, "Inputs must be CUDA tensors"
+    assert x.ndim == 5, "x must be [N, C, D, H, W]"
+    N, C, D_in, H_in, W_in = x.shape
+
+    # MaxPool3d with kernel_size=2, stride=2, padding=0
+    D_out = D_in // 2
+    H_out = H_in // 2
+    W_out = W_in // 2
+
+    y = torch.empty((N, C, D_out, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    # Flatten multiplier to [C] for fast channel-wise access
+    mul_flat = multiplier.view(C).contiguous()
+
+    total_elems = N * C * D_out * H_out * W_out
+    BLOCK = 128  # power-of-two as required
+
+    grid = lambda META: (max(1, triton.cdiv(total_elems, META["BLOCK"])),)
+
+    fused_leaky_relu_mul_maxpool3d_kernel[grid](
+        x, mul_flat, y,
+        N, C, D_out, H_out, W_out,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
+        y.stride(0), y.stride(1), y.stride(2), y.stride(3), y.stride(4),
+        total_elems,
+        negative_slope,
+        BLOCK=BLOCK,
+        num_warps=4,
+    )
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Model that performs a 3D transposed convolution, applies LeakyReLU, multiplies by a learnable parameter,
+    applies LeakyReLU again, and performs a max pooling operation, with the last three ops fused in Triton.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, multiplier_shape):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            output_padding=output_padding,
+        )
+        self.multiplier = nn.Parameter(torch.randn(multiplier_shape))
+        self.negative_slope = 0.2
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = fused_leaky_relu_mul_maxpool3d(x, self.multiplier, negative_slope=self.negative_slope)
+        return x
