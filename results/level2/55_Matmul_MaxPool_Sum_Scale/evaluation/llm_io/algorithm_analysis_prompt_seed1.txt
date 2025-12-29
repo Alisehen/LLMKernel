@@ -1,0 +1,275 @@
+You are a GPU kernel optimization architect. Analyze the kernel and identify **ONE high-level algorithmic optimization**.
+
+# PyTorch Reference
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs matrix multiplication, max pooling, sum, and scaling.
+    """
+    def __init__(self, in_features, out_features, kernel_size, scale_factor):
+        super(Model, self).__init__()
+        self.matmul = nn.Linear(in_features, out_features)
+        self.max_pool = nn.MaxPool1d(kernel_size)
+        self.scale_factor = scale_factor
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_features).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_features).
+        """
+        x = self.matmul(x)
+        x = self.max_pool(x.unsqueeze(1)).squeeze(1)
+        x = torch.sum(x, dim=1)
+        x = x * self.scale_factor
+        return x
+
+batch_size = 128
+in_features = 32768
+out_features = 32768
+kernel_size = 2
+scale_factor = 0.5
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features)]
+
+def get_init_inputs():
+    return [in_features, out_features, kernel_size, scale_factor]
+```
+
+# Current Triton Kernel
+```python
+import torch, torch.nn as nn, triton, triton.language as tl
+
+
+@triton.jit
+def fused_linear_maxpool_sum_kernel(
+    x_ptr, w_ptr, bias_ptr, out_ptr,
+    M, N, K, N_pairs,
+    stride_xm, stride_xk,
+    stride_wk, stride_wn,
+    stride_out,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    # Program IDs
+    pid_m = tl.program_id(0)  # over batch (M)
+    pid_p = tl.program_id(1)  # over pooled-output columns (N_pairs)
+
+    # Offsets
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_p = pid_p * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k_block = tl.arange(0, BLOCK_K)
+
+    mask_m = offs_m < M
+    mask_p = offs_p < N_pairs
+
+    # Map pooled indices to original column indices (two per pair)
+    col0 = 2 * offs_p
+    col1 = 2 * offs_p + 1
+
+    # Accumulators for the two columns in each pair
+    acc0 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc1 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # GEMM: [M, K] x [K, N] -> columns 2*offs_p and 2*offs_p+1
+    k0 = 0
+    while k0 < K:
+        offs_k = k0 + offs_k_block
+        k_mask = offs_k < K
+
+        # A tile: x[offs_m, offs_k]
+        a_ptrs = x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk
+        a = tl.load(a_ptrs, mask=mask_m[:, None] & k_mask[None, :], other=0.0)
+        a = a.to(tl.float32)
+
+        # B tiles: w[offs_k, col0] and w[offs_k, col1]
+        b0_ptrs = w_ptr + offs_k[:, None] * stride_wk + col0[None, :] * stride_wn
+        b1_ptrs = w_ptr + offs_k[:, None] * stride_wk + col1[None, :] * stride_wn
+
+        b0 = tl.load(
+            b0_ptrs,
+            mask=k_mask[:, None] & mask_p[None, :] & (col0[None, :] < N),
+            other=0.0,
+        )
+        b1 = tl.load(
+            b1_ptrs,
+            mask=k_mask[:, None] & mask_p[None, :] & (col1[None, :] < N),
+            other=0.0,
+        )
+        b0 = b0.to(tl.float32)
+        b1 = b1.to(tl.float32)
+
+        # Matrix multiply-accumulate
+        acc0 += tl.dot(a, b0, allow_tf32=True)
+        acc1 += tl.dot(a, b1, allow_tf32=True)
+
+        k0 += BLOCK_K
+
+    # Add bias for both columns in each pair
+    bias0 = tl.load(
+        bias_ptr + col0,
+        mask=mask_p & (col0 < N),
+        other=0.0,
+    ).to(tl.float32)
+    bias1 = tl.load(
+        bias_ptr + col1,
+        mask=mask_p & (col1 < N),
+        other=0.0,
+    ).to(tl.float32)
+
+    acc0 += bias0[None, :]
+    acc1 += bias1[None, :]
+
+    # MaxPool1d(kernel_size=2, stride=2) along feature dimension (pairwise max)
+    pooled = tl.maximum(acc0, acc1)
+
+    # Sum over pooled feature dimension -> one scalar per row (partial sum for this tile)
+    row_partial = tl.sum(pooled, axis=1)  # shape: [BLOCK_M]
+
+    # Atomically accumulate into output vector
+    tl.atomic_add(
+        out_ptr + offs_m * stride_out,
+        row_partial,
+        mask=mask_m,
+    )
+
+
+def fused_linear_maxpool_sum(x: torch.Tensor,
+                             weight: torch.Tensor,
+                             bias: torch.Tensor,
+                             scale_factor: float) -> torch.Tensor:
+    """
+    Fused implementation of:
+      y = Linear(x)  # matmul + bias
+      y = MaxPool1d(kernel_size=2, stride=2) along feature dim
+      y = sum(y, dim=1)
+      y = y * scale_factor
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda, "All tensors must be on CUDA"
+    assert x.dtype == weight.dtype == bias.dtype == torch.float32, "Use float32 tensors for this fused kernel"
+
+    M, K = x.shape           # batch, in_features
+    N = weight.shape[0]      # out_features
+    N_pairs = N // 2         # number of pooling windows
+
+    # Weight for GEMM as [K, N]
+    w_t = weight.t().contiguous()
+
+    # Output: one scalar per batch element
+    out = torch.zeros((M,), device=x.device, dtype=torch.float32)
+
+    BLOCK_M = 32
+    BLOCK_N = 64   # pairs per tile
+    BLOCK_K = 64
+
+    def grid(meta):
+        bm = max(1, triton.cdiv(M, meta['BLOCK_M']))
+        # ensure >0 even if N_pairs == 0
+        np_eff = N_pairs if N_pairs > 0 else 1
+        bn = max(1, triton.cdiv(np_eff, meta['BLOCK_N']))
+        return bm, bn
+
+    fused_linear_maxpool_sum_kernel[grid](
+        x, w_t, bias, out,
+        M, N, K, N_pairs,
+        x.stride(0), x.stride(1),
+        w_t.stride(0), w_t.stride(1),
+        out.stride(0),
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        num_warps=4,
+        num_stages=3,
+    )
+
+    if scale_factor != 1.0:
+        out = out * scale_factor
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized replacement for the reference model:
+      Linear -> MaxPool1d(kernel_size=2) -> sum(dim=1) -> scale.
+    """
+    def __init__(self, in_features, out_features, kernel_size, scale_factor):
+        super(ModelNew, self).__init__()
+        assert kernel_size == 2, "This fused kernel currently supports kernel_size=2 only."
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.bias = nn.Parameter(torch.randn(out_features))
+        self.scale_factor = float(scale_factor)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return fused_linear_maxpool_sum(x, self.weight, self.bias, self.scale_factor)
+```
+
+# Performance
+- **PyTorch baseline**: 5.98 ms
+- **Current Triton**: 46.89 ms
+- **Current speedup**: 0.13x (-684.3% vs baseline)
+
+
+---
+
+## Analysis Steps
+
+1. **Code Analysis**: Count kernels, identify operations, check for inefficiencies
+2. **Performance Diagnosis**: Use metrics/latency to identify bottleneck type
+3. **Root Cause**: Combine code + performance to find the core issue
+
+## Optimization Categories (pick ONE if worth optimizing):
+
+### 1. Operator Fusion
+Fuse consecutive ops into fewer kernels to reduce memory traffic and launch overhead.
+
+### 2. Algorithm Replacement
+Replace naive algorithm with optimized variant.
+- For Attention: Flash Attention, online softmax
+- For Convolution: Winograd, im2col
+- **For RNN/GRU/LSTM**: Persistent kernel with HYBRID computation
+  - **CRITICAL**: Use hybrid approach for best performance:
+    * Precompute input-side gates ONCE (outside kernel): `gates_x = (T*B, In) @ W_ih`
+    * Persistent kernel (inside): only recurrent-side: `for t: gates_h = h @ W_hh`
+  - Time loop `for t in range(T)` must be inside kernel, NOT in Python
+  - Launch kernel once per layer, not once per timestep
+  - Expected speedup: 10-100x (vs per-timestep launches)
+
+### 3. Kernel Launch Reduction
+Combine multiple small kernels to reduce overhead.
+- **For RNN/GRU/LSTM**: See "Algorithm Replacement" above for persistent kernel approach
+
+### 4. Memory Layout Optimization
+Use in-place operations, buffer reuse, or better layouts.
+
+## Should We Optimize?
+
+Before proposing optimization, determine if it's worthwhile:
+- **Not worth optimizing** if:
+  - Code is already near-optimal (expected speedup < 10%)
+  - Bottleneck cannot be addressed (hardware limited, already optimal algorithm)
+  - Optimization would add significant complexity with minimal gain
+
+- **Worth optimizing** if:
+  - Clear algorithmic inefficiency exists (multiple kernels, suboptimal algorithm)
+  - Expected speedup >= 20%
+  - Concrete optimization path available
+
+## Output (JSON)
+
+```json
+{
+  "worth_optimizing": "yes/no",
+  "reason": "<Why worth or not worth optimizing, 1 sentence>",
+  "bottleneck": "<Root cause in 1-2 sentences, empty if not worth optimizing>",
+  "optimisation method": "<Specific optimization in 1-2 sentences, empty if not worth optimizing>",
+  "modification plan": "<Implementation steps in 2-3 sentences, empty if not worth optimizing>",
+  "expected_speedup": "<e.g., '30-40%', empty if not worth optimizing>"
+}
+```
+
+Return JSON only.

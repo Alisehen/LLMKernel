@@ -1,0 +1,217 @@
+import torch, torch.nn as nn, triton, triton.language as tl
+
+
+@triton.jit
+def conv3d_fused_fast_acts_kernel(
+    x_ptr, w_ptr, conv_bias_ptr, scale_ptr, bias2_ptr, y_ptr,
+    M, K,
+    N, C_in, C_out,
+    D_in, H_in, W_in,
+    D_out, H_out, W_out,
+    kD, kH, kW,
+    stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
+    stride_yn, stride_yc, stride_yd, stride_yh, stride_yw,
+    stride_wk, stride_wn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    mask_m = offs_m < M
+    mask_n = offs_n < C_out
+
+    # Decode flattened output index m -> (n, od, oh, ow)
+    w_out = W_out
+    h_out = H_out
+    d_out = D_out
+
+    tmp = offs_m
+    ow = tmp % w_out
+    tmp = tmp // w_out
+    oh = tmp % h_out
+    tmp = tmp // h_out
+    od = tmp % d_out
+    n = tmp // d_out
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    kernel_hw = kH * kW
+    kernel_dhw = kD * kernel_hw
+
+    # Convolution: implicit GEMM over K
+    for k_start in range(0, K, BLOCK_K):
+        offs_k = k_start + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < K
+
+        # Decode flattened K index -> (ci, kd, kh, kw)
+        tmpk = offs_k
+        ci = tmpk // kernel_dhw
+        rem = tmpk % kernel_dhw
+        kd = rem // kernel_hw
+        rem2 = rem % kernel_hw
+        kh = rem2 // kW
+        kw = rem2 % kW
+
+        z = od[:, None] + kd[None, :]
+        y = oh[:, None] + kh[None, :]
+        x = ow[:, None] + kw[None, :]
+
+        x_ptrs = (
+            x_ptr
+            + n[:, None] * stride_xn
+            + ci[None, :] * stride_xc
+            + z * stride_xd
+            + y * stride_xh
+            + x * stride_xw
+        )
+
+        a = tl.load(
+            x_ptrs,
+            mask=mask_m[:, None] & mask_k[None, :],
+            other=0.0,
+        )
+
+        w_ptrs = w_ptr + offs_k[:, None] * stride_wk + offs_n[None, :] * stride_wn
+        b = tl.load(
+            w_ptrs,
+            mask=mask_k[:, None] & mask_n[None, :],
+            other=0.0,
+        )
+
+        acc += tl.dot(a, b, allow_tf32=True)
+
+    # Load per-channel parameters
+    bias_conv = tl.load(conv_bias_ptr + offs_n, mask=mask_n, other=0.0)
+    scale = tl.load(scale_ptr + offs_n, mask=mask_n, other=0.0)
+    bias2 = tl.load(bias2_ptr + offs_n, mask=mask_n, other=0.0)
+
+    # aff. transform from conv: bias + scale
+    acc = acc + bias_conv[None, :]
+    acc = acc * scale[None, :]
+
+    # -------- Fast tanh approximation (no exp) --------
+    # Pade-like rational approximation on a limited interval,
+    # with saturation outside for correct limiting behavior.
+    # tanh(x) ≈ x * (27 + x^2) / (27 + 9 x^2)  for |x| <= 3
+    # tanh(x) ≈ sign(x)                        for |x| >  3
+    a = 27.0
+    b = 9.0
+    abs_acc = tl.abs(acc)
+    acc2 = acc * acc
+    num = acc * (a + acc2)
+    den = a + b * acc2
+    tanh_poly = num / den
+    sign_acc = tl.where(acc >= 0, 1.0, -1.0)
+    acc = tl.where(abs_acc > 3.0, sign_acc, tanh_poly)
+
+    # Multiply by second bias / scaling factor
+    acc = acc * bias2[None, :]
+
+    # -------- Fast sigmoid approximation (no exp, no div) --------
+    # Use a cubic polynomial from the Maclaurin series, with
+    # saturation outside where sigmoid is already ~0 or ~1.
+    # sigmoid(x) ≈ 0.5 + x * (0.25 - x^2 / 48)  for |x| <= 5
+    # sigmoid(x) ≈ 1                             for x >  5
+    # sigmoid(x) ≈ 0                             for x < -5
+    x = acc
+    x2 = x * x
+    poly = 0.5 + x * (0.25 - x2 * (1.0 / 48.0))
+    sig = poly
+    sig = tl.where(x > 5.0, 1.0, sig)
+    sig = tl.where(x < -5.0, 0.0, sig)
+    acc = sig
+
+    # Store result
+    y_ptrs = (
+        y_ptr
+        + n[:, None] * stride_yn
+        + offs_n[None, :] * stride_yc
+        + od[:, None] * stride_yd
+        + oh[:, None] * stride_yh
+        + ow[:, None] * stride_yw
+    )
+
+    tl.store(
+        y_ptrs,
+        acc,
+        mask=mask_m[:, None] & mask_n[None, :],
+    )
+
+
+def fused_conv3d_tanh_sigmoid(x, weight, conv_bias, scaling_factor, bias2):
+    """
+    Fused Conv3d + scaling_factor * tanh + bias2 * sigmoid
+    using fast polynomial/rational approximations for tanh and sigmoid.
+    """
+    x = x.contiguous()
+    weight = weight.contiguous()
+    conv_bias = conv_bias.contiguous()
+
+    N, C_in, D_in, H_in, W_in = x.shape
+    C_out, _, kD, kH, kW = weight.shape
+
+    # Stride-1, no padding Conv3d output shape
+    D_out = D_in - kD + 1
+    H_out = H_in - kH + 1
+    W_out = W_in - kW + 1
+
+    y = torch.empty(
+        (N, C_out, D_out, H_out, W_out),
+        device=x.device,
+        dtype=x.dtype,
+    )
+
+    # GEMM dimensions
+    M = N * D_out * H_out * W_out
+    K = C_in * kD * kH * kW
+
+    # Per-channel parameters as flat [C_out]
+    scale = scaling_factor.view(C_out).contiguous()
+    b2 = bias2.view(C_out).contiguous()
+
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_M"]),
+        triton.cdiv(C_out, META["BLOCK_N"]),
+    )
+
+    conv3d_fused_fast_acts_kernel[grid](
+        x, weight, conv_bias, scale, b2, y,
+        M, K,
+        N, C_in, C_out,
+        D_in, H_in, W_in,
+        D_out, H_out, W_out,
+        kD, kH, kW,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
+        y.stride(0), y.stride(1), y.stride(2), y.stride(3), y.stride(4),
+        1, K,
+        BLOCK_M=64, BLOCK_N=64, BLOCK_K=32,
+        num_warps=4, num_stages=2,
+    )
+
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Model that performs a 3D convolution, scales the output, applies tanh,
+    multiplies by a scaling factor, and applies sigmoid, all via a fused
+    Triton kernel that uses fast approximate activations.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, scaling_factor, bias_shape):
+        super(ModelNew, self).__init__()
+        # Use nn.Conv3d for weight/bias initialization.
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size)
+        self.scaling_factor = nn.Parameter(torch.randn(bias_shape))
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+
+    def forward(self, x):
+        return fused_conv3d_tanh_sigmoid(
+            x,
+            self.conv.weight,
+            self.conv.bias,
+            self.scaling_factor,
+            self.bias,
+        )

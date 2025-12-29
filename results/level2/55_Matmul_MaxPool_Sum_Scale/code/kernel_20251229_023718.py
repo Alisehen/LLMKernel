@@ -1,0 +1,165 @@
+import torch, torch.nn as nn, triton, triton.language as tl
+
+
+@triton.jit
+def fused_linear_maxpool_sum_kernel(
+    x_ptr, w_ptr, bias_ptr, out_ptr,
+    M, N, K, N_pairs,
+    stride_xm, stride_xk,
+    stride_wk, stride_wn,
+    stride_out,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    # 1D grid over batch rows
+    pid_m = tl.program_id(0)
+
+    # Rows this program instance will handle
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offs_m < M
+
+    # Running sum over all pooled feature pairs for each row
+    row_sum = tl.zeros((BLOCK_M,), dtype=tl.float32)
+
+    # Tile over pooled feature pairs (N_pairs) in BLOCK_N chunks
+    pair_start = 0
+    while pair_start < N_pairs:
+        offs_p = pair_start + tl.arange(0, BLOCK_N)
+        mask_p = offs_p < N_pairs
+
+        # Map pooled indices to original column indices (two per pair)
+        col0 = 2 * offs_p
+        col1 = 2 * offs_p + 1
+
+        # Accumulators for the two columns in each pair for this tile
+        acc0 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        acc1 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+        # GEMM over K dimension for this (rows x pair-tile)
+        k0 = 0
+        while k0 < K:
+            offs_k = k0 + tl.arange(0, BLOCK_K)
+            k_mask = offs_k < K
+
+            # A tile: x[offs_m, offs_k]
+            a_ptrs = x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk
+            a = tl.load(a_ptrs, mask=mask_m[:, None] & k_mask[None, :], other=0.0)
+            a = a.to(tl.float32)
+
+            # B tiles: w[offs_k, col0] and w[offs_k, col1]
+            b0_ptrs = w_ptr + offs_k[:, None] * stride_wk + col0[None, :] * stride_wn
+            b1_ptrs = w_ptr + offs_k[:, None] * stride_wk + col1[None, :] * stride_wn
+
+            b0 = tl.load(
+                b0_ptrs,
+                mask=k_mask[:, None] & mask_p[None, :] & (col0[None, :] < N),
+                other=0.0,
+            )
+            b1 = tl.load(
+                b1_ptrs,
+                mask=k_mask[:, None] & mask_p[None, :] & (col1[None, :] < N),
+                other=0.0,
+            )
+            b0 = b0.to(tl.float32)
+            b1 = b1.to(tl.float32)
+
+            # Matrix multiply-accumulate
+            acc0 += tl.dot(a, b0, allow_tf32=True)
+            acc1 += tl.dot(a, b1, allow_tf32=True)
+
+            k0 += BLOCK_K
+
+        # Add bias for both columns in each pair
+        bias0 = tl.load(
+            bias_ptr + col0,
+            mask=mask_p & (col0 < N),
+            other=0.0,
+        ).to(tl.float32)
+        bias1 = tl.load(
+            bias_ptr + col1,
+            mask=mask_p & (col1 < N),
+            other=0.0,
+        ).to(tl.float32)
+
+        acc0 += bias0[None, :]
+        acc1 += bias1[None, :]
+
+        # MaxPool1d(kernel_size=2, stride=2) along feature dimension (pairwise max)
+        pooled = tl.maximum(acc0, acc1)
+
+        # Sum over pooled feature dimension for this tile -> partial sum per row
+        row_partial = tl.sum(pooled, axis=1)  # shape: [BLOCK_M]
+
+        # Accumulate locally (no atomics needed)
+        row_sum += row_partial
+
+        pair_start += BLOCK_N
+
+    # Write final per-row result
+    tl.store(out_ptr + offs_m * stride_out, row_sum, mask=mask_m)
+
+
+def fused_linear_maxpool_sum(x: torch.Tensor,
+                             weight: torch.Tensor,
+                             bias: torch.Tensor,
+                             scale_factor: float) -> torch.Tensor:
+    """
+    Fused implementation of:
+      y = Linear(x)  # matmul + bias
+      y = MaxPool1d(kernel_size=2, stride=2) along feature dim
+      y = sum(y, dim=1)
+      y = y * scale_factor
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda, "All tensors must be on CUDA"
+    assert x.dtype == weight.dtype == bias.dtype == torch.float32, "Use float32 tensors for this fused kernel"
+
+    M, K = x.shape           # batch, in_features
+    N = weight.shape[0]      # out_features
+    N_pairs = N // 2         # number of pooling windows
+
+    # Weight for GEMM as [K, N]
+    w_t = weight.t().contiguous()
+
+    # Output: one scalar per batch element
+    out = torch.zeros((M,), device=x.device, dtype=torch.float32)
+
+    # Tunable tile sizes (all powers of two)
+    BLOCK_M = 32
+    BLOCK_N = 64   # pooled pairs per tile
+    BLOCK_K = 64
+
+    def grid(meta):
+        bm = triton.cdiv(M, meta['BLOCK_M'])
+        return (bm,)
+
+    fused_linear_maxpool_sum_kernel[grid](
+        x, w_t, bias, out,
+        M, N, K, N_pairs,
+        x.stride(0), x.stride(1),
+        w_t.stride(0), w_t.stride(1),
+        out.stride(0),
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        num_warps=4,
+        num_stages=3,
+    )
+
+    if scale_factor != 1.0:
+        out = out * scale_factor
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized replacement for the reference model:
+      Linear -> MaxPool1d(kernel_size=2) -> sum(dim=1) -> scale.
+    """
+    def __init__(self, in_features, out_features, kernel_size, scale_factor):
+        super(ModelNew, self).__init__()
+        assert kernel_size == 2, "This fused kernel currently supports kernel_size=2 only."
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.bias = nn.Parameter(torch.randn(out_features))
+        self.scale_factor = float(scale_factor)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return fused_linear_maxpool_sum(x, self.weight, self.bias, self.scale_factor)

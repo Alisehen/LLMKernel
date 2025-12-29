@@ -1,129 +1,57 @@
 ```python
-import torch
-import torch.nn as nn
-import triton
-import triton.language as tl
+# optimized Triton code
+
+import torch, torch.nn as nn, triton, triton.language as tl
 
 
-# ------------------------------
-# Optimized Triton GEMM: Linear (matmul + bias)
-# ------------------------------
-
-@triton.autotune(
-    configs=[
-        triton.Config(
-            {
-                "BLOCK_M": 128,
-                "BLOCK_N": 128,
-                "BLOCK_K": 32,
-                "GROUP_M": 8,
-            },
-            num_warps=8,
-            num_stages=4,
-        ),
-        triton.Config(
-            {
-                "BLOCK_M": 64,
-                "BLOCK_N": 128,
-                "BLOCK_K": 32,
-                "GROUP_M": 8,
-            },
-            num_warps=4,
-            num_stages=4,
-        ),
-        triton.Config(
-            {
-                "BLOCK_M": 128,
-                "BLOCK_N": 64,
-                "BLOCK_K": 32,
-                "GROUP_M": 8,
-            },
-            num_warps=4,
-            num_stages=4,
-        ),
-        triton.Config(
-            {
-                "BLOCK_M": 64,
-                "BLOCK_N": 64,
-                "BLOCK_K": 32,
-                "GROUP_M": 8,
-            },
-            num_warps=4,
-            num_stages=3,
-        ),
-        triton.Config(
-            {
-                "BLOCK_M": 128,
-                "BLOCK_N": 256,
-                "BLOCK_K": 32,
-                "GROUP_M": 4,
-            },
-            num_warps=8,
-            num_stages=4,
-        ),
-        triton.Config(
-            {
-                "BLOCK_M": 256,
-                "BLOCK_N": 128,
-                "BLOCK_K": 32,
-                "GROUP_M": 4,
-            },
-            num_warps=8,
-            num_stages=4,
-        ),
-    ],
-    key=["M", "N", "K"],
-)
 @triton.jit
 def linear_kernel(
-    a_ptr,  # [M, K]
-    b_ptr,  # [K, N] (weight.T, contiguous)
-    bias_ptr,  # [N]
-    c_ptr,  # [M, N]
+    a_ptr, b_ptr, bias_ptr, c_ptr,
     M, N, K,
     stride_am, stride_ak,
     stride_bk, stride_bn,
     stride_cm, stride_cn,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    GROUP_M: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
-    # 1D program id, grouped along M to maximize L2 reuse of B
-    pid = tl.program_id(axis=0)
+    """
+    Compute: C = A @ B + bias, where
+      A: (M, K)
+      B: (K, N)
+      bias: (N,)
+      C: (M, N)
 
-    num_pid_m = tl.cdiv(M, BLOCK_M)
-    num_pid_n = tl.cdiv(N, BLOCK_N)
+    Fused ops (matmul + bias-add) share the same grid and (offs_m, offs_n, mask_out).
+    """
 
-    num_pid_in_group = GROUP_M * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * GROUP_M
+    # 2D grid for output tiles
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
 
-    # within group, m is fastest-changing to keep reusing B tile
-    group_size_m = tl.minimum(num_pid_m - first_pid_m, GROUP_M)
-    pid_m = first_pid_m + (pid % group_size_m)
-    pid_n = (pid % num_pid_in_group) // group_size_m
+    # Offsets in output space
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # [BLOCK_M]
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # [BLOCK_N]
 
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_k = tl.arange(0, BLOCK_K)
-
-    # Masks for output tile
+    # Masks for output region (shared by all fused ops)
     mask_m = offs_m < M
     mask_n = offs_n < N
+    mask_out = mask_m[:, None] & mask_n[None, :]
 
-    # Initialize accumulator
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    # K offsets (reused inside the K-loop)
+    offs_k = tl.arange(0, BLOCK_K)  # [BLOCK_K]
 
-    # Initial pointers
+    # Base pointers for A and B tiles
     a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
     b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
 
+    # Accumulator in FP32 for better precision / tensor cores
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
     # Loop over K dimension
     for k in range(0, K, BLOCK_K):
-        k_remaining = K - k
-        k_mask = offs_k < k_remaining
+        k_rem = K - k
+        k_mask = offs_k < k_rem
 
+        # Load tiles of A and B; K masking is orthogonal to output masking
         a = tl.load(
             a_ptrs,
             mask=mask_m[:, None] & k_mask[None, :],
@@ -135,162 +63,175 @@ def linear_kernel(
             other=0.0,
         )
 
+        # Matrix multiply accumulate; allow_tf32 for best 4090 perf
         acc += tl.dot(a, b, allow_tf32=True)
 
+        # Advance pointers along K
         a_ptrs += BLOCK_K * stride_ak
         b_ptrs += BLOCK_K * stride_bk
 
-    # Bias add (fused on same [offs_m, offs_n] tile)
+    # FUSED BIAS ADD:
+    # Bias is 1D over N; broadcasting over M uses same offs_n/mask_n and mask_out
     bias = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0)
     acc += bias[None, :]
 
-    # Write output
+    # Store result tile using the shared output mask
     c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
-    tl.store(
-        c_ptrs,
-        acc,
-        mask=mask_m[:, None] & mask_n[None, :],
-    )
+    tl.store(c_ptrs, acc, mask=mask_out)
 
 
-def triton_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+def fused_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
     """
-    x: [M, K]
-    weight: [N, K] (same as nn.Linear.weight)
-    bias: [N]
-    returns: [M, N] = x @ weight.T + bias
+    x: (M, K)
+    weight: (N, K)  (same layout as nn.Linear.weight)
+    bias: (N,)
+    returns: (M, N)
     """
     assert x.is_cuda and weight.is_cuda and bias.is_cuda
     M, K = x.shape
-    N, Kw = weight.shape
-    assert Kw == K, "in_features mismatch"
+    N = weight.shape[0]
 
-    # Use weight.T as [K, N] for GEMM, contiguous in N
-    b = weight.t().contiguous()
+    # Triton kernel expects B as (K, N)
+    w_t = weight.contiguous().T  # (K, N)
+
     y = torch.empty((M, N), device=x.device, dtype=x.dtype)
 
     def grid(meta):
-        return (triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]),)
+        return (
+            triton.cdiv(M, meta["BLOCK_M"]),
+            triton.cdiv(N, meta["BLOCK_N"]),
+        )
 
+    # Tuned for high-end GPUs (e.g., 4090 / Ada)
     linear_kernel[grid](
-        x, b, bias, y,
+        x, w_t, bias, y,
         M, N, K,
         x.stride(0), x.stride(1),
-        b.stride(0), b.stride(1),
+        w_t.stride(0), w_t.stride(1),
         y.stride(0), y.stride(1),
+        BLOCK_M=128,
+        BLOCK_N=128,
+        BLOCK_K=64,
+        num_warps=8,
+        num_stages=3,
     )
     return y
 
 
-# ------------------------------
-# Optimized Triton kernel: MaxPool1d(kernel_size=2, stride=2) + sum + scale
-# Input:  x [B, L]
-# Output: out [B]
-# out[b] = scale * sum_j max(x[b, 2j], x[b, 2j+1])
-# ------------------------------
-
 @triton.jit
 def maxpool_sum_scale_kernel(
-    x_ptr,       # [B, L]
-    out_ptr,     # [B]
-    B,           # batch size
-    L2,          # number of pooled positions = L // 2
-    stride_xb,   # stride over batch dim
-    stride_xl,   # stride over feature dim
-    scale,       # scaling factor (float32)
-    BLOCK_WIN: tl.constexpr,  # pooled positions per program
+    y_ptr, out_ptr,
+    M, P, N,
+    stride_ym, stride_yn,
+    scale,
+    KERNEL_SIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_P: tl.constexpr,
 ):
-    # 2D grid over batch and pooled-window chunks
-    pid_b = tl.program_id(axis=0)
-    pid_g = tl.program_id(axis=1)
-
-    if pid_b >= B:
-        return
-
-    # windows handled by this program
-    offs_win = pid_g * BLOCK_WIN + tl.arange(0, BLOCK_WIN)
-    mask = offs_win < L2
-
-    col0 = 2 * offs_win
-    col1 = col0 + 1
-
-    base = x_ptr + pid_b * stride_xb
-    ptr0 = base + col0 * stride_xl
-    ptr1 = base + col1 * stride_xl
-
-    # Load and pool
-    v0 = tl.load(ptr0, mask=mask, other=-float("inf"))
-    v1 = tl.load(ptr1, mask=mask, other=-float("inf"))
-
-    vmax = tl.maximum(v0, v1)
-
-    # Accumulate in fp32 for better precision
-    vmax_f32 = vmax.to(tl.float32)
-    acc = tl.sum(vmax_f32, axis=0) * scale
-
-    # Atomic add partial sum into output
-    tl.atomic_add(out_ptr + pid_b, acc)
-
-
-def triton_maxpool_sum_scale(x: torch.Tensor, scale: float) -> torch.Tensor:
     """
-    x: [B, L]
-    returns: [B]
-    Implements: MaxPool1d(kernel_size=2, stride=2) on last dim,
-    then sum over pooled dim, then multiply by scale.
+    y: (M, N)
+    P = N // KERNEL_SIZE  (number of pooling windows)
+
+    For each row m:
+        out[m] = scale * sum_{p=0..P-1} max_{i=0..KERNEL_SIZE-1} y[m, p*KERNEL_SIZE + i]
+
+    Fused ops (max-pool, sum over windows, scaling) all share the SAME grid and
+    the SAME (offs_m, mask_m) for the output dimension.
+    A single kernel instance reduces over the entire P dimension to avoid atomics.
     """
-    assert x.is_cuda
-    B, L = x.shape
-    L2 = L // 2  # floor, matches MaxPool1d(kernel_size=2, stride=2)
 
-    out = torch.zeros((B,), device=x.device, dtype=x.dtype)
-    BLOCK_WIN = 128  # number of pooled positions per program
+    # 1D grid over M (output dimension)
+    pid_m = tl.program_id(0)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # [BLOCK_M]
+    mask_m = offs_m < M
 
-    grid = (
-        B,
-        triton.cdiv(L2, BLOCK_WIN),
-    )
+    # Per-row accumulator for sum of pooled maxima
+    row_sum = tl.zeros((BLOCK_M,), dtype=tl.float32)
+
+    # Static window indices inside a tile
+    offs_p_base = tl.arange(0, BLOCK_P)  # [BLOCK_P]
+
+    # Iterate over all pooling windows in tiles of BLOCK_P
+    p = 0
+    while p < P:
+        offs_p = p + offs_p_base  # [BLOCK_P]
+        mask_p = offs_p < P
+
+        # Max values for current tile of windows (rows x windows)
+        max_vals = tl.full((BLOCK_M, BLOCK_P), -1e30, dtype=tl.float32)
+
+        # Compute max over each pooling window
+        for i in range(KERNEL_SIZE):
+            offs_n = offs_p * KERNEL_SIZE + i  # [BLOCK_P]
+            # Pointer to y[m, n]
+            ptrs = y_ptr + offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn
+            vals = tl.load(
+                ptrs,
+                mask=mask_m[:, None] & mask_p[None, :],
+                other=-1e30,
+            )
+            max_vals = tl.maximum(max_vals, vals)
+
+        # Zero-out invalid windows (tail)
+        max_vals = tl.where(mask_p[None, :], max_vals, 0.0)
+
+        # Sum over the pooled dimension for this tile and accumulate into row_sum
+        row_sum += tl.sum(max_vals, axis=1)
+
+        p += BLOCK_P
+
+    # Final fused scaling + store, using the shared (offs_m, mask_m)
+    out_vals = row_sum * scale
+    tl.store(out_ptr + offs_m, out_vals, mask=mask_m)
+
+
+def fused_maxpool_sum_scale(y: torch.Tensor, kernel_size: int, scale_factor: float) -> torch.Tensor:
+    """
+    y: (M, N)
+    returns: (M,)
+    """
+    assert y.is_cuda
+    M, N = y.shape
+    kernel_size = int(kernel_size)
+    P = N // kernel_size  # number of pooling windows
+
+    out = torch.empty((M,), device=y.device, dtype=y.dtype)
+
+    def grid(meta):
+        # Grid only along M (each row reduced entirely in one kernel instance)
+        return (triton.cdiv(M, meta["BLOCK_M"]),)
 
     maxpool_sum_scale_kernel[grid](
-        x, out,
-        B, L2,
-        x.stride(0), x.stride(1),
-        float(scale),
-        BLOCK_WIN=BLOCK_WIN,
+        y, out,
+        M, P, N,
+        y.stride(0), y.stride(1),
+        float(scale_factor),
+        KERNEL_SIZE=kernel_size,
+        BLOCK_M=128,
+        BLOCK_P=128,
         num_warps=4,
+        num_stages=1,
     )
     return out
 
 
-# ------------------------------
-# PyTorch module using Triton kernels
-# ------------------------------
-
 class ModelNew(nn.Module):
     """
-    Model that performs matrix multiplication, max pooling, sum, and scaling
-    using Triton kernels for the heavy computations.
+    Triton-optimized version:
+      x -> Linear -> MaxPool1d(kernel_size, stride=kernel_size) over feature dim
+        -> sum over feature dim -> scale_factor
     """
     def __init__(self, in_features, out_features, kernel_size, scale_factor):
         super(ModelNew, self).__init__()
-        assert kernel_size == 2, "This implementation assumes kernel_size=2"
-        self.in_features = in_features
-        self.out_features = out_features
-        self.scale_factor = float(scale_factor)
-
-        # Parameters analogous to nn.Linear(in_features, out_features)
+        # Match nn.Linear parameter shapes
         self.weight = nn.Parameter(torch.randn(out_features, in_features))
         self.bias = nn.Parameter(torch.randn(out_features))
+        self.kernel_size = int(kernel_size)
+        self.scale_factor = float(scale_factor)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Ensure CUDA tensors for Triton
-        assert x.is_cuda, "Input must be a CUDA tensor for Triton kernels"
-
-        # Linear: x @ W^T + b
-        x = triton_linear(x, self.weight, self.bias)  # [B, out_features]
-
-        # MaxPool1d(kernel_size=2, stride=2) + sum over last dim + scale
-        x = triton_maxpool_sum_scale(x, self.scale_factor)  # [B]
-
-        return x
+        # x: (batch_size, in_features)
+        y = fused_linear(x, self.weight, self.bias)                          # (B, out_features)
+        out = fused_maxpool_sum_scale(y, self.kernel_size, self.scale_factor)  # (B,)
+        return out
 ```

@@ -1,0 +1,439 @@
+[Seed] Generating seed kernel...
+[Seed 1/2] Generating...
+[92mFinish reason: stop[0m
+Usage: In=1688, Out=11588, Total=13276
+[seed_0] score=1.2152 (baseline=5.9787ms)
+[seed_0] metrics saved to: /home/hyc/LLMKernel/run/20251229_022947_batch_range55to77_openai_deepseek/55_Matmul_MaxPool_Sum_Scale/evaluation/eval_0000.json
+[Seed 1] Final score: 1.2152 ✓
+[Seed 2/2] Generating...
+[92mFinish reason: stop[0m
+Usage: In=1688, Out=8844, Total=10532
+[seed_1] score=0.1275 (baseline=5.9787ms)
+[seed_1] metrics saved to: /home/hyc/LLMKernel/run/20251229_022947_batch_range55to77_openai_deepseek/55_Matmul_MaxPool_Sum_Scale/evaluation/eval_0001.json
+[Seed 2] Final score: 0.1275 ✓
+
+================================================================================
+[Hybrid Strategy] Analyzing all seeds for algorithmic optimization...
+[Hybrid Strategy] - 1 seed(s) with score < 1.0 (rescue)
+[Hybrid Strategy] - 1 seed(s) with score >= 1.0 (further optimization)
+================================================================================
+
+[Hybrid] Seed 1: score=1.2152 >= 1.0
+[Hybrid] Attempting algorithm analysis for further optimization...
+[ncu] Using GPU device 2 (CUDA_VISIBLE_DEVICES=2)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_3555121.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_3555121.py /home/hyc/LLMKernel/KernelBench/t/55_Matmul_MaxPool_Sum_Scale.py /home/hyc/LLMKernel/run/20251229_022947_batch_range55to77_openai_deepseek/55_Matmul_MaxPool_Sum_Scale/code/test_kernel_analysis_seed0.py --repeat 1
+[ncu stdout]: [bench] Completed 1 iterations successfully
+
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_3555121.csv
+[Hybrid] Requesting LLM analysis for seed 1...
+[92mFinish reason: stop[0m
+Usage: In=2642, Out=1831, Total=4473
+[Hybrid] Worth optimizing: yes
+[Hybrid] Reason: The current design materializes the full (M, N) matmul output and then rereads it in a second kernel for max-pooling and reduction, which is avoidable.
+[Hybrid] Analysis complete for seed 1, generating optimized kernel...
+[Hybrid] Bottleneck: The separate maxpool_sum_scale kernel introduces an extra full read of the large...
+[Hybrid] Optimization: Fuse the linear and maxpool+sum+scale into a single GEMM+reduction Triton kernel...
+[Hybrid] Expected speedup: 15-25%
+[92mFinish reason: stop[0m
+Usage: In=2938, Out=8916, Total=11854
+[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 43, in wrapper
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 1101, in __getitem__
+    raise ValueError(f"unsupported tensor index: {sl}")
+ValueError: unsupported tensor index: int32[]
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 555, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251229_022947_batch_range55to77_openai_deepseek/55_Matmul_MaxPool_Sum_Scale/code/kernel_20251229_023427.py", line 182, in forward
+    out = fused_linear_maxpool_sum_scale(
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251229_022947_batch_range55to77_openai_deepseek/55_Matmul_MaxPool_Sum_Scale/code/kernel_20251229_023427.py", line 145, in fused_linear_maxpool_sum_scale
+    linear_maxpool_sum_scale_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 419, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 733, in run
+    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 861, in _do_compile
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 300, in compile
+    module = src.make_ir(target, options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 80, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 83:15:
+    # Current running max within a pooling window for each row
+    cur_max = tl.full((BLOCK_M,), -1e30, dtype=tl.float32)
+
+    # Iterate over local N within the tile; BLOCK_N is a compile-time constant
+    for ln in range(0, BLOCK_N):
+        global_n = tile_n_start + ln
+
+        # Is this column part of any valid pooling window?
+        is_valid_col = global_n < valid_N
+
+        # Load the column of the GEMM result from registers
+        vals = acc[:, ln]  # [BLOCK_M]
+               ^
+unsupported tensor index: int32[]
+
+[algorithm_optimized_seed0] failed. See metrics.message for details.
+[algorithm_optimized_seed0] metrics saved to: /home/hyc/LLMKernel/run/20251229_022947_batch_range55to77_openai_deepseek/55_Matmul_MaxPool_Sum_Scale/evaluation/eval_0002.json
+[Hybrid] Algorithm-optimized kernel failed, attempting repair...
+[92mFinish reason: stop[0m
+Usage: In=3008, Out=8250, Total=11258
+[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 555, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251229_022947_batch_range55to77_openai_deepseek/55_Matmul_MaxPool_Sum_Scale/code/kernel_20251229_023540.py", line 208, in forward
+    out = fused_linear_maxpool_sum_scale(
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251229_022947_batch_range55to77_openai_deepseek/55_Matmul_MaxPool_Sum_Scale/code/kernel_20251229_023540.py", line 172, in fused_linear_maxpool_sum_scale
+    linear_maxpool_sum_scale_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 419, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 733, in run
+    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 861, in _do_compile
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 300, in compile
+    module = src.make_ir(target, options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 80, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 97:4:
+    global_n = tile_n_start + local_n
+
+    # Columns that belong to at least one valid pooling window
+    valid_col_mask = (global_n < valid_N) & mask_n  # [BN]
+
+    row_partial_sum = tl.zeros((BLOCK_M,), dtype=tl.float32)
+
+    # Number of pooling windows per tile (BLOCK_N guaranteed % KERNEL_SIZE == 0)
+    NUM_WIN_TILE = BLOCK_N // KERNEL_SIZE
+
+    # Loop over pooling windows inside this N-tile
+    for w in tl.static_range(0, NUM_WIN_TILE):
+    ^
+AssertionError('int32[] used as tl.static_range end value is not a constexpr')
+
+[algorithm_optimized_seed0_repair1] failed. See metrics.message for details.
+[algorithm_optimized_seed0_repair1] metrics saved to: /home/hyc/LLMKernel/run/20251229_022947_batch_range55to77_openai_deepseek/55_Matmul_MaxPool_Sum_Scale/evaluation/eval_0003.json
+[Hybrid] ✗ Rescue failed, keeping original seed
+
+[Hybrid] Seed 2: score=0.1275 < 1.0
+[Hybrid] Attempting algorithm analysis rescue...
+[ncu] Using GPU device 2 (CUDA_VISIBLE_DEVICES=2)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_3555121.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_3555121.py /home/hyc/LLMKernel/KernelBench/t/55_Matmul_MaxPool_Sum_Scale.py /home/hyc/LLMKernel/run/20251229_022947_batch_range55to77_openai_deepseek/55_Matmul_MaxPool_Sum_Scale/code/test_kernel_analysis_seed1.py --repeat 1
+[ncu stdout]: [bench] Completed 1 iterations successfully
+
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_3555121.csv
+[Hybrid] Requesting LLM analysis for seed 2...
+[92mFinish reason: stop[0m
+Usage: In=2479, Out=1471, Total=3950
+[Hybrid] Worth optimizing: yes
+[Hybrid] Reason: The fused Triton kernel is ~8x slower than the PyTorch baseline, indicating a major algorithmic inefficiency.
+[Hybrid] Analysis complete for seed 2, generating optimized kernel...
+[Hybrid] Bottleneck: The kernel parallelizes along the pooled feature dimension (N_pairs) and then us...
+[Hybrid] Optimization: Restructure the algorithm so that each program instance owns one (or a small gro...
+[Hybrid] Expected speedup: 5-10x vs the current Triton kernel (bringing it to at least parity and likely ahead of the PyTorch baseline).
+[92mFinish reason: stop[0m
+Usage: In=2794, Out=5074, Total=7868
+[algorithm_optimized_seed1] score=0.0096 (baseline=5.9787ms)
+[algorithm_optimized_seed1] metrics saved to: /home/hyc/LLMKernel/run/20251229_022947_batch_range55to77_openai_deepseek/55_Matmul_MaxPool_Sum_Scale/evaluation/eval_0004.json
+[Hybrid] ✓ Rescue successful: 0.1275 → 0.0096
+
+================================================================================
+[Hybrid] Candidate Selection
+================================================================================
+[Hybrid] Total candidates: 3
+  [1] seed 1: 1.2152
+  [2] seed 2: 0.1275
+  [3] algo-optimized (from seed 1): 0.0096
+
+[Hybrid] ★ Selected best candidate: score=1.2152
+
+[Optimization] Starting 3-stage optimization...
+
+================================================================================
+[Stage 1/3] grid_and_parallel
+Description: Optimize grid layout and parallel work distribution across SMs.
+Current candidates: 1, best score: 1.2152
+================================================================================
+[Stage 1] Profiling best candidate...
+[ncu] Using GPU device 2 (CUDA_VISIBLE_DEVICES=2)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_3555121.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_3555121.py /home/hyc/LLMKernel/KernelBench/t/55_Matmul_MaxPool_Sum_Scale.py /home/hyc/LLMKernel/run/20251229_022947_batch_range55to77_openai_deepseek/55_Matmul_MaxPool_Sum_Scale/code/test_kernel_analysis_seed1.py --repeat 1
+[ncu stdout]: [bench] Completed 1 iterations successfully
+
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_3555121.csv
+[Stage 1] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=2499, Out=5168, Total=7667
+[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 555, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251229_022947_batch_range55to77_openai_deepseek/55_Matmul_MaxPool_Sum_Scale/code/kernel_20251229_023828.py", line 233, in forward
+    y = fused_linear(x, self.weight, self.bias)                          # (B, out_features)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251229_022947_batch_range55to77_openai_deepseek/55_Matmul_MaxPool_Sum_Scale/code/kernel_20251229_023828.py", line 105, in fused_linear
+    linear_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 419, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 756, in run
+    launch_metadata = kernel.launch_metadata(grid, stream, *bound_args.values())
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 490, in launch_metadata
+    self._init_handles()
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 464, in _init_handles
+    raise_(OutOfResources(self.metadata.shared, max_shared, "shared memory"))
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 456, in raise_
+    raise err
+triton.runtime.errors.OutOfResources: out of resource: shared memory, Required: 131072, Hardware limit: 101376. Reducing block sizes or `num_stages` may help.
+
+[stage1_grid_and_parallel] failed. See metrics.message for details.
+[stage1_grid_and_parallel] metrics saved to: /home/hyc/LLMKernel/run/20251229_022947_batch_range55to77_openai_deepseek/55_Matmul_MaxPool_Sum_Scale/evaluation/eval_0005.json
+  Optimization failed, attempting repair...
+[92mFinish reason: stop[0m
+Usage: In=3125, Out=4253, Total=7378
+[stage1_grid_and_parallel_repair] score=0.8641 (baseline=5.9787ms)
+[stage1_grid_and_parallel_repair] metrics saved to: /home/hyc/LLMKernel/run/20251229_022947_batch_range55to77_openai_deepseek/55_Matmul_MaxPool_Sum_Scale/evaluation/eval_0006.json
+  Optimized kernel score: 0.8641 ✓
+[Stage 1] Current: 0.8641 (global best: 1.2152)
+
+================================================================================
+[Stage 2/3] block_tiling
+Description: Tune BLOCK_M/N/K sizes for optimal register/memory balance.
+Current candidates: 1, best score: 1.2152
+================================================================================
+[Stage 2] Profiling best candidate...
+[ncu] Using GPU device 2 (CUDA_VISIBLE_DEVICES=2)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_3555121.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_3555121.py /home/hyc/LLMKernel/KernelBench/t/55_Matmul_MaxPool_Sum_Scale.py /home/hyc/LLMKernel/run/20251229_022947_batch_range55to77_openai_deepseek/55_Matmul_MaxPool_Sum_Scale/code/test_kernel_analysis_seed1.py --repeat 1
+[ncu stdout]: [bench] Completed 1 iterations successfully
+
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_3555121.csv
+[Stage 2] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=2711, Out=8854, Total=11565
+[stage2_block_tiling] score=1.1904 (baseline=5.9787ms)
+[stage2_block_tiling] metrics saved to: /home/hyc/LLMKernel/run/20251229_022947_batch_range55to77_openai_deepseek/55_Matmul_MaxPool_Sum_Scale/evaluation/eval_0007.json
+  Optimized kernel score: 1.1904 ✓
+[Stage 2] Current: 1.1904 (global best: 1.2152)
+
+================================================================================
+[Stage 3/3] memory_and_tuning
+Description: Optimize memory access patterns and fine-tune num_stages/num_warps.
+Current candidates: 1, best score: 1.2152
+================================================================================
+[Stage 3] Profiling best candidate...
+[ncu] Using GPU device 2 (CUDA_VISIBLE_DEVICES=2)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_3555121.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_3555121.py /home/hyc/LLMKernel/KernelBench/t/55_Matmul_MaxPool_Sum_Scale.py /home/hyc/LLMKernel/run/20251229_022947_batch_range55to77_openai_deepseek/55_Matmul_MaxPool_Sum_Scale/code/test_kernel_analysis_seed1.py --repeat 1
+[ncu stdout]: [bench] Completed 1 iterations successfully
+
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_3555121.csv
+[Stage 3] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=3139, Out=20135, Total=23274
+[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 43, in wrapper
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 1638, in arange
+    return _semantic.arange(start, end)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/semantic.py", line 574, in arange
+    raise ValueError("arange's arguments must be of type tl.constexpr")
+ValueError: arange's arguments must be of type tl.constexpr
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 555, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251229_022947_batch_range55to77_openai_deepseek/55_Matmul_MaxPool_Sum_Scale/code/kernel_20251229_024400.py", line 432, in forward
+    out = fused_linear_maxpool_sum_scale(
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251229_022947_batch_range55to77_openai_deepseek/55_Matmul_MaxPool_Sum_Scale/code/kernel_20251229_024400.py", line 395, in fused_linear_maxpool_sum_scale
+    linear_maxpool_sum_scale_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 419, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 238, in run
+    benchmark()
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 227, in benchmark
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 227, in <dictcomp>
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 162, in _bench
+    return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/testing.py", line 149, in do_bench
+    fn()
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 148, in kernel_call
+    self.fn.run(
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 733, in run
+    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 861, in _do_compile
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 300, in compile
+    module = src.make_ir(target, options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 80, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 40:19:
+
+    # Row indices for this program
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # [BLOCK_M]
+    mask_m = offs_m < M
+
+    # Window indices for this program's tile
+    offs_p = pid_p * BLOCK_P + tl.arange(0, BLOCK_P)  # [BLOCK_P]
+    mask_p = offs_p < P
+
+    # Columns covered by this tile
+    N_TILE = BLOCK_P * KERNEL_SIZE
+    offs_n_local = tl.arange(0, N_TILE)  # [N_TILE]
+                   ^
+arange's arguments must be of type tl.constexpr
+
+[stage3_memory_and_tuning] failed. See metrics.message for details.
+[stage3_memory_and_tuning] metrics saved to: /home/hyc/LLMKernel/run/20251229_022947_batch_range55to77_openai_deepseek/55_Matmul_MaxPool_Sum_Scale/evaluation/eval_0008.json
+  Optimization failed, attempting repair...
+[92mFinish reason: stop[0m
+Usage: In=5279, Out=7065, Total=12344
+[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 43, in wrapper
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 1101, in __getitem__
+    raise ValueError(f"unsupported tensor index: {sl}")
+ValueError: unsupported tensor index: int32[]
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 555, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251229_022947_batch_range55to77_openai_deepseek/55_Matmul_MaxPool_Sum_Scale/code/kernel_20251229_024456.py", line 424, in forward
+    out = fused_linear_maxpool_sum_scale(
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20251229_022947_batch_range55to77_openai_deepseek/55_Matmul_MaxPool_Sum_Scale/code/kernel_20251229_024456.py", line 387, in fused_linear_maxpool_sum_scale
+    linear_maxpool_sum_scale_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 419, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 238, in run
+    benchmark()
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 227, in benchmark
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 227, in <dictcomp>
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 162, in _bench
+    return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/testing.py", line 149, in do_bench
+    fn()
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 148, in kernel_call
+    self.fn.run(
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 733, in run
+    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 861, in _do_compile
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 300, in compile
+    module = src.make_ir(target, options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 80, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 92:19:
+        # Global window index for this tile
+        global_p = pid_p * BLOCK_P + p_local
+        valid_p = global_p < P
+
+        base_col = p_local * KERNEL_SIZE
+
+        window_max = tl.full((BLOCK_M,), -1.0e30, dtype=tl.float32)
+
+        # Max over KERNEL_SIZE columns for this window
+        for i in range(KERNEL_SIZE):
+            col = base_col + i  # local column index within this tile
+            vals = acc[:, col]
+                   ^
+unsupported tensor index: int32[]
+
+[stage3_memory_and_tuning_repair] failed. See metrics.message for details.
+[stage3_memory_and_tuning_repair] metrics saved to: /home/hyc/LLMKernel/run/20251229_022947_batch_range55to77_openai_deepseek/55_Matmul_MaxPool_Sum_Scale/evaluation/eval_0009.json
+  Optimization failed, keeping previous candidate ✗
+[Stage 3] Current: 1.1904 (global best: 1.2152)
+[55_Matmul_MaxPool_Sum_Scale.py] Figure saved to: /home/hyc/LLMKernel/run/20251229_022947_batch_range55to77_openai_deepseek/55_Matmul_MaxPool_Sum_Scale/figures/55_Matmul_MaxPool_Sum_Scale_score.png

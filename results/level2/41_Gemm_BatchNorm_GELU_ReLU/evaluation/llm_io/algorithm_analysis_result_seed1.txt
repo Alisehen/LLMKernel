@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The kernel is clearly memory-bandwidth-bound (≈86% DRAM utilization) with low SM utilization, so reducing bytes moved per FLOP can yield substantial gains.",
+  "bottleneck": "The fused kernel streams large fp32 activations and weights through DRAM with limited data reuse (L2 hit ≈50%), leading to only ~8% active warps and ~35% SM throughput despite a well-fused computation.",
+  "optimisation method": "Switch the GEMM + fused epilogue to mixed precision (fp16/bf16 inputs/weights/activations with fp32 accumulation) and tile the Triton matmul to use Tensor Cores, halving memory traffic and increasing compute density.",
+  "modification plan": "Store the Linear layer weights and (optionally) activations in fp16/bf16, casting to fp32 only for accumulation inside the kernel; update the Triton kernel signatures and internal `tl.load`/`tl.dot` dtypes to use half-precision operands with fp32 accumulators and ensure BatchNorm parameters are converted/used consistently in fp16/bf16. Validate numerical accuracy under autocast-style settings, then tune BLOCK_M/BLOCK_N/BLOCK_K for Tensor Core–aligned shapes (multiples of 16) to fully exploit the higher throughput.",
+  "expected_speedup": "50-100%"
+}

@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The current kernel implements convolution as an implicit GEMM, which causes a lot of redundant global-memory reads for overlapping 3D windows, making the kernel memory-bound.",
+  "bottleneck": "Each output voxel independently gathers its Cin*Kd*Kh*Kw input patch from global memory, so neighboring outputs re-read most of the same input values. This low spatial data reuse keeps arithmetic intensity low and underutilizes the GPU’s compute capability.",
+  "optimisation method": "Replace the implicit GEMM formulation with a spatially tiled direct 3D convolution kernel that loads a (D,H,W) input tile (plus halo) into shared memory once per block and computes many neighboring output voxels from that tile, then applies the fused scale+tanh*scale+sigmoid epilogue on the fly.",
+  "modification plan": "Redesign the Triton kernel so that the primary tiling is over (Dout, Hout, Wout) for a given batch chunk and a block of Cout channels. For each tile, cooperatively load the corresponding 3D input region (with Kd/Kh/Kw halo) into shared memory, then iterate over Cin and kernel offsets to accumulate outputs for all voxels in the tile using the shared input, drastically reducing global loads. Keep the current per-channel parameter loads and fused nonlinearity as an epilogue on the accumulator before writing results back, preserving the single-kernel fusion while improving data reuse.",
+  "expected_speedup": "20-30%"
+}

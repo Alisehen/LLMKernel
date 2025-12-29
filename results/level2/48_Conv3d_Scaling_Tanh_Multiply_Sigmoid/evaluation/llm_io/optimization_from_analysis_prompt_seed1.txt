@@ -1,0 +1,375 @@
+You are optimizing a Triton kernel based on algorithmic analysis.
+
+# PyTorch Reference (Target Behavior)
+
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs a 3D convolution, scales the output, applies tanh, multiplies by a scaling factor, and applies sigmoid.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, scaling_factor, bias_shape):
+        super(Model, self).__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size)
+        self.scaling_factor = nn.Parameter(torch.randn(bias_shape))
+        self.bias = nn.Parameter(torch.randn(bias_shape)) 
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = x * self.scaling_factor 
+        x = torch.tanh(x)
+        x = x * self.bias
+        x = torch.sigmoid(x)
+        return x
+
+batch_size = 128
+in_channels = 3
+out_channels = 16
+depth, height, width = 16, 64, 64
+kernel_size = 3
+scaling_factor = 2
+bias_shape = (out_channels, 1, 1, 1)
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, depth, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, scaling_factor, bias_shape]
+```
+
+**CRITICAL**: Study the PyTorch code carefully to understand:
+- What does `forward()` return? (full output sequence vs final hidden state only)
+- What is the computational pattern?
+- What are the input/output shapes?
+
+Your optimized kernel MUST match this exact behavior.
+
+---
+
+# Analysis Results
+
+**Bottleneck**: Each output voxel independently gathers its Cin*Kd*Kh*Kw input patch from global memory, so neighboring outputs re-read most of the same input values. This low spatial data reuse keeps arithmetic intensity low and underutilizes the GPU’s compute capability.
+
+**Optimization Strategy**: Replace the implicit GEMM formulation with a spatially tiled direct 3D convolution kernel that loads a (D,H,W) input tile (plus halo) into shared memory once per block and computes many neighboring output voxels from that tile, then applies the fused scale+tanh*scale+sigmoid epilogue on the fly.
+
+**Implementation Plan**: Redesign the Triton kernel so that the primary tiling is over (Dout, Hout, Wout) for a given batch chunk and a block of Cout channels. For each tile, cooperatively load the corresponding 3D input region (with Kd/Kh/Kw halo) into shared memory, then iterate over Cin and kernel offsets to accumulate outputs for all voxels in the tile using the shared input, drastically reducing global loads. Keep the current per-channel parameter loads and fused nonlinearity as an epilogue on the accumulator before writing results back, preserving the single-kernel fusion while improving data reuse.
+
+**Expected Speedup**: 20-30%
+
+---
+
+# Current Kernel (needs optimization)
+
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def conv3d_fused_tanh_sigmoid_kernel(
+    x_ptr,                # *f32, input  (B, Cin, Din, Hin, Win)
+    w_ptr,                # *f32, weight (K, Cout)  where K = Cin*Kd*Kh*Kw
+    conv_bias_ptr,        # *f32, (Cout,)
+    scale_ptr,            # *f32, (Cout,)
+    bias_ptr,             # *f32, (Cout,)
+    out_ptr,              # *f32, output (B, Cout, Dout, Hout, Wout)
+    B, Cin,
+    Din, Hin, Win,
+    Cout,
+    Kd, Kh, Kw,
+    Dout, Hout, Wout,
+    stride_xb, stride_xc, stride_xd, stride_xh, stride_xw,
+    stride_wk, stride_wn,
+    stride_ob, stride_oc, stride_od, stride_oh, stride_ow,
+    M, N, K,              # M = B*Dout*Hout*Wout, N = Cout, K = Cin*Kd*Kh*Kw
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # Program ids
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    # Offsets for M, N, K
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+
+    # Decompose M index into (b, od, oh, ow)
+    # m = n * (Dout*Hout*Wout) + od * (Hout*Wout) + oh * Wout + ow
+    m = offs_m[:, None]  # (BM, 1)
+    tmp_m = m
+    ow = tmp_m % Wout
+    tmp_m = tmp_m // Wout
+    oh = tmp_m % Hout
+    tmp_m = tmp_m // Hout
+    od = tmp_m % Dout
+    tmp_m = tmp_m // Dout
+    n_idx = tmp_m  # batch index, (BM, 1)
+
+    # Accumulator
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # K-loop
+    for k0 in range(0, K, BLOCK_K):
+        k_idx = k0 + offs_k  # (BLOCK_K,)
+        mask_k = k_idx < K
+
+        # Decompose K index into (cin, kd, kh, kw)
+        k = k_idx[None, :]  # (1, BK)
+        tmp_k = k
+        kw_idx = tmp_k % Kw
+        tmp_k = tmp_k // Kw
+        kh_idx = tmp_k % Kh
+        tmp_k = tmp_k // Kh
+        kd_idx = tmp_k % Kd
+        tmp_k = tmp_k // Kd
+        cin_idx = tmp_k  # (1, BK)
+
+        # Input coordinates (din, hin, win) for each (m, k)
+        din = od + kd_idx          # (BM, BK)
+        hin = oh + kh_idx          # (BM, BK)
+        win = ow + kw_idx          # (BM, BK)
+
+        # Build input pointers
+        x_ptrs = (
+            x_ptr
+            + n_idx * stride_xb
+            + cin_idx * stride_xc
+            + din * stride_xd
+            + hin * stride_xh
+            + win * stride_xw
+        )
+
+        mask_a = mask_m[:, None] & mask_k[None, :]
+        a = tl.load(x_ptrs, mask=mask_a, other=0.0)
+
+        # Weight tile: w_ptr has shape (K, N)
+        w_ptrs = w_ptr + k_idx[:, None] * stride_wk + offs_n[None, :] * stride_wn
+        mask_b = mask_k[:, None] & mask_n[None, :]
+        b = tl.load(w_ptrs, mask=mask_b, other=0.0)
+
+        acc += tl.dot(a, b, allow_tf32=True)
+
+    # Load per-output-channel parameters
+    conv_bias = tl.load(conv_bias_ptr + offs_n, mask=mask_n, other=0.0)
+    scale = tl.load(scale_ptr + offs_n, mask=mask_n, other=1.0)
+    bias = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0)
+
+    # Add conv bias
+    acc = acc + conv_bias[None, :]
+
+    # Multiply by scaling_factor
+    acc = acc * scale[None, :]
+
+    # tanh: (exp(2x) - 1) / (exp(2x) + 1)
+    two_x = 2.0 * acc
+    e2x = tl.exp(two_x)
+    acc = (e2x - 1.0) / (e2x + 1.0)
+
+    # Multiply by bias
+    acc = acc * bias[None, :]
+
+    # Sigmoid: 1 / (1 + exp(-x))
+    acc = 1.0 / (1.0 + tl.exp(-acc))
+
+    # Map (m, n) back to (b, cout, dout, hout, wout)
+    m_out = offs_m[:, None]
+    tmp_m_out = m_out
+    wout = tmp_m_out % Wout
+    tmp_m_out = tmp_m_out // Wout
+    hout = tmp_m_out % Hout
+    tmp_m_out = tmp_m_out // Hout
+    dout = tmp_m_out % Dout
+    tmp_m_out = tmp_m_out // Dout
+    b_out = tmp_m_out  # (BM, 1)
+
+    cout = offs_n[None, :]  # (1, BN)
+
+    out_ptrs = (
+        out_ptr
+        + b_out * stride_ob
+        + cout * stride_oc
+        + dout * stride_od
+        + hout * stride_oh
+        + wout * stride_ow
+    )
+    mask_out = mask_m[:, None] & mask_n[None, :]
+    tl.store(out_ptrs, acc, mask=mask_out)
+
+
+def fused_conv3d_tanh_sigmoid(x, weight, conv_bias, scaling_factor, bias_param):
+    """
+    x:              (B, Cin, Din, Hin, Win)
+    weight:         (Cout, Cin, Kd, Kh, Kw)
+    conv_bias:      (Cout,)
+    scaling_factor: (Cout, 1, 1, 1)
+    bias_param:     (Cout, 1, 1, 1)
+    """
+    x = x.contiguous()
+    weight = weight.contiguous()
+    conv_bias = conv_bias.contiguous()
+    scaling_factor = scaling_factor.contiguous().view(-1)
+    bias_param = bias_param.contiguous().view(-1)
+
+    B, Cin, Din, Hin, Win = x.shape
+    Cout, Cin_w, Kd, Kh, Kw = weight.shape
+    assert Cin == Cin_w, "Input channels must match weight channels"
+
+    # Valid 3D conv, stride=1, padding=0
+    Dout = Din - Kd + 1
+    Hout = Hin - Kh + 1
+    Wout = Win - Kw + 1
+
+    # Flatten weight to (K, Cout)
+    K = Cin * Kd * Kh * Kw
+    weight_flat = weight.view(Cout, K).transpose(0, 1).contiguous()
+
+    # Output
+    out = torch.empty((B, Cout, Dout, Hout, Wout), device=x.device, dtype=x.dtype)
+
+    stride_xb, stride_xc, stride_xd, stride_xh, stride_xw = x.stride()
+    stride_ob, stride_oc, stride_od, stride_oh, stride_ow = out.stride()
+    stride_wk, stride_wn = weight_flat.stride()
+
+    M = B * Dout * Hout * Wout
+    N = Cout
+
+    # Block sizes must be powers of two
+    BLOCK_M = 64
+    BLOCK_N = 64
+    BLOCK_K = 32
+
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta["BLOCK_M"]),
+            triton.cdiv(N, meta["BLOCK_N"]),
+        )
+
+    conv3d_fused_tanh_sigmoid_kernel[grid](
+        x,
+        weight_flat,
+        conv_bias,
+        scaling_factor,
+        bias_param,
+        out,
+        B,
+        Cin,
+        Din,
+        Hin,
+        Win,
+        Cout,
+        Kd,
+        Kh,
+        Kw,
+        Dout,
+        Hout,
+        Wout,
+        stride_xb,
+        stride_xc,
+        stride_xd,
+        stride_xh,
+        stride_xw,
+        stride_wk,
+        stride_wn,
+        stride_ob,
+        stride_oc,
+        stride_od,
+        stride_oh,
+        stride_ow,
+        M,
+        N,
+        K,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+    )
+
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized version:
+    3D convolution (valid, stride=1) + scale + tanh + scale + sigmoid.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, scaling_factor, bias_shape):
+        super(ModelNew, self).__init__()
+
+        if isinstance(kernel_size, int):
+            Kd = Kh = Kw = kernel_size
+        else:
+            Kd, Kh, Kw = kernel_size
+
+        self.weight = nn.Parameter(
+            torch.randn(out_channels, in_channels, Kd, Kh, Kw)
+        )
+        self.conv_bias = nn.Parameter(torch.randn(out_channels))
+
+        self.scaling_factor = nn.Parameter(torch.randn(bias_shape))
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+
+    def forward(self, x):
+        return fused_conv3d_tanh_sigmoid(
+            x,
+            self.weight,
+            self.conv_bias,
+            self.scaling_factor,
+            self.bias,
+        )
+```
+
+---
+
+# Your Task
+
+Implement the optimization strategy above. Focus on the specific bottleneck identified.
+
+## Key Requirements
+
+1. **Preserve correctness**: Maintain the same input/output behavior
+2. **Apply the optimization**: Follow the implementation plan exactly
+3. **Use valid Triton syntax**:
+   - Every kernel MUST have `@triton.jit` decorator
+   - Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+   - BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+   - No `continue`, `break`, `return` inside kernels (use masking)
+   - Prefer `tl.dot(a, b, allow_tf32=True)` for matmul operations
+
+4. **CRITICAL for RNN/GRU/LSTM Persistent Kernels**:
+   - Time loop MUST be inside @triton.jit kernel, NOT in Python forward()
+   - **HYBRID computation strategy** (CRITICAL for performance):
+     * Precompute input-side gates OUTSIDE kernel: `gates_x = (T*B, In) @ W_ih` (ONE large GEMM)
+     * INSIDE kernel: only recurrent-side: `for t: gates_h = h @ W_hh` (T small GEMMs)
+   - CORRECT (FAST - use this):
+     ```python
+     # Python forward():
+     gates_x_all = x.reshape(T*B, In) @ W_ih + b_ih  # ONE large GEMM
+     gates_x_all = gates_x_all.view(T, B, 3*H)
+     gru_persistent_kernel[grid](gates_x_all, h0, W_hh, ...)  # Launch ONCE
+
+     @triton.jit
+     def gru_persistent_kernel(gates_x_ptr, h_ptr, W_hh_ptr, ...):
+         for t in range(T):  # Inside kernel
+             gates_x_t = tl.load(gates_x_ptr + t*...)  # Precomputed
+             gates_h = h @ W_hh  # Only recurrent GEMM
+             h = (1-z)*n + z*h   # Fuse and update
+     ```
+
+5. **Output format**:
+   - Imports: `import torch, torch.nn as nn, triton, triton.language as tl`
+   - `@triton.jit` kernel(s)
+   - Wrapper function(s)
+   - `class ModelNew(nn.Module)` — REQUIRED
+   - NO testing code, NO `if __name__ == "__main__"`
+
+---
+
+Generate the optimized kernel now. Output ONLY the complete Python code.

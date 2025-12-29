@@ -1,5 +1,0 @@
-{
-  "critical_issue": "The Python loop `for j in range(0, BLOCK_N, 2)` causes `mask_n[j]` to execute outside Triton’s JIT, so tensor indexing runs without a builder.",
-  "why_it_matters": "When the loop is executed by Python, Triton tensors are indexed in normal Python code, which lacks an active IR builder and triggers the `_builder` / `@triton.jit` ValueError during compilation.",
-  "minimal_fix_hint": "Avoid Python scalar loops over BLOCK_N; use Triton-vectorized indexing (tl.arange-based pair indices) so all tensor operations remain inside the JIT-compiled Triton IR."
-}

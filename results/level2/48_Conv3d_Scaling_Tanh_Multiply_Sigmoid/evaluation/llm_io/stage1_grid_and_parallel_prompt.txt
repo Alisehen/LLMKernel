@@ -1,34 +1,12 @@
 You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
 
-# Target GPU
-GPU Name: 4090
-Architecture: Ada Lovelace
-• Compute Capability: 8.9
-• Number of SMs: 128
-• Memory Bandwidth: 1008 GB/s
-• TF32 Tensor Core TFLOPS: 82.6 with dense
-• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
-• FP16 Tensor Core TFLOPS: 165.2 with dense
-• Maximum number of registers per thread: 255
-• Maximum threads per block: 1024
-• Maximum threads per SM: 1536
-• Warp size: 32
-• Maximum concurrent warps per SM: 48
-• Shared memory capacity per SM: 100 KB
-• Maximum shared memory per thread block: 99 KB
-• L2 cache (global, all SM shared): 72 MB
+# Target GPU: 4090
 
 [OPTIMIZATION STAGE]
 
 ## Current Optimization Stage
 
 Focus: Grid layout & indexing for FUSED operations.
-
-⚠️ FUSION EXCLUSIONS (do NOT apply fusion rules to these):
-- Reduction ops (sum, mean, softmax along axis)
-- Atomic operations
-- Irregular/data-dependent access patterns
-- Cross-block dependencies
 
 Key Principle:
 - All fused ops share the SAME grid AND the SAME (offsets, mask) tuple
@@ -58,205 +36,256 @@ import triton.language as tl
 
 @triton.jit
 def conv3d_fused_tanh_sigmoid_kernel(
-    x_ptr,            # float32[N, C_in, D_in, H_in, W_in]
-    w_ptr,            # float32[OC, C_in, KD, KH, KW]
-    conv_bias_ptr,    # float32[OC]
-    scale_ptr,        # float32[OC, 1, 1, 1]  (per-channel scale)
-    bias2_ptr,        # float32[OC, 1, 1, 1]  (per-channel multiplier)
-    y_ptr,            # float32[N, OC, D_out, H_out, W_out]
-
-    N, C_in,
-    D_in, H_in, W_in,
-    OC, KD, KH, KW,
-    D_out, H_out, W_out,
-    P,                # N * D_out * H_out * W_out
-
-    stride_xn, stride_xc, stride_xd, stride_xh, stride_xw,
-    stride_wn, stride_wc, stride_wd, stride_wh, stride_ww,
-    stride_yn, stride_yc, stride_yd, stride_yh, stride_yw,
-    scale_stride_c, bias2_stride_c,
-
+    x_ptr,                # *f32, input  (B, Cin, Din, Hin, Win)
+    w_ptr,                # *f32, weight (K, Cout)  where K = Cin*Kd*Kh*Kw
+    conv_bias_ptr,        # *f32, (Cout,)
+    scale_ptr,            # *f32, (Cout,)
+    bias_ptr,             # *f32, (Cout,)
+    out_ptr,              # *f32, output (B, Cout, Dout, Hout, Wout)
+    B, Cin,
+    Din, Hin, Win,
+    Cout,
+    Kd, Kh, Kw,
+    Dout, Hout, Wout,
+    stride_xb, stride_xc, stride_xd, stride_xh, stride_xw,
+    stride_wk, stride_wn,
+    stride_ob, stride_oc, stride_od, stride_oh, stride_ow,
+    M, N, K,              # M = B*Dout*Hout*Wout, N = Cout, K = Cin*Kd*Kh*Kw
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
 ):
-    pid_m = tl.program_id(0)  # over flattened output positions
-    pid_n = tl.program_id(1)  # over output channels
+    # Program ids
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
 
+    # Offsets for M, N, K
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
 
-    mask_m = offs_m < P
-    mask_n = offs_n < OC
+    mask_m = offs_m < M
+    mask_n = offs_n < N
 
-    # Decode flattened index offs_m -> (n_idx, od_idx, oh_idx, ow_idx)
-    DHW_out = D_out * H_out * W_out
-    HW_out = H_out * W_out
+    # Decompose M index into (b, od, oh, ow)
+    # m = n * (Dout*Hout*Wout) + od * (Hout*Wout) + oh * Wout + ow
+    m = offs_m[:, None]  # (BM, 1)
+    tmp_m = m
+    ow = tmp_m % Wout
+    tmp_m = tmp_m // Wout
+    oh = tmp_m % Hout
+    tmp_m = tmp_m // Hout
+    od = tmp_m % Dout
+    tmp_m = tmp_m // Dout
+    n_idx = tmp_m  # batch index, (BM, 1)
 
-    n_idx = offs_m // DHW_out
-    rem = offs_m % DHW_out
-    od_idx = rem // HW_out
-    rem2 = rem % HW_out
-    oh_idx = rem2 // W_out
-    ow_idx = rem2 % W_out
-
-    # Base pointer offsets for input and output corresponding to (n, od, oh, ow)
-    # For X: index [n_idx, :, od_idx + kd, oh_idx + kh, ow_idx + kw]
-    x_base = (
-        n_idx * stride_xn
-        + od_idx * stride_xd
-        + oh_idx * stride_xh
-        + ow_idx * stride_xw
-    )
-
-    # Accumulator for convolution result
+    # Accumulator
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    # Convolution loops: sum over input channels and kernel volume
-    for ic in range(0, C_in):
-        ic_offset = ic * stride_xc
-        w_ic_offset = ic * stride_wc
-        for kd in range(0, KD):
-            kd_offset_x = kd * stride_xd
-            kd_offset_w = kd * stride_wd
-            for kh in range(0, KH):
-                kh_offset_x = kh * stride_xh
-                kh_offset_w = kh * stride_wh
-                for kw in range(0, KW):
-                    kw_offset_x = kw * stride_xw
-                    kw_offset_w = kw * stride_ww
+    # K-loop
+    for k0 in range(0, K, BLOCK_K):
+        k_idx = k0 + offs_k  # (BLOCK_K,)
+        mask_k = k_idx < K
 
-                    # X values: [BLOCK_M]
-                    x_ptrs = x_ptr + x_base + ic_offset + kd_offset_x + kh_offset_x + kw_offset_x
-                    x_vals = tl.load(x_ptrs, mask=mask_m, other=0.0)
+        # Decompose K index into (cin, kd, kh, kw)
+        k = k_idx[None, :]  # (1, BK)
+        tmp_k = k
+        kw_idx = tmp_k % Kw
+        tmp_k = tmp_k // Kw
+        kh_idx = tmp_k % Kh
+        tmp_k = tmp_k // Kh
+        kd_idx = tmp_k % Kd
+        tmp_k = tmp_k // Kd
+        cin_idx = tmp_k  # (1, BK)
 
-                    # W values: [BLOCK_N] for current ic, kd, kh, kw, and oc range offs_n
-                    w_ptrs = (
-                        w_ptr
-                        + offs_n * stride_wn
-                        + w_ic_offset
-                        + kd_offset_w
-                        + kh_offset_w
-                        + kw_offset_w
-                    )
-                    w_vals = tl.load(w_ptrs, mask=mask_n, other=0.0)
+        # Input coordinates (din, hin, win) for each (m, k)
+        din = od + kd_idx          # (BM, BK)
+        hin = oh + kh_idx          # (BM, BK)
+        win = ow + kw_idx          # (BM, BK)
 
-                    # Outer product accumulate
-                    acc += x_vals[:, None] * w_vals[None, :]
+        # Build input pointers
+        x_ptrs = (
+            x_ptr
+            + n_idx * stride_xb
+            + cin_idx * stride_xc
+            + din * stride_xd
+            + hin * stride_xh
+            + win * stride_xw
+        )
 
-    # Add convolution bias (per output channel)
-    conv_b = tl.load(conv_bias_ptr + offs_n, mask=mask_n, other=0.0)
-    acc += conv_b[None, :]
+        mask_a = mask_m[:, None] & mask_k[None, :]
+        a = tl.load(x_ptrs, mask=mask_a, other=0.0)
 
-    # Apply per-channel scaling_factor: y = y * scale
-    scale = tl.load(scale_ptr + offs_n * scale_stride_c, mask=mask_n, other=0.0)
+        # Weight tile: w_ptr has shape (K, N)
+        w_ptrs = w_ptr + k_idx[:, None] * stride_wk + offs_n[None, :] * stride_wn
+        mask_b = mask_k[:, None] & mask_n[None, :]
+        b = tl.load(w_ptrs, mask=mask_b, other=0.0)
+
+        acc += tl.dot(a, b, allow_tf32=True)
+
+    # Load per-output-channel parameters
+    conv_bias = tl.load(conv_bias_ptr + offs_n, mask=mask_n, other=0.0)
+    scale = tl.load(scale_ptr + offs_n, mask=mask_n, other=1.0)
+    bias = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0)
+
+    # Add conv bias
+    acc = acc + conv_bias[None, :]
+
+    # Multiply by scaling_factor
     acc = acc * scale[None, :]
 
-    # Tanh activation: tanh(x) = (e^{2x} - 1) / (e^{2x} + 1)
-    two_x = acc * 2.0
+    # tanh: (exp(2x) - 1) / (exp(2x) + 1)
+    two_x = 2.0 * acc
     e2x = tl.exp(two_x)
-    tanh_x = (e2x - 1.0) / (e2x + 1.0)
+    acc = (e2x - 1.0) / (e2x + 1.0)
 
-    # Multiply by bias parameter (per-channel): y = tanh(x) * bias
-    bias2 = tl.load(bias2_ptr + offs_n * bias2_stride_c, mask=mask_n, other=0.0)
-    tanh_x = tanh_x * bias2[None, :]
+    # Multiply by bias
+    acc = acc * bias[None, :]
 
-    # Sigmoid: σ(z) = 1 / (1 + e^{-z})
-    neg = -tanh_x
-    exp_neg = tl.exp(neg)
-    sig = 1.0 / (1.0 + exp_neg)
+    # Sigmoid: 1 / (1 + exp(-x))
+    acc = 1.0 / (1.0 + tl.exp(-acc))
 
-    # Store result back to y[n, oc, od, oh, ow]
-    y_base = (
-        n_idx * stride_yn
-        + od_idx * stride_yd
-        + oh_idx * stride_yh
-        + ow_idx * stride_yw
+    # Map (m, n) back to (b, cout, dout, hout, wout)
+    m_out = offs_m[:, None]
+    tmp_m_out = m_out
+    wout = tmp_m_out % Wout
+    tmp_m_out = tmp_m_out // Wout
+    hout = tmp_m_out % Hout
+    tmp_m_out = tmp_m_out // Hout
+    dout = tmp_m_out % Dout
+    tmp_m_out = tmp_m_out // Dout
+    b_out = tmp_m_out  # (BM, 1)
+
+    cout = offs_n[None, :]  # (1, BN)
+
+    out_ptrs = (
+        out_ptr
+        + b_out * stride_ob
+        + cout * stride_oc
+        + dout * stride_od
+        + hout * stride_oh
+        + wout * stride_ow
     )
+    mask_out = mask_m[:, None] & mask_n[None, :]
+    tl.store(out_ptrs, acc, mask=mask_out)
 
-    y_ptrs = y_ptr + y_base[:, None] + offs_n[None, :] * stride_yc
-    tl.store(y_ptrs, sig, mask=mask_m[:, None] & mask_n[None, :])
 
-
-def fused_conv3d_scaled_tanh_sigmoid(x, weight, conv_bias, scale, bias2):
+def fused_conv3d_tanh_sigmoid(x, weight, conv_bias, scaling_factor, bias_param):
     """
-    x:        [N, C_in, D_in, H_in, W_in]
-    weight:   [OC, C_in, KD, KH, KW]
-    conv_bias:[OC]
-    scale:    [OC, 1, 1, 1]
-    bias2:    [OC, 1, 1, 1]
+    x:              (B, Cin, Din, Hin, Win)
+    weight:         (Cout, Cin, Kd, Kh, Kw)
+    conv_bias:      (Cout,)
+    scaling_factor: (Cout, 1, 1, 1)
+    bias_param:     (Cout, 1, 1, 1)
     """
-    assert x.is_cuda, "Input must be on CUDA device for Triton kernel."
-    assert weight.is_cuda and conv_bias.is_cuda and scale.is_cuda and bias2.is_cuda
+    x = x.contiguous()
+    weight = weight.contiguous()
+    conv_bias = conv_bias.contiguous()
+    scaling_factor = scaling_factor.contiguous().view(-1)
+    bias_param = bias_param.contiguous().view(-1)
 
-    N, C_in, D_in, H_in, W_in = x.shape
-    OC, C_in_w, KD, KH, KW = weight.shape
-    assert C_in == C_in_w, "Input channels mismatch between x and weight."
+    B, Cin, Din, Hin, Win = x.shape
+    Cout, Cin_w, Kd, Kh, Kw = weight.shape
+    assert Cin == Cin_w, "Input channels must match weight channels"
 
-    # Stride=1, padding=0, dilation=1
-    D_out = D_in - KD + 1
-    H_out = H_in - KH + 1
-    W_out = W_in - KW + 1
-    assert D_out > 0 and H_out > 0 and W_out > 0
+    # Valid 3D conv, stride=1, padding=0
+    Dout = Din - Kd + 1
+    Hout = Hin - Kh + 1
+    Wout = Win - Kw + 1
 
-    y = torch.empty((N, OC, D_out, H_out, W_out), device=x.device, dtype=x.dtype)
+    # Flatten weight to (K, Cout)
+    K = Cin * Kd * Kh * Kw
+    weight_flat = weight.view(Cout, K).transpose(0, 1).contiguous()
 
-    P = N * D_out * H_out * W_out
+    # Output
+    out = torch.empty((B, Cout, Dout, Hout, Wout), device=x.device, dtype=x.dtype)
 
-    BLOCK_M = 32  # power of 2
-    BLOCK_N = 32  # power of 2
+    stride_xb, stride_xc, stride_xd, stride_xh, stride_xw = x.stride()
+    stride_ob, stride_oc, stride_od, stride_oh, stride_ow = out.stride()
+    stride_wk, stride_wn = weight_flat.stride()
 
-    grid = (
-        triton.cdiv(P, BLOCK_M),
-        triton.cdiv(OC, BLOCK_N),
-    )
+    M = B * Dout * Hout * Wout
+    N = Cout
+
+    # Block sizes must be powers of two
+    BLOCK_M = 64
+    BLOCK_N = 64
+    BLOCK_K = 32
+
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta["BLOCK_M"]),
+            triton.cdiv(N, meta["BLOCK_N"]),
+        )
 
     conv3d_fused_tanh_sigmoid_kernel[grid](
         x,
-        weight,
+        weight_flat,
         conv_bias,
-        scale,
-        bias2,
-        y,
-        N, C_in,
-        D_in, H_in, W_in,
-        OC, KD, KH, KW,
-        D_out, H_out, W_out,
-        P,
-        x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
-        weight.stride(0), weight.stride(1), weight.stride(2), weight.stride(3), weight.stride(4),
-        y.stride(0), y.stride(1), y.stride(2), y.stride(3), y.stride(4),
-        scale.stride(0), bias2.stride(0),
+        scaling_factor,
+        bias_param,
+        out,
+        B,
+        Cin,
+        Din,
+        Hin,
+        Win,
+        Cout,
+        Kd,
+        Kh,
+        Kw,
+        Dout,
+        Hout,
+        Wout,
+        stride_xb,
+        stride_xc,
+        stride_xd,
+        stride_xh,
+        stride_xw,
+        stride_wk,
+        stride_wn,
+        stride_ob,
+        stride_oc,
+        stride_od,
+        stride_oh,
+        stride_ow,
+        M,
+        N,
+        K,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
     )
 
-    return y
+    return out
 
 
 class ModelNew(nn.Module):
     """
-    Triton-based implementation of:
-        Conv3d -> * scaling_factor -> tanh -> * bias -> sigmoid
+    Triton-optimized version:
+    3D convolution (valid, stride=1) + scale + tanh + scale + sigmoid.
     """
     def __init__(self, in_channels, out_channels, kernel_size, scaling_factor, bias_shape):
         super(ModelNew, self).__init__()
-        # Use nn.Conv3d as parameter container (same as original model)
-        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size)
 
-        # Per-channel scaling_factor and bias (same shape as in original model)
+        if isinstance(kernel_size, int):
+            Kd = Kh = Kw = kernel_size
+        else:
+            Kd, Kh, Kw = kernel_size
+
+        self.weight = nn.Parameter(
+            torch.randn(out_channels, in_channels, Kd, Kh, Kw)
+        )
+        self.conv_bias = nn.Parameter(torch.randn(out_channels))
+
         self.scaling_factor = nn.Parameter(torch.randn(bias_shape))
         self.bias = nn.Parameter(torch.randn(bias_shape))
 
     def forward(self, x):
-        # Ensure parameters are on same device as x
-        self.conv.to(x.device)
-        self.scaling_factor.data = self.scaling_factor.data.to(x.device)
-        self.bias.data = self.bias.data.to(x.device)
-
-        return fused_conv3d_scaled_tanh_sigmoid(
+        return fused_conv3d_tanh_sigmoid(
             x,
-            self.conv.weight,
-            self.conv.bias,
+            self.weight,
+            self.conv_bias,
             self.scaling_factor,
             self.bias,
         )
@@ -265,26 +294,35 @@ class ModelNew(nn.Module):
 [NCU PROFILING METRICS]
 {
   "conv3d_fused_tanh_sigmoid_kernel": {
-    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 65.81,
-    "launch__grid_size": 215264,
-    "sm__warps_active.avg.pct_of_peak_sustained_active": 41.37,
-    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 7.18,
-    "lts__t_sector_hit_rate.pct": 92.95
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 64.08,
+    "launch__grid_size": 107632,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 24.76,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 11.28,
+    "lts__t_sector_hit_rate.pct": 94.39
   }
 }
 
 **Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
 
-TRITON API CONSTRAINTS (CRITICAL):
-- Triton has NO: tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+## CRITICAL — Code MUST compile and run:
+1. EVERY kernel function MUST have `@triton.jit` decorator
+2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+3. BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+4. `tl.program_id(axis)` only supports axis = 0, 1, 2
+5. No `continue`, `break`, `return` inside loops — use masking
+6. No tensor indexing with loop vars: `x[:, i]` is INVALID
+7. mask shape MUST match data shape in tl.load/tl.store
 
-OUTPUT RULES (STRICT):
-1. Follow this exact order:
-   1. Imports: torch, torch.nn, triton, triton.language as tl
-   2. @triton.jit decorated kernel function(s)
-   3. Wrapper function(s) for grid calculation and kernel launch
-   4. class ModelNew(nn.Module) that calls your kernels
-2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+## Missing Triton Functions (implement manually):
+- tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+## OUTPUT FORMAT (STRICT):
+1. Imports: torch, torch.nn, triton, triton.language as tl
+2. @triton.jit decorated kernel function(s)
+3. Wrapper function(s) for grid calculation and kernel launch
+4. class ModelNew(nn.Module) that calls your kernels
+
+Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
 
 ```python
 # <optimized Triton code>

@@ -1,287 +1,273 @@
 ```python
+# <optimized Triton code>
+
 import torch
 import torch.nn as nn
 import triton
 import triton.language as tl
-import math
 
+
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=3,
+        ),
+        triton.Config(
+            {'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=4,
+        ),
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32},
+            num_warps=4,
+            num_stages=4,
+        ),
+        triton.Config(
+            {'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32},
+            num_warps=8,
+            num_stages=4,
+        ),
+    ],
+    key=['M', 'N', 'K'],
+)
 @triton.jit
-def fused_gelu_pool_kernel_optimized(
-    x_ptr,
-    output_ptr,
-    B,
-    C,
-    H,
-    W,
-    BLOCK_SIZE_C: tl.constexpr,
-    BLOCK_SIZE_HW: tl.constexpr,
-    USE_TENSOR_CORES: tl.constexpr,
+def conv2d_gelu_kernel(
+    x_ptr, w_ptr, bias_ptr, y_ptr,
+    B, C_in, H, W,
+    C_out, KH, KW,
+    H_out, W_out,
+    M, N, K,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_wk, stride_wn,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
-    # 3D grid: batch, channel blocks, spatial blocks
-    pid_b = tl.program_id(axis=0)
-    pid_c_block = tl.program_id(axis=1)
-    pid_hw_block = tl.program_id(axis=2)
-    
-    # Each thread processes one channel
-    c_idx = pid_c_block * BLOCK_SIZE_C + tl.arange(0, BLOCK_SIZE_C)
-    c_mask = c_idx < C
-    
-    # Each thread processes multiple spatial positions
-    hw_start = pid_hw_block * BLOCK_SIZE_HW
-    hw_offsets = tl.arange(0, BLOCK_SIZE_HW)
-    hw_pos = hw_start + hw_offsets
-    hw_mask = hw_pos < (H * W)
-    
-    # Calculate offsets for the current tile
-    base_offset = pid_b * C * H * W
-    channel_stride = H * W
-    
-    # Initialize accumulator for partial sums
-    acc = tl.zeros((BLOCK_SIZE_C,), dtype=tl.float32)
-    
-    # Process spatial positions within this block
-    for i in tl.range(0, BLOCK_SIZE_HW, 32):  # Process in chunks of 32 for better memory coalescing
-        hw_chunk = hw_offsets[i:i+32]
-        hw_chunk_mask = hw_mask[i:i+32]
-        
-        if tl.sum(hw_chunk_mask) > 0:  # Early exit if mask is empty
-            # Load data for this chunk
-            offsets = base_offset + tl.reshape(c_idx, (BLOCK_SIZE_C, 1)) * channel_stride + \
-                     tl.reshape(hw_chunk, (1, 32))
-            x_chunk = tl.load(x_ptr + offsets, 
-                            mask=tl.reshape(c_mask, (BLOCK_SIZE_C, 1)) & 
-                                 tl.reshape(hw_chunk_mask, (1, 32)))
-            
-            # Apply GELU with high-precision approximation
-            sqrt_2_over_pi = 0.7978845608028654
-            gelu_const = 0.044715
-            
-            # Compute using tensor cores if enabled (for Ada Lovelace)
-            if USE_TENSOR_CORES:
-                # Use FP16 for tensor core computation
-                x_fp16 = x_chunk.to(tl.float16)
-                x_cubed_fp16 = x_fp16 * x_fp16 * x_fp16
-                z_fp16 = sqrt_2_over_pi * (x_fp16 + gelu_const * x_cubed_fp16)
-                exp_2z_fp16 = tl.exp(2.0 * z_fp16)
-                tanh_z_fp16 = (exp_2z_fp16 - 1.0) / (exp_2z_fp16 + 1.0)
-                gelu_chunk = 0.5 * x_fp16 * (1.0 + tanh_z_fp16)
-                gelu_chunk = gelu_chunk.to(tl.float32)  # Convert back to FP32 for accumulation
-            else:
-                # Regular FP32 computation
-                x_cubed = x_chunk * x_chunk * x_chunk
-                z = sqrt_2_over_pi * (x_chunk + gelu_const * x_cubed)
-                exp_2z = tl.exp(2.0 * z)
-                tanh_z = (exp_2z - 1.0) / (exp_2z + 1.0)
-                gelu_chunk = 0.5 * x_chunk * (1.0 + tanh_z)
-            
-            # Accumulate partial sums
-            acc += tl.sum(gelu_chunk, axis=1)
-    
-    # Reduce across spatial blocks using shared memory
-    shmem = tl.reshape(acc, (BLOCK_SIZE_C, 1))  # Store in shared memory for reduction
-    
-    # Perform reduction across spatial dimension
-    num_spatial_blocks = tl.cdiv(H * W, BLOCK_SIZE_HW)
-    
-    # Use atomic add for final accumulation
-    if pid_hw_block == 0:
-        # First block in spatial dimension initializes the output
-        output = acc / (H * W)
-        output_offset = pid_b * C + c_idx
-        tl.store(output_ptr + output_offset, output, mask=c_mask)
-    else:
-        # Subsequent blocks atomically add their contributions
-        # Note: This requires proper atomic operations support
-        # For simplicity, we'll use a different approach with multiple kernel launches
-        pass
+    # 2D grid over output [M, N]
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
 
-@triton.jit
-def fused_gelu_pool_kernel_final(
-    x_ptr,
-    output_ptr,
-    B,
-    C,
-    H,
-    W,
-    BLOCK_SIZE_C: tl.constexpr,
-):
-    # Simple 2D grid for maximum parallelism
-    pid = tl.program_id(axis=0)
-    total_threads = tl.num_programs(0)
-    
-    # Dynamic work distribution
-    threads_per_batch = total_threads // B
-    batch_idx = pid // threads_per_batch
-    thread_in_batch = pid % threads_per_batch
-    
-    if batch_idx >= B:
-        return
-    
-    # Each thread handles multiple channels
-    channels_per_thread = tl.cdiv(C, threads_per_batch)
-    c_start = thread_in_batch * channels_per_thread
-    c_end = min(c_start + channels_per_thread, C)
-    
-    # Process assigned channels
-    for c_idx in range(c_start, c_end, BLOCK_SIZE_C):
-        c_offsets = c_idx + tl.arange(0, BLOCK_SIZE_C)
-        c_mask = c_offsets < C
-        
-        # Initialize accumulator
-        acc = tl.zeros((BLOCK_SIZE_C,), dtype=tl.float32)
-        
-        # Process all spatial positions
-        # Use vectorized operations for better memory access
-        for hw_start in range(0, H * W, 128):
-            hw_offsets = tl.arange(0, 128)
-            hw_mask = hw_offsets < (H * W - hw_start)
-            
-            # Calculate indices with vectorized operations
-            base = batch_idx * C * H * W + tl.reshape(c_offsets, (BLOCK_SIZE_C, 1)) * H * W
-            offsets = base + hw_start + tl.reshape(hw_offsets, (1, 128))
-            
-            # Load with vectorized mask
-            mask = tl.reshape(c_mask, (BLOCK_SIZE_C, 1)) & tl.reshape(hw_mask, (1, 128))
-            x_block = tl.load(x_ptr + offsets, mask=mask)
-            
-            # Fast GELU with polynomial approximation (better for Ada Lovelace)
-            # Using Chebyshev polynomial approximation for tanh
-            sqrt_2_over_pi = 0.7978845608028654
-            a = 0.044715
-            
-            # Direct polynomial approximation of GELU (faster on Ada)
-            # gelu(x) ≈ 0.5x * (1 + tanh(√(2/π)(x + 0.044715x³)))
-            # Pre-computed polynomial coefficients for approximation
-            x_sq = x_block * x_block
-            x_cubed = x_block * x_sq
-            inner = sqrt_2_over_pi * (x_block + a * x_cubed)
-            
-            # Fast tanh approximation using polynomials
-            inner_sq = inner * inner
-            # Pade approximant for tanh
-            tanh_approx = inner * (135135.0 + inner_sq * (17325.0 + inner_sq * (378.0 + inner_sq))) / \
-                         (135135.0 + inner_sq * (62370.0 + inner_sq * (3150.0 + inner_sq * 28.0)))
-            
-            gelu_block = 0.5 * x_block * (1.0 + tanh_approx)
-            
-            # Accumulate
-            acc += tl.sum(gelu_block, axis=1)
-        
-        # Store result
-        if tl.sum(c_mask) > 0:
-            output = acc / (H * W)
-            output_offset = batch_idx * C + c_offsets
-            tl.store(output_ptr + output_offset, output, mask=c_mask)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
 
-def triton_fused_gelu_pool_optimized(x: torch.Tensor) -> torch.Tensor:
-    B, C, H, W = x.shape
-    output = torch.empty(B, C, device=x.device, dtype=x.dtype)
-    
-    # Calculate optimal grid size for Ada Lovelace (4090)
-    # Target: Fill all 128 SMs with sufficient parallelism
-    total_elements = B * C * H * W
-    
-    # Choose grid configuration based on problem size
-    if total_elements < 131072:  # Small problem
-        # Use simple 1D grid
-        BLOCK_SIZE = 1024
-        grid = (triton.cdiv(B * C, BLOCK_SIZE),)
-        
-        @triton.jit
-        def small_kernel(x_ptr, output_ptr, B, C, H, W, BLOCK_SIZE: tl.constexpr):
-            pid = tl.program_id(0)
-            idx = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-            batch_idx = idx // C
-            channel_idx = idx % C
-            
-            mask = batch_idx < B
-            batch_idx = tl.where(mask, batch_idx, 0)
-            channel_idx = tl.where(mask, channel_idx, 0)
-            
-            acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
-            
-            for hw in range(H * W):
-                offset = batch_idx * C * H * W + channel_idx * H * W + hw
-                val = tl.load(x_ptr + offset, mask=mask)
-                
-                # Fast GELU
-                sqrt_2_over_pi = 0.7978845608028654
-                a = 0.044715
-                x_sq = val * val
-                x_cubed = val * x_sq
-                inner = sqrt_2_over_pi * (val + a * x_cubed)
-                inner_sq = inner * inner
-                tanh_approx = inner * (135135.0 + inner_sq * (17325.0 + inner_sq * (378.0 + inner_sq))) / \
-                             (135135.0 + inner_sq * (62370.0 + inner_sq * (3150.0 + inner_sq * 28.0)))
-                gelu_val = 0.5 * val * (1.0 + tanh_approx)
-                
-                acc += tl.where(mask, gelu_val, 0.0)
-            
-            result = tl.where(mask, acc / (H * W), 0.0)
-            out_offset = batch_idx * C + channel_idx
-            tl.store(output_ptr + out_offset, result, mask=mask)
-        
-        small_kernel[grid](x, output, B, C, H, W, BLOCK_SIZE=BLOCK_SIZE)
-        
-    else:
-        # Large problem - use optimized 2D grid
-        # Tuned for Ada Lovelace architecture
-        BLOCK_SIZE_C = 128  # Maximize channel parallelism
-        threads_per_batch = 512  # Good balance for 4090
-        
-        total_threads = B * threads_per_batch
-        grid = (total_threads,)
-        
-        fused_gelu_pool_kernel_final[grid](
-            x, output, B, C, H, W,
-            BLOCK_SIZE_C=BLOCK_SIZE_C,
-            num_warps=8,  # 8 warps = 256 threads, good for 4090
+    tl.multiple_of(offs_m, BLOCK_M)
+    tl.multiple_of(offs_n, BLOCK_N)
+    tl.multiple_of(offs_k, BLOCK_K)
+
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+
+    # Decode linear index offs_m -> (batch, oy, ox)
+    hw_out = H_out * W_out
+    bs = offs_m // hw_out
+    rem = offs_m - bs * hw_out
+    oy = rem // W_out
+    ox = rem - oy * W_out
+
+    # Broadcasted versions for input indexing (shared by all fused ops)
+    bs_b = bs[:, None]        # (BLOCK_M, 1)
+    oy_b = oy[:, None]        # (BLOCK_M, 1)
+    ox_b = ox[:, None]        # (BLOCK_M, 1)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    k_hw = KH * KW
+
+    # GEMM-style loop over K dimension
+    for k_start in range(0, K, BLOCK_K):
+        k_idx = k_start + offs_k                 # (BLOCK_K,)
+        mask_k = k_idx < K
+
+        # Decode flattened K index -> (in_channel, ky, kx)
+        kk_c = k_idx // k_hw
+        kk_rem = k_idx - kk_c * k_hw
+        ky = kk_rem // KW
+        kx = kk_rem - ky * KW
+
+        ic_b = kk_c[None, :]                    # (1, BLOCK_K)
+        ky_b = ky[None, :]                      # (1, BLOCK_K)
+        kx_b = kx[None, :]                      # (1, BLOCK_K)
+
+        in_y = oy_b + ky_b                      # (BLOCK_M, BLOCK_K)
+        in_x = ox_b + kx_b                      # (BLOCK_M, BLOCK_K)
+
+        # Input tile [BLOCK_M, BLOCK_K]
+        a_ptrs = (
+            x_ptr
+            + bs_b * stride_xn
+            + ic_b * stride_xc
+            + in_y * stride_xh
+            + in_x * stride_xw
         )
-    
-    return output
+        # Weight tile [BLOCK_K, BLOCK_N]
+        b_ptrs = (
+            w_ptr
+            + k_idx[:, None] * stride_wk
+            + offs_n[None, :] * stride_wn
+        )
+
+        a_mask = mask_m[:, None] & mask_k[None, :]
+        b_mask = mask_k[:, None] & mask_n[None, :]
+
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+        # Accumulate in fp32
+        acc += tl.dot(a, b, allow_tf32=True)
+
+    # ---- FUSED BIAS + GELU ----
+    # All fused ops use the SAME offsets (offs_m, offs_n) and SAME mask (mask_m/mask_n)
+    bias = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0)  # (BLOCK_N,)
+    acc = acc + bias[None, :]                                  # broadcast over BLOCK_M
+
+    # GELU (tanh approximation) in fp32
+    x_fp32 = acc
+    x_cubed = x_fp32 * x_fp32 * x_fp32
+    k0 = 0.7978845608028654  # sqrt(2/pi)
+    inner = k0 * (x_fp32 + 0.044715 * x_cubed)
+    # tanh(inner) implemented via exp, no tl.tanh available
+    two_inner = 2.0 * inner
+    exp2 = tl.exp(two_inner)
+    tanh_inner = (exp2 - 1.0) / (exp2 + 1.0)
+    acc = 0.5 * x_fp32 * (1.0 + tanh_inner)
+
+    # ---- STORE OUTPUT ----
+    # Use the same decoded indices (bs, oy, ox) -> same offsets/masks as conv & bias/GELU
+    bs_s = bs
+    oy_s = oy
+    ox_s = ox
+
+    y_ptrs = (
+        y_ptr
+        + bs_s[:, None] * stride_yn
+        + offs_n[None, :] * stride_yc
+        + oy_s[:, None] * stride_yh
+        + ox_s[:, None] * stride_yw
+    )
+
+    out_mask = mask_m[:, None] & mask_n[None, :]
+    tl.store(y_ptrs, acc, mask=out_mask)
+
+
+@triton.jit
+def global_avg_pool2d_kernel(
+    x_ptr, y_ptr,
+    B, C, H, W,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_yn, stride_yc,
+    BLOCK_HW: tl.constexpr,
+):
+    # One program per (b, c)
+    pid = tl.program_id(0)
+    bc = pid
+    b = bc // C
+    c = bc - b * C
+
+    HW = H * W
+    sum_val = tl.zeros((), dtype=tl.float32)
+
+    # Reduction over spatial dimension
+    for hw_start in range(0, HW, BLOCK_HW):
+        offs_hw = hw_start + tl.arange(0, BLOCK_HW)
+        mask_hw = offs_hw < HW
+
+        h_idx = offs_hw // W
+        w_idx = offs_hw - h_idx * W
+
+        x_ptrs = (
+            x_ptr
+            + b * stride_xn
+            + c * stride_xc
+            + h_idx * stride_xh
+            + w_idx * stride_xw
+        )
+        vals = tl.load(x_ptrs, mask=mask_hw, other=0.0)
+        sum_val += tl.sum(vals, axis=0)
+
+    avg = sum_val / HW
+
+    y_ptrs = y_ptr + b * stride_yn + c * stride_yc
+    tl.store(y_ptrs, avg)
+
+
+def conv2d_gelu_triton(x, weight, bias):
+    """
+    x: [B, C_in, H, W]
+    weight: [C_out, C_in, KH, KW]
+    bias: [C_out]
+    returns: [B, C_out, H_out, W_out]
+    """
+    B, C_in, H, W = x.shape
+    C_out, _, KH, KW = weight.shape
+
+    H_out = H - KH + 1
+    W_out = W - KW + 1
+
+    K = C_in * KH * KW
+    M = B * H_out * W_out
+    N = C_out
+
+    # Flatten weights to [K, N] with N contiguous for coalesced loads
+    w_flat = weight.view(C_out, -1).transpose(0, 1).contiguous()
+
+    y = torch.empty((B, C_out, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta['BLOCK_M']),
+            triton.cdiv(N, meta['BLOCK_N']),
+        )
+
+    conv2d_gelu_kernel[grid](
+        x, w_flat, bias, y,
+        B, C_in, H, W,
+        C_out, KH, KW,
+        H_out, W_out,
+        M, N, K,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        w_flat.stride(0), w_flat.stride(1),
+        y.stride(0), y.stride(1), y.stride(2), y.stride(3),
+    )
+    return y
+
+
+def global_avg_pool2d_triton(x):
+    """
+    x: [B, C, H, W]
+    returns: [B, C]
+    """
+    B, C, H, W = x.shape
+    y = torch.empty((B, C), device=x.device, dtype=x.dtype)
+
+    def grid(meta):
+        # One program per (b, c) pair; ensure grid > 0
+        return (max(1, B * C),)
+
+    global_avg_pool2d_kernel[grid](
+        x, y,
+        B, C, H, W,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        y.stride(0), y.stride(1),
+        BLOCK_HW=256,
+    )
+    return y
+
 
 class ModelNew(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size):
         super(ModelNew, self).__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.weight = nn.Parameter(
+            torch.randn(out_channels, in_channels, kernel_size, kernel_size)
+        )
+        self.bias = nn.Parameter(torch.randn(out_channels))
 
     def forward(self, x):
-        """
-        Args:
-            x: Input tensor of shape (batch_size, in_channels, height, width)
-        Returns:
-            Output tensor of shape (batch_size, out_channels)
-        """
-        # Keep PyTorch convolution (highly optimized with cuDNN)
-        x = self.conv(x)
-        
-        # Optimized fused GELU + Global Average Pooling
-        x = triton_fused_gelu_pool_optimized(x)
-        
+        x = conv2d_gelu_triton(x, self.weight, self.bias)
+        x = global_avg_pool2d_triton(x)
         return x
 ```
-
-**Optimizations Applied:**
-
-1. **Dynamic Grid Configuration**: Uses different strategies for small vs. large problems to maximize SM utilization.
-
-2. **Ada Lovelace-Specific Tuning**: 
-   - Uses 8 warps (256 threads) per block, optimal for 4090's 1536 threads/SM
-   - Larger channel blocks (128) to maximize parallelism
-   - Vectorized memory access patterns
-
-3. **Fast GELU Approximation**: Uses Chebyshev polynomial approximation for tanh, which is faster on Ada Lovelace while maintaining accuracy.
-
-4. **Efficient Work Distribution**: Dynamically distributes work across threads with load balancing for irregular problem sizes.
-
-5. **Memory Access Optimization**: 
-   - Coalesced memory access patterns
-   - Vectorized loads/stores
-   - Proper masking for boundary conditions
-
-6. **Grid Size Optimization**: 
-   - Small problems: Simple 1D grid
-   - Large problems: Optimized 2D grid with dynamic thread distribution
-   - Targets >60% SM utilization by ensuring sufficient parallelism
-
-The kernel is tuned specifically for RTX 4090's Ada Lovelace architecture, maximizing Tensor Core utilization and memory bandwidth while maintaining correctness.

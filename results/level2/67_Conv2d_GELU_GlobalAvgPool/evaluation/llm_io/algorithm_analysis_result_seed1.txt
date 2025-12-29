@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The custom Triton kernel is over 10x slower than the PyTorch baseline, indicating a major algorithmic inefficiency in how convolution is implemented.",
+  "bottleneck": "The kernel implements convolution as a per-(batch, out_channel) serial loop over all spatial positions and the full C_in*K*K reduction, missing GEMM-style tiling and reuse; this prevents use of highly-optimized matrix-multiply patterns and tensor cores.",
+  "optimisation method": "Replace the direct per-position convolution with a GEMM-based (im2col-style) convolution that maps the operation to a matrix multiplication, and then fuse GELU and global average pooling into that matmul kernel.",
+  "modification plan": "Reshape the input to form an im2col matrix X_col of shape (C_in*K*K, H_out*W_out) per batch, and treat the weights as a matrix W of shape (C_out, C_in*K*K). Implement a Triton matmul kernel computing Y = W @ X_col with 2D tiling over (C_out, H_out*W_out), and inside the matmul loop apply GELU to the accumulated output tile and perform a running reduction over the spatial dimension to produce the global average pooled outputs (B, C_out) without ever materializing the full (B, C_out, H_out, W_out) tensor.",
+  "expected_speedup": "5-15x vs the current Triton kernel (and likely up to ~2x vs the PyTorch baseline if matmul is well-tuned and tensor cores are used)."
+}

@@ -1,0 +1,281 @@
+You are a GPU kernel optimization architect. Analyze the kernel and identify **ONE high-level algorithmic optimization**.
+
+# PyTorch Reference
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs a convolution, applies GELU, and then performs global average pooling.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size):
+        super(Model, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor of shape (batch_size, in_channels, height, width)
+        Returns:
+            Output tensor of shape (batch_size, out_channels)
+        """
+        x = self.conv(x)
+        x = torch.nn.functional.gelu(x)
+        x = torch.nn.functional.adaptive_avg_pool2d(x, 1)
+        x = x.squeeze(-1).squeeze(-1)
+        return x
+
+batch_size = 128
+in_channels = 8
+out_channels = 64
+height, width = 256, 256
+kernel_size = 3
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size]
+```
+
+# Current Triton Kernel
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def conv_gelu_gap_kernel(
+    x_ptr, w_ptr, bias_ptr, out_ptr,
+    B, C_in, H, W, C_out, K, H_out, W_out, P,
+    stride_xb, stride_xc, stride_xh, stride_xw,
+    stride_wco, stride_wci, stride_wkh, stride_wkw,
+    stride_outb, stride_outc,
+    inv_P,
+    BLOCK_P: tl.constexpr,  # block over spatial output positions
+    BLOCK_R: tl.constexpr,  # block over C_in * K * K reduction
+):
+    pid = tl.program_id(0)  # one program per (batch, out_channel)
+    b = pid // C_out
+    oc = pid % C_out
+
+    # Guard against out-of-range pids (shouldn't happen with our grid, but safe)
+    if pid >= B * C_out:
+        return
+
+    # Base pointer for weights of this output channel
+    w_oc_ptr = w_ptr + oc * stride_wco
+
+    # Bias for this output channel
+    bias_val = tl.load(bias_ptr + oc)
+
+    # Total reduction length over input channels and kernel window
+    R = C_in * K * K
+
+    # Accumulator over spatial positions (for global average pooling)
+    acc_sum = tl.zeros((), dtype=tl.float32)
+
+    # Loop over spatial positions in blocks of BLOCK_P
+    for p_start in range(0, P, BLOCK_P):
+        offs_p = p_start + tl.arange(0, BLOCK_P)
+        mask_p = offs_p < P
+
+        # Map flattened spatial index -> (oh, ow)
+        oh = offs_p // W_out
+        ow = offs_p - oh * W_out
+
+        # Per-position accumulator for convolution result
+        val_p = tl.zeros((BLOCK_P,), dtype=tl.float32)
+
+        # Loop over combined (C_in, K, K) reduction dimension in tiles of BLOCK_R
+        for r_start in range(0, R, BLOCK_R):
+            offs_r = r_start + tl.arange(0, BLOCK_R)
+            mask_r = offs_r < R
+
+            # Decode offs_r -> (ic, kh, kw)
+            kk = K * K
+            ic = offs_r // kk
+            rem = offs_r - ic * kk
+            kh = rem // K
+            kw = rem - kh * K
+
+            # Compute input coordinates for each (p, r) pair
+            in_h = oh[:, None] + kh[None, :]
+            in_w = ow[:, None] + kw[None, :]
+
+            # Pointers for input x[b, ic, in_h, in_w]
+            x_ptrs = (
+                x_ptr
+                + b * stride_xb
+                + ic[None, :] * stride_xc
+                + in_h * stride_xh
+                + in_w * stride_xw
+            )
+
+            mask_x = mask_p[:, None] & mask_r[None, :]
+
+            x_vals = tl.load(x_ptrs, mask=mask_x, other=0.0)
+
+            # Pointers for weights w[oc, ic, kh, kw]
+            w_ptrs = w_oc_ptr + ic * stride_wci + kh * stride_wkh + kw * stride_wkw
+            w_vals = tl.load(w_ptrs, mask=mask_r, other=0.0)
+
+            # Accumulate dot-product over BLOCK_R for each position in BLOCK_P
+            val_p += tl.sum(x_vals * w_vals[None, :], axis=1)
+
+        # Add bias and apply GELU (tanh-based approximation)
+        x_val = val_p + bias_val
+        c0 = 0.7978845608028654  # sqrt(2/pi)
+        c1 = 0.044715
+        x3 = x_val * x_val * x_val
+        inner = c0 * (x_val + c1 * x3)
+        t = tl.exp(2.0 * inner)
+        tanh_inner = (t - 1.0) / (t + 1.0)
+        gelu_val = 0.5 * x_val * (1.0 + tanh_inner)
+
+        # Zero out inactive positions
+        gelu_val = tl.where(mask_p, gelu_val, 0.0)
+
+        # Accumulate for global average pooling
+        acc_sum += tl.sum(gelu_val, axis=0)
+
+    # Finish global average pooling
+    out_val = acc_sum * inv_P
+
+    # Store result: out[b, oc]
+    out_ptrs = out_ptr + b * stride_outb + oc * stride_outc
+    tl.store(out_ptrs, out_val)
+
+
+def fused_conv_gelu_gap(x, weight, bias):
+    """
+    x: (B, C_in, H, W)
+    weight: (C_out, C_in, K, K)
+    bias: (C_out,)
+    returns: (B, C_out) after Conv2d -> GELU -> global average pooling
+    """
+    assert x.is_cuda, "Input must be on CUDA device for Triton kernel"
+    B, C_in, H, W = x.shape
+    C_out, C_in_w, K_h, K_w = weight.shape
+    assert C_in == C_in_w, "in_channels mismatch"
+    assert K_h == K_w, "Only square kernels supported"
+    K = K_h
+
+    H_out = H - K + 1
+    W_out = W - K + 1
+    P = H_out * W_out
+    inv_P = 1.0 / float(P)
+
+    out = torch.empty((B, C_out), device=x.device, dtype=x.dtype)
+
+    N = B * C_out
+    grid = lambda META: (triton.cdiv(N, 1),)
+
+    conv_gelu_gap_kernel[grid](
+        x, weight, bias, out,
+        B, C_in, H, W, C_out, K, H_out, W_out, P,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        weight.stride(0), weight.stride(1), weight.stride(2), weight.stride(3),
+        out.stride(0), out.stride(1),
+        inv_P,
+        BLOCK_P=64,
+        BLOCK_R=64,
+        num_warps=4,
+        num_stages=2,
+    )
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized version of:
+      Conv2d -> GELU -> global average pooling
+    """
+    def __init__(self, in_channels, out_channels, kernel_size):
+        super(ModelNew, self).__init__()
+        if isinstance(kernel_size, tuple):
+            assert kernel_size[0] == kernel_size[1], "Only square kernels supported"
+            k = kernel_size[0]
+        else:
+            k = kernel_size
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = k
+
+        self.weight = nn.Parameter(
+            torch.randn(out_channels, in_channels, k, k)
+        )
+        self.bias = nn.Parameter(torch.randn(out_channels))
+
+    def forward(self, x):
+        return fused_conv_gelu_gap(x, self.weight, self.bias)
+```
+
+# Performance
+- **PyTorch baseline**: 14.29 ms
+- **Current Triton**: 158.33 ms
+- **Current speedup**: 0.09x (-1007.8% vs baseline)
+
+
+---
+
+## Analysis Steps
+
+1. **Code Analysis**: Count kernels, identify operations, check for inefficiencies
+2. **Performance Diagnosis**: Use metrics/latency to identify bottleneck type
+3. **Root Cause**: Combine code + performance to find the core issue
+
+## Optimization Categories (pick ONE if worth optimizing):
+
+### 1. Operator Fusion
+Fuse consecutive ops into fewer kernels to reduce memory traffic and launch overhead.
+
+### 2. Algorithm Replacement
+Replace naive algorithm with optimized variant.
+- For Attention: Flash Attention, online softmax
+- For Convolution: Winograd, im2col
+- **For RNN/GRU/LSTM**: Persistent kernel with HYBRID computation
+  - **CRITICAL**: Use hybrid approach for best performance:
+    * Precompute input-side gates ONCE (outside kernel): `gates_x = (T*B, In) @ W_ih`
+    * Persistent kernel (inside): only recurrent-side: `for t: gates_h = h @ W_hh`
+  - Time loop `for t in range(T)` must be inside kernel, NOT in Python
+  - Launch kernel once per layer, not once per timestep
+  - Expected speedup: 10-100x (vs per-timestep launches)
+
+### 3. Kernel Launch Reduction
+Combine multiple small kernels to reduce overhead.
+- **For RNN/GRU/LSTM**: See "Algorithm Replacement" above for persistent kernel approach
+
+### 4. Memory Layout Optimization
+Use in-place operations, buffer reuse, or better layouts.
+
+## Should We Optimize?
+
+Before proposing optimization, determine if it's worthwhile:
+- **Not worth optimizing** if:
+  - Code is already near-optimal (expected speedup < 10%)
+  - Bottleneck cannot be addressed (hardware limited, already optimal algorithm)
+  - Optimization would add significant complexity with minimal gain
+
+- **Worth optimizing** if:
+  - Clear algorithmic inefficiency exists (multiple kernels, suboptimal algorithm)
+  - Expected speedup >= 20%
+  - Concrete optimization path available
+
+## Output (JSON)
+
+```json
+{
+  "worth_optimizing": "yes/no",
+  "reason": "<Why worth or not worth optimizing, 1 sentence>",
+  "bottleneck": "<Root cause in 1-2 sentences, empty if not worth optimizing>",
+  "optimisation method": "<Specific optimization in 1-2 sentences, empty if not worth optimizing>",
+  "modification plan": "<Implementation steps in 2-3 sentences, empty if not worth optimizing>",
+  "expected_speedup": "<e.g., '30-40%', empty if not worth optimizing>"
+}
+```
+
+Return JSON only.

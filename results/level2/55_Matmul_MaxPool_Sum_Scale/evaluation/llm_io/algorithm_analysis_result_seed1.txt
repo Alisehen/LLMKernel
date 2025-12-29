@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The fused Triton kernel is ~8x slower than the PyTorch baseline, indicating a major algorithmic inefficiency.",
+  "bottleneck": "The kernel parallelizes along the pooled feature dimension (N_pairs) and then uses tl.atomic_add to accumulate partial row sums, causing massive contention and poor occupancy; the reduction over features is done across blocks instead of locally within a block.",
+  "optimisation method": "Restructure the algorithm so that each program instance owns one (or a small group of) batch row(s) and performs the full reduction over the feature dimension locally (looping over all N in tiles), thereby eliminating the N_pairs grid dimension and all atomic_adds.",
+  "modification plan": "Change the launch grid to be 1D over M only (or mostly over M) so that no two programs write to the same output row. Inside each program, add an outer loop over N in BLOCK_N tiles: for each N-tile, run the current K-loop to compute acc0/acc1, apply max-pooling for that tile, immediately reduce along the BLOCK_N axis into a running row_sum accumulator in registers/shared memory. At the end of processing all N-tiles, write a single scalar per row to out_ptr (optionally applying scale_factor) with a non-atomic store.",
+  "expected_speedup": "5-10x vs the current Triton kernel (bringing it to at least parity and likely ahead of the PyTorch baseline)."
+}

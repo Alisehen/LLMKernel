@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "A large intermediate activation tensor is written and then immediately re-read just to perform a simple global average, so fusing the pooling into the conv kernel can significantly reduce memory traffic and kernel launches.",
+  "bottleneck": "The current design materializes the full (B, C_out, H_out, W_out) tensor to global memory after conv+GELU, then a separate kernel rereads all of it to do global average pooling, making the workload partially memory-bandwidth and launch-overhead bound on this large tensor.",
+  "optimisation method": "Fuse global average pooling into the conv2d_gelu kernel so that each thread/program computes conv+GELU and simultaneously accumulates the spatial sum per (batch, channel), emitting only the final (B, C_out) result instead of the full 4D activation.",
+  "modification plan": "Redesign the Triton conv kernel’s tiling so the grid is over (B, C_out) and the inner loops iterate over spatial positions (H_out, W_out), accumulating per-(b, c) sums in registers or shared memory while computing conv+GELU. At the end of the spatial loop, divide by H_out*W_out in-kernel and directly store the pooled value to the output tensor, removing the need for the separate global_avg_pool2d kernel and the large intermediate output buffer. Adjust index decoding and reduction patterns accordingly while keeping the GEMM-style K loop for the convolution part.",
+  "expected_speedup": "15-25%"
+}

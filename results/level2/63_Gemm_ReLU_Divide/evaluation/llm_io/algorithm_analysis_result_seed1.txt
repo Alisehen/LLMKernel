@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The kernel reimplements a large FP32 GEMM that is slower than cuBLAS; switching the core computation to mixed-precision Tensor-Core-friendly math can yield a substantial speedup.",
+  "bottleneck": "The dominant cost is the FP32 matrix multiplication in the custom Triton loop, which cannot match highly tuned vendor GEMM and underutilizes hardware throughput for lower-precision Tensor Core paths.",
+  "optimisation method": "Replace the FP32 GEMM with a mixed-precision version (FP16/BF16 inputs, FP32 accumulation) so the Triton `tl.dot` uses Tensor Cores at much higher throughput, while keeping the fused bias+ReLU+scale epilogue.",
+  "modification plan": "Store `weight` (and optionally `x`) in FP16/BF16 on the module, cast `x` to FP16/BF16 inside `fused_linear_relu_div`, and update the Triton kernel to use FP16/BF16 for A/B tiles and FP32 for `acc`. Keep bias and `inv_div` in FP32, perform the epilogue (bias add, ReLU, scaling) in FP32, and optionally cast the final output back to FP32. Tune tile sizes (BLOCK_M/N/K) for the mixed-precision path to align with Tensor Core-friendly shapes.",
+  "expected_speedup": "30-40%"
+}

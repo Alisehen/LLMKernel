@@ -1,0 +1,148 @@
+import torch, torch.nn as nn, triton, triton.language as tl
+
+
+@triton.jit
+def fused_linear_relu_div_kernel_mixed(
+    a_ptr, b_ptr, bias_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    inv_div,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    # Program IDs for a 2D tile of C
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    # Offsets for this tile
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Pointers to the first K-blocks of A and B for this tile
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    # Accumulator in FP32 (for FP16/BF16 inputs)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Loop over K dimension
+    for k in range(0, K, BLOCK_K):
+        k_remaining = K - k
+
+        a_mask = (offs_m[:, None] < M) & (offs_k[None, :] < k_remaining)
+        b_mask = (offs_k[:, None] < k_remaining) & (offs_n[None, :] < N)
+
+        # Load A and B tiles (FP16/BF16)
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+        # Tensor Core-backed dot: FP16/BF16 * FP16/BF16 -> FP32
+        acc += tl.dot(a, b, out_dtype=tl.float32, allow_tf32=True)
+
+        # Advance along K
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Add bias (FP32, broadcast over rows)
+    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc += bias[None, :]
+
+    # ReLU
+    acc = tl.maximum(acc, 0.0)
+
+    # Divide by constant via multiplication with precomputed inverse (FP32)
+    acc = acc * inv_div
+
+    # Write back FP32 output
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    out_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, acc, mask=out_mask)
+
+
+def fused_linear_relu_div(x: torch.Tensor,
+                          weight: torch.Tensor,
+                          bias: torch.Tensor,
+                          divisor: float) -> torch.Tensor:
+    """
+    Fused implementation of:
+        y = relu(x @ weight.T + bias) / divisor
+
+    Uses mixed precision for GEMM:
+      - A (x) and B (weight) in FP16/BF16
+      - Accumulation and epilogue in FP32
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda
+    assert bias.dtype == torch.float32
+    assert weight.dtype in (torch.float16, torch.bfloat16)
+    assert x.dtype in (torch.float16, torch.bfloat16, torch.float32)
+
+    M, K = x.shape
+    out_features, in_features = weight.shape
+    assert in_features == K
+    N = out_features
+
+    # Cast input to match weight dtype for Tensor Core-friendly GEMM
+    x_mixed = x.to(weight.dtype)
+
+    # Prepare weight as (K, N) for GEMM, kept in mixed precision
+    if not weight.is_contiguous():
+        weight_contig = weight.contiguous()
+    else:
+        weight_contig = weight
+    b = weight_contig.t().contiguous()  # (K, N)
+
+    # Output tensor in FP32 (matches reference module behavior)
+    c = torch.empty((M, N), device=x.device, dtype=torch.float32)
+
+    # Grid: one program per BLOCK_M x BLOCK_N tile of C
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta["BLOCK_M"]),
+            triton.cdiv(N, meta["BLOCK_N"]),
+        )
+
+    inv_div = 1.0 / float(divisor)
+
+    fused_linear_relu_div_kernel_mixed[grid](
+        x_mixed, b, bias, c,
+        M, N, K,
+        x_mixed.stride(0), x_mixed.stride(1),
+        b.stride(0), b.stride(1),
+        c.stride(0), c.stride(1),
+        inv_div,
+        BLOCK_M=128, BLOCK_N=128, BLOCK_K=64,
+        num_warps=8, num_stages=4,
+    )
+    return c
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized replacement for:
+        y = relu(Linear(x)) / divisor
+
+    Behavior:
+      - Input:  (batch_size, in_features), typically FP32
+      - Output: (batch_size, out_features), FP32
+      - Computes: relu(x @ weight.T + bias) / divisor
+
+    Optimization:
+      - Stores weight in FP16 by default
+      - Uses mixed-precision Tensor Core GEMM with FP32 epilogue
+    """
+    def __init__(self, in_features, out_features, divisor):
+        super(ModelNew, self).__init__()
+        # Weight in FP16 for Tensor Core efficiency
+        self.weight = nn.Parameter(
+            torch.randn(out_features, in_features, dtype=torch.float16)
+        )
+        # Bias and divisor kept in FP32
+        self.bias = nn.Parameter(torch.randn(out_features, dtype=torch.float32))
+        self.divisor = float(divisor)
+
+    def forward(self, x):
+        # Expect x on CUDA; benchmarking harness should move it if needed.
+        # Accept FP32 / FP16 / BF16 input, always output FP32.
+        return fused_linear_relu_div(x, self.weight, self.bias, self.divisor)

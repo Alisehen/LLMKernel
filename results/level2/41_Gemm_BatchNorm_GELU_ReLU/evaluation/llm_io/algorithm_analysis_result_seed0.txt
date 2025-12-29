@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The pipeline performs multiple full passes over the large (M, N) activation tensor, and one of those passes (batchnorm_reduce_kernel) is purely memory-bound and redundant with the preceding GEMM.",
+  "bottleneck": "batchnorm_reduce_kernel re-reads the entire GEMM output from DRAM to compute per-feature mean/variance, with very low SM utilization and very high DRAM utilization, adding an extra full-bandwidth pass over a 16384×4096 tensor.",
+  "optimisation method": "Fuse BatchNorm statistics computation into linear_forward_kernel: while computing the GEMM, accumulate per-feature sums and sums of squares (for mean/variance) directly in that kernel, using block-local reductions and atomic adds to global accumulators, and eliminate the separate batchnorm_reduce_kernel (leaving only a small 1D kernel to convert sums to mean/inv_std).",
+  "modification plan": "Extend linear_forward_kernel to maintain FP32 accumulators for sum and sumsq over its BLOCK_N output columns, update them as each BLOCK_M×BLOCK_N tile of the GEMM is produced, and at the end of the kernel atomically add these partial sums/sumsq into global arrays of size N. After the GEMM+stats kernel, launch a lightweight 1D kernel that converts global sums/sumsq into mean and inv_std; then keep batchnorm_act_kernel as-is to apply BN+GELU+ReLU using those statistics. This removes the full-memory-scan batchnorm_reduce_kernel and its extra read of y.",
+  "expected_speedup": "20-30%"
+}

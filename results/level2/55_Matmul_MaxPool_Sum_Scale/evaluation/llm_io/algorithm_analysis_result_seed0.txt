@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The current design materializes the full (M, N) matmul output and then rereads it in a second kernel for max-pooling and reduction, which is avoidable.",
+  "bottleneck": "The separate maxpool_sum_scale kernel introduces an extra full read of the large y tensor and an extra kernel launch; this adds memory bandwidth pressure and latency without adding useful computation.",
+  "optimisation method": "Fuse the linear and maxpool+sum+scale into a single GEMM+reduction Triton kernel that directly produces the final scaled scalar per row, using N-tiling aligned with KERNEL_SIZE and per-row atomic adds to accumulate partial sums across N tiles.",
+  "modification plan": "Extend linear_kernel so that after finishing the K loop for each (BLOCK_M, BLOCK_N) tile, it performs the 1D max-pooling over N within the tile (grouping columns in chunks of KERNEL_SIZE, ensured by choosing BLOCK_N % KERNEL_SIZE == 0), sums the pooled values along the pooled-N dimension to obtain a partial row sum, multiplies by scale_factor, and atomically adds this partial result into an output vector out[m]. Remove the intermediate y allocation and the separate maxpool_sum_scale kernel, and wire ModelNew.forward to call only the fused kernel that takes x, weight, bias, and scale_factor and returns (M,) directly.",
+  "expected_speedup": "15-25%"
+}

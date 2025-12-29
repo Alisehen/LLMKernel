@@ -1,0 +1,8 @@
+{
+  "worth_optimizing": "yes",
+  "reason": "The fused kernel performs two expensive transcendental activations (tanh and sigmoid) per output element, which likely dominate runtime given the relatively small 3×3×3 convolution and make the kernel SFU/compute-bound rather than purely memory-bound.",
+  "bottleneck": "Both tanh and sigmoid are implemented via exponentials (`tl.exp`), so each output element pays for two `exp` calls plus several divides; on modern GPUs transcendental throughput is much lower than FMA throughput, so the math for activations can cost as much or more than the convolution itself.",
+  "optimisation method": "Replace the exact exp-based tanh and sigmoid with fast polynomial or rational approximations that avoid `exp` and division, so the activation portion becomes dominated by cheap FMAs and adds, significantly reducing per-element compute cost while keeping approximation error within acceptable ML tolerances.",
+  "modification plan": "Implement approximate tanh and sigmoid in Triton using low-order polynomials/rationals (e.g., piecewise or clipped approximations) that use only mul/add and possibly one reciprocal, and validate their max/mean error against Torch’s reference on representative tensors. Then substitute these approximations for the current tanh/sigmoid code paths in the fused kernel (optionally behind a flag for exact vs fast mode) and re-benchmark to confirm that SFU utilization drops and overall latency improves.",
+  "expected_speedup": "20-40%"
+}

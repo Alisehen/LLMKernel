@@ -1,54 +1,73 @@
 
-Write high-performance Triton kernels to replace PyTorch operators. Generate the FASTEST kernel while maintaining correctness.
+Write high-performance Triton kernels to replace PyTorch operators.
+Generate the FASTEST kernel while maintaining correctness.
 
-**Triton Essentials**:
-- Use `tl.program_id()` for block indices, `tl.arange()` for element indices
-- Work with blocks of data (NOT individual threads like CUDA)
-- Triton auto-manages shared memory and sync (NO manual __shared__ or syncthreads)
+## CRITICAL — These cause 60%+ of failures:
+1. EVERY kernel function MUST have `@triton.jit` decorator — MANDATORY
+2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+3. BLOCK sizes MUST be power-of-2 constexpr: 16, 32, 64, 128, 256
+4. `tl.program_id(axis)` only supports axis = 0, 1, 2 (max 3D grid)
 
-**Critical Constraints** (违反会导致编译错误):
-- tl.reshape() requires compile-time constant shapes (use tensor.reshape(-1) instead)
-- tl.arange() arguments must be constexpr or literals (NOT variables like: tl.arange(0, block_size))
-- tl.load/store: if pointer is scalar, value must be scalar; if pointer is block, value must be block
-- No tl.tanh() - use tl.exp() to implement: (e^{2x}-1)/(e^{2x}+1)
-- Type conversions: use .to(tl.float32), NOT tl.float32()
-- Always use constexpr for BLOCK sizes in function signatures
+## Triton Syntax Rules:
+- For matmul/conv/linear ops, prefer `tl.dot(a, b, allow_tf32=True)` over element-wise multiply-add
+- No `continue`, `break`, `return` inside loops — use masking instead
+- No tensor indexing with loop vars: `x[:, i]` or `x[i, :]` is INVALID
+- No tuple unpacking inside kernel: `a, b = tl.load(...)` is INVALID
+- No nested functions inside @triton.jit
+- No Python control flow on tl.tensor or BLOCK_* values
+- No dynamic `tl.reshape()` or view operations
 
-**Output Format**:
-1. Imports → 2. @triton.jit kernels → 3. Wrapper functions → 4. class ModelNew
-2. Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+## Missing Triton Functions (implement manually):
+- tl.tanh → `(tl.exp(2*x) - 1) / (tl.exp(2*x) + 1)`
+- tl.sigmoid → `1 / (1 + tl.exp(-x))`
+- tl.gelu, tl.silu, tl.softmax, tl.mish → implement from definition
 
-**CRITICAL**: ModelNew must have the SAME __init__ signature as the original Model class:
-- If Model.__init__() has no parameters, ModelNew.__init__() must also have no parameters
-- If Model.__init__(self, dim, ...), ModelNew.__init__(self, dim, ...) must match exactly
-- The forward() method must accept the same inputs and return the same outputs
+## Load/Store Rules:
+- Pointer + scalar offset → scalar value
+- Pointer + block offset (via tl.arange) → block of values
+- mask shape MUST match data shape exactly
+
+## Output Format (STRICT):
+1. Imports: `import torch, torch.nn as nn, triton, triton.language as tl` (and math if needed)
+2. `@triton.jit` kernel(s) — MUST have this decorator
+3. Wrapper function with grid calculation
+4. `class ModelNew(nn.Module)` — REQUIRED
+
+Do NOT include: testing code, `if __name__ == "__main__"`, get_inputs, get_init_inputs
+
+
 
 Example PyTorch:
 '''
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 class Model(nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
+    """
+    Fusion example: Gemm + Add + ReLU
+    Three operations fused together.
+    """
+    def __init__(self, in_features, out_features, bias_shape):
+        super(Model, self).__init__()
+        self.gemm = nn.Linear(in_features, out_features)
+        self.bias = nn.Parameter(torch.randn(bias_shape))
 
-    def forward(self, a, b):
-        return a + b
+    def forward(self, x):
+        x = self.gemm(x)
+        x = x + self.bias
+        x = torch.relu(x)
+        return x
 
 
 def get_inputs():
-    # randomly generate input tensors based on the model architecture
-    a = torch.randn(1, 128).cuda()
-    b = torch.randn(1, 128).cuda()
-    return [a, b]
+    return [torch.randn(128, 512).cuda()]
 
 
 def get_init_inputs():
-    # randomly generate tensors required for initialization based on the model architecture
-    return []
+    return [512, 512, (512,)]
 '''
+
 Example Triton:
 '''
 import torch
@@ -57,56 +76,63 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def add_kernel(
-    x_ptr,
-    y_ptr,
-    output_ptr,
-    n_elements,
-    BLOCK_SIZE: tl.constexpr,
+def fused_gemm_add_relu_kernel(
+    a_ptr, b_ptr, bias_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
-    pid = tl.program_id(axis=0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
 
-    x = tl.load(x_ptr + offsets, mask=mask)
-    y = tl.load(y_ptr + offsets, mask=mask)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
 
-    output = x + y
-    tl.store(output_ptr + offsets, output, mask=mask)
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
 
-def triton_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    output = torch.empty_like(x)
-    n_elements = output.numel()
-    BLOCK_SIZE = 1024
-    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
-    add_kernel[grid](x, y, output, n_elements, BLOCK_SIZE=BLOCK_SIZE)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k in range(0, K, BLOCK_K):
+        a = tl.load(a_ptrs, mask=(offs_m[:, None] < M) & (offs_k[None, :] < K - k), other=0.0)
+        b = tl.load(b_ptrs, mask=(offs_k[:, None] < K - k) & (offs_n[None, :] < N), other=0.0)
+        acc += tl.dot(a, b, allow_tf32=True)
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
 
-    return output
+    # Fused: add bias
+    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc += bias[None, :]
+
+    # Fused: ReLU
+    acc = tl.maximum(acc, 0.0)
+
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    tl.store(c_ptrs, acc, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+
+
+def fused_gemm_add_relu(x, weight, bias):
+    M, K = x.shape
+    N = weight.shape[0]
+    c = torch.empty((M, N), device=x.device, dtype=x.dtype)
+    b = weight.t().contiguous()
+    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']), triton.cdiv(N, META['BLOCK_N']))
+    fused_gemm_add_relu_kernel[grid](
+        x, b, bias, c, M, N, K,
+        x.stride(0), x.stride(1), b.stride(0), b.stride(1), c.stride(0), c.stride(1),
+    )
+    return c
+
 
 class ModelNew(nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, in_features, out_features, bias_shape):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.bias = nn.Parameter(torch.randn(bias_shape))
 
-    def forward(self, a, b):
-        return triton_add(a, b)
+    def forward(self, x):
+        return fused_gemm_add_relu(x, self.weight, self.bias)
 '''
-
-Hardware architecture:
-• Compute Capability: 8.9
-• Number of SMs: 128
-• Memory Bandwidth: 1008 GB/s
-• TF32 Tensor Core TFLOPS: 82.6 with dense
-• BFLOAT16 Tensor Core TFLOPS: 165.2 with dense
-• FP16 Tensor Core TFLOPS: 165.2 with dense
-• Maximum number of registers per thread: 255
-• Maximum threads per block: 1024
-• Maximum threads per SM: 1536
-• Warp size: 32
-• Maximum concurrent warps per SM: 48
-• Shared memory capacity per SM: 100 KB
-• Maximum shared memory per thread block: 99 KB
-• L2 cache (global, all SM shared): 72 MB
 
 Target:
 ```python
@@ -145,6 +171,3 @@ def get_inputs():
 
 def get_init_inputs():
     return [in_channels, out_channels, kernel_size]
-```
-
-Generate the fastest Triton implementation as ModelNew.

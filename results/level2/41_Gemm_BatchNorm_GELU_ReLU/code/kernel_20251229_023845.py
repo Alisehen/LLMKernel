@@ -1,0 +1,225 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32},
+            num_warps=8,
+            num_stages=4,
+        ),
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 32},
+            num_warps=4,
+            num_stages=4,
+        ),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32},
+            num_warps=4,
+            num_stages=4,
+        ),
+    ],
+    key=["M", "N", "K"],
+)
+@triton.jit
+def fused_linear_bn_gelu_relu_kernel(
+    x_ptr,              # fp16 [M, K]
+    wt_ptr,             # fp16 [K, N]  (pre-transposed weight)
+    b_ptr,              # fp32 [N]
+    running_mean_ptr,   # fp32 [N]
+    running_var_ptr,    # fp32 [N]
+    gamma_ptr,          # fp32 [N]
+    beta_ptr,           # fp32 [N]
+    y_ptr,              # fp32 [M, N]
+    M, N, K,
+    stride_xm, stride_xk,
+    stride_wtk, stride_wtn,  # strides for wt: [K, N]
+    stride_ym, stride_yn,
+    eps,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # ----------------------------
+    # Program ids = output tiles
+    # ----------------------------
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    # Offsets in output space (shared by ALL fused ops)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # [BLOCK_M]
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # [BLOCK_N]
+
+    # Masks for output bounds (shared by ALL fused ops)
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+    y_mask = mask_m[:, None] & mask_n[None, :]        # [BLOCK_M, BLOCK_N]
+
+    # Precompute output pointers once (same grid / offsets / mask for all fused ops)
+    y_ptrs = y_ptr + offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn
+
+    # ----------------------------
+    # GEMM: x[M,K] @ wt[K,N]
+    # ----------------------------
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    offs_k = tl.arange(0, BLOCK_K)
+
+    for k0 in range(0, K, BLOCK_K):
+        k_idx = k0 + offs_k  # [BLOCK_K]
+        k_mask = k_idx < K
+
+        # Load A tile: x[offs_m, k_idx]
+        a_ptrs = x_ptr + offs_m[:, None] * stride_xm + k_idx[None, :] * stride_xk
+        a_mask = mask_m[:, None] & k_mask[None, :]
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+
+        # Load B tile: wt[k_idx, offs_n]  (wt is [K, N])
+        b_ptrs = wt_ptr + k_idx[:, None] * stride_wtk + offs_n[None, :] * stride_wtn
+        b_mask = k_mask[:, None] & mask_n[None, :]
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+        # Tensor-core matmul: fp16 x fp16 -> fp32
+        acc += tl.dot(a, b)
+
+    # ----------------------------
+    # Fused Linear Bias + BatchNorm
+    # All use SAME offs_n and masks, broadcast over M via [None, :]
+    # ----------------------------
+    mask_n_vec = mask_n
+
+    bias = tl.load(b_ptr + offs_n, mask=mask_n_vec, other=0.0)
+    acc += bias[None, :]
+
+    running_mean = tl.load(running_mean_ptr + offs_n, mask=mask_n_vec, other=0.0)
+    running_var = tl.load(running_var_ptr + offs_n, mask=mask_n_vec, other=0.0)
+    gamma = tl.load(gamma_ptr + offs_n, mask=mask_n_vec, other=1.0)
+    beta = tl.load(beta_ptr + offs_n, mask=mask_n_vec, other=0.0)
+
+    inv_std = 1.0 / tl.sqrt(running_var + eps)
+    scale = gamma * inv_std
+    bn_bias = beta - running_mean * scale
+
+    acc = acc * scale[None, :] + bn_bias[None, :]
+
+    # ----------------------------
+    # GELU (exact, erf-based) + ReLU
+    # Still using SAME output offsets/mask
+    # ----------------------------
+    INV_SQRT_2 = 0.70710678118654752440
+    x_val = acc
+    erf_arg = x_val * INV_SQRT_2
+    gelu_val = 0.5 * x_val * (1.0 + tl.math.erf(erf_arg))
+
+    out = tl.maximum(gelu_val, 0.0)
+
+    # ----------------------------
+    # Store
+    # ----------------------------
+    tl.store(y_ptrs, out, mask=y_mask)
+
+
+def fused_linear_bn_gelu_relu(x, linear: nn.Linear, bn: nn.BatchNorm1d):
+    """
+    Fused implementation of:
+        y = ReLU(GELU(BatchNorm1d(Linear(x))))
+    Optimized for RTX 4090:
+    - GEMM in fp16 on Tensor Cores with fp32 accumulation
+    - Pre-transposed weight for coalesced loads
+    - BatchNorm, GELU, ReLU in fp32, all sharing the same grid/indexing.
+    """
+    assert x.is_cuda, "Triton kernel requires CUDA tensor"
+
+    # Shapes: x [M, K], weight [N, K]
+    M, K = x.shape
+    w = linear.weight
+    N = w.shape[0]
+    assert w.shape[1] == K, "Incompatible Linear weight shape"
+
+    # Cast activations and weights to fp16 for GEMM
+    x_half = x.to(torch.float16).contiguous()
+
+    # Pre-transpose weight to [K, N] for better memory access in kernel
+    w_half_t = w.to(torch.float16).t().contiguous()  # [K, N]
+
+    # Bias (fp32)
+    if linear.bias is None:
+        b = torch.zeros(N, device=x.device, dtype=torch.float32)
+    else:
+        b = linear.bias.to(torch.float32).contiguous()
+
+    # BatchNorm parameters (fp32)
+    running_mean = bn.running_mean.to(torch.float32).contiguous()
+    running_var = bn.running_var.to(torch.float32).contiguous()
+
+    if bn.weight is None:
+        gamma = torch.ones_like(running_mean, dtype=torch.float32, device=x.device)
+    else:
+        gamma = bn.weight.to(torch.float32).contiguous()
+
+    if bn.bias is None:
+        beta = torch.zeros_like(running_mean, dtype=torch.float32, device=x.device)
+    else:
+        beta = bn.bias.to(torch.float32).contiguous()
+
+    eps = float(bn.eps)
+
+    # Output in fp32
+    y = torch.empty((M, N), device=x.device, dtype=torch.float32)
+
+    def grid(meta):
+        return (
+            triton.cdiv(M, meta["BLOCK_M"]),
+            triton.cdiv(N, meta["BLOCK_N"]),
+        )
+
+    fused_linear_bn_gelu_relu_kernel[grid](
+        x_half,
+        w_half_t,
+        b,
+        running_mean,
+        running_var,
+        gamma,
+        beta,
+        y,
+        M,
+        N,
+        K,
+        x_half.stride(0),
+        x_half.stride(1),
+        w_half_t.stride(0),  # stride_wtk
+        w_half_t.stride(1),  # stride_wtn
+        y.stride(0),
+        y.stride(1),
+        eps,
+    )
+    return y
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized model:
+
+    - Training / CPU: standard PyTorch Linear + BatchNorm1d + GELU + ReLU
+    - Eval on CUDA: aggressively optimized fused Triton kernel
+    """
+
+    def __init__(self, in_features, out_features):
+        super(ModelNew, self).__init__()
+        self.gemm = nn.Linear(in_features, out_features)
+        self.batch_norm = nn.BatchNorm1d(out_features)
+
+    def forward(self, x):
+        # Training or CPU: exact PyTorch behavior
+        if (not x.is_cuda) or self.training:
+            x = self.gemm(x)
+            x = self.batch_norm(x)
+            x = torch.nn.functional.gelu(x)
+            x = torch.relu(x)
+            return x
+
+        # Inference on CUDA: use fused Triton implementation
+        return fused_linear_bn_gelu_relu(x, self.gemm, self.batch_norm)

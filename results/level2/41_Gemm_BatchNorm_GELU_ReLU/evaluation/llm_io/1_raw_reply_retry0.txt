@@ -7,259 +7,205 @@ import triton.language as tl
 
 @triton.autotune(
     configs=[
-        # Larger tiles for high arithmetic intensity
         triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_M": 8},
+            {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32},
             num_warps=8,
-            num_stages=3,
+            num_stages=4,
         ),
         triton.Config(
-            {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_M": 8},
+            {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 32},
             num_warps=4,
-            num_stages=3,
+            num_stages=4,
         ),
         triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 32, "GROUP_M": 8},
+            {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32},
             num_warps=4,
-            num_stages=3,
-        ),
-        # Smaller tiles as a fallback for odd shapes / low K
-        triton.Config(
-            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32, "GROUP_M": 8},
-            num_warps=4,
-            num_stages=2,
+            num_stages=4,
         ),
     ],
     key=["M", "N", "K"],
 )
 @triton.jit
-def fused_gemm_bn_gelu_relu_kernel(
-    a_ptr,              # *f32, (M, K)
-    b_ptr,              # *f32, (K, N) = weight^T
-    bias_lin_ptr,       # *f32, (N,)
-    bn_weight_ptr,      # *f32, (N,)
-    bn_bias_ptr,        # *f32, (N,)
-    bn_mean_ptr,        # *f32, (N,)
-    bn_var_ptr,         # *f32, (N,)
-    c_ptr,              # *f32, (M, N)
-
+def fused_linear_bn_gelu_relu_kernel(
+    x_ptr,              # fp16 [M, K]
+    wt_ptr,             # fp16 [K, N]  (pre-transposed weight)
+    b_ptr,              # fp32 [N]
+    running_mean_ptr,   # fp32 [N]
+    running_var_ptr,    # fp32 [N]
+    gamma_ptr,          # fp32 [N]
+    beta_ptr,           # fp32 [N]
+    y_ptr,              # fp32 [M, N]
     M, N, K,
-    eps,                # f32, BN epsilon
-
-    stride_am, stride_ak,
-    stride_bk, stride_bn,
-    stride_cm, stride_cn,
-
+    stride_xm, stride_xk,
+    stride_wtk, stride_wtn,  # strides for wt: [K, N]
+    stride_ym, stride_yn,
+    eps,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
-    GROUP_M: tl.constexpr,
 ):
-    # 1D launch grid, mapped to 2D tiles with M-grouping for better L2 reuse of B
-    pid = tl.program_id(0)
+    # ----------------------------
+    # Program ids = output tiles
+    # ----------------------------
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
 
-    num_pid_m = tl.cdiv(M, BLOCK_M)
-    num_pid_n = tl.cdiv(N, BLOCK_N)
+    # Offsets in output space (shared by ALL fused ops)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # [BLOCK_M]
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # [BLOCK_N]
 
-    # Group program IDs along M to increase B tile reuse in L2
-    num_pid_in_group = GROUP_M * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * GROUP_M
-
-    group_size_m = tl.minimum(num_pid_m - first_pid_m, GROUP_M)
-    pid_m = first_pid_m + (pid % group_size_m)
-    pid_n = (pid % num_pid_in_group) // group_size_m
-
-    # Offsets within output tile
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-
-    # Masks corresponding to output tile bounds
+    # Masks for output bounds (shared by ALL fused ops)
     mask_m = offs_m < M
     mask_n = offs_n < N
+    y_mask = mask_m[:, None] & mask_n[None, :]        # [BLOCK_M, BLOCK_N]
 
-    # Provide alignment hints to the compiler
-    tl.multiple_of(offs_m, BLOCK_M)
-    tl.multiple_of(offs_n, BLOCK_N)
+    # Precompute output pointers once (same grid / offsets / mask for all fused ops)
+    y_ptrs = y_ptr + offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn
 
-    # Accumulator for GEMM (always in fp32)
+    # ----------------------------
+    # GEMM: x[M,K] @ wt[K,N]
+    # ----------------------------
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    # K loop
     offs_k = tl.arange(0, BLOCK_K)
-    tl.multiple_of(offs_k, BLOCK_K)
 
-    k = 0
-    while k < K:
-        k_offsets = k + offs_k
-        k_mask = k_offsets < K
+    for k0 in range(0, K, BLOCK_K):
+        k_idx = k0 + offs_k  # [BLOCK_K]
+        k_mask = k_idx < K
 
-        # Shared offsets / masks for GEMM loads
-        a_ptrs = (
-            a_ptr
-            + offs_m[:, None] * stride_am
-            + k_offsets[None, :] * stride_ak
-        )
-        b_ptrs = (
-            b_ptr
-            + k_offsets[:, None] * stride_bk
-            + offs_n[None, :] * stride_bn
-        )
+        # Load A tile: x[offs_m, k_idx]
+        a_ptrs = x_ptr + offs_m[:, None] * stride_xm + k_idx[None, :] * stride_xk
+        a_mask = mask_m[:, None] & k_mask[None, :]
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
 
-        # All GEMM loads use masks derived from mask_m and mask_n
-        a = tl.load(
-            a_ptrs,
-            mask=mask_m[:, None] & k_mask[None, :],
-            other=0.0,
-        )
-        b = tl.load(
-            b_ptrs,
-            mask=k_mask[:, None] & mask_n[None, :],
-            other=0.0,
-        )
+        # Load B tile: wt[k_idx, offs_n]  (wt is [K, N])
+        b_ptrs = wt_ptr + k_idx[:, None] * stride_wtk + offs_n[None, :] * stride_wtn
+        b_mask = k_mask[:, None] & mask_n[None, :]
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
 
-        # Tensor-core friendly dot-product (TF32 on fp32 inputs)
-        acc += tl.dot(a, b, allow_tf32=True)
+        # Tensor-core matmul: fp16 x fp16 -> fp32
+        acc += tl.dot(a, b)
 
-        k += BLOCK_K
+    # ----------------------------
+    # Fused Linear Bias + BatchNorm
+    # All use SAME offs_n and masks, broadcast over M via [None, :]
+    # ----------------------------
+    mask_n_vec = mask_n
 
-    # ---- FUSED ELEMENTWISE BLOCK (BN + GELU + ReLU) ----
-    # All fused ops share the same (offs_m, offs_n) tile and output mask
+    bias = tl.load(b_ptr + offs_n, mask=mask_n_vec, other=0.0)
+    acc += bias[None, :]
 
-    # Load per-channel parameters (broadcast over M)
-    bias_lin = tl.load(
-        bias_lin_ptr + offs_n,
-        mask=mask_n,
-        other=0.0,
-    )[None, :]  # (1, BLOCK_N)
+    running_mean = tl.load(running_mean_ptr + offs_n, mask=mask_n_vec, other=0.0)
+    running_var = tl.load(running_var_ptr + offs_n, mask=mask_n_vec, other=0.0)
+    gamma = tl.load(gamma_ptr + offs_n, mask=mask_n_vec, other=1.0)
+    beta = tl.load(beta_ptr + offs_n, mask=mask_n_vec, other=0.0)
 
-    bn_weight = tl.load(
-        bn_weight_ptr + offs_n,
-        mask=mask_n,
-        other=1.0,
-    )[None, :]
-    bn_bias = tl.load(
-        bn_bias_ptr + offs_n,
-        mask=mask_n,
-        other=0.0,
-    )[None, :]
-    bn_mean = tl.load(
-        bn_mean_ptr + offs_n,
-        mask=mask_n,
-        other=0.0,
-    )[None, :]
-    bn_var = tl.load(
-        bn_var_ptr + offs_n,
-        mask=mask_n,
-        other=1.0,
-    )[None, :]
+    inv_std = 1.0 / tl.sqrt(running_var + eps)
+    scale = gamma * inv_std
+    bn_bias = beta - running_mean * scale
 
-    # Linear bias
-    y = acc + bias_lin
+    acc = acc * scale[None, :] + bn_bias[None, :]
 
-    # BatchNorm (eval mode)
-    inv_std = tl.rsqrt(bn_var + eps)
-    y = (y - bn_mean) * inv_std
-    y = y * bn_weight + bn_bias
+    # ----------------------------
+    # GELU (exact, erf-based) + ReLU
+    # Still using SAME output offsets/mask
+    # ----------------------------
+    INV_SQRT_2 = 0.70710678118654752440
+    x_val = acc
+    erf_arg = x_val * INV_SQRT_2
+    gelu_val = 0.5 * x_val * (1.0 + tl.math.erf(erf_arg))
 
-    # GELU via erf approximation (no libdevice GELU; uses exp + poly)
-    sqrt_2_inv = 0.7071067811865476
-    u = y * sqrt_2_inv
+    out = tl.maximum(gelu_val, 0.0)
 
-    sign = tl.where(u >= 0, 1.0, -1.0)
-    absu = tl.abs(u)
-    t = 1.0 / (1.0 + 0.3275911 * absu)
-
-    a1 = 0.254829592
-    a2 = -0.284496736
-    a3 = 1.421413741
-    a4 = -1.453152027
-    a5 = 1.061405429
-
-    poly = (((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t)
-    erf_u = sign * (1.0 - poly * tl.exp(-absu * absu))
-
-    gelu = 0.5 * y * (1.0 + erf_u)
-
-    # ReLU
-    out = tl.maximum(gelu, 0.0)
-
-    # Store result using the same (offs_m, offs_n) tile / mask
-    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
-    out_mask = mask_m[:, None] & mask_n[None, :]
-    tl.store(c_ptrs, out, mask=out_mask)
+    # ----------------------------
+    # Store
+    # ----------------------------
+    tl.store(y_ptrs, out, mask=y_mask)
 
 
-def fused_gemm_bn_gelu_relu(x: torch.Tensor, linear: nn.Linear, bn: nn.BatchNorm1d):
+def fused_linear_bn_gelu_relu(x, linear: nn.Linear, bn: nn.BatchNorm1d):
     """
-    Fused eval-mode path:
-        y = ReLU(GELU(BN(x @ W^T + b)))
-    Uses a single high-performance Triton kernel on CUDA.
-    Falls back to standard PyTorch ops for CPU or training mode.
+    Fused implementation of:
+        y = ReLU(GELU(BatchNorm1d(Linear(x))))
+    Optimized for RTX 4090:
+    - GEMM in fp16 on Tensor Cores with fp32 accumulation
+    - Pre-transposed weight for coalesced loads
+    - BatchNorm, GELU, ReLU in fp32, all sharing the same grid/indexing.
     """
-    assert linear.bias is not None, "Linear layer must have bias for this fused kernel."
+    assert x.is_cuda, "Triton kernel requires CUDA tensor"
 
-    # Fallback to PyTorch if not CUDA
-    if x.device.type != "cuda":
-        y = linear(x)
-        y = bn(y)
-        y = torch.nn.functional.gelu(y)
-        y = torch.nn.functional.relu(y)
-        return y
-
+    # Shapes: x [M, K], weight [N, K]
     M, K = x.shape
-    N = linear.weight.shape[0]
+    w = linear.weight
+    N = w.shape[0]
+    assert w.shape[1] == K, "Incompatible Linear weight shape"
 
-    # Ensure explicit, performant layouts
-    x_fp32 = x.to(device=x.device, dtype=torch.float32)
-    W = linear.weight.to(device=x.device, dtype=torch.float32, non_blocking=True)
-    B = W.t().contiguous()  # (K, N), row-major
+    # Cast activations and weights to fp16 for GEMM
+    x_half = x.to(torch.float16).contiguous()
 
-    # Allocate output
-    y = torch.empty((M, N), device=x.device, dtype=torch.float32)
+    # Pre-transpose weight to [K, N] for better memory access in kernel
+    w_half_t = w.to(torch.float16).t().contiguous()  # [K, N]
 
-    # BN parameters (eval mode uses running stats)
-    bn_weight = bn.weight.to(device=x.device, dtype=torch.float32, non_blocking=True)
-    bn_bias = bn.bias.to(device=x.device, dtype=torch.float32, non_blocking=True)
-    bn_mean = bn.running_mean.to(device=x.device, dtype=torch.float32, non_blocking=True)
-    bn_var = bn.running_var.to(device=x.device, dtype=torch.float32, non_blocking=True)
+    # Bias (fp32)
+    if linear.bias is None:
+        b = torch.zeros(N, device=x.device, dtype=torch.float32)
+    else:
+        b = linear.bias.to(torch.float32).contiguous()
+
+    # BatchNorm parameters (fp32)
+    running_mean = bn.running_mean.to(torch.float32).contiguous()
+    running_var = bn.running_var.to(torch.float32).contiguous()
+
+    if bn.weight is None:
+        gamma = torch.ones_like(running_mean, dtype=torch.float32, device=x.device)
+    else:
+        gamma = bn.weight.to(torch.float32).contiguous()
+
+    if bn.bias is None:
+        beta = torch.zeros_like(running_mean, dtype=torch.float32, device=x.device)
+    else:
+        beta = bn.bias.to(torch.float32).contiguous()
+
     eps = float(bn.eps)
 
-    # Grid: 1D over (M, N) tiles; kernel maps to 2D tiles internally
+    # Output in fp32
+    y = torch.empty((M, N), device=x.device, dtype=torch.float32)
+
     def grid(meta):
         return (
-            triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]),
+            triton.cdiv(M, meta["BLOCK_M"]),
+            triton.cdiv(N, meta["BLOCK_N"]),
         )
 
-    fused_gemm_bn_gelu_relu_kernel[grid](
-        x_fp32,
-        B,
-        linear.bias.to(device=x.device, dtype=torch.float32, non_blocking=True),
-        bn_weight,
-        bn_bias,
-        bn_mean,
-        bn_var,
+    fused_linear_bn_gelu_relu_kernel[grid](
+        x_half,
+        w_half_t,
+        b,
+        running_mean,
+        running_var,
+        gamma,
+        beta,
         y,
         M,
         N,
         K,
-        eps,
-        x_fp32.stride(0),
-        x_fp32.stride(1),
-        B.stride(0),
-        B.stride(1),
+        x_half.stride(0),
+        x_half.stride(1),
+        w_half_t.stride(0),  # stride_wtk
+        w_half_t.stride(1),  # stride_wtn
         y.stride(0),
         y.stride(1),
+        eps,
     )
-
     return y
 
 
 class ModelNew(nn.Module):
     """
-    GEMM + BatchNorm + GELU + ReLU.
-    Uses fused Triton kernel in eval mode on CUDA, and the standard PyTorch
-    implementation (preserving BN training semantics) otherwise.
+    Triton-optimized model:
+
+    - Training / CPU: standard PyTorch Linear + BatchNorm1d + GELU + ReLU
+    - Eval on CUDA: aggressively optimized fused Triton kernel
     """
 
     def __init__(self, in_features, out_features):
@@ -267,15 +213,15 @@ class ModelNew(nn.Module):
         self.gemm = nn.Linear(in_features, out_features)
         self.batch_norm = nn.BatchNorm1d(out_features)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Training mode or non-CUDA: use full PyTorch path for correct semantics
-        if self.training or x.device.type != "cuda":
+    def forward(self, x):
+        # Training or CPU: exact PyTorch behavior
+        if (not x.is_cuda) or self.training:
             x = self.gemm(x)
             x = self.batch_norm(x)
             x = torch.nn.functional.gelu(x)
-            x = torch.nn.functional.relu(x)
+            x = torch.relu(x)
             return x
 
-        # Eval-mode fast path: fused Triton kernel
-        return fused_gemm_bn_gelu_relu(x, self.gemm, self.batch_norm)
+        # Inference on CUDA: use fused Triton implementation
+        return fused_linear_bn_gelu_relu(x, self.gemm, self.batch_norm)
 ```

@@ -3,183 +3,198 @@ import torch
 import torch.nn as nn
 import triton
 import triton.language as tl
-import math
+
 
 @triton.jit
-def gelu_kernel(
-    x_ptr,
-    output_ptr,
-    n_elements,
-    BLOCK_SIZE: tl.constexpr,
+def conv2d_gelu_kernel(
+    x_ptr, w_ptr, bias_ptr, y_ptr,
+    B, C_in, H, W,
+    C_out, KH, KW,
+    H_out, W_out,
+    M, N, K,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_wk, stride_wn,
+    stride_yn, stride_yc, stride_yh, stride_yw,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
-    pid = tl.program_id(axis=0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-    
-    x = tl.load(x_ptr + offsets, mask=mask)
-    
-    # GELU approximation: x * 0.5 * (1.0 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-    # Using tanh(z) = (e^{2z} - 1)/(e^{2z} + 1)
-    sqrt_2_over_pi = 0.7978845608028654
-    x_cubed = x * x * x
-    z = sqrt_2_over_pi * (x + 0.044715 * x_cubed)
-    
-    # Compute tanh using exp
-    exp_2z = tl.exp(2.0 * z)
-    tanh_z = (exp_2z - 1.0) / (exp_2z + 1.0)
-    
-    output = 0.5 * x * (1.0 + tanh_z)
-    tl.store(output_ptr + offsets, output, mask=mask)
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+
+    hw_out = H_out * W_out
+
+    bs = offs_m // hw_out
+    rem = offs_m % hw_out
+    oy = rem // W_out
+    ox = rem % W_out
+
+    bs_b = bs[:, None]
+    oy_b = oy[:, None]
+    ox_b = ox[:, None]
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k_start in range(0, K, BLOCK_K):
+        k_idx = k_start + offs_k
+        mask_k = k_idx < K
+
+        kk = k_idx
+        kk_c = kk // (KH * KW)
+        kk_rem = kk % (KH * KW)
+        ky = kk_rem // KW
+        kx = kk_rem % KW
+
+        ic_b = kk_c[None, :]
+        ky_b = ky[None, :]
+        kx_b = kx[None, :]
+
+        in_y = oy_b + ky_b
+        in_x = ox_b + kx_b
+
+        a_ptrs = x_ptr + bs_b * stride_xn + ic_b * stride_xc + in_y * stride_xh + in_x * stride_xw
+        b_ptrs = w_ptr + k_idx[:, None] * stride_wk + offs_n[None, :] * stride_wn
+
+        a = tl.load(a_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0)
+        b = tl.load(b_ptrs, mask=mask_k[:, None] & mask_n[None, :], other=0.0)
+
+        acc += tl.dot(a, b, allow_tf32=True)
+
+    bias = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0)
+    acc = acc + bias[None, :]
+
+    x_fp32 = acc
+    x_cubed = x_fp32 * x_fp32 * x_fp32
+    k0 = 0.7978845608028654  # sqrt(2/pi)
+    inner = k0 * (x_fp32 + 0.044715 * x_cubed)
+    two_inner = 2.0 * inner
+    exp2 = tl.exp(two_inner)
+    tanh_inner = (exp2 - 1.0) / (exp2 + 1.0)
+    acc = 0.5 * x_fp32 * (1.0 + tanh_inner)
+
+    bs_s = bs_b[:, 0]
+    oy_s = oy_b[:, 0]
+    ox_s = ox_b[:, 0]
+
+    y_ptrs = (
+        y_ptr
+        + bs_s[:, None] * stride_yn
+        + offs_n[None, :] * stride_yc
+        + oy_s[:, None] * stride_yh
+        + ox_s[:, None] * stride_yw
+    )
+
+    tl.store(y_ptrs, acc, mask=mask_m[:, None] & mask_n[None, :])
+
 
 @triton.jit
-def global_avg_pool_kernel(
-    x_ptr,
-    output_ptr,
-    B,
-    C,
-    H,
-    W,
-    BLOCK_SIZE_C: tl.constexpr,
-    BLOCK_SIZE_HW: tl.constexpr,
+def global_avg_pool2d_kernel(
+    x_ptr, y_ptr,
+    B, C, H, W,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_yn, stride_yc,
+    BLOCK_HW: tl.constexpr,
 ):
-    pid_b = tl.program_id(axis=0)
-    pid_c_block = tl.program_id(axis=1)
-    
-    # Each block processes BLOCK_SIZE_C channels
-    c_start = pid_c_block * BLOCK_SIZE_C
-    c_offsets = c_start + tl.arange(0, BLOCK_SIZE_C)
-    c_mask = c_offsets < C
-    
-    # Initialize accumulator for each channel
-    acc = tl.zeros((BLOCK_SIZE_C,), dtype=tl.float32)
-    
-    # Process spatial dimensions in blocks
-    for hw_start in range(0, H * W, BLOCK_SIZE_HW):
-        hw_offsets = tl.arange(0, BLOCK_SIZE_HW)
-        hw_mask = hw_offsets < (H * W - hw_start)
-        
-        # Calculate full indices
-        full_offsets = (pid_b * C * H * W + 
-                       tl.reshape(c_offsets, (BLOCK_SIZE_C, 1)) * H * W +
-                       hw_start + tl.reshape(hw_offsets, (1, BLOCK_SIZE_HW)))
-        
-        # Load and accumulate
-        x_block = tl.load(x_ptr + full_offsets, mask=tl.reshape(c_mask, (BLOCK_SIZE_C, 1)) & tl.reshape(hw_mask, (1, BLOCK_SIZE_HW)))
-        acc += tl.sum(x_block, axis=1)
-    
-    # Average and store
-    output = acc / (H * W)
-    output_offset = pid_b * C + c_offsets
-    tl.store(output_ptr + output_offset, output, mask=c_mask)
+    pid = tl.program_id(0)
+    bc = pid
+    b = bc // C
+    c = bc % C
 
-@triton.jit
-def fused_gelu_pool_kernel(
-    x_ptr,
-    output_ptr,
-    B,
-    C,
-    H,
-    W,
-    BLOCK_SIZE_C: tl.constexpr,
-    BLOCK_SIZE_HW: tl.constexpr,
-):
-    pid_b = tl.program_id(axis=0)
-    pid_c_block = tl.program_id(axis=1)
-    
-    # Each block processes BLOCK_SIZE_C channels
-    c_start = pid_c_block * BLOCK_SIZE_C
-    c_offsets = c_start + tl.arange(0, BLOCK_SIZE_C)
-    c_mask = c_offsets < C
-    
-    # Initialize accumulator for each channel
-    acc = tl.zeros((BLOCK_SIZE_C,), dtype=tl.float32)
-    
-    # Constants for GELU
-    sqrt_2_over_pi = 0.7978845608028654
-    gelu_const = 0.044715
-    
-    # Process spatial dimensions in blocks
-    for hw_start in range(0, H * W, BLOCK_SIZE_HW):
-        hw_offsets = tl.arange(0, BLOCK_SIZE_HW)
-        hw_mask = hw_offsets < (H * W - hw_start)
-        
-        # Calculate full indices
-        full_offsets = (pid_b * C * H * W + 
-                       tl.reshape(c_offsets, (BLOCK_SIZE_C, 1)) * H * W +
-                       hw_start + tl.reshape(hw_offsets, (1, BLOCK_SIZE_HW)))
-        
-        # Load
-        x_block = tl.load(x_ptr + full_offsets, mask=tl.reshape(c_mask, (BLOCK_SIZE_C, 1)) & tl.reshape(hw_mask, (1, BLOCK_SIZE_HW)))
-        
-        # Apply GELU
-        x_cubed = x_block * x_block * x_block
-        z = sqrt_2_over_pi * (x_block + gelu_const * x_cubed)
-        exp_2z = tl.exp(2.0 * z)
-        tanh_z = (exp_2z - 1.0) / (exp_2z + 1.0)
-        gelu_block = 0.5 * x_block * (1.0 + tanh_z)
-        
-        # Accumulate
-        acc += tl.sum(gelu_block, axis=1)
-    
-    # Average and store
-    output = acc / (H * W)
-    output_offset = pid_b * C + c_offsets
-    tl.store(output_ptr + output_offset, output, mask=c_mask)
+    HW = H * W
+    sum_val = tl.zeros((), dtype=tl.float32)
 
-def triton_gelu(x: torch.Tensor) -> torch.Tensor:
-    output = torch.empty_like(x)
-    n_elements = output.numel()
-    BLOCK_SIZE = 1024
-    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
-    gelu_kernel[grid](x, output, n_elements, BLOCK_SIZE=BLOCK_SIZE)
-    return output
+    for hw_start in range(0, HW, BLOCK_HW):
+        offs_hw = hw_start + tl.arange(0, BLOCK_HW)
+        mask_hw = offs_hw < HW
 
-def triton_global_avg_pool(x: torch.Tensor) -> torch.Tensor:
+        h_idx = offs_hw // W
+        w_idx = offs_hw % W
+
+        x_ptrs = (
+            x_ptr
+            + b * stride_xn
+            + c * stride_xc
+            + h_idx * stride_xh
+            + w_idx * stride_xw
+        )
+        vals = tl.load(x_ptrs, mask=mask_hw, other=0.0)
+        sum_val += tl.sum(vals, axis=0)
+
+    denom = HW
+    avg = sum_val / denom
+
+    y_ptrs = y_ptr + b * stride_yn + c * stride_yc
+    tl.store(y_ptrs, avg)
+
+
+def conv2d_gelu_triton(x, weight, bias):
+    B, C_in, H, W = x.shape
+    C_out, _, KH, KW = weight.shape
+
+    H_out = H - KH + 1
+    W_out = W - KW + 1
+
+    K = C_in * KH * KW
+    M = B * H_out * W_out
+    N = C_out
+
+    w_flat = weight.view(C_out, -1).transpose(0, 1).contiguous()
+
+    y = torch.empty((B, C_out, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_M"]),
+        triton.cdiv(N, META["BLOCK_N"]),
+    )
+
+    conv2d_gelu_kernel[grid](
+        x, w_flat, bias, y,
+        B, C_in, H, W,
+        C_out, KH, KW,
+        H_out, W_out,
+        M, N, K,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        w_flat.stride(0), w_flat.stride(1),
+        y.stride(0), y.stride(1), y.stride(2), y.stride(3),
+        BLOCK_M=64, BLOCK_N=64, BLOCK_K=32,
+    )
+    return y
+
+
+def global_avg_pool2d_triton(x):
     B, C, H, W = x.shape
-    output = torch.empty(B, C, device=x.device, dtype=x.dtype)
-    
-    # Optimize block sizes based on hardware constraints
-    BLOCK_SIZE_C = 64  # Process 64 channels at once
-    BLOCK_SIZE_HW = 256  # Process 256 spatial positions at once
-    
-    grid = (B, triton.cdiv(C, BLOCK_SIZE_C))
-    global_avg_pool_kernel[grid](x, output, B, C, H, W, 
-                                 BLOCK_SIZE_C=BLOCK_SIZE_C, 
-                                 BLOCK_SIZE_HW=BLOCK_SIZE_HW)
-    return output
+    y = torch.empty((B, C), device=x.device, dtype=x.dtype)
 
-def triton_fused_gelu_pool(x: torch.Tensor) -> torch.Tensor:
-    B, C, H, W = x.shape
-    output = torch.empty(B, C, device=x.device, dtype=x.dtype)
-    
-    # Optimize block sizes - tuned for A100
-    BLOCK_SIZE_C = 64  # Good balance for register usage and parallelism
-    BLOCK_SIZE_HW = 256  # Maximize spatial parallelism
-    
-    grid = (B, triton.cdiv(C, BLOCK_SIZE_C))
-    fused_gelu_pool_kernel[grid](x, output, B, C, H, W,
-                                BLOCK_SIZE_C=BLOCK_SIZE_C,
-                                BLOCK_SIZE_HW=BLOCK_SIZE_HW)
-    return output
+    grid = lambda META: (triton.cdiv(B * C, 1),)
+
+    global_avg_pool2d_kernel[grid](
+        x, y,
+        B, C, H, W,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        y.stride(0), y.stride(1),
+        BLOCK_HW=256,
+    )
+    return y
+
 
 class ModelNew(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size):
         super(ModelNew, self).__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.weight = nn.Parameter(
+            torch.randn(out_channels, in_channels, kernel_size, kernel_size)
+        )
+        self.bias = nn.Parameter(torch.randn(out_channels))
 
     def forward(self, x):
-        """
-        Args:
-            x: Input tensor of shape (batch_size, in_channels, height, width)
-        Returns:
-            Output tensor of shape (batch_size, out_channels)
-        """
-        # Keep PyTorch convolution (highly optimized with cuDNN)
-        x = self.conv(x)
-        
-        # Fused GELU + Global Average Pooling for maximum performance
-        x = triton_fused_gelu_pool(x)
-        
+        x = conv2d_gelu_triton(x, self.weight, self.bias)
+        x = global_avg_pool2d_triton(x)
         return x
 ```

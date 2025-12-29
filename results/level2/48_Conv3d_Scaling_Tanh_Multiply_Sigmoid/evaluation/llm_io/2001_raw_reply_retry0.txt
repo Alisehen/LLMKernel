@@ -1,0 +1,313 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def conv3d_tiled_fused_tanh_sigmoid_kernel(
+    x_ptr,                # *f32, input  (B, Cin, Din, Hin, Win)
+    w_ptr,                # *f32, weight (Cout, Cin, Kd, Kh, Kw)
+    conv_bias_ptr,        # *f32, (Cout,)
+    scale_ptr,            # *f32, (Cout,)
+    bias_ptr,             # *f32, (Cout,)
+    out_ptr,              # *f32, output (B, Cout, Dout, Hout, Wout)
+    B, Cin,
+    Din, Hin, Win,
+    Cout,
+    Dout, Hout, Wout,
+    stride_xb, stride_xc, stride_xd, stride_xh, stride_xw,
+    stride_wc, stride_wcin, stride_wd, stride_wh, stride_ww,
+    stride_ob, stride_oc, stride_od, stride_oh, stride_ow,
+    num_dtiles, num_htiles, num_wtiles,
+    Kd: tl.constexpr,
+    Kh: tl.constexpr,
+    Kw: tl.constexpr,
+    BLOCK_OD: tl.constexpr,
+    BLOCK_OH: tl.constexpr,
+    BLOCK_OW: tl.constexpr,
+    BLOCK_OC: tl.constexpr,
+):
+    """
+    Direct 3D convolution with spatial tiling over (Dout, Hout, Wout)
+    for a given batch element and block of output channels, followed by:
+      * per-channel bias add
+      * per-channel scaling_factor multiply
+      * tanh
+      * per-channel bias multiply
+      * sigmoid
+    """
+    # -------------------------------------------------------------------------
+    # Tile geometry (all constexpr)
+    # -------------------------------------------------------------------------
+    IN_TILE_D = BLOCK_OD + Kd - 1
+    IN_TILE_H = BLOCK_OH + Kh - 1
+    IN_TILE_W = BLOCK_OW + Kw - 1
+    BLOCK_P = BLOCK_OD * BLOCK_OH * BLOCK_OW
+    TILE_SIZE = IN_TILE_D * IN_TILE_H * IN_TILE_W
+
+    # -------------------------------------------------------------------------
+    # Program IDs -> (batch, tile_d, tile_h, tile_w, cout-tile)
+    # -------------------------------------------------------------------------
+    pid0 = tl.program_id(0)  # over batch * spatial tiles
+    pid1 = tl.program_id(1)  # over output-channel tiles
+
+    tiles_per_b = num_dtiles * num_htiles * num_wtiles
+    b = pid0 // tiles_per_b
+    tile_id = pid0 % tiles_per_b
+
+    tile_d = tile_id // (num_htiles * num_wtiles)
+    tmp = tile_id % (num_htiles * num_wtiles)
+    tile_h = tmp // num_wtiles
+    tile_w = tmp % num_wtiles
+
+    od0 = tile_d * BLOCK_OD
+    oh0 = tile_h * BLOCK_OH
+    ow0 = tile_w * BLOCK_OW
+
+    oc0 = pid1 * BLOCK_OC
+    oc_offsets = oc0 + tl.arange(0, BLOCK_OC)
+    mask_oc = oc_offsets < Cout
+
+    # -------------------------------------------------------------------------
+    # Base pointers for this batch
+    # -------------------------------------------------------------------------
+    x_batch_ptr = x_ptr + b * stride_xb
+    out_batch_ptr = out_ptr + b * stride_ob
+
+    # -------------------------------------------------------------------------
+    # Accumulator over (P = OD*OH*OW, OC)
+    # -------------------------------------------------------------------------
+    acc = tl.zeros((BLOCK_P, BLOCK_OC), dtype=tl.float32)
+
+    # -------------------------------------------------------------------------
+    # Precompute flattened tile indices for input load
+    # -------------------------------------------------------------------------
+    tile_idx = tl.arange(0, TILE_SIZE)
+    in_w_rel = tile_idx % IN_TILE_W
+    tmp2 = tile_idx // IN_TILE_W
+    in_h_rel = tmp2 % IN_TILE_H
+    in_d_rel = tmp2 // IN_TILE_H
+
+    in_d = od0 + in_d_rel
+    in_h = oh0 + in_h_rel
+    in_w = ow0 + in_w_rel
+
+    # Masks to avoid out-of-bounds loads from input
+    mask_in = (in_d < Din) & (in_h < Hin) & (in_w < Win)
+
+    # -------------------------------------------------------------------------
+    # Convolution: loop over input channels, kernel depth/height/width
+    # -------------------------------------------------------------------------
+    for cin in range(0, Cin):
+        # Load input tile for this (b, cin) once
+        x_chan_base = x_batch_ptr + cin * stride_xc
+        x_ptrs = (
+            x_chan_base
+            + in_d * stride_xd
+            + in_h * stride_xh
+            + in_w * stride_xw
+        )
+        x_tile_flat = tl.load(x_ptrs, mask=mask_in, other=0.0)
+        x_tile = tl.reshape(x_tile_flat, (IN_TILE_D, IN_TILE_H, IN_TILE_W))
+
+        # Loop over kernel offsets (all constexpr ranges)
+        for kd in range(0, Kd):
+            for kh in range(0, Kh):
+                for kw in range(0, Kw):
+                    # Sub-tile of inputs corresponding to this kernel offset and
+                    # this output spatial tile: shape (BLOCK_OD, BLOCK_OH, BLOCK_OW)
+                    x_sub = x_tile[
+                        kd : kd + BLOCK_OD,
+                        kh : kh + BLOCK_OH,
+                        kw : kw + BLOCK_OW,
+                    ]
+                    x_patch = tl.reshape(x_sub, (BLOCK_P,))  # (P,)
+
+                    # Load weights for this (cin, kd, kh, kw) and OC-tile
+                    w_ptrs = (
+                        w_ptr
+                        + oc_offsets * stride_wc
+                        + cin * stride_wcin
+                        + kd * stride_wd
+                        + kh * stride_wh
+                        + kw * stride_ww
+                    )
+                    w = tl.load(w_ptrs, mask=mask_oc, other=0.0)  # (OC,)
+
+                    # FMA: (P, 1) * (1, OC) -> (P, OC)
+                    acc += x_patch[:, None] * w[None, :]
+
+    # -------------------------------------------------------------------------
+    # Fused epilogue: bias + scale + tanh + bias + sigmoid
+    # -------------------------------------------------------------------------
+    conv_bias = tl.load(conv_bias_ptr + oc_offsets, mask=mask_oc, other=0.0)
+    scale = tl.load(scale_ptr + oc_offsets, mask=mask_oc, other=1.0)
+    bias = tl.load(bias_ptr + oc_offsets, mask=mask_oc, other=0.0)
+
+    acc = acc + conv_bias[None, :]
+    acc = acc * scale[None, :]
+
+    # tanh via exp
+    two_x = 2.0 * acc
+    e2x = tl.exp(two_x)
+    acc = (e2x - 1.0) / (e2x + 1.0)
+
+    acc = acc * bias[None, :]
+
+    # sigmoid
+    acc = 1.0 / (1.0 + tl.exp(-acc))
+
+    # -------------------------------------------------------------------------
+    # Write back: map local P-index to (dout, hout, wout)
+    # -------------------------------------------------------------------------
+    p = tl.arange(0, BLOCK_P)
+    pw = p % BLOCK_OW
+    tmp_p = p // BLOCK_OW
+    ph = tmp_p % BLOCK_OH
+    pd = tmp_p // BLOCK_OH
+
+    od = od0 + pd
+    oh = oh0 + ph
+    ow = ow0 + pw
+
+    mask_spatial = (od < Dout) & (oh < Hout) & (ow < Wout)
+    mask_out = mask_spatial[:, None] & mask_oc[None, :]
+
+    out_ptrs = (
+        out_batch_ptr
+        + oc_offsets[None, :] * stride_oc
+        + od[:, None] * stride_od
+        + oh[:, None] * stride_oh
+        + ow[:, None] * stride_ow
+    )
+    tl.store(out_ptrs, acc, mask=mask_out)
+
+
+def fused_conv3d_tanh_sigmoid(x, weight, conv_bias, scaling_factor, bias_param):
+    """
+    x:              (B, Cin, Din, Hin, Win)
+    weight:         (Cout, Cin, Kd, Kh, Kw)
+    conv_bias:      (Cout,)
+    scaling_factor: (Cout, 1, 1, 1)
+    bias_param:     (Cout, 1, 1, 1)
+    Returns:
+      out:          (B, Cout, Dout, Hout, Wout)
+    """
+    x = x.contiguous()
+    weight = weight.contiguous()
+    conv_bias = conv_bias.contiguous()
+    scaling_factor = scaling_factor.contiguous().view(-1)
+    bias_param = bias_param.contiguous().view(-1)
+
+    B, Cin, Din, Hin, Win = x.shape
+    Cout, Cin_w, Kd, Kh, Kw = weight.shape
+    assert Cin == Cin_w, "Input channels must match weight channels"
+
+    # Valid 3D conv, stride=1, padding=0
+    Dout = Din - Kd + 1
+    Hout = Hin - Kh + 1
+    Wout = Win - Kw + 1
+
+    out = torch.empty((B, Cout, Dout, Hout, Wout), device=x.device, dtype=x.dtype)
+
+    # Strides
+    stride_xb, stride_xc, stride_xd, stride_xh, stride_xw = x.stride()
+    stride_ob, stride_oc, stride_od, stride_oh, stride_ow = out.stride()
+    stride_wc, stride_wcin, stride_wd, stride_wh, stride_ww = weight.stride()
+
+    # Tile sizes (powers of two as required)
+    BLOCK_OD = 2
+    BLOCK_OH = 4
+    BLOCK_OW = 4
+    BLOCK_OC = 32
+
+    # Spatial tiling
+    num_dtiles = triton.cdiv(Dout, BLOCK_OD)
+    num_htiles = triton.cdiv(Hout, BLOCK_OH)
+    num_wtiles = triton.cdiv(Wout, BLOCK_OW)
+    tiles_per_b = num_dtiles * num_htiles * num_wtiles
+
+    grid = (
+        B * tiles_per_b,
+        triton.cdiv(Cout, BLOCK_OC),
+    )
+
+    conv3d_tiled_fused_tanh_sigmoid_kernel[grid](
+        x,
+        weight,
+        conv_bias,
+        scaling_factor,
+        bias_param,
+        out,
+        B,
+        Cin,
+        Din,
+        Hin,
+        Win,
+        Cout,
+        Dout,
+        Hout,
+        Wout,
+        stride_xb,
+        stride_xc,
+        stride_xd,
+        stride_xh,
+        stride_xw,
+        stride_wc,
+        stride_wcin,
+        stride_wd,
+        stride_wh,
+        stride_ww,
+        stride_ob,
+        stride_oc,
+        stride_od,
+        stride_oh,
+        stride_ow,
+        num_dtiles,
+        num_htiles,
+        num_wtiles,
+        Kd=Kd,
+        Kh=Kh,
+        Kw=Kw,
+        BLOCK_OD=BLOCK_OD,
+        BLOCK_OH=BLOCK_OH,
+        BLOCK_OW=BLOCK_OW,
+        BLOCK_OC=BLOCK_OC,
+    )
+
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    Triton-optimized version:
+    3D convolution (valid, stride=1) + per-channel scale + tanh + per-channel scale + sigmoid.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, scaling_factor, bias_shape):
+        super(ModelNew, self).__init__()
+
+        if isinstance(kernel_size, int):
+            Kd = Kh = Kw = kernel_size
+        else:
+            Kd, Kh, Kw = kernel_size
+
+        self.weight = nn.Parameter(
+            torch.randn(out_channels, in_channels, Kd, Kh, Kw)
+        )
+        self.conv_bias = nn.Parameter(torch.randn(out_channels))
+
+        # Per-channel factors with shape (Cout, 1, 1, 1)
+        self.scaling_factor = nn.Parameter(torch.randn(bias_shape))
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+
+    def forward(self, x):
+        return fused_conv3d_tanh_sigmoid(
+            x,
+            self.weight,
+            self.conv_bias,
+            self.scaling_factor,
+            self.bias,
+        )
+```
