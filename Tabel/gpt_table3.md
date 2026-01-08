@@ -1,19 +1,19 @@
 # Kernel Benchmark Summary
 | 算子 | best_score | 状态 |
 | 1 | 1.26 | ✅ |
-| 2_Standard_matrix_multiplication | 0 | ✅ |
+| 2_Standard_matrix_multiplication | 0.9043 | ✅ |
 | 3_Batched_matrix_multiplication | 1.45 | ✅ |
 | 4_Matrix_vector_multiplication | 0 | ✅ |
 | 5_Matrix_scalar_multiplication | 0 | ✅ |
 | 6_Matmul_with_large_K_dimension | 0.91 | ✅ |
-| 7_Matmul_with_small_K_dimension | 0 | ✅ |
-| 8_Matmul_with_irregular_shapes | 0.04 | ✅ |
-| 9_Tall_skinny_matrix_multiplication | 0 | ✅ |
+| 7_Matmul_with_small_K_dimension | 0.0818 | ✅ |
+| 8_Matmul_with_irregular_shapes | 0.6113 | ✅ |
+| 9_Tall_skinny_matrix_multiplication | 0.8522 | ✅ |
 | 10_3D_tensor_matrix_multiplication | 0.85 | ✅ |
 | 11 | 0 | ✅ |
 | 12_Matmul_with_diagonal_matrices | 0.98 | ✅ |
-| 13_Matmul_for_symmetric_matrices | 0.43 | ✅ |
-| 14_Matmul_for_upper_triangular_matrices | 0.2 | ✅ |
+| 13_Matmul_for_symmetric_matrices | 0.9620 | ✅ |
+| 14_Matmul_for_upper_triangular_matrices | 1.1871 | ✅ |
 | 15_Matmul_for_lower_triangular_matrices | 1.05 | ✅ |
 | 16_Matmul_with_transposed_A | 0 | ✅ |
 | 17_Matmul_with_transposed_B | 0 | ✅ |
@@ -22,9 +22,9 @@
 | 20_LeakyReLU | 1.0 | ✅ |
 | 21_Sigmoid | 1.01 | ✅ |
 | 22_Tanh | 0.53 | ✅ |
-| 23_Softmax | 0 | ✅ |
+| 23_Softmax | 0.5641 | ✅ |
 | 24_LogSoftmax | 0.93 | ✅ |
-| 25_Swish | 0.92 | ✅ |
+| 25_Swish | 1.3445 | ✅ |
 | 26_GELU | 0.99 | ✅ |
 | 27_SELU | 1.01 | ✅ |
 | 28_HardSigmoid | 0.975 | ✅ |

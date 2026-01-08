@@ -2,18 +2,18 @@
 """
 Kernel Benchmark 统计分析脚本
 
-计算指标 (所有指标基于全部样本，失败记为0):
-- 成功率 (Success Rate)
-- 平均加速比 (Mean Speedup)
-- P75, P50, P25
-- Fast1: 加速比 > 1.0x 的任务比例
+计算指标:
+- 成功率 (Success Rate): 基于全部样本
+- 平均加速比 (Mean Speedup): 只统计成功生成的案例
+- P75, P50, P25: 基于全部样本（失败记为0）
+- Fast1: 加速比 > 1.0x 的任务比例（基于全部样本）
 """
 
 import numpy as np
 from pathlib import Path
 
-def calculate_statistics(summary_file='summary_table2.md'):
-    """从summary_table.md计算统计指标，失败的记为0分"""
+def calculate_statistics(summary_file='gpt_table2.md'):
+    """从summary_table.md计算统计指标，加速比统计只基于成功生成的案例"""
 
     summary_path = Path(__file__).parent / summary_file
 
@@ -64,9 +64,17 @@ def calculate_statistics(summary_file='summary_table2.md'):
 
     all_scores = np.array(all_scores)
 
-    # 计算统计指标（全部基于 all_scores，失败记为0）
+    # 计算统计指标
     success_rate = success_count / total_count
-    mean_speedup = np.mean(all_scores)
+
+    # 平均加速比只基于成功生成的案例（score > 0）
+    success_scores = all_scores[all_scores > 0]
+    if len(success_scores) > 0:
+        mean_speedup = np.mean(success_scores)
+    else:
+        mean_speedup = 0.0
+
+    # 其他指标基于全部样本（失败记为0）
     p50 = np.median(all_scores)
     p75 = np.percentile(all_scores, 75)
     p25 = np.percentile(all_scores, 25)
@@ -77,7 +85,7 @@ def calculate_statistics(summary_file='summary_table2.md'):
     print(f"Kernel Benchmark Statistics: {summary_file}")
     print("=" * 50)
     print(f"成功率: {success_count}/{total_count} ({success_rate*100:.1f}%)")
-    print(f"平均加速比: {mean_speedup:.4f}x")
+    print(f"平均加速比: {mean_speedup:.4f}x (基于{success_count}个成功案例)")
     print(f"P75: {p75:.4f}x")
     print(f"P50: {p50:.4f}x")
     print(f"P25: {p25:.4f}x")

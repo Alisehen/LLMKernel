@@ -1,7 +1,7 @@
 # Kernel Benchmark Summary
 | 算子 | best_score | 状态 |
 | 1 | 1.91 | ✅ |
-| 2_Standard_matrix_multiplication | 0 | ✅ |
+| 2_Standard_matrix_multiplication | 1.19 | ✅ |
 | 3_Batched_matrix_multiplication | 0 | ✅ |
 | 4_Matrix_vector_multiplication | 0 | ✅ |
 | 5_Matrix_scalar_multiplication | 0.677 | ✅ |
@@ -18,7 +18,7 @@
 | 16_Matmul_with_transposed_A | 0 | ✅ |
 | 17_Matmul_with_transposed_B | 0 | ✅ |
 | 18_Matmul_with_transposed_both | 0 | ✅ |
-| 19_ReLU | 0 | ✅ |
+| 19_ReLU | 0.677 | ✅ |
 | 20_LeakyReLU | 0.6763 | ✅ |
 | 21_Sigmoid | 0.6770 | ✅ |
 | 22_Tanh | 0.6768 | ✅ |
@@ -31,14 +31,14 @@
 | 29_Softplus | 0.6755 | ✅ |
 | 30_Softsign | 2.6923 | ✅ |
 | 31 | 0 | ✅ |
-| 32 | 0 | ✅ |
-| 33 | 0.97 | ✅ |
-| 34 | 0.97 | ✅ |
+| 32 | 1.001 | ✅ |
+| 33 | 1.01 | ✅ |
+| 34 | 1.01 | ✅ |
 | 35 | 0.97 | ✅ |
 | 36 | 0 | ✅ |
 | 37 | 0 | ✅ |
 | 38 | 0 | ✅ |
-| 39 | 0 | ✅ |
+| 39 | 0.67 | ✅ |
 | 40_LayerNorm | 0 | ✅ |
 | 41_Max_Pooling_1D | 0 | ✅ |
 | 42_Max_Pooling_2D | 0 | ✅ |
@@ -66,37 +66,37 @@
 | 64_conv_transposed_1D | 0 | ✅ |
 | 65_conv_transposed_2D_square_input_asymmetric_kernel | 0 | ✅ |
 | 66_conv_standard_3D_asymmetric_input_asymmetric_kernel | 0 | ✅ |
-| 67_conv_standard_1D | 0.6 | ✅ |
+| 67_conv_standard_1D | 0 | ✅ |
 | 68_conv_transposed_3D_square_input_asymmetric_kernel | 0.08 | ✅ |
 | 69_conv_transposed_2D_asymmetric_input_asymmetric_kernel | 0 | ✅ |
 | 70_conv_transposed_3D_asymmetric_input_square_kernel | 0 | ✅ |
 | 71_conv_transposed_2D_asymmetric_input_square_kernel | 0.35 | ✅ |
 | 72_conv_transposed_3D_asymmetric_strided_padded_grouped | 0 | ✅ |
-| 73_conv_transposed_3D_asymmetric_square_strided_padded_grouped | 0.08 | ✅ |
+| 73_conv_transposed_3D_asymmetric_square_strided_padded_grouped | 0 | ✅ |
 | 74_conv_transposed_1D_dilated | 0 | ✅ |
 | 75_conv_transposed_2D_asymmetric_strided_grouped_padded_dilated | 0 | ✅ |
-| 76_conv_standard_1D_dilated_strided | 1.7 |  ✅ |
+| 76_conv_standard_1D_dilated_strided | 0|  ✅ |
 | 77_conv_transposed_3D_square_padded_dilated_strided | 0 | ✅ |
 | 78_conv_transposed_2D_asymmetric_padded | 0.2 | ✅ |
 | 79_conv_transposed_1D_asymmetric_padded_strided_dilated | 0.6 | ✅ |
 | 80_conv_standard_2D_square_asymmetric_dilated_padded | 0 | ✅ |
-| 81_conv_transposed_2D_asymmetric_square_dilated_padded_strided | 0.45 | ✅ |
-| 82_conv_depthwise_2D_square_square | 1.17 | ✅ |
+| 81_conv_transposed_2D_asymmetric_square_dilated_padded_strided | 0 | ✅ |
+| 82_conv_depthwise_2D_square_square | 0 | ✅ |
 | 83_conv_depthwise_2D_square_asymmetric | 0 | ✅ |
-| 84_conv_depthwise_2D_asymmetric_square | 0.99 | ✅ |
+| 84_conv_depthwise_2D_asymmetric_square | 0 | ✅ |
 | 85_conv_depthwise_2D_asymmetric_asymmetric | 0 | ✅ |
 | 86_conv_depthwise_separable_2D | 0 | ✅ |
 | 87_conv_pointwise_2D | 0 | ✅ |
 | 88_MinGPTNewGelu | 6.0525 | ✅ |
 | 89_cumsum | 0 | ✅ |
 | 90_cumprod | 0.31 | ✅ |
-| 91_cumsum_reverse | 0.76 | ✅ |
+| 91_cumsum_reverse | 0 | ✅ |
 | 92_cumsum_exclusive | 0 | ✅ |
-| 93_masked_cumsum | 0.2359 | ✅ |
-| 94_MSELoss | 0 | ✅ |
+| 93_masked_cumsum | 0 | ✅ |
+| 94_MSELoss | 3.0 | ✅ |
 | 95_CrossEntropyLoss | 0 | ✅ |
-| 96_HuberLoss_score | 0 |
-| 97_ScaledDotProductAttention | 1.47 | ✅ |
+| 96_HuberLoss_score | 0 | ✅ 
+| 97_ScaledDotProductAttention | 0 | ✅ |
 | 98_KLDivLoss | 0 | ✅ |
 | 99_TripletMarginLoss | 0 | ✅ |
 | 100_HingeLoss | 0 | ✅ |

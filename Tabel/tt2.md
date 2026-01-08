@@ -97,7 +97,7 @@
 | 93_masked_cumsum | 1.59 | ✅ |
 | 94_MSELoss | 0.67 | ✅ |
 | 95_CrossEntropyLoss | 5.4 | ✅ |
-| 96_HuberLoss_score | 1.05 |
+| 96_HuberLoss_score | 1.05 | ✅ |
 | 97_ScaledDotProductAttention | 1.02 | ✅ |
 | 98_KLDivLoss | 5.36 | ✅ |
 | 99_TripletMarginLoss | 1.41 | ✅ |
