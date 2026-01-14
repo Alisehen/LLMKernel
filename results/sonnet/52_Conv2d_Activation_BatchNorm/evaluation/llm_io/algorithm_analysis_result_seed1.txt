@@ -1,0 +1,10 @@
+```json
+{
+  "worth_optimizing": "yes",
+  "reason": "The Mish activation and BatchNorm are executed as separate kernels with an intermediate memory round-trip, creating unnecessary memory bandwidth overhead.",
+  "bottleneck": "After Mish activation writes results to global memory, BatchNorm immediately reads the same data back, causing redundant memory traffic. The two operations access the same data spatially but are separated by a kernel boundary.",
+  "optimisation method": "Fuse Mish activation directly into the BatchNorm kernel by computing Mish inline during the normalization pass, eliminating the intermediate memory write/read and reducing global memory transactions by ~33%.",
+  "modification plan": "Modify batchnorm_forward_kernel to accept the pre-activation conv output instead of post-Mish output. Inside the kernel, load conv output, compute Mish activation inline, then immediately apply normalization without storing intermediate results. Remove the separate fused_mish_kernel call and launch only the combined kernel.",
+  "expected_speedup": "25-35%"
+}
+```

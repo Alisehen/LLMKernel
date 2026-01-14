@@ -1,0 +1,136 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU: 4090
+
+[OPTIMIZATION STAGE]
+
+## Current Optimization Stage
+
+Focus: BLOCK_SIZE with register pressure awareness.
+
+Key Principle:
+- Fusion increases register usage (intermediates stay in registers)
+- Spill to local memory kills fusion benefit
+
+Register Pressure Signals (from NCU):
+- launch__registers_per_thread > 128 → likely spilling
+- launch__occupancy_limit_registers < other limits → register-bound
+
+Rules:
+- Start conservative: BLOCK_SIZE ∈ {256, 512} for element-wise
+- For matmul fusion: BLOCK_M/N ∈ {32, 64}, BLOCK_K ∈ {32}
+- If registers > 128: reduce BLOCK_* by half
+- Trade-off: recompute cheap ops (e.g., x*0.5) vs store intermediate
+
+When to Recompute vs Keep:
+- Keep: expensive ops (exp, log, div, sqrt)
+- Recompute: cheap ops (add, mul, max) if register pressure high
+- Example: `y = relu(x); z = y * scale` → keep y
+- Example: `y = x * 0.5; z = y + bias` → can recompute y if needed
+
+Autotune:
+- 2-3 BLOCK_SIZE configs, always include smaller fallback
+
+
+
+[CURRENT CODE]
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def fused_relu_hardswish_kernel(
+    x_ptr, out_ptr,
+    N,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < N
+    
+    # Load input
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+    
+    # Fused ReLU: max(x, 0)
+    x_relu = tl.maximum(x, 0.0)
+    
+    # Fused HardSwish: x * clamp((x + 3) / 6, 0, 1)
+    # Optimized: use fused multiply-add and minimize operations
+    x_plus_3 = x_relu + 3.0
+    # Multiply by 1/6 instead of divide by 6 (faster)
+    x_scaled = x_plus_3 * 0.16666666666666666
+    # Clamp to [0, 1]
+    clamped = tl.minimum(tl.maximum(x_scaled, 0.0), 1.0)
+    # Final multiply
+    result = x_relu * clamped
+    
+    # Store result
+    tl.store(out_ptr + offs, result, mask=mask)
+
+
+def fused_relu_hardswish(x):
+    N = x.numel()
+    out = torch.empty_like(x)
+    
+    # Optimized block size for RTX 4090 (Ada architecture)
+    # 256 provides good balance between occupancy and memory coalescing
+    BLOCK_SIZE = 256
+    grid = lambda meta: (triton.cdiv(N, meta['BLOCK_SIZE']),)
+    
+    fused_relu_hardswish_kernel[grid](
+        x, out,
+        N,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    return out
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = fused_relu_hardswish(x)
+        return x
+```
+
+[NCU PROFILING METRICS]
+{
+  "fused_relu_hardswish_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 4.44,
+    "launch__grid_size": 508032,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 88.55,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 93.78,
+    "lts__t_sector_hit_rate.pct": 50.01
+  }
+}
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+## CRITICAL — Code MUST compile and run:
+1. EVERY kernel function MUST have `@triton.jit` decorator
+2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+3. BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+4. `tl.program_id(axis)` only supports axis = 0, 1, 2
+5. No `continue`, `break`, `return` inside loops — use masking
+6. No tensor indexing with loop vars: `x[:, i]` is INVALID
+7. mask shape MUST match data shape in tl.load/tl.store
+
+## Missing Triton Functions (implement manually):
+- tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+## OUTPUT FORMAT (STRICT):
+1. Imports: torch, torch.nn, triton, triton.language as tl
+2. @triton.jit decorated kernel function(s)
+3. Wrapper function(s) for grid calculation and kernel launch
+4. class ModelNew(nn.Module) that calls your kernels
+
+Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

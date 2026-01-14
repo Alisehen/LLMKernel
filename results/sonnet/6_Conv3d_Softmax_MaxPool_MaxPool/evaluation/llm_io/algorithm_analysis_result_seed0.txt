@@ -1,0 +1,10 @@
+```json
+{
+  "worth_optimizing": "yes",
+  "reason": "The current implementation launches separate kernels for softmax and maxpool, and the maxpool kernel has poor memory access patterns with scalar loads in nested loops.",
+  "bottleneck": "The maxpool3d_4x4x4_kernel performs 64 individual scalar loads per output element in a triple-nested loop, causing extremely poor memory coalescing and high memory latency. Additionally, the softmax kernel processes one spatial position per thread block, underutilizing GPU parallelism.",
+  "optimisation method": "Fuse softmax and maxpool into a single kernel, and use vectorized/coalesced memory access patterns. Load contiguous memory blocks and compute both softmax and max pooling in registers before writing output.",
+  "modification plan": "Create a fused kernel where each thread block handles a tile of the output. First, cooperatively load the input tile needed for both softmax and pooling into shared memory with coalesced accesses. Compute softmax across channels in shared memory, then compute the 4x4x4 max pooling from the softmax results, writing final output. This eliminates the intermediate tensor and improves memory access patterns.",
+  "expected_speedup": "2-3x (bringing performance close to or better than PyTorch baseline)"
+}
+```

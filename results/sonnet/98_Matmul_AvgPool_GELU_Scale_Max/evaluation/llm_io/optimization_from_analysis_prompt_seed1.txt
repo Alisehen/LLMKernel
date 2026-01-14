@@ -1,0 +1,257 @@
+You are optimizing a Triton kernel based on algorithmic analysis.
+
+# PyTorch Reference (Target Behavior)
+
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    A model implementing the pattern "Matmul_AvgPool_GELU_Scale_Max".
+    """
+    def __init__(self, in_features, out_features, pool_kernel_size, scale_factor):
+        super(Model, self).__init__()
+        self.matmul = nn.Linear(in_features, out_features)
+        self.avg_pool = nn.AvgPool1d(kernel_size=pool_kernel_size)
+        self.scale_factor = scale_factor
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_features).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_features).
+        """
+        x = self.matmul(x)
+        x = self.avg_pool(x.unsqueeze(1)).squeeze(1)
+        x = torch.nn.functional.gelu(x)
+        x = x * self.scale_factor
+        x = torch.max(x, dim=1).values
+        return x
+
+batch_size = 1024
+in_features = 8192
+out_features = 8192
+pool_kernel_size = 16
+scale_factor = 2.0
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features)]
+
+def get_init_inputs():
+    return [in_features, out_features, pool_kernel_size, scale_factor]
+```
+
+**CRITICAL**: Study the PyTorch code carefully to understand:
+- What does `forward()` return? (full output sequence vs final hidden state only)
+- What is the computational pattern?
+- What are the input/output shapes?
+
+Your optimized kernel MUST match this exact behavior.
+
+---
+
+# Analysis Results
+
+**Bottleneck**: The second kernel loads the entire matmul output (1024×8192 elements) repeatedly for pooling operations, causing massive redundant memory traffic. Each batch row is accessed N_pooled × pool_kernel_size times instead of once.
+
+**Optimization Strategy**: Fuse avgpool+GELU+scale+max directly into the matmul kernel's output stage. As each matmul tile computes results, immediately apply pooling/GELU/scale within shared memory before writing to global memory, eliminating the intermediate 1024×8192 buffer entirely.
+
+**Implementation Plan**: Modify matmul_kernel to accumulate pooled results in registers: for each BLOCK_N tile, compute pool groups, apply GELU+scale in registers, and maintain running max per row. After all N tiles complete, write only the final max value (1024 elements) instead of full matmul output (8M elements). This reduces global memory writes by 8000× and eliminates the second kernel entirely.
+
+**Expected Speedup**: 60-80%
+
+---
+
+# Current Kernel (needs optimization)
+
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+import math
+
+@triton.jit
+def matmul_kernel(
+    x_ptr, weight_ptr, bias_ptr, output_ptr,
+    M, N, K,
+    stride_xm, stride_xk,
+    stride_wn, stride_wk,
+    stride_om, stride_on,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    
+    x_ptrs = x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk
+    w_ptrs = weight_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk
+    
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k in range(0, K, BLOCK_K):
+        mask_k = offs_k < K - k
+        x_block = tl.load(x_ptrs, mask=(offs_m[:, None] < M) & (mask_k[None, :]), other=0.0)
+        w_block = tl.load(w_ptrs, mask=(offs_n[:, None] < N) & (mask_k[None, :]), other=0.0)
+        acc += tl.dot(x_block, tl.trans(w_block), allow_tf32=True)
+        x_ptrs += BLOCK_K * stride_xk
+        w_ptrs += BLOCK_K * stride_wk
+    
+    bias_vals = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc += bias_vals[None, :]
+    
+    output_ptrs = output_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
+    tl.store(output_ptrs, acc, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+
+
+@triton.jit
+def avgpool_gelu_scale_max_kernel(
+    input_ptr, output_ptr,
+    M, N,
+    pool_kernel_size, scale_factor,
+    stride_m, stride_n,
+    BLOCK_M: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    
+    max_val = tl.full((BLOCK_M,), -float('inf'), dtype=tl.float32)
+    
+    N_pooled = N // pool_kernel_size
+    for n_pool in range(N_pooled):
+        pool_sum = tl.zeros((BLOCK_M,), dtype=tl.float32)
+        
+        for k in range(pool_kernel_size):
+            n_idx = n_pool * pool_kernel_size + k
+            
+            ptrs = input_ptr + offs_m * stride_m + n_idx * stride_n
+            vals = tl.load(ptrs, mask=offs_m < M, other=0.0)
+            pool_sum += vals
+        
+        pool_avg = pool_sum / tl.cast(pool_kernel_size, tl.float32)
+        
+        # GELU approximation using manual tanh implementation
+        sqrt_2_over_pi = 0.7978845608028654
+        x = pool_avg
+        tanh_arg = sqrt_2_over_pi * (x + 0.044715 * x * x * x)
+        
+        # Manual tanh approximation: tanh(x) ≈ (exp(2x) - 1) / (exp(2x) + 1)
+        # For numerical stability, use: tanh(x) = (1 - exp(-2x)) / (1 + exp(-2x)) for x > 0
+        # and tanh(x) = (exp(2x) - 1) / (exp(2x) + 1) for x <= 0
+        exp_2x = tl.exp(2.0 * tanh_arg)
+        tanh_val = (exp_2x - 1.0) / (exp_2x + 1.0)
+        
+        gelu_val = 0.5 * x * (1.0 + tanh_val)
+        
+        scaled_val = gelu_val * scale_factor
+        
+        max_val = tl.maximum(max_val, scaled_val)
+    
+    output_ptrs = output_ptr + offs_m
+    tl.store(output_ptrs, max_val, mask=offs_m < M)
+
+
+def fused_forward(x, weight, bias, pool_kernel_size, scale_factor):
+    M, K = x.shape
+    N = weight.shape[0]
+    
+    # Matmul
+    matmul_out = torch.empty((M, N), device=x.device, dtype=x.dtype)
+    grid_matmul = lambda META: (
+        triton.cdiv(M, META['BLOCK_M']),
+        triton.cdiv(N, META['BLOCK_N'])
+    )
+    
+    BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32
+    
+    matmul_kernel[grid_matmul](
+        x, weight, bias, matmul_out,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        weight.stride(0), weight.stride(1),
+        matmul_out.stride(0), matmul_out.stride(1),
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+    )
+    
+    # AvgPool + GELU + Scale + Max
+    output = torch.empty((M,), device=x.device, dtype=x.dtype)
+    grid_pool = lambda META: (triton.cdiv(M, META['BLOCK_M']),)
+    
+    avgpool_gelu_scale_max_kernel[grid_pool](
+        matmul_out, output,
+        M, N,
+        pool_kernel_size, scale_factor,
+        matmul_out.stride(0), matmul_out.stride(1),
+        BLOCK_M=128,
+    )
+    
+    return output
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, pool_kernel_size, scale_factor):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.bias = nn.Parameter(torch.randn(out_features))
+        self.pool_kernel_size = pool_kernel_size
+        self.scale_factor = scale_factor
+
+    def forward(self, x):
+        return fused_forward(x, self.weight, self.bias, self.pool_kernel_size, self.scale_factor)
+```
+
+---
+
+# Your Task
+
+Implement the optimization strategy above. Focus on the specific bottleneck identified.
+
+## Key Requirements
+
+1. **Preserve correctness**: Maintain the same input/output behavior
+2. **Apply the optimization**: Follow the implementation plan exactly
+3. **Use valid Triton syntax**:
+   - Every kernel MUST have `@triton.jit` decorator
+   - Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+   - BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+   - No `continue`, `break`, `return` inside kernels (use masking)
+   - Prefer `tl.dot(a, b, allow_tf32=True)` for matmul operations
+
+4. **CRITICAL for RNN/GRU/LSTM Persistent Kernels**:
+   - Time loop MUST be inside @triton.jit kernel, NOT in Python forward()
+   - **HYBRID computation strategy** (CRITICAL for performance):
+     * Precompute input-side gates OUTSIDE kernel: `gates_x = (T*B, In) @ W_ih` (ONE large GEMM)
+     * INSIDE kernel: only recurrent-side: `for t: gates_h = h @ W_hh` (T small GEMMs)
+   - CORRECT (FAST - use this):
+     ```python
+     # Python forward():
+     gates_x_all = x.reshape(T*B, In) @ W_ih + b_ih  # ONE large GEMM
+     gates_x_all = gates_x_all.view(T, B, 3*H)
+     gru_persistent_kernel[grid](gates_x_all, h0, W_hh, ...)  # Launch ONCE
+
+     @triton.jit
+     def gru_persistent_kernel(gates_x_ptr, h_ptr, W_hh_ptr, ...):
+         for t in range(T):  # Inside kernel
+             gates_x_t = tl.load(gates_x_ptr + t*...)  # Precomputed
+             gates_h = h @ W_hh  # Only recurrent GEMM
+             h = (1-z)*n + z*h   # Fuse and update
+     ```
+
+5. **Output format**:
+   - Imports: `import torch, torch.nn as nn, triton, triton.language as tl`
+   - `@triton.jit` kernel(s)
+   - Wrapper function(s)
+   - `class ModelNew(nn.Module)` — REQUIRED
+   - NO testing code, NO `if __name__ == "__main__"`
+
+---
+
+Generate the optimized kernel now. Output ONLY the complete Python code.

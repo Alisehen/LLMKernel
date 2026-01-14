@@ -1,0 +1,294 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU: 4090
+
+[OPTIMIZATION STAGE]
+
+## Current Optimization Stage
+
+Focus: BLOCK_SIZE with register pressure awareness.
+
+Key Principle:
+- Fusion increases register usage (intermediates stay in registers)
+- Spill to local memory kills fusion benefit
+
+Register Pressure Signals (from NCU):
+- launch__registers_per_thread > 128 → likely spilling
+- launch__occupancy_limit_registers < other limits → register-bound
+
+Rules:
+- Start conservative: BLOCK_SIZE ∈ {256, 512} for element-wise
+- For matmul fusion: BLOCK_M/N ∈ {32, 64}, BLOCK_K ∈ {32}
+- If registers > 128: reduce BLOCK_* by half
+- Trade-off: recompute cheap ops (e.g., x*0.5) vs store intermediate
+
+When to Recompute vs Keep:
+- Keep: expensive ops (exp, log, div, sqrt)
+- Recompute: cheap ops (add, mul, max) if register pressure high
+- Example: `y = relu(x); z = y * scale` → keep y
+- Example: `y = x * 0.5; z = y + bias` → can recompute y if needed
+
+Autotune:
+- 2-3 BLOCK_SIZE configs, always include smaller fallback
+
+
+
+[CURRENT CODE]
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def fused_scale_bn_avgpool_atomic_kernel(
+    x_ptr, out_ptr,
+    gamma_ptr, beta_ptr, mean_ptr, var_ptr,
+    scale_factor, eps,
+    N, C, D, H, W,
+    stride_n, stride_c, stride_d, stride_h, stride_w,
+    total_elements,
+    BLOCK_SIZE: tl.constexpr,
+    NUM_BLOCKS: tl.constexpr,
+):
+    # 2D grid: (N*C, NUM_BLOCKS)
+    nc_idx = tl.program_id(0)
+    block_idx = tl.program_id(1)
+    
+    batch_idx = nc_idx // C
+    channel_idx = nc_idx % C
+    
+    # Load batch norm parameters for this channel
+    gamma = tl.load(gamma_ptr + channel_idx)
+    beta = tl.load(beta_ptr + channel_idx)
+    mean = tl.load(mean_ptr + channel_idx)
+    var = tl.load(var_ptr + channel_idx)
+    
+    # Precompute batch norm coefficients with scale fused in
+    inv_std = 1.0 / tl.sqrt(var + eps)
+    coeff = scale_factor * gamma * inv_std
+    bias = beta - mean * gamma * inv_std
+    
+    # Each block processes a range of elements
+    start_idx = block_idx * BLOCK_SIZE
+    offs = start_idx + tl.arange(0, BLOCK_SIZE)
+    mask = offs < total_elements
+    
+    # Convert linear index to 3D indices
+    HW = H * W
+    d_idx = offs // HW
+    hw_rem = offs % HW
+    h_idx = hw_rem // W
+    w_idx = hw_rem % W
+    
+    # Compute pointers
+    base_ptr = x_ptr + batch_idx * stride_n + channel_idx * stride_c
+    ptrs = base_ptr + d_idx * stride_d + h_idx * stride_h + w_idx * stride_w
+    
+    # Load values
+    x_vals = tl.load(ptrs, mask=mask, other=0.0)
+    
+    # Apply fused scale + batch norm
+    y_vals = x_vals * coeff + bias
+    
+    # Compute partial sum
+    partial_sum = tl.sum(tl.where(mask, y_vals, 0.0), axis=0)
+    
+    # Atomic add to output (will be divided later)
+    tl.atomic_add(out_ptr + nc_idx, partial_sum)
+
+
+@triton.jit
+def divide_kernel(
+    out_ptr,
+    divisor,
+    N_ELEMENTS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < N_ELEMENTS
+    
+    vals = tl.load(out_ptr + offs, mask=mask)
+    vals = vals / divisor
+    tl.store(out_ptr + offs, vals, mask=mask)
+
+
+@triton.jit
+def fused_scale_bn_avgpool_single_kernel_opt(
+    x_ptr, out_ptr,
+    gamma_ptr, beta_ptr, mean_ptr, var_ptr,
+    scale_factor, eps,
+    N, C, D, H, W,
+    stride_n, stride_c, stride_d, stride_h, stride_w,
+    total_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    batch_idx = pid // C
+    channel_idx = pid % C
+    
+    gamma = tl.load(gamma_ptr + channel_idx)
+    beta = tl.load(beta_ptr + channel_idx)
+    mean = tl.load(mean_ptr + channel_idx)
+    var = tl.load(var_ptr + channel_idx)
+    
+    inv_std = 1.0 / tl.sqrt(var + eps)
+    coeff = scale_factor * gamma * inv_std
+    bias = beta - mean * gamma * inv_std
+    
+    HW = H * W
+    accumulator = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+    
+    base_ptr = x_ptr + batch_idx * stride_n + channel_idx * stride_c
+    
+    num_iters = tl.cdiv(total_elements, BLOCK_SIZE)
+    for i in range(num_iters):
+        start = i * BLOCK_SIZE
+        offs = start + tl.arange(0, BLOCK_SIZE)
+        mask = offs < total_elements
+        
+        d_idx = offs // HW
+        hw_rem = offs % HW
+        h_idx = hw_rem // W
+        w_idx = hw_rem % W
+        
+        ptrs = base_ptr + d_idx * stride_d + h_idx * stride_h + w_idx * stride_w
+        x_vals = tl.load(ptrs, mask=mask, other=0.0)
+        
+        y_vals = x_vals * coeff + bias
+        accumulator += tl.where(mask, y_vals, 0.0)
+    
+    total_sum = tl.sum(accumulator, axis=0)
+    avg = total_sum / total_elements
+    
+    tl.store(out_ptr + pid, avg)
+
+
+def fused_scale_bn_avgpool(x, gamma, beta, running_mean, running_var, scale_factor, eps):
+    N, C, D, H, W = x.shape
+    out = torch.empty((N, C, 1, 1, 1), device=x.device, dtype=x.dtype)
+    
+    total_elements = D * H * W
+    
+    # For RTX 4090, use larger blocks
+    if total_elements <= 8192:
+        # Single kernel approach for smaller inputs
+        BLOCK_SIZE = 1024
+        grid = (N * C,)
+        fused_scale_bn_avgpool_single_kernel_opt[grid](
+            x, out.view(-1),
+            gamma, beta, running_mean, running_var,
+            scale_factor, eps,
+            N, C, D, H, W,
+            x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
+            total_elements,
+            BLOCK_SIZE=BLOCK_SIZE,
+        )
+    else:
+        # Multi-block with atomic reduction
+        BLOCK_SIZE = 2048
+        NUM_BLOCKS = triton.cdiv(total_elements, BLOCK_SIZE)
+        
+        # Initialize output to zero for atomic adds
+        out_flat = out.view(-1)
+        out_flat.zero_()
+        
+        grid = (N * C, NUM_BLOCKS)
+        fused_scale_bn_avgpool_atomic_kernel[grid](
+            x, out_flat,
+            gamma, beta, running_mean, running_var,
+            scale_factor, eps,
+            N, C, D, H, W,
+            x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
+            total_elements,
+            BLOCK_SIZE=BLOCK_SIZE,
+            NUM_BLOCKS=NUM_BLOCKS,
+        )
+        
+        # Divide by total elements
+        n_elements = N * C
+        DIV_BLOCK = 256
+        div_grid = (triton.cdiv(n_elements, DIV_BLOCK),)
+        divide_kernel[div_grid](
+            out_flat,
+            float(total_elements),
+            N_ELEMENTS=n_elements,
+            BLOCK_SIZE=DIV_BLOCK,
+        )
+    
+    return out
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, scale_factor, eps=1e-5, momentum=0.1):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size)
+        self.scale_factor = scale_factor
+        self.batch_norm = nn.BatchNorm3d(out_channels, eps=eps, momentum=momentum)
+        self.eps = eps
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        
+        if self.training:
+            x = x * self.scale_factor
+            x = self.batch_norm(x)
+            x = torch.mean(x, dim=[2, 3, 4], keepdim=True)
+            return x
+        else:
+            return fused_scale_bn_avgpool(
+                x,
+                self.batch_norm.weight,
+                self.batch_norm.bias,
+                self.batch_norm.running_mean,
+                self.batch_norm.running_var,
+                self.scale_factor,
+                self.eps
+            )
+```
+
+[NCU PROFILING METRICS]
+{
+  "fused_scale_bn_avgpool_atomic_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 35.85,
+    "launch__grid_size": 26624,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 54.52,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 93.83,
+    "lts__t_sector_hit_rate.pct": 7.84
+  },
+  "divide_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 0.05,
+    "launch__grid_size": 8,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 8.25,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 0.59,
+    "lts__t_sector_hit_rate.pct": 82.59
+  }
+}
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+## CRITICAL — Code MUST compile and run:
+1. EVERY kernel function MUST have `@triton.jit` decorator
+2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+3. BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+4. `tl.program_id(axis)` only supports axis = 0, 1, 2
+5. No `continue`, `break`, `return` inside loops — use masking
+6. No tensor indexing with loop vars: `x[:, i]` is INVALID
+7. mask shape MUST match data shape in tl.load/tl.store
+
+## Missing Triton Functions (implement manually):
+- tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+## OUTPUT FORMAT (STRICT):
+1. Imports: torch, torch.nn, triton, triton.language as tl
+2. @triton.jit decorated kernel function(s)
+3. Wrapper function(s) for grid calculation and kernel launch
+4. class ModelNew(nn.Module) that calls your kernels
+
+Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

@@ -1,0 +1,111 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def fused_matmul_activations_kernel(
+    a_ptr, b_ptr, bias_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    # Matmul loop - optimized for memory coalescing
+    for k in range(0, K, BLOCK_K):
+        mask_k = offs_k < K - k
+        mask_a = (offs_m[:, None] < M) & (mask_k[None, :])
+        mask_b = (mask_k[:, None]) & (offs_n[None, :] < N)
+        
+        a = tl.load(a_ptrs, mask=mask_a, other=0.0)
+        b = tl.load(b_ptrs, mask=mask_b, other=0.0)
+        acc = tl.dot(a, b, acc, allow_tf32=True)
+        
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Load bias once and add
+    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc = acc + bias[None, :]
+
+    # Fused activations - optimized for register reuse
+    # Swish (silu): x * sigmoid(x)
+    sigmoid_acc = 1.0 / (1.0 + tl.exp(-acc))
+    acc = acc * sigmoid_acc
+
+    # Tanh: (exp(2x) - 1) / (exp(2x) + 1)
+    acc_2 = acc * 2.0
+    exp_2x = tl.exp(acc_2)
+    acc = (exp_2x - 1.0) / (exp_2x + 1.0)
+
+    # GELU: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    x_cubed = acc * acc * acc
+    inner = 0.7978845608028654 * (acc + 0.044715 * x_cubed)
+    inner_2 = inner * 2.0
+    exp_2inner = tl.exp(inner_2)
+    tanh_inner = (exp_2inner - 1.0) / (exp_2inner + 1.0)
+    acc = 0.5 * acc * (1.0 + tanh_inner)
+
+    # Hardtanh: clamp between -1 and 1
+    acc = tl.where(acc > 1.0, 1.0, acc)
+    acc = tl.where(acc < -1.0, -1.0, acc)
+
+    # Store result - single store operation
+    mask_out = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    tl.store(c_ptrs, acc, mask=mask_out)
+
+
+def fused_matmul_activations(x, weight, bias):
+    M, K = x.shape
+    N = weight.shape[0]
+    c = torch.empty((M, N), device=x.device, dtype=x.dtype)
+    b = weight.t().contiguous()
+    
+    # Optimized for RTX 4090 with high register pressure from fusion
+    # Larger blocks to improve SM throughput (currently 44.58%)
+    # num_warps=8 to increase active warps (currently 24.09%)
+    BLOCK_M = 128
+    BLOCK_N = 128
+    BLOCK_K = 32
+    
+    def grid(META):
+        return (
+            triton.cdiv(M, META['BLOCK_M']), 
+            triton.cdiv(N, META['BLOCK_N'])
+        )
+    
+    fused_matmul_activations_kernel[grid](
+        x, b, bias, c, 
+        M, N, K,
+        x.stride(0), x.stride(1), 
+        b.stride(0), b.stride(1), 
+        c.stride(0), c.stride(1),
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        num_warps=8,
+        num_stages=2,
+    )
+    return c
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, add_value_shape):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.add_value = nn.Parameter(torch.randn(add_value_shape))
+
+    def forward(self, x):
+        return fused_matmul_activations(x, self.weight, self.add_value)
+```

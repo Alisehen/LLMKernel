@@ -1,0 +1,10 @@
+```json
+{
+  "worth_optimizing": "yes",
+  "reason": "The current kernel performs expensive modulo and division operations per element to compute channel indices, which can be eliminated with a restructured grid.",
+  "bottleneck": "The kernel computes channel indices using expensive integer division and modulo operations (`(offsets % (C * spatial_size)) // spatial_size`) for every element, adding significant arithmetic overhead to what should be simple element-wise operations.",
+  "optimisation method": "Restructure the kernel to use a 2D grid where one dimension iterates over channels and another over spatial elements within each channel, eliminating the need for runtime channel index computation.",
+  "modification plan": "Launch a 2D grid with dimensions (num_channels, ceil(N * spatial_size / BLOCK_SIZE)). Each program instance handles elements from a single channel, loading scaling_factor and bias once per block. Compute element offsets directly as `batch_idx * C * spatial_size + channel_idx * spatial_size + spatial_offset`.",
+  "expected_speedup": "15-25%"
+}
+```

@@ -1,0 +1,266 @@
+You are optimizing a Triton kernel based on algorithmic analysis.
+
+# PyTorch Reference (Target Behavior)
+
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    A model that performs a convolution, applies tanh, scaling, adds a bias term, and then max-pools.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, scaling_factor, bias_shape, pool_kernel_size):
+        super(Model, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.scaling_factor = scaling_factor
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.max_pool = nn.MaxPool2d(pool_kernel_size)
+
+    def forward(self, x):
+        # Convolution
+        x = self.conv(x)
+        # Tanh activation
+        x = torch.tanh(x)
+        # Scaling
+        x = x * self.scaling_factor
+        # Bias addition
+        x = x + self.bias
+        # Max-pooling
+        x = self.max_pool(x)
+        return x
+
+batch_size = 128
+in_channels = 8
+out_channels = 64
+height, width = 256, 256
+kernel_size = 3
+scaling_factor = 2.0
+bias_shape = (out_channels, 1, 1)
+pool_kernel_size = 4
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, scaling_factor, bias_shape, pool_kernel_size]
+```
+
+**CRITICAL**: Study the PyTorch code carefully to understand:
+- What does `forward()` return? (full output sequence vs final hidden state only)
+- What is the computational pattern?
+- What are the input/output shapes?
+
+Your optimized kernel MUST match this exact behavior.
+
+---
+
+# Analysis Results
+
+**Bottleneck**: The max_pool2d_kernel computes 4D tensor indices (n, c, h_out, w_out) from a flat offset for every element, then performs nested loops with strided memory accesses. This causes excessive address computation overhead and poor memory access patterns.
+
+**Optimization Strategy**: Fuse max pooling directly into the tanh-scale-bias kernel to eliminate the intermediate buffer write/read, and restructure the pooling computation to work on 2D tiles with better memory locality and reduced index arithmetic.
+
+**Implementation Plan**: Create a single fused kernel that: (1) loads conv output in tiles corresponding to pooling windows, (2) applies tanh-scale-bias element-wise, (3) immediately computes max reduction within each pooling window using shared memory or registers, (4) writes final pooled output. Use 2D thread blocks mapped to output spatial dimensions to naturally align with pooling windows and minimize index calculations.
+
+**Expected Speedup**: 25-35%
+
+---
+
+# Current Kernel (needs optimization)
+
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def fused_tanh_scale_bias_kernel(
+    x_ptr, bias_ptr, out_ptr,
+    N, C, H, W,
+    scaling_factor,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_on, stride_oc, stride_oh, stride_ow,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    num_elements = N * C * H * W
+    
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < num_elements
+    
+    # Load input
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+    
+    # Tanh activation: (exp(2*x) - 1) / (exp(2*x) + 1)
+    exp_2x = tl.exp(2.0 * x)
+    x = (exp_2x - 1.0) / (exp_2x + 1.0)
+    
+    # Scaling
+    x = x * scaling_factor
+    
+    # Compute channel index for bias
+    c_idx = (offs // (H * W)) % C
+    bias = tl.load(bias_ptr + c_idx, mask=mask, other=0.0)
+    
+    # Add bias
+    x = x + bias
+    
+    # Store output
+    tl.store(out_ptr + offs, x, mask=mask)
+
+@triton.jit
+def max_pool2d_kernel(
+    x_ptr, out_ptr,
+    N, C, H_in, W_in, H_out, W_out,
+    kernel_size,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_on, stride_oc, stride_oh, stride_ow,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    num_elements = N * C * H_out * W_out
+    
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < num_elements
+    
+    # Compute indices
+    n = offs // (C * H_out * W_out)
+    c = (offs // (H_out * W_out)) % C
+    h_out = (offs // W_out) % H_out
+    w_out = offs % W_out
+    
+    # Compute input starting positions
+    h_in_start = h_out * kernel_size
+    w_in_start = w_out * kernel_size
+    
+    # Initialize max value with very negative number
+    max_val = tl.full((BLOCK_SIZE,), float('-inf'), dtype=tl.float32)
+    
+    # Max pooling loop
+    for kh in range(kernel_size):
+        for kw in range(kernel_size):
+            h_in = h_in_start + kh
+            w_in = w_in_start + kw
+            
+            # Compute input offset
+            in_offs = (n * stride_xn + c * stride_xc + 
+                      h_in * stride_xh + w_in * stride_xw)
+            
+            # Load and update max
+            valid = mask & (h_in < H_in) & (w_in < W_in)
+            val = tl.load(x_ptr + in_offs, mask=valid, other=float('-inf'))
+            max_val = tl.maximum(max_val, val)
+    
+    # Store output
+    tl.store(out_ptr + offs, max_val, mask=mask)
+
+def fused_tanh_scale_bias(x, bias, scaling_factor):
+    N, C, H, W = x.shape
+    out = torch.empty_like(x)
+    
+    num_elements = N * C * H * W
+    BLOCK_SIZE = 1024
+    grid = lambda meta: (triton.cdiv(num_elements, meta['BLOCK_SIZE']),)
+    
+    fused_tanh_scale_bias_kernel[grid](
+        x, bias, out,
+        N, C, H, W,
+        scaling_factor,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    return out
+
+def max_pool2d_triton(x, kernel_size):
+    N, C, H_in, W_in = x.shape
+    H_out = H_in // kernel_size
+    W_out = W_in // kernel_size
+    
+    out = torch.empty((N, C, H_out, W_out), device=x.device, dtype=x.dtype)
+    
+    num_elements = N * C * H_out * W_out
+    BLOCK_SIZE = 256
+    grid = lambda meta: (triton.cdiv(num_elements, meta['BLOCK_SIZE']),)
+    
+    max_pool2d_kernel[grid](
+        x, out,
+        N, C, H_in, W_in, H_out, W_out,
+        kernel_size,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    return out
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, scaling_factor, bias_shape, pool_kernel_size):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.scaling_factor = scaling_factor
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.pool_kernel_size = pool_kernel_size
+
+    def forward(self, x):
+        # Convolution (using PyTorch as it's highly optimized)
+        x = self.conv(x)
+        
+        # Fused: Tanh + Scaling + Bias addition
+        bias_flat = self.bias.view(-1)
+        x = fused_tanh_scale_bias(x, bias_flat, self.scaling_factor)
+        
+        # Max-pooling
+        x = max_pool2d_triton(x, self.pool_kernel_size)
+        
+        return x
+```
+
+---
+
+# Your Task
+
+Implement the optimization strategy above. Focus on the specific bottleneck identified.
+
+## Key Requirements
+
+1. **Preserve correctness**: Maintain the same input/output behavior
+2. **Apply the optimization**: Follow the implementation plan exactly
+3. **Use valid Triton syntax**:
+   - Every kernel MUST have `@triton.jit` decorator
+   - Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+   - BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+   - No `continue`, `break`, `return` inside kernels (use masking)
+   - Prefer `tl.dot(a, b, allow_tf32=True)` for matmul operations
+
+4. **CRITICAL for RNN/GRU/LSTM Persistent Kernels**:
+   - Time loop MUST be inside @triton.jit kernel, NOT in Python forward()
+   - **HYBRID computation strategy** (CRITICAL for performance):
+     * Precompute input-side gates OUTSIDE kernel: `gates_x = (T*B, In) @ W_ih` (ONE large GEMM)
+     * INSIDE kernel: only recurrent-side: `for t: gates_h = h @ W_hh` (T small GEMMs)
+   - CORRECT (FAST - use this):
+     ```python
+     # Python forward():
+     gates_x_all = x.reshape(T*B, In) @ W_ih + b_ih  # ONE large GEMM
+     gates_x_all = gates_x_all.view(T, B, 3*H)
+     gru_persistent_kernel[grid](gates_x_all, h0, W_hh, ...)  # Launch ONCE
+
+     @triton.jit
+     def gru_persistent_kernel(gates_x_ptr, h_ptr, W_hh_ptr, ...):
+         for t in range(T):  # Inside kernel
+             gates_x_t = tl.load(gates_x_ptr + t*...)  # Precomputed
+             gates_h = h @ W_hh  # Only recurrent GEMM
+             h = (1-z)*n + z*h   # Fuse and update
+     ```
+
+5. **Output format**:
+   - Imports: `import torch, torch.nn as nn, triton, triton.language as tl`
+   - `@triton.jit` kernel(s)
+   - Wrapper function(s)
+   - `class ModelNew(nn.Module)` — REQUIRED
+   - NO testing code, NO `if __name__ == "__main__"`
+
+---
+
+Generate the optimized kernel now. Output ONLY the complete Python code.

@@ -1,0 +1,209 @@
+You are optimizing a Triton kernel based on algorithmic analysis.
+
+# PyTorch Reference (Target Behavior)
+
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs a gemm, swish, divide, clamp, tanh, and clamp operations.
+    """
+    def __init__(self, in_features, out_features, bias=True):
+        super(Model, self).__init__()
+        self.gemm = nn.Linear(in_features, out_features, bias=bias)
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_features).
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_features).
+        """
+        x = self.gemm(x)
+        x = x * torch.sigmoid(x)  # Swish activation
+        x = x / 2.0
+        x = torch.clamp(x, min=-1.0, max=1.0)  # Clamp between -1 and 1
+        x = torch.tanh(x)  # Tanh activation
+        x = torch.clamp(x, min=-1.0, max=1.0)  # Clamp between -1 and 1
+        return x
+
+batch_size = 1024
+in_features = 8192
+out_features = 8192
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features)]
+
+def get_init_inputs():
+    return [in_features, out_features]
+```
+
+**CRITICAL**: Study the PyTorch code carefully to understand:
+- What does `forward()` return? (full output sequence vs final hidden state only)
+- What is the computational pattern?
+- What are the input/output shapes?
+
+Your optimized kernel MUST match this exact behavior.
+
+---
+
+# Analysis Results
+
+**Bottleneck**: The BLOCK_K=32 is too small for the K=8192 dimension, requiring 256 iterations of the accumulation loop with excessive memory traffic. Additionally, the kernel performs GEMM accumulation in float32 but the elementwise operations could benefit from maintaining higher precision throughout.
+
+**Optimization Strategy**: Increase BLOCK_K from 32 to 64 or 128 to reduce loop iterations and improve memory coalescing, and tune BLOCK_M/BLOCK_N to better utilize shared memory and register resources for the large 8192x8192 GEMM.
+
+**Implementation Plan**: Change blocking parameters to BLOCK_M=64, BLOCK_N=64, BLOCK_K=64 or BLOCK_M=128, BLOCK_N=64, BLOCK_K=64 to reduce the K-loop iterations from 256 to 128 or 64. This increases arithmetic intensity by loading more data per iteration and reduces global memory transactions. Add autotuning to find optimal configuration for this specific problem size.
+
+**Expected Speedup**: 40-60%
+
+---
+
+# Current Kernel (needs optimization)
+
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def fused_gemm_swish_ops_kernel(
+    a_ptr, b_ptr, bias_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+    has_bias: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k in range(0, K, BLOCK_K):
+        mask_a = (offs_m[:, None] < M) & (offs_k[None, :] < K - k)
+        mask_b = (offs_k[:, None] < K - k) & (offs_n[None, :] < N)
+        a = tl.load(a_ptrs, mask=mask_a, other=0.0)
+        b = tl.load(b_ptrs, mask=mask_b, other=0.0)
+        acc += tl.dot(a, b, allow_tf32=True)
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Add bias if present
+    if has_bias:
+        bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+        acc += bias[None, :]
+
+    # Fused operations: swish, divide, clamp, tanh, clamp
+    # Swish: x * sigmoid(x)
+    sigmoid_acc = 1.0 / (1.0 + tl.exp(-acc))
+    acc = acc * sigmoid_acc
+    
+    # Divide by 2.0
+    acc = acc / 2.0
+    
+    # Clamp between -1.0 and 1.0
+    acc = tl.minimum(tl.maximum(acc, -1.0), 1.0)
+    
+    # Tanh
+    exp_2x = tl.exp(2.0 * acc)
+    acc = (exp_2x - 1.0) / (exp_2x + 1.0)
+    
+    # Clamp between -1.0 and 1.0 again
+    acc = tl.minimum(tl.maximum(acc, -1.0), 1.0)
+
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    mask_c = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, acc, mask=mask_c)
+
+
+def fused_gemm_swish_ops(x, weight, bias):
+    M, K = x.shape
+    N = weight.shape[0]
+    c = torch.empty((M, N), device=x.device, dtype=x.dtype)
+    b = weight.t().contiguous()
+    
+    has_bias = bias is not None
+    bias_ptr = bias if has_bias else x  # dummy pointer if no bias
+    
+    grid = lambda META: (
+        triton.cdiv(M, META['BLOCK_M']), 
+        triton.cdiv(N, META['BLOCK_N'])
+    )
+    
+    fused_gemm_swish_ops_kernel[grid](
+        x, b, bias_ptr, c, M, N, K,
+        x.stride(0), x.stride(1), 
+        b.stride(0), b.stride(1), 
+        c.stride(0), c.stride(1),
+        has_bias,
+        BLOCK_M=128, BLOCK_N=128, BLOCK_K=32,
+    )
+    return c
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, bias=True):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.bias = nn.Parameter(torch.randn(out_features)) if bias else None
+
+    def forward(self, x):
+        return fused_gemm_swish_ops(x, self.weight, self.bias)
+```
+
+---
+
+# Your Task
+
+Implement the optimization strategy above. Focus on the specific bottleneck identified.
+
+## Key Requirements
+
+1. **Preserve correctness**: Maintain the same input/output behavior
+2. **Apply the optimization**: Follow the implementation plan exactly
+3. **Use valid Triton syntax**:
+   - Every kernel MUST have `@triton.jit` decorator
+   - Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+   - BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+   - No `continue`, `break`, `return` inside kernels (use masking)
+   - Prefer `tl.dot(a, b, allow_tf32=True)` for matmul operations
+
+4. **CRITICAL for RNN/GRU/LSTM Persistent Kernels**:
+   - Time loop MUST be inside @triton.jit kernel, NOT in Python forward()
+   - **HYBRID computation strategy** (CRITICAL for performance):
+     * Precompute input-side gates OUTSIDE kernel: `gates_x = (T*B, In) @ W_ih` (ONE large GEMM)
+     * INSIDE kernel: only recurrent-side: `for t: gates_h = h @ W_hh` (T small GEMMs)
+   - CORRECT (FAST - use this):
+     ```python
+     # Python forward():
+     gates_x_all = x.reshape(T*B, In) @ W_ih + b_ih  # ONE large GEMM
+     gates_x_all = gates_x_all.view(T, B, 3*H)
+     gru_persistent_kernel[grid](gates_x_all, h0, W_hh, ...)  # Launch ONCE
+
+     @triton.jit
+     def gru_persistent_kernel(gates_x_ptr, h_ptr, W_hh_ptr, ...):
+         for t in range(T):  # Inside kernel
+             gates_x_t = tl.load(gates_x_ptr + t*...)  # Precomputed
+             gates_h = h @ W_hh  # Only recurrent GEMM
+             h = (1-z)*n + z*h   # Fuse and update
+     ```
+
+5. **Output format**:
+   - Imports: `import torch, torch.nn as nn, triton, triton.language as tl`
+   - `@triton.jit` kernel(s)
+   - Wrapper function(s)
+   - `class ModelNew(nn.Module)` — REQUIRED
+   - NO testing code, NO `if __name__ == "__main__"`
+
+---
+
+Generate the optimized kernel now. Output ONLY the complete Python code.

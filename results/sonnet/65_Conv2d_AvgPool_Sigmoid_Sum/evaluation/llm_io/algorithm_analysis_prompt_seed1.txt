@@ -1,0 +1,228 @@
+You are a GPU kernel optimization architect. Analyze the kernel and identify **ONE high-level algorithmic optimization**.
+
+# PyTorch Reference
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    This model performs a convolution, average pooling, applies sigmoid, and sums the result.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, pool_kernel_size):
+        super(Model, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.avg_pool = nn.AvgPool2d(pool_kernel_size)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.avg_pool(x)
+        x = torch.sigmoid(x)
+        x = torch.sum(x, dim=[1,2,3]) # Sum over all spatial dimensions
+        return x
+
+batch_size = 128
+in_channels = 8
+out_channels = 64
+height, width = 384, 384
+kernel_size = 3
+pool_kernel_size = 4
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, pool_kernel_size]
+```
+
+# Current Triton Kernel
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def fused_avgpool_sigmoid_kernel(
+    input_ptr, output_ptr,
+    batch, channels, height, width,
+    pool_size,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    
+    out_height = height // pool_size
+    out_width = width // pool_size
+    total_elements = batch * channels * out_height * out_width
+    
+    idx = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = idx < total_elements
+    
+    b = idx // (channels * out_height * out_width)
+    rem = idx % (channels * out_height * out_width)
+    c = rem // (out_height * out_width)
+    rem2 = rem % (out_height * out_width)
+    oh = rem2 // out_width
+    ow = rem2 % out_width
+    
+    # Compute average pooling - initialize with proper shape
+    pool_sum = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+    
+    for ph in range(pool_size):
+        for pw in range(pool_size):
+            ih = oh * pool_size + ph
+            iw = ow * pool_size + pw
+            in_idx = b * (channels * height * width) + c * (height * width) + ih * width + iw
+            valid = (b < batch) & (c < channels) & (ih < height) & (iw < width)
+            val = tl.load(input_ptr + in_idx, mask=valid & mask, other=0.0)
+            pool_sum += val
+    
+    avg_val = pool_sum / (pool_size * pool_size)
+    
+    # Apply sigmoid
+    sigmoid_val = 1.0 / (1.0 + tl.exp(-avg_val))
+    
+    tl.store(output_ptr + idx, sigmoid_val, mask=mask)
+
+
+@triton.jit
+def sum_reduction_kernel(
+    input_ptr, output_ptr,
+    batch, channels, height, width,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    b = pid
+    
+    if b >= batch:
+        return
+    
+    total = 0.0
+    num_elements = channels * height * width
+    
+    for start_idx in range(0, num_elements, BLOCK_SIZE):
+        idx = start_idx + tl.arange(0, BLOCK_SIZE)
+        mask = idx < num_elements
+        
+        offset = b * num_elements + idx
+        val = tl.load(input_ptr + offset, mask=mask, other=0.0)
+        total += tl.sum(val)
+    
+    tl.store(output_ptr + b, total)
+
+
+def fused_avgpool_sigmoid(x, pool_size):
+    batch, channels, height, width = x.shape
+    out_height = height // pool_size
+    out_width = width // pool_size
+    
+    pooled = torch.empty((batch, channels, out_height, out_width), device=x.device, dtype=x.dtype)
+    
+    total_elements = batch * channels * out_height * out_width
+    BLOCK_SIZE = 256
+    grid = (triton.cdiv(total_elements, BLOCK_SIZE),)
+    
+    fused_avgpool_sigmoid_kernel[grid](
+        x, pooled,
+        batch, channels, height, width,
+        pool_size,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    
+    return pooled
+
+
+def sum_all_dims(x):
+    batch, channels, height, width = x.shape
+    output = torch.empty((batch,), device=x.device, dtype=x.dtype)
+    
+    BLOCK_SIZE = 256
+    grid = (batch,)
+    
+    sum_reduction_kernel[grid](
+        x, output,
+        batch, channels, height, width,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    
+    return output
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, pool_kernel_size):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.pool_kernel_size = pool_kernel_size
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = fused_avgpool_sigmoid(x, self.pool_kernel_size)
+        x = sum_all_dims(x)
+        return x
+```
+
+# Performance
+- **PyTorch baseline**: 26.87 ms
+- **Current Triton**: 27.40 ms
+- **Current speedup**: 0.98x (-2.0% vs baseline)
+
+
+---
+
+## Analysis Steps
+
+1. **Code Analysis**: Count kernels, identify operations, check for inefficiencies
+2. **Performance Diagnosis**: Use metrics/latency to identify bottleneck type
+3. **Root Cause**: Combine code + performance to find the core issue
+
+## Optimization Categories (pick ONE if worth optimizing):
+
+### 1. Operator Fusion
+Fuse consecutive ops into fewer kernels to reduce memory traffic and launch overhead.
+
+### 2. Algorithm Replacement
+Replace naive algorithm with optimized variant.
+- For Attention: Flash Attention, online softmax
+- For Convolution: Winograd, im2col
+- **For RNN/GRU/LSTM**: Persistent kernel with HYBRID computation
+  - **CRITICAL**: Use hybrid approach for best performance:
+    * Precompute input-side gates ONCE (outside kernel): `gates_x = (T*B, In) @ W_ih`
+    * Persistent kernel (inside): only recurrent-side: `for t: gates_h = h @ W_hh`
+  - Time loop `for t in range(T)` must be inside kernel, NOT in Python
+  - Launch kernel once per layer, not once per timestep
+  - Expected speedup: 10-100x (vs per-timestep launches)
+
+### 3. Kernel Launch Reduction
+Combine multiple small kernels to reduce overhead.
+- **For RNN/GRU/LSTM**: See "Algorithm Replacement" above for persistent kernel approach
+
+### 4. Memory Layout Optimization
+Use in-place operations, buffer reuse, or better layouts.
+
+## Should We Optimize?
+
+Before proposing optimization, determine if it's worthwhile:
+- **Not worth optimizing** if:
+  - Code is already near-optimal (expected speedup < 10%)
+  - Bottleneck cannot be addressed (hardware limited, already optimal algorithm)
+  - Optimization would add significant complexity with minimal gain
+
+- **Worth optimizing** if:
+  - Clear algorithmic inefficiency exists (multiple kernels, suboptimal algorithm)
+  - Expected speedup >= 20%
+  - Concrete optimization path available
+
+## Output (JSON)
+
+```json
+{
+  "worth_optimizing": "yes/no",
+  "reason": "<Why worth or not worth optimizing, 1 sentence>",
+  "bottleneck": "<Root cause in 1-2 sentences, empty if not worth optimizing>",
+  "optimisation method": "<Specific optimization in 1-2 sentences, empty if not worth optimizing>",
+  "modification plan": "<Implementation steps in 2-3 sentences, empty if not worth optimizing>",
+  "expected_speedup": "<e.g., '30-40%', empty if not worth optimizing>"
+}
+```
+
+Return JSON only.

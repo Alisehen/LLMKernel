@@ -1,0 +1,274 @@
+You are a GPU kernel optimization architect. Analyze the kernel and identify **ONE high-level algorithmic optimization**.
+
+# PyTorch Reference
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs a 3D transposed convolution, followed by two max pooling layers and a sum operation.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding):
+        super(Model, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding)
+        self.max_pool1 = nn.MaxPool3d(kernel_size=2)
+        self.max_pool2 = nn.MaxPool3d(kernel_size=3)
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = self.max_pool1(x)
+        x = self.max_pool2(x)
+        x = torch.sum(x, dim=1, keepdim=True) 
+        return x
+
+batch_size = 16
+in_channels = 32
+out_channels = 64
+depth, height, width = 32, 32, 32
+kernel_size = 5
+stride = 2
+padding = 2
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, depth, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, stride, padding]
+```
+
+# Current Triton Kernel
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def max_pool3d_kernel(
+    input_ptr, output_ptr,
+    batch, channels, in_d, in_h, in_w,
+    out_d, out_h, out_w,
+    kernel_d, kernel_h, kernel_w,
+    stride_d, stride_h, stride_w,
+    stride_bn, stride_bc, stride_bd, stride_bh, stride_bw,
+    stride_on, stride_oc, stride_od, stride_oh, stride_ow,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    total_elements = batch * channels * out_d * out_h * out_w
+    
+    idx = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = idx < total_elements
+    
+    n = idx // (channels * out_d * out_h * out_w)
+    rem = idx % (channels * out_d * out_h * out_w)
+    c = rem // (out_d * out_h * out_w)
+    rem = rem % (out_d * out_h * out_w)
+    od = rem // (out_h * out_w)
+    rem = rem % (out_h * out_w)
+    oh = rem // out_w
+    ow = rem % out_w
+    
+    max_val = tl.full([BLOCK_SIZE], -1e20, dtype=tl.float32)
+    
+    for kd in range(kernel_d):
+        for kh in range(kernel_h):
+            for kw in range(kernel_w):
+                id = od * stride_d + kd
+                ih = oh * stride_h + kh
+                iw = ow * stride_w + kw
+                
+                valid = (id < in_d) & (ih < in_h) & (iw < in_w) & mask
+                
+                input_offset = (n * stride_bn + c * stride_bc + 
+                               id * stride_bd + ih * stride_bh + iw * stride_bw)
+                val = tl.load(input_ptr + input_offset, mask=valid, other=-1e20)
+                max_val = tl.maximum(max_val, val)
+    
+    output_offset = (n * stride_on + c * stride_oc + 
+                    od * stride_od + oh * stride_oh + ow * stride_ow)
+    tl.store(output_ptr + output_offset, max_val, mask=mask)
+
+@triton.jit
+def sum_channels_kernel(
+    input_ptr, output_ptr,
+    batch, channels, depth, height, width,
+    stride_bn, stride_bc, stride_bd, stride_bh, stride_bw,
+    stride_on, stride_oc, stride_od, stride_oh, stride_ow,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    total_elements = batch * depth * height * width
+    
+    idx = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = idx < total_elements
+    
+    n = idx // (depth * height * width)
+    rem = idx % (depth * height * width)
+    d = rem // (height * width)
+    rem = rem % (height * width)
+    h = rem // width
+    w = rem % width
+    
+    sum_val = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+    for c in range(channels):
+        input_offset = (n * stride_bn + c * stride_bc + 
+                       d * stride_bd + h * stride_bh + w * stride_bw)
+        val = tl.load(input_ptr + input_offset, mask=mask, other=0.0)
+        sum_val += val
+    
+    output_offset = (n * stride_on + 0 * stride_oc + 
+                    d * stride_od + h * stride_oh + w * stride_ow)
+    tl.store(output_ptr + output_offset, sum_val, mask=mask)
+
+def max_pool3d_triton(x, kernel_size, stride=None):
+    if stride is None:
+        stride = kernel_size
+    
+    batch, channels, in_d, in_h, in_w = x.shape
+    
+    if isinstance(kernel_size, int):
+        kernel_d = kernel_h = kernel_w = kernel_size
+    else:
+        kernel_d, kernel_h, kernel_w = kernel_size
+    
+    if isinstance(stride, int):
+        stride_d = stride_h = stride_w = stride
+    else:
+        stride_d, stride_h, stride_w = stride
+    
+    out_d = (in_d - kernel_d) // stride_d + 1
+    out_h = (in_h - kernel_h) // stride_h + 1
+    out_w = (in_w - kernel_w) // stride_w + 1
+    
+    output = torch.empty((batch, channels, out_d, out_h, out_w), 
+                         device=x.device, dtype=x.dtype)
+    
+    total_elements = batch * channels * out_d * out_h * out_w
+    BLOCK_SIZE = 256
+    grid = lambda meta: (triton.cdiv(total_elements, BLOCK_SIZE),)
+    
+    max_pool3d_kernel[grid](
+        x, output,
+        batch, channels, in_d, in_h, in_w,
+        out_d, out_h, out_w,
+        kernel_d, kernel_h, kernel_w,
+        stride_d, stride_h, stride_w,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
+        output.stride(0), output.stride(1), output.stride(2), output.stride(3), output.stride(4),
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    
+    return output
+
+def sum_channels_triton(x):
+    batch, channels, depth, height, width = x.shape
+    output = torch.empty((batch, 1, depth, height, width), 
+                         device=x.device, dtype=x.dtype)
+    
+    total_elements = batch * depth * height * width
+    BLOCK_SIZE = 256
+    grid = lambda meta: (triton.cdiv(total_elements, BLOCK_SIZE),)
+    
+    sum_channels_kernel[grid](
+        x, output,
+        batch, channels, depth, height, width,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
+        output.stride(0), output.stride(1), output.stride(2), output.stride(3), output.stride(4),
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    
+    return output
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding)
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = max_pool3d_triton(x, kernel_size=2)
+        x = max_pool3d_triton(x, kernel_size=3)
+        x = sum_channels_triton(x)
+        return x
+```
+
+# NCU Metrics
+{
+  "max_pool3d_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 12.91,
+    "launch__grid_size": 4000,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 76.13,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 83.52,
+    "lts__t_sector_hit_rate.pct": 15.62
+  },
+  "sum_channels_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 2.6,
+    "launch__grid_size": 63,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 8.14,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 44.29,
+    "lts__t_sector_hit_rate.pct": 5.36
+  }
+}
+
+
+---
+
+## Analysis Steps
+
+1. **Code Analysis**: Count kernels, identify operations, check for inefficiencies
+2. **Performance Diagnosis**: Use metrics/latency to identify bottleneck type
+3. **Root Cause**: Combine code + performance to find the core issue
+
+## Optimization Categories (pick ONE if worth optimizing):
+
+### 1. Operator Fusion
+Fuse consecutive ops into fewer kernels to reduce memory traffic and launch overhead.
+
+### 2. Algorithm Replacement
+Replace naive algorithm with optimized variant.
+- For Attention: Flash Attention, online softmax
+- For Convolution: Winograd, im2col
+- **For RNN/GRU/LSTM**: Persistent kernel with HYBRID computation
+  - **CRITICAL**: Use hybrid approach for best performance:
+    * Precompute input-side gates ONCE (outside kernel): `gates_x = (T*B, In) @ W_ih`
+    * Persistent kernel (inside): only recurrent-side: `for t: gates_h = h @ W_hh`
+  - Time loop `for t in range(T)` must be inside kernel, NOT in Python
+  - Launch kernel once per layer, not once per timestep
+  - Expected speedup: 10-100x (vs per-timestep launches)
+
+### 3. Kernel Launch Reduction
+Combine multiple small kernels to reduce overhead.
+- **For RNN/GRU/LSTM**: See "Algorithm Replacement" above for persistent kernel approach
+
+### 4. Memory Layout Optimization
+Use in-place operations, buffer reuse, or better layouts.
+
+## Should We Optimize?
+
+Before proposing optimization, determine if it's worthwhile:
+- **Not worth optimizing** if:
+  - Code is already near-optimal (expected speedup < 10%)
+  - Bottleneck cannot be addressed (hardware limited, already optimal algorithm)
+  - Optimization would add significant complexity with minimal gain
+
+- **Worth optimizing** if:
+  - Clear algorithmic inefficiency exists (multiple kernels, suboptimal algorithm)
+  - Expected speedup >= 20%
+  - Concrete optimization path available
+
+## Output (JSON)
+
+```json
+{
+  "worth_optimizing": "yes/no",
+  "reason": "<Why worth or not worth optimizing, 1 sentence>",
+  "bottleneck": "<Root cause in 1-2 sentences, empty if not worth optimizing>",
+  "optimisation method": "<Specific optimization in 1-2 sentences, empty if not worth optimizing>",
+  "modification plan": "<Implementation steps in 2-3 sentences, empty if not worth optimizing>",
+  "expected_speedup": "<e.g., '30-40%', empty if not worth optimizing>"
+}
+```
+
+Return JSON only.

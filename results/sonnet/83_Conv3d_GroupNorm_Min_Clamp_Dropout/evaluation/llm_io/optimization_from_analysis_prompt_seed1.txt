@@ -1,0 +1,192 @@
+You are optimizing a Triton kernel based on algorithmic analysis.
+
+# PyTorch Reference (Target Behavior)
+
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs a 3D convolution, applies Group Normalization, minimum, clamp, and dropout.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, groups, min_value, max_value, dropout_p):
+        super(Model, self).__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size)
+        self.norm = nn.GroupNorm(groups, out_channels)
+        self.dropout = nn.Dropout(dropout_p)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.norm(x)
+        x = torch.min(x, torch.tensor(min_value, device=x.device))
+        x = torch.clamp(x, min=min_value, max=max_value)
+        x = self.dropout(x)
+        return x
+
+batch_size = 128
+in_channels = 3
+out_channels = 16
+depth, height, width = 16, 64, 64
+kernel_size = 3
+groups = 8
+min_value = 0.0
+max_value = 1.0
+dropout_p = 0.2
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, depth, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, groups, min_value, max_value, dropout_p]
+```
+
+**CRITICAL**: Study the PyTorch code carefully to understand:
+- What does `forward()` return? (full output sequence vs final hidden state only)
+- What is the computational pattern?
+- What are the input/output shapes?
+
+Your optimized kernel MUST match this exact behavior.
+
+---
+
+# Analysis Results
+
+**Bottleneck**: The Conv3d and GroupNorm operations are executed as separate PyTorch kernels, requiring multiple global memory reads/writes. The fused min_clamp_dropout kernel only handles lightweight operations after the expensive normalization.
+
+**Optimization Strategy**: Operator Fusion: Fuse GroupNorm with the min/clamp/dropout operations into a single kernel. GroupNorm requires computing mean/variance per group, then normalizing - this can be combined with the subsequent element-wise operations to avoid an extra memory round-trip.
+
+**Implementation Plan**: Implement a fused GroupNorm + min + clamp + dropout kernel: (1) First pass computes per-group mean and variance using parallel reduction, (2) Second pass normalizes each element, applies affine transform (gamma/beta), then immediately applies min, clamp, and dropout in the same kernel. This eliminates the intermediate tensor write/read between GroupNorm and post-processing.
+
+**Expected Speedup**: 15-25%
+
+---
+
+# Current Kernel (needs optimization)
+
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def fused_min_clamp_dropout_kernel(
+    x_ptr, output_ptr, 
+    n_elements,
+    min_value, max_value,
+    dropout_p, seed,
+    training: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    
+    # Min operation: x = min(x, min_value)
+    x = tl.minimum(x, min_value)
+    
+    # Clamp operation: x = clamp(x, min_value, max_value)
+    x = tl.maximum(x, min_value)
+    x = tl.minimum(x, max_value)
+    
+    # Dropout (only during training)
+    if training:
+        random = tl.rand(seed, offsets)
+        dropout_mask = random > dropout_p
+        scale = 1.0 / (1.0 - dropout_p)
+        x = tl.where(dropout_mask, x * scale, 0.0)
+    
+    tl.store(output_ptr + offsets, x, mask=mask)
+
+
+def fused_min_clamp_dropout(x, min_value, max_value, dropout_p, training):
+    output = torch.empty_like(x)
+    n_elements = x.numel()
+    
+    BLOCK_SIZE = 1024
+    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
+    
+    seed = torch.randint(0, 2**31 - 1, (1,), device=x.device).item() if training else 0
+    
+    fused_min_clamp_dropout_kernel[grid](
+        x, output,
+        n_elements,
+        min_value, max_value,
+        dropout_p, seed,
+        training,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    
+    return output
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model with fused min, clamp, and dropout operations.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, groups, min_value, max_value, dropout_p):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size)
+        self.norm = nn.GroupNorm(groups, out_channels)
+        self.min_value = min_value
+        self.max_value = max_value
+        self.dropout_p = dropout_p
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.norm(x)
+        x = fused_min_clamp_dropout(x, self.min_value, self.max_value, self.dropout_p, self.training)
+        return x
+```
+
+---
+
+# Your Task
+
+Implement the optimization strategy above. Focus on the specific bottleneck identified.
+
+## Key Requirements
+
+1. **Preserve correctness**: Maintain the same input/output behavior
+2. **Apply the optimization**: Follow the implementation plan exactly
+3. **Use valid Triton syntax**:
+   - Every kernel MUST have `@triton.jit` decorator
+   - Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+   - BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+   - No `continue`, `break`, `return` inside kernels (use masking)
+   - Prefer `tl.dot(a, b, allow_tf32=True)` for matmul operations
+
+4. **CRITICAL for RNN/GRU/LSTM Persistent Kernels**:
+   - Time loop MUST be inside @triton.jit kernel, NOT in Python forward()
+   - **HYBRID computation strategy** (CRITICAL for performance):
+     * Precompute input-side gates OUTSIDE kernel: `gates_x = (T*B, In) @ W_ih` (ONE large GEMM)
+     * INSIDE kernel: only recurrent-side: `for t: gates_h = h @ W_hh` (T small GEMMs)
+   - CORRECT (FAST - use this):
+     ```python
+     # Python forward():
+     gates_x_all = x.reshape(T*B, In) @ W_ih + b_ih  # ONE large GEMM
+     gates_x_all = gates_x_all.view(T, B, 3*H)
+     gru_persistent_kernel[grid](gates_x_all, h0, W_hh, ...)  # Launch ONCE
+
+     @triton.jit
+     def gru_persistent_kernel(gates_x_ptr, h_ptr, W_hh_ptr, ...):
+         for t in range(T):  # Inside kernel
+             gates_x_t = tl.load(gates_x_ptr + t*...)  # Precomputed
+             gates_h = h @ W_hh  # Only recurrent GEMM
+             h = (1-z)*n + z*h   # Fuse and update
+     ```
+
+5. **Output format**:
+   - Imports: `import torch, torch.nn as nn, triton, triton.language as tl`
+   - `@triton.jit` kernel(s)
+   - Wrapper function(s)
+   - `class ModelNew(nn.Module)` — REQUIRED
+   - NO testing code, NO `if __name__ == "__main__"`
+
+---
+
+Generate the optimized kernel now. Output ONLY the complete Python code.

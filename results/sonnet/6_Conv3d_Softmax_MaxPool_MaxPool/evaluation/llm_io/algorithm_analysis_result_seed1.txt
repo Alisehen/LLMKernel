@@ -1,0 +1,10 @@
+```json
+{
+  "worth_optimizing": "yes",
+  "reason": "The current implementation launches separate kernels for softmax and pooling, and the softmax kernel has poor memory access patterns with one thread per spatial location causing low parallelism and inefficient memory coalescing.",
+  "bottleneck": "The softmax kernel processes one spatial location per program with strided memory accesses across channels, leading to poor memory coalescing. Additionally, launching separate kernels for softmax and pooling incurs unnecessary global memory round-trips.",
+  "optimisation method": "Fuse softmax and max pooling into a single kernel that computes softmax over channels and immediately performs the 4x4x4 max pooling reduction, eliminating the intermediate tensor write/read.",
+  "modification plan": "Create a fused kernel where each program handles one output element of the final pooled tensor. For each output position, load the 4x4x4 input region, compute softmax across channels for each spatial location within the region, then find the maximum across the 64 softmax outputs. This eliminates the intermediate tensor and reduces global memory traffic by ~2x.",
+  "expected_speedup": "2-3x"
+}
+```

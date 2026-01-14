@@ -1,0 +1,139 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def compute_mish_stats_kernel(
+    x_ptr, mean_ptr, var_ptr,
+    N, C, HW,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid_c = tl.program_id(0)
+    
+    sum_val = 0.0
+    sum_sq_val = 0.0
+    count = N * HW
+    
+    for n in range(N):
+        hw_start = 0
+        while hw_start < HW:
+            offs_hw = hw_start + tl.arange(0, BLOCK_SIZE)
+            mask_hw = offs_hw < HW
+            
+            idx = n * C * HW + pid_c * HW + offs_hw
+            x = tl.load(x_ptr + idx, mask=mask_hw, other=0.0)
+            
+            # Mish: x * tanh(softplus(x))
+            softplus = tl.where(x > 20.0, x, tl.log(1.0 + tl.exp(x)))
+            exp_2x = tl.exp(2.0 * softplus)
+            tanh_val = (exp_2x - 1.0) / (exp_2x + 1.0)
+            x_mish = x * tanh_val
+            
+            sum_val += tl.sum(tl.where(mask_hw, x_mish, 0.0))
+            sum_sq_val += tl.sum(tl.where(mask_hw, x_mish * x_mish, 0.0))
+            
+            hw_start += BLOCK_SIZE
+    
+    mean = sum_val / count
+    var = (sum_sq_val / count) - (mean * mean)
+    
+    tl.store(mean_ptr + pid_c, mean)
+    tl.store(var_ptr + pid_c, var)
+
+@triton.jit
+def fused_mish_batchnorm_kernel(
+    x_ptr, out_ptr, weight_ptr, bias_ptr,
+    mean_ptr, var_ptr,
+    N, C, HW,
+    eps: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid_c = tl.program_id(0)
+    pid_hw = tl.program_id(1)
+    
+    offs_hw = pid_hw * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask_hw = offs_hw < HW
+    
+    mean = tl.load(mean_ptr + pid_c)
+    var = tl.load(var_ptr + pid_c)
+    weight = tl.load(weight_ptr + pid_c)
+    bias = tl.load(bias_ptr + pid_c)
+    
+    inv_std = 1.0 / tl.sqrt(var + eps)
+    
+    for n in range(N):
+        idx = n * C * HW + pid_c * HW + offs_hw
+        x = tl.load(x_ptr + idx, mask=mask_hw, other=0.0)
+        
+        # Mish activation
+        softplus = tl.where(x > 20.0, x, tl.log(1.0 + tl.exp(x)))
+        exp_2x = tl.exp(2.0 * softplus)
+        tanh_val = (exp_2x - 1.0) / (exp_2x + 1.0)
+        x_mish = x * tanh_val
+        
+        # BatchNorm
+        x_norm = (x_mish - mean) * inv_std
+        out = weight * x_norm + bias
+        
+        tl.store(out_ptr + idx, out, mask=mask_hw)
+
+def fused_mish_batchnorm2d_triton(x, weight, bias, running_mean, running_var, training, momentum, eps):
+    N, C, H, W = x.shape
+    HW = H * W
+    out = torch.empty_like(x)
+    
+    if training:
+        mean = torch.empty(C, device=x.device, dtype=x.dtype)
+        var = torch.empty(C, device=x.device, dtype=x.dtype)
+        
+        BLOCK_SIZE = 256
+        grid = (C,)
+        
+        compute_mish_stats_kernel[grid](
+            x, mean, var,
+            N, C, HW,
+            BLOCK_SIZE=BLOCK_SIZE,
+        )
+        
+        with torch.no_grad():
+            running_mean.mul_(1 - momentum).add_(mean * momentum)
+            running_var.mul_(1 - momentum).add_(var * momentum)
+        
+        mean_ptr = mean
+        var_ptr = var
+    else:
+        mean_ptr = running_mean
+        var_ptr = running_var
+    
+    BLOCK_SIZE = 256
+    grid = (C, triton.cdiv(HW, BLOCK_SIZE))
+    
+    fused_mish_batchnorm_kernel[grid](
+        x, out, weight, bias,
+        mean_ptr, var_ptr,
+        N, C, HW,
+        eps=eps,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    return out
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, eps=1e-5, momentum=0.1):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.bn_weight = nn.Parameter(torch.ones(out_channels))
+        self.bn_bias = nn.Parameter(torch.zeros(out_channels))
+        self.register_buffer('running_mean', torch.zeros(out_channels))
+        self.register_buffer('running_var', torch.ones(out_channels))
+        self.eps = eps
+        self.momentum = momentum
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = fused_mish_batchnorm2d_triton(
+            x, self.bn_weight, self.bn_bias,
+            self.running_mean, self.running_var,
+            self.training, self.momentum, self.eps
+        )
+        return x

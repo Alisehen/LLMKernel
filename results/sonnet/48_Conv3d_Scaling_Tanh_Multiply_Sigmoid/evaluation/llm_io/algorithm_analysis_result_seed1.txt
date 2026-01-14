@@ -1,0 +1,10 @@
+```json
+{
+  "worth_optimizing": "yes",
+  "reason": "The current kernel has inefficient channel index computation with expensive modulo and division operations executed per element, and suboptimal memory access patterns for scaling_factor/bias.",
+  "bottleneck": "Each thread computes channel index using expensive integer modulo and division operations (offsets % (C * spatial_size)) // spatial_size). Additionally, scaling_factor and bias are loaded with scattered access patterns based on computed channel indices, causing poor cache utilization.",
+  "optimisation method": "Restructure the kernel to use a 2D grid where one dimension iterates over channels and another over spatial elements within each channel. This eliminates per-element channel index computation and allows broadcasting scaling_factor/bias values across all spatial elements of a channel.",
+  "modification plan": "Launch a 2D grid with (num_channels, ceil(N * spatial_size / BLOCK_SIZE)) dimensions. Each program loads scaling_factor and bias once per channel (register reuse), then processes all spatial elements for that channel across all batches. This removes modulo/division overhead and improves memory coalescing for the main data access.",
+  "expected_speedup": "20-35%"
+}
+```

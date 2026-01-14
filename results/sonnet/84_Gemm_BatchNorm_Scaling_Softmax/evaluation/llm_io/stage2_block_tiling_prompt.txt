@@ -1,0 +1,234 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU: 4090
+
+[OPTIMIZATION STAGE]
+
+## Current Optimization Stage
+
+Focus: BLOCK_SIZE with register pressure awareness.
+
+Key Principle:
+- Fusion increases register usage (intermediates stay in registers)
+- Spill to local memory kills fusion benefit
+
+Register Pressure Signals (from NCU):
+- launch__registers_per_thread > 128 → likely spilling
+- launch__occupancy_limit_registers < other limits → register-bound
+
+Rules:
+- Start conservative: BLOCK_SIZE ∈ {256, 512} for element-wise
+- For matmul fusion: BLOCK_M/N ∈ {32, 64}, BLOCK_K ∈ {32}
+- If registers > 128: reduce BLOCK_* by half
+- Trade-off: recompute cheap ops (e.g., x*0.5) vs store intermediate
+
+When to Recompute vs Keep:
+- Keep: expensive ops (exp, log, div, sqrt)
+- Recompute: cheap ops (add, mul, max) if register pressure high
+- Example: `y = relu(x); z = y * scale` → keep y
+- Example: `y = x * 0.5; z = y + bias` → can recompute y if needed
+
+Autotune:
+- 2-3 BLOCK_SIZE configs, always include smaller fallback
+
+
+
+[CURRENT CODE]
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def fused_gemm_bn_scale_softmax_kernel(
+    a_ptr, b_ptr, bias_ptr, bn_weight_ptr, bn_bias_ptr, bn_mean_ptr, bn_var_ptr,
+    scale_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+    bn_eps: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+    
+    for k in range(0, K, BLOCK_K):
+        a_mask = (offs_m[:, None] < M) & ((k + offs_k[None, :]) < K)
+        b_mask = ((k + offs_k[:, None]) < K) & (offs_n[None, :] < N)
+        
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+        
+        acc += tl.dot(a, b, allow_tf32=True)
+        
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+    
+    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc += bias[None, :]
+    
+    bn_mean = tl.load(bn_mean_ptr + offs_n, mask=offs_n < N, other=0.0)
+    bn_var = tl.load(bn_var_ptr + offs_n, mask=offs_n < N, other=0.0)
+    bn_weight = tl.load(bn_weight_ptr + offs_n, mask=offs_n < N, other=1.0)
+    bn_bias = tl.load(bn_bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    
+    acc = (acc - bn_mean[None, :]) * tl.rsqrt(bn_var[None, :] + bn_eps)
+    acc = acc * bn_weight[None, :] + bn_bias[None, :]
+    
+    scale = tl.load(scale_ptr)
+    acc = scale * acc
+    
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, acc, mask=c_mask)
+
+
+@triton.jit
+def online_softmax_kernel(
+    x_ptr, output_ptr,
+    M, N,
+    stride_xm, stride_xn, stride_om, stride_on,
+    BLOCK_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    
+    offs_m = pid_m
+    offs_n = tl.arange(0, BLOCK_N)
+    
+    max_val = float('-inf')
+    for n in range(0, N, BLOCK_N):
+        curr_offs_n = n + offs_n
+        mask = curr_offs_n < N
+        x_ptrs = x_ptr + offs_m * stride_xm + curr_offs_n * stride_xn
+        x = tl.load(x_ptrs, mask=mask, other=float('-inf'))
+        max_val = tl.maximum(max_val, tl.max(x, axis=0))
+    
+    sum_exp = 0.0
+    for n in range(0, N, BLOCK_N):
+        curr_offs_n = n + offs_n
+        mask = curr_offs_n < N
+        x_ptrs = x_ptr + offs_m * stride_xm + curr_offs_n * stride_xn
+        x = tl.load(x_ptrs, mask=mask, other=0.0)
+        exp_x = tl.exp(x - max_val)
+        sum_exp += tl.sum(tl.where(mask, exp_x, 0.0), axis=0)
+    
+    for n in range(0, N, BLOCK_N):
+        curr_offs_n = n + offs_n
+        mask = curr_offs_n < N
+        x_ptrs = x_ptr + offs_m * stride_xm + curr_offs_n * stride_xn
+        x = tl.load(x_ptrs, mask=mask, other=0.0)
+        exp_x = tl.exp(x - max_val)
+        output = exp_x / sum_exp
+        
+        output_ptrs = output_ptr + offs_m * stride_om + curr_offs_n * stride_on
+        tl.store(output_ptrs, output, mask=mask)
+
+
+def fused_gemm_bn_scale_softmax(x, weight, bias, bn_weight, bn_bias, bn_mean, bn_var, scale, bn_eps):
+    M, K = x.shape
+    N = weight.shape[0]
+    
+    intermediate = torch.empty((M, N), device=x.device, dtype=x.dtype)
+    b = weight.t().contiguous()
+    
+    BLOCK_M = 64
+    BLOCK_N = 64
+    BLOCK_K = 32
+    
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+    fused_gemm_bn_scale_softmax_kernel[grid](
+        x, b, bias, bn_weight, bn_bias, bn_mean, bn_var, scale, intermediate,
+        M, N, K,
+        x.stride(0), x.stride(1), b.stride(0), b.stride(1), 
+        intermediate.stride(0), intermediate.stride(1),
+        bn_eps,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+    )
+    
+    output = torch.empty((M, N), device=x.device, dtype=x.dtype)
+    
+    grid = (M,)
+    online_softmax_kernel[grid](
+        intermediate, output,
+        M, N,
+        intermediate.stride(0), intermediate.stride(1),
+        output.stride(0), output.stride(1),
+        BLOCK_N=256,
+    )
+    
+    return output
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, bn_eps=1e-5, bn_momentum=0.1, scale_shape=(1,)):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.bias = nn.Parameter(torch.randn(out_features))
+        self.bn_weight = nn.Parameter(torch.ones(out_features))
+        self.bn_bias = nn.Parameter(torch.zeros(out_features))
+        self.register_buffer('bn_mean', torch.zeros(out_features))
+        self.register_buffer('bn_var', torch.ones(out_features))
+        self.scale = nn.Parameter(torch.ones(scale_shape))
+        self.bn_eps = bn_eps
+
+    def forward(self, x):
+        return fused_gemm_bn_scale_softmax(
+            x, self.weight, self.bias, 
+            self.bn_weight, self.bn_bias, self.bn_mean, self.bn_var,
+            self.scale, self.bn_eps
+        )
+```
+
+[NCU PROFILING METRICS]
+{
+  "fused_gemm_bn_scale_softmax_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 43.69,
+    "launch__grid_size": 2048,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 24.02,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 16.04,
+    "lts__t_sector_hit_rate.pct": 96.35
+  },
+  "online_softmax_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 35.65,
+    "launch__grid_size": 1024,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 64.46,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 52.81,
+    "lts__t_sector_hit_rate.pct": 75.03
+  }
+}
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+## CRITICAL — Code MUST compile and run:
+1. EVERY kernel function MUST have `@triton.jit` decorator
+2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+3. BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+4. `tl.program_id(axis)` only supports axis = 0, 1, 2
+5. No `continue`, `break`, `return` inside loops — use masking
+6. No tensor indexing with loop vars: `x[:, i]` is INVALID
+7. mask shape MUST match data shape in tl.load/tl.store
+
+## Missing Triton Functions (implement manually):
+- tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+## OUTPUT FORMAT (STRICT):
+1. Imports: torch, torch.nn, triton, triton.language as tl
+2. @triton.jit decorated kernel function(s)
+3. Wrapper function(s) for grid calculation and kernel launch
+4. class ModelNew(nn.Module) that calls your kernels
+
+Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

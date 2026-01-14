@@ -117,9 +117,9 @@ def query_server(
             from openai import OpenAI
             # client = OpenAI(api_key=OPENAI_KEY)
             client = OpenAI(api_key=OPENAI_KEY, base_url="https://api.jiekou.ai/openai/v1")
-            model = "gpt-5.1"
-            use_responses_api = False  # This API uses Responses API
-
+            # model = "gpt-5.1"
+            model="claude-opus-4-5-20251101"
+            # use_responses_api=True
         case _:
             raise NotImplementedError(f"Unsupported server_type: {server_type}")
 

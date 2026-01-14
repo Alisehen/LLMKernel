@@ -1,0 +1,10 @@
+```json
+{
+  "worth_optimizing": "yes",
+  "reason": "Two separate kernel launches with intermediate materialization of full tensor between fused operations and logsumexp creates unnecessary memory traffic.",
+  "bottleneck": "The fused_groupnorm_tanh_hardswish_residual kernel writes full (N, C, H, W) tensor to global memory, then logsumexp_kernel reads it back entirely. This intermediate materialization causes redundant DRAM traffic of ~128*64*128*128*4 bytes = 512MB per forward pass.",
+  "optimisation method": "Fuse logsumexp reduction directly into the groupnorm kernel by computing running max and sum_exp accumulators during the normalization pass, eliminating the intermediate tensor write/read and reducing memory traffic by ~50%.",
+  "modification plan": "Extend fused_groupnorm_tanh_hardswish_residual_kernel to maintain per-(N,HW) max and sum_exp accumulators across the channel dimension during the second pass. After computing x_res for each channel, immediately update the logsumexp accumulators instead of storing to memory. Add a final write that outputs both x_res (if needed downstream) and the logsumexp result, or only logsumexp if x_res is not reused.",
+  "expected_speedup": "25-35%"
+}
+```

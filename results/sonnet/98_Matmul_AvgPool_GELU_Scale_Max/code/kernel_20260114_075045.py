@@ -1,0 +1,161 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4, num_stages=2),
+    ],
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def matmul_kernel(
+    x_ptr, weight_ptr, bias_ptr, output_ptr,
+    M, N, K,
+    stride_xm, stride_xk,
+    stride_wn, stride_wk,
+    stride_om, stride_on,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    
+    x_ptrs = x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk
+    w_ptrs = weight_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk
+    
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    for k in range(0, K, BLOCK_K):
+        mask_k = offs_k < K - k
+        mask_x = (offs_m[:, None] < M) & (mask_k[None, :])
+        mask_w = (offs_n[:, None] < N) & (mask_k[None, :])
+        
+        x_block = tl.load(x_ptrs, mask=mask_x, other=0.0)
+        w_block = tl.load(w_ptrs, mask=mask_w, other=0.0)
+        
+        acc += tl.dot(x_block, tl.trans(w_block), allow_tf32=True)
+        
+        x_ptrs += BLOCK_K * stride_xk
+        w_ptrs += BLOCK_K * stride_wk
+    
+    bias_vals = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc += bias_vals[None, :]
+    
+    output_ptrs = output_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
+    mask_out = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(output_ptrs, acc, mask=mask_out)
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 128}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 256}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 128}, num_warps=8, num_stages=2),
+    ],
+    key=['M', 'N', 'pool_kernel_size'],
+)
+@triton.jit
+def fused_pool_gelu_scale_reduce_kernel(
+    input_ptr, output_ptr,
+    M, N,
+    pool_kernel_size, scale_factor,
+    stride_m, stride_n,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    
+    offs_m = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask_m = offs_m < M
+    
+    N_pooled = N // pool_kernel_size
+    inv_pool_size = 1.0 / tl.cast(pool_kernel_size, tl.float32)
+    sqrt_2_over_pi = 0.7978845608028654
+    c = 0.044715
+    
+    max_val = tl.full((BLOCK_SIZE,), -float('inf'), dtype=tl.float32)
+    
+    for n_pool in range(N_pooled):
+        pool_sum = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+        
+        base_n = n_pool * pool_kernel_size
+        
+        for k in range(pool_kernel_size):
+            n_idx = base_n + k
+            ptrs = input_ptr + offs_m * stride_m + n_idx * stride_n
+            vals = tl.load(ptrs, mask=mask_m, other=0.0)
+            pool_sum += vals
+        
+        pool_avg = pool_sum * inv_pool_size
+        
+        x = pool_avg
+        x_sq = x * x
+        x_cubed = x_sq * x
+        tanh_arg = sqrt_2_over_pi * (x + c * x_cubed)
+        
+        tanh_arg = tl.where(tanh_arg > 10.0, 10.0, tanh_arg)
+        tanh_arg = tl.where(tanh_arg < -10.0, -10.0, tanh_arg)
+        
+        exp_2x = tl.exp(2.0 * tanh_arg)
+        tanh_val = (exp_2x - 1.0) / (exp_2x + 1.0)
+        
+        gelu_val = 0.5 * x * (1.0 + tanh_val)
+        scaled_val = gelu_val * scale_factor
+        
+        max_val = tl.maximum(max_val, scaled_val)
+    
+    output_ptrs = output_ptr + offs_m
+    tl.store(output_ptrs, max_val, mask=mask_m)
+
+
+def fused_forward(x, weight, bias, pool_kernel_size, scale_factor):
+    M, K = x.shape
+    N = weight.shape[0]
+    
+    matmul_out = torch.empty((M, N), device=x.device, dtype=x.dtype)
+    
+    grid_matmul = lambda meta: (
+        triton.cdiv(M, meta['BLOCK_M']),
+        triton.cdiv(N, meta['BLOCK_N'])
+    )
+    
+    matmul_kernel[grid_matmul](
+        x, weight, bias, matmul_out,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        weight.stride(0), weight.stride(1),
+        matmul_out.stride(0), matmul_out.stride(1),
+    )
+    
+    output = torch.empty((M,), device=x.device, dtype=x.dtype)
+    
+    grid_fused = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE']),)
+    
+    fused_pool_gelu_scale_reduce_kernel[grid_fused](
+        matmul_out, output,
+        M, N,
+        pool_kernel_size, scale_factor,
+        matmul_out.stride(0), matmul_out.stride(1),
+    )
+    
+    return output
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, pool_kernel_size, scale_factor):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.bias = nn.Parameter(torch.randn(out_features))
+        self.pool_kernel_size = pool_kernel_size
+        self.scale_factor = scale_factor
+
+    def forward(self, x):
+        return fused_forward(x, self.weight, self.bias, self.pool_kernel_size, self.scale_factor)

@@ -1,0 +1,93 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def fused_elementwise_kernel(
+    x_ptr, out_ptr,
+    N,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Fused elementwise operations: swish -> div -> clamp -> tanh -> clamp
+    """
+    pid = tl.program_id(0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < N
+    
+    # Load input
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    
+    # Swish activation: x * sigmoid(x)
+    sigmoid_x = 1.0 / (1.0 + tl.exp(-x))
+    x = x * sigmoid_x
+    
+    # Divide by 2.0
+    x = x / 2.0
+    
+    # Clamp between -1.0 and 1.0
+    x = tl.minimum(tl.maximum(x, -1.0), 1.0)
+    
+    # Tanh activation
+    exp_2x = tl.exp(2.0 * x)
+    x = (exp_2x - 1.0) / (exp_2x + 1.0)
+    
+    # Clamp between -1.0 and 1.0 again
+    x = tl.minimum(tl.maximum(x, -1.0), 1.0)
+    
+    # Store output
+    tl.store(out_ptr + offsets, x, mask=mask)
+
+
+def fused_elementwise(x):
+    """
+    Apply fused elementwise operations using Triton kernel
+    """
+    N = x.numel()
+    out = torch.empty_like(x)
+    
+    BLOCK_SIZE = 1024
+    grid = lambda meta: (triton.cdiv(N, meta['BLOCK_SIZE']),)
+    
+    fused_elementwise_kernel[grid](
+        x, out, N,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model using cuBLAS for GEMM and Triton for fused elementwise ops
+    """
+    def __init__(self, in_features, out_features, bias=True):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.bias = nn.Parameter(torch.randn(out_features)) if bias else None
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_features).
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_features).
+        """
+        # Stage 1: Use optimized cuBLAS for GEMM
+        x = torch.matmul(x, self.weight.t())
+        if self.bias is not None:
+            x = x + self.bias
+        
+        # Stage 2: Fused elementwise operations in Triton
+        # Flatten for efficient processing
+        original_shape = x.shape
+        x_flat = x.reshape(-1)
+        out_flat = fused_elementwise(x_flat)
+        out = out_flat.reshape(original_shape)
+        
+        return out
+```

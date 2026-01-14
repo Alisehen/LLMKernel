@@ -12,7 +12,7 @@ Kernel Benchmark 统计分析脚本
 import numpy as np
 from pathlib import Path
 
-def calculate_statistics(summary_file='gpt_table2.md'):
+def calculate_statistics(summary_file='sonnet.md'):
     """从summary_table.md计算统计指标，加速比统计只基于成功生成的案例"""
 
     summary_path = Path(__file__).parent / summary_file

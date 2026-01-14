@@ -1,0 +1,10 @@
+```json
+{
+  "worth_optimizing": "yes",
+  "reason": "The GroupNorm kernel has severe inefficiency with 3 separate passes over data (mean, variance, normalize) causing excessive memory traffic.",
+  "bottleneck": "GroupNorm kernel performs 3 sequential passes over the same data (mean computation, variance computation, normalization), each requiring full memory reads. This causes 3x memory bandwidth usage compared to optimal single-pass approach.",
+  "optimisation method": "Replace 3-pass GroupNorm with Welford's online algorithm in a single pass: compute running mean and M2 (sum of squared differences) simultaneously in one loop, then normalize in the same pass using cached values.",
+  "modification plan": "Rewrite groupnorm_kernel to use single loop with Welford's algorithm: accumulate count, mean, and M2 in one pass over channels. After loop completes, compute variance from M2, then immediately normalize and write output in a second loop (or fuse if possible). This reduces memory reads from 3N to 2N per group.",
+  "expected_speedup": "25-35%"
+}
+```

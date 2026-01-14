@@ -1,0 +1,233 @@
+Fix the Triton kernel errors. Generate correct code.
+
+## ERROR LOG
+```
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 576, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20260114_074311_98_Matmul_AvgPool_GELU_Scale_Max_openai_deepseek/98_Matmul_AvgPool_GELU_Scale_Max/code/kernel_20260114_075024.py", line 168, in forward
+    return fused_forward(x, self.weight, self.bias, self.pool_kernel_size, self.scale_factor)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20260114_074311_98_Matmul_AvgPool_GELU_Scale_Max_openai_deepseek/98_Matmul_AvgPool_GELU_Scale_Max/code/kernel_20260114_075024.py", line 134, in fused_forward
+    matmul_kernel[grid_matmul](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 419, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 238, in run
+    benchmark()
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 227, in benchmark
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 227, in <dictcomp>
+    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 137, in _bench
+    raise ValueError(f"Conflicting meta-parameters: {', '.join(conflicts)}."
+ValueError: Conflicting meta-parameters: BLOCK_N, BLOCK_M, BLOCK_K. Make sure that you don't re-define auto-tuned symbols.
+```
+
+## Broken Code
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4, num_stages=2),
+    ],
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def matmul_kernel(
+    x_ptr, weight_ptr, bias_ptr, output_ptr,
+    M, N, K,
+    stride_xm, stride_xk,
+    stride_wn, stride_wk,
+    stride_om, stride_on,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    
+    x_ptrs = x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk
+    w_ptrs = weight_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk
+    
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    for k in range(0, K, BLOCK_K):
+        mask_k = offs_k < K - k
+        mask_x = (offs_m[:, None] < M) & (mask_k[None, :])
+        mask_w = (offs_n[:, None] < N) & (mask_k[None, :])
+        
+        x_block = tl.load(x_ptrs, mask=mask_x, other=0.0)
+        w_block = tl.load(w_ptrs, mask=mask_w, other=0.0)
+        
+        acc += tl.dot(x_block, tl.trans(w_block), allow_tf32=True)
+        
+        x_ptrs += BLOCK_K * stride_xk
+        w_ptrs += BLOCK_K * stride_wk
+    
+    bias_vals = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc += bias_vals[None, :]
+    
+    output_ptrs = output_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
+    mask_out = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(output_ptrs, acc, mask=mask_out)
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 128}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 256}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 128}, num_warps=8, num_stages=2),
+    ],
+    key=['M', 'N', 'pool_kernel_size'],
+)
+@triton.jit
+def fused_pool_gelu_scale_reduce_kernel(
+    input_ptr, output_ptr,
+    M, N,
+    pool_kernel_size, scale_factor,
+    stride_m, stride_n,
+    BLOCK_M: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    
+    offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offs_m < M
+    
+    N_pooled = N // pool_kernel_size
+    inv_pool_size = 1.0 / tl.cast(pool_kernel_size, tl.float32)
+    sqrt_2_over_pi = 0.7978845608028654
+    c = 0.044715
+    
+    max_val = tl.full((BLOCK_M,), -float('inf'), dtype=tl.float32)
+    
+    for n_pool in range(N_pooled):
+        pool_sum = tl.zeros((BLOCK_M,), dtype=tl.float32)
+        
+        base_n = n_pool * pool_kernel_size
+        
+        for k in range(pool_kernel_size):
+            n_idx = base_n + k
+            ptrs = input_ptr + offs_m * stride_m + n_idx * stride_n
+            vals = tl.load(ptrs, mask=mask_m, other=0.0)
+            pool_sum += vals
+        
+        pool_avg = pool_sum * inv_pool_size
+        
+        x = pool_avg
+        x_sq = x * x
+        x_cubed = x_sq * x
+        tanh_arg = sqrt_2_over_pi * (x + c * x_cubed)
+        
+        tanh_arg = tl.where(tanh_arg > 10.0, 10.0, tanh_arg)
+        tanh_arg = tl.where(tanh_arg < -10.0, -10.0, tanh_arg)
+        
+        exp_2x = tl.exp(2.0 * tanh_arg)
+        tanh_val = (exp_2x - 1.0) / (exp_2x + 1.0)
+        
+        gelu_val = 0.5 * x * (1.0 + tanh_val)
+        scaled_val = gelu_val * scale_factor
+        
+        max_val = tl.maximum(max_val, scaled_val)
+    
+    output_ptrs = output_ptr + offs_m
+    tl.store(output_ptrs, max_val, mask=mask_m)
+
+
+def fused_forward(x, weight, bias, pool_kernel_size, scale_factor):
+    M, K = x.shape
+    N = weight.shape[0]
+    
+    matmul_out = torch.empty((M, N), device=x.device, dtype=x.dtype)
+    
+    BLOCK_M = 128
+    BLOCK_N = 128
+    BLOCK_K = 32
+    
+    grid_matmul = (
+        triton.cdiv(M, BLOCK_M),
+        triton.cdiv(N, BLOCK_N)
+    )
+    
+    matmul_kernel[grid_matmul](
+        x, weight, bias, matmul_out,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        weight.stride(0), weight.stride(1),
+        matmul_out.stride(0), matmul_out.stride(1),
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+    )
+    
+    output = torch.empty((M,), device=x.device, dtype=x.dtype)
+    
+    BLOCK_M_FUSED = 128
+    grid_fused = (triton.cdiv(M, BLOCK_M_FUSED),)
+    
+    fused_pool_gelu_scale_reduce_kernel[grid_fused](
+        matmul_out, output,
+        M, N,
+        pool_kernel_size, scale_factor,
+        matmul_out.stride(0), matmul_out.stride(1),
+        BLOCK_M=BLOCK_M_FUSED,
+    )
+    
+    return output
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, pool_kernel_size, scale_factor):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.bias = nn.Parameter(torch.randn(out_features))
+        self.pool_kernel_size = pool_kernel_size
+        self.scale_factor = scale_factor
+
+    def forward(self, x):
+        return fused_forward(x, self.weight, self.bias, self.pool_kernel_size, self.scale_factor)
+```
+
+## CRITICAL — These cause 60%+ of failures:
+1. EVERY kernel function MUST have `@triton.jit` decorator — MANDATORY
+2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+3. BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+4. `tl.program_id(axis)` only supports axis = 0, 1, 2
+5. No `continue`, `break`, `return` inside loops — use masking
+6. No tensor indexing with loop vars: `x[:, i]` is INVALID
+7. mask shape MUST match data shape in tl.load/tl.store
+
+## Missing Triton Functions (implement manually):
+- tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+## OUTPUT FORMAT (STRICT):
+1. Imports: torch, torch.nn, triton, triton.language as tl (and math if needed)
+2. @triton.jit decorated kernel function(s)
+3. Wrapper function(s) for grid calculation and kernel launch
+4. class ModelNew(nn.Module) — REQUIRED
+
+Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <corrected code>
+```

@@ -1,0 +1,103 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8, num_stages=2),
+    ],
+    key=['N'],
+)
+@triton.jit
+def fused_relu_hardswish_kernel(
+    x_ptr, out_ptr,
+    N,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < N
+    
+    # Load input - single load, stays in registers
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0, eviction_policy='evict_last')
+    
+    # Fused computation: ReLU -> HardSwish
+    # ReLU: max(x, 0)
+    x_relu = tl.maximum(x, 0.0)
+    
+    # HardSwish: x * clamp((x + 3) / 6, 0, 1)
+    # Optimized: (x + 3) / 6 = x * (1/6) + 0.5
+    # This reduces one add operation
+    x_scaled = x_relu * 0.16666666666666666 + 0.5
+    
+    # Clamp to [0, 1] using fused min/max
+    clamped = tl.minimum(tl.maximum(x_scaled, 0.0), 1.0)
+    
+    # Final result: x_relu * clamped
+    result = x_relu * clamped
+    
+    # Single store - final output only
+    tl.store(out_ptr + offs, result, mask=mask, eviction_policy='evict_first')
+
+
+@triton.jit
+def fused_relu_hardswish_kernel_small(
+    x_ptr, out_ptr,
+    N,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < N
+    
+    # Load input
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+    
+    # Fused ReLU + HardSwish computation
+    x_relu = tl.maximum(x, 0.0)
+    x_scaled = x_relu * 0.16666666666666666 + 0.5
+    clamped = tl.minimum(tl.maximum(x_scaled, 0.0), 1.0)
+    result = x_relu * clamped
+    
+    # Store result
+    tl.store(out_ptr + offs, result, mask=mask)
+
+
+def fused_relu_hardswish(x):
+    N = x.numel()
+    out = torch.empty_like(x)
+    
+    # Optimize for memory bandwidth (93% DRAM utilization indicates memory-bound)
+    # Use larger blocks to maximize coalescing and reduce launch overhead
+    if N >= 512 * 1024:
+        # Large tensors: use autotuned kernel with large blocks
+        grid = lambda meta: (triton.cdiv(N, meta['BLOCK_SIZE']),)
+        fused_relu_hardswish_kernel[grid](x, out, N)
+    else:
+        # Small tensors: use fixed configuration
+        BLOCK_SIZE = 256
+        grid = (triton.cdiv(N, BLOCK_SIZE),)
+        fused_relu_hardswish_kernel_small[grid](
+            x, out, N,
+            BLOCK_SIZE=BLOCK_SIZE,
+            num_warps=4,
+            num_stages=2,
+        )
+    
+    return out
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = fused_relu_hardswish(x)
+        return x
+```

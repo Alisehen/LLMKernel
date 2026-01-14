@@ -1,0 +1,227 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU: 4090
+
+[OPTIMIZATION STAGE]
+
+## Current Optimization Stage
+
+Focus: Grid layout & indexing for FUSED operations.
+
+Key Principle:
+- All fused ops share the SAME grid AND the SAME (offsets, mask) tuple
+- Grid covers OUTPUT tensor dimensions
+
+Hard Rules:
+- Every fused op MUST use identical offset calculation
+- Every fused op MUST use identical boundary mask
+- If broadcast needed: explicit `[None, :]` or `[:, None]`, NOT different offsets
+- Element-wise: 1D grid, single `offs = pid * BLOCK + tl.arange(0, BLOCK)`
+- Matmul fusion: 2D grid, `offs_m/offs_n` shared by bias add & activation
+
+Verification:
+- Check: all tl.load/tl.store use same `offsets` variable
+- Check: all masks derived from same boundary condition
+- If ANY op needs different indexing → do NOT fuse, split kernel
+
+
+
+[CURRENT CODE]
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+import math
+
+@triton.jit
+def fused_gemm_bias_hardtanh_mish_kernel(
+    a_ptr, b_ptr, bias_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k in range(0, K, BLOCK_K):
+        mask_a = (offs_m[:, None] < M) & (offs_k[None, :] < K - k)
+        mask_b = (offs_k[:, None] < K - k) & (offs_n[None, :] < N)
+        a = tl.load(a_ptrs, mask=mask_a, other=0.0)
+        b = tl.load(b_ptrs, mask=mask_b, other=0.0)
+        acc += tl.dot(a, b, allow_tf32=True)
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Fused: add bias
+    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc += bias[None, :]
+
+    # Fused: Hardtanh (clamp between -1 and 1)
+    acc = tl.minimum(tl.maximum(acc, -1.0), 1.0)
+
+    # Fused: Mish = x * tanh(softplus(x)) = x * tanh(ln(1 + exp(x)))
+    # softplus(x) = ln(1 + exp(x))
+    softplus = tl.log(1.0 + tl.exp(acc))
+    # tanh(x) = (exp(2*x) - 1) / (exp(2*x) + 1)
+    exp_2x = tl.exp(2.0 * softplus)
+    tanh_val = (exp_2x - 1.0) / (exp_2x + 1.0)
+    acc = acc * tanh_val
+
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    mask_c = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, acc, mask=mask_c)
+
+
+@triton.jit
+def groupnorm_kernel(
+    x_ptr, out_ptr, gamma_ptr, beta_ptr,
+    M, N, num_groups,
+    stride_xm, stride_xn, stride_om, stride_on,
+    eps: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    
+    batch_idx = pid // num_groups
+    group_idx = pid % num_groups
+    
+    channels_per_group = N // num_groups
+    start_channel = group_idx * channels_per_group
+    
+    # Compute mean
+    mean_val = 0.0
+    for c_offset in range(0, channels_per_group, BLOCK_SIZE):
+        offs = start_channel + c_offset + tl.arange(0, BLOCK_SIZE)
+        mask = offs < start_channel + channels_per_group
+        x_ptrs = x_ptr + batch_idx * stride_xm + offs * stride_xn
+        x = tl.load(x_ptrs, mask=mask, other=0.0)
+        mean_val += tl.sum(x)
+    mean_val = mean_val / channels_per_group
+    
+    # Compute variance
+    var_val = 0.0
+    for c_offset in range(0, channels_per_group, BLOCK_SIZE):
+        offs = start_channel + c_offset + tl.arange(0, BLOCK_SIZE)
+        mask = offs < start_channel + channels_per_group
+        x_ptrs = x_ptr + batch_idx * stride_xm + offs * stride_xn
+        x = tl.load(x_ptrs, mask=mask, other=0.0)
+        diff = x - mean_val
+        var_val += tl.sum(diff * diff)
+    var_val = var_val / channels_per_group
+    
+    rstd = 1.0 / tl.sqrt(var_val + eps)
+    
+    # Normalize and apply affine transform
+    for c_offset in range(0, channels_per_group, BLOCK_SIZE):
+        offs = start_channel + c_offset + tl.arange(0, BLOCK_SIZE)
+        mask = offs < start_channel + channels_per_group
+        x_ptrs = x_ptr + batch_idx * stride_xm + offs * stride_xn
+        out_ptrs = out_ptr + batch_idx * stride_om + offs * stride_on
+        
+        x = tl.load(x_ptrs, mask=mask, other=0.0)
+        gamma = tl.load(gamma_ptr + offs, mask=mask, other=1.0)
+        beta = tl.load(beta_ptr + offs, mask=mask, other=0.0)
+        
+        normalized = (x - mean_val) * rstd
+        out = normalized * gamma + beta
+        
+        tl.store(out_ptrs, out, mask=mask)
+
+
+def fused_gemm_bias_hardtanh_mish(x, weight, bias):
+    M, K = x.shape
+    N = weight.shape[0]
+    c = torch.empty((M, N), device=x.device, dtype=x.dtype)
+    b = weight.t().contiguous()
+    
+    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']), triton.cdiv(N, META['BLOCK_N']))
+    fused_gemm_bias_hardtanh_mish_kernel[grid](
+        x, b, bias, c, M, N, K,
+        x.stride(0), x.stride(1), b.stride(0), b.stride(1), c.stride(0), c.stride(1),
+        BLOCK_M=128, BLOCK_N=128, BLOCK_K=32,
+    )
+    return c
+
+
+def groupnorm_triton(x, num_groups, gamma, beta, eps=1e-5):
+    M, N = x.shape
+    out = torch.empty_like(x)
+    
+    grid = lambda META: (M * num_groups,)
+    groupnorm_kernel[grid](
+        x, out, gamma, beta,
+        M, N, num_groups,
+        x.stride(0), x.stride(1), out.stride(0), out.stride(1),
+        eps=eps,
+        BLOCK_SIZE=128,
+    )
+    return out
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, bias_shape, num_groups):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.num_groups = num_groups
+        self.gamma = nn.Parameter(torch.ones(out_features))
+        self.beta = nn.Parameter(torch.zeros(out_features))
+
+    def forward(self, x):
+        x = fused_gemm_bias_hardtanh_mish(x, self.weight, self.bias)
+        x = groupnorm_triton(x, self.num_groups, self.gamma, self.beta)
+        return x
+```
+
+[NCU PROFILING METRICS]
+{
+  "fused_gemm_bias_hardtanh_mish_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 44.56,
+    "launch__grid_size": 512,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 8.33,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 21.86,
+    "lts__t_sector_hit_rate.pct": 90.85
+  },
+  "groupnorm_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 85.09,
+    "launch__grid_size": 262144,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 84.42,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 15.09,
+    "lts__t_sector_hit_rate.pct": 66.51
+  }
+}
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+## CRITICAL — Code MUST compile and run:
+1. EVERY kernel function MUST have `@triton.jit` decorator
+2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+3. BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+4. `tl.program_id(axis)` only supports axis = 0, 1, 2
+5. No `continue`, `break`, `return` inside loops — use masking
+6. No tensor indexing with loop vars: `x[:, i]` is INVALID
+7. mask shape MUST match data shape in tl.load/tl.store
+
+## Missing Triton Functions (implement manually):
+- tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+## OUTPUT FORMAT (STRICT):
+1. Imports: torch, torch.nn, triton, triton.language as tl
+2. @triton.jit decorated kernel function(s)
+3. Wrapper function(s) for grid calculation and kernel launch
+4. class ModelNew(nn.Module) that calls your kernels
+
+Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

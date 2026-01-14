@@ -1,0 +1,193 @@
+You are optimizing a Triton kernel based on algorithmic analysis.
+
+# PyTorch Reference (Target Behavior)
+
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs a sequence of operations:
+        - Matrix multiplication
+        - Summation
+        - Max
+        - Average pooling
+        - LogSumExp
+        - LogSumExp
+    """
+    def __init__(self, in_features, out_features):
+        super(Model, self).__init__()
+        self.linear = nn.Linear(in_features, out_features)
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_features).
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, 1).
+        """
+        x = self.linear(x)  # (batch_size, out_features)
+        x = torch.sum(x, dim=1, keepdim=True) # (batch_size, 1)
+        x = torch.max(x, dim=1, keepdim=True)[0] # (batch_size, 1)
+        x = torch.mean(x, dim=1, keepdim=True) # (batch_size, 1)
+        x = torch.logsumexp(x, dim=1, keepdim=True) # (batch_size, 1)
+        x = torch.logsumexp(x, dim=1, keepdim=True) # (batch_size, 1)
+        return x
+
+batch_size = 1024
+in_features  = 8192  
+out_features = 8192
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features)]
+
+def get_init_inputs():
+    return [in_features, out_features]
+```
+
+**CRITICAL**: Study the PyTorch code carefully to understand:
+- What does `forward()` return? (full output sequence vs final hidden state only)
+- What is the computational pattern?
+- What are the input/output shapes?
+
+Your optimized kernel MUST match this exact behavior.
+
+---
+
+# Analysis Results
+
+**Bottleneck**: Each thread block processes one batch element independently, loading w_sum redundantly 1024 times from global memory. The low L2 cache hit rate (11.51%) confirms excessive memory traffic for the shared weight vector.
+
+**Optimization Strategy**: Memory Layout Optimization - Load w_sum into shared memory once per block and reuse across multiple batch elements processed by the same block, or use a tiled approach where multiple batch elements share the cached weight vector.
+
+**Implementation Plan**: Modify the kernel to process multiple batch elements per thread block (e.g., 4-8 batch elements). Load w_sum tiles into shared memory once, then have all threads in the block reuse this cached data for their respective batch elements. This reduces global memory reads of w_sum by a factor equal to batch elements per block.
+
+**Expected Speedup**: 40-60%
+
+---
+
+# Current Kernel (needs optimization)
+
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def fused_linear_sum_kernel(
+    x_ptr, w_sum_ptr, bias_sum_ptr, out_ptr,
+    B, K,
+    stride_xb, stride_xk,
+    BLOCK_K: tl.constexpr,
+):
+    # Each program handles one batch element
+    pid_b = tl.program_id(0)
+    
+    # Compute dot product of x[pid_b, :] with w_sum[:]
+    acc = tl.zeros((BLOCK_K,), dtype=tl.float32)
+    
+    for k_start in range(0, K, BLOCK_K):
+        offs_k = k_start + tl.arange(0, BLOCK_K)
+        mask = offs_k < K
+        
+        x_vals = tl.load(x_ptr + pid_b * stride_xb + offs_k * stride_xk, mask=mask, other=0.0)
+        w_vals = tl.load(w_sum_ptr + offs_k, mask=mask, other=0.0)
+        
+        acc += x_vals * w_vals
+    
+    # Sum the accumulator to get scalar result
+    result_sum = tl.sum(acc, axis=0)
+    
+    # Add bias sum
+    bias_sum = tl.load(bias_sum_ptr)
+    result = result_sum + bias_sum
+    
+    # Store result - out_ptr + pid_b is a scalar pointer, result is now scalar
+    tl.store(out_ptr + pid_b, result)
+
+
+def fused_linear_sum(x, w_sum, bias_sum):
+    B, K = x.shape
+    out = torch.empty((B,), device=x.device, dtype=x.dtype)
+    
+    BLOCK_K = 1024
+    grid = (B,)
+    
+    fused_linear_sum_kernel[grid](
+        x, w_sum, bias_sum, out,
+        B, K,
+        x.stride(0), x.stride(1),
+        BLOCK_K=BLOCK_K,
+    )
+    return out.unsqueeze(1)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features):
+        super(ModelNew, self).__init__()
+        self.linear = nn.Linear(in_features, out_features)
+        self.in_features = in_features
+        self.out_features = out_features
+        
+    def forward(self, x):
+        # Precompute the sum of weights across output dimension
+        # W is (out_features, in_features), we need sum over dim=0 -> (in_features,)
+        w_sum = self.linear.weight.sum(dim=0)  # (in_features,)
+        bias_sum = self.linear.bias.sum().view(1)  # scalar as 1-element tensor
+        
+        # The result is x @ w_sum + bias_sum
+        # x: (B, in_features), w_sum: (in_features,) -> result: (B,)
+        result = fused_linear_sum(x, w_sum, bias_sum)
+        
+        return result
+```
+
+---
+
+# Your Task
+
+Implement the optimization strategy above. Focus on the specific bottleneck identified.
+
+## Key Requirements
+
+1. **Preserve correctness**: Maintain the same input/output behavior
+2. **Apply the optimization**: Follow the implementation plan exactly
+3. **Use valid Triton syntax**:
+   - Every kernel MUST have `@triton.jit` decorator
+   - Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+   - BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+   - No `continue`, `break`, `return` inside kernels (use masking)
+   - Prefer `tl.dot(a, b, allow_tf32=True)` for matmul operations
+
+4. **CRITICAL for RNN/GRU/LSTM Persistent Kernels**:
+   - Time loop MUST be inside @triton.jit kernel, NOT in Python forward()
+   - **HYBRID computation strategy** (CRITICAL for performance):
+     * Precompute input-side gates OUTSIDE kernel: `gates_x = (T*B, In) @ W_ih` (ONE large GEMM)
+     * INSIDE kernel: only recurrent-side: `for t: gates_h = h @ W_hh` (T small GEMMs)
+   - CORRECT (FAST - use this):
+     ```python
+     # Python forward():
+     gates_x_all = x.reshape(T*B, In) @ W_ih + b_ih  # ONE large GEMM
+     gates_x_all = gates_x_all.view(T, B, 3*H)
+     gru_persistent_kernel[grid](gates_x_all, h0, W_hh, ...)  # Launch ONCE
+
+     @triton.jit
+     def gru_persistent_kernel(gates_x_ptr, h_ptr, W_hh_ptr, ...):
+         for t in range(T):  # Inside kernel
+             gates_x_t = tl.load(gates_x_ptr + t*...)  # Precomputed
+             gates_h = h @ W_hh  # Only recurrent GEMM
+             h = (1-z)*n + z*h   # Fuse and update
+     ```
+
+5. **Output format**:
+   - Imports: `import torch, torch.nn as nn, triton, triton.language as tl`
+   - `@triton.jit` kernel(s)
+   - Wrapper function(s)
+   - `class ModelNew(nn.Module)` — REQUIRED
+   - NO testing code, NO `if __name__ == "__main__"`
+
+---
+
+Generate the optimized kernel now. Output ONLY the complete Python code.

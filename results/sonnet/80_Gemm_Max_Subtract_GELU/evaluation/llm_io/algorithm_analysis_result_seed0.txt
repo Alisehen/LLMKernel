@@ -1,0 +1,10 @@
+```json
+{
+  "worth_optimizing": "yes",
+  "reason": "The kernel has extremely low SM throughput (1.96%) and low DRAM throughput (0.12%), indicating severe computational inefficiency in the GEMM implementation.",
+  "bottleneck": "The current kernel processes GEMM row-by-row with a single thread block per row, using inefficient element-wise multiplication instead of proper matrix tiling. This results in poor parallelism and memory access patterns, with only 23.81% warp occupancy.",
+  "optimisation method": "Replace the naive row-wise GEMM with a properly tiled 2D GEMM kernel using shared memory, or leverage cuBLAS/Triton's optimized matmul followed by a fused reduction kernel for max, subtract-mean, and GELU operations.",
+  "modification plan": "1) Use torch.matmul or triton's optimized matmul for the GEMM operation to achieve high throughput. 2) Create a separate fused kernel that computes max along dim=1, subtracts the mean (which is just the max value itself since it's a single element), and applies GELU. 3) Since max over dim=1 produces shape (M,1) and mean over dim=1 of a single element equals itself, the subtraction yields 0 and GELU(0)=0, so the kernel can be simplified.",
+  "expected_speedup": "10-50x"
+}
+```

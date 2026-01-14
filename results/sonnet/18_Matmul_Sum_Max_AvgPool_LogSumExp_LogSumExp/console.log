@@ -1,0 +1,265 @@
+[Seed] Generating seed kernel...
+[Seed 1/2] Generating...
+[92mFinish reason: stop[0m
+Usage: In=2270, Out=1633, Total=3903
+[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 43, in wrapper
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 2192, in store
+    return _semantic.store(pointer, value, mask, boundary_check, cache_modifier, eviction_policy)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/semantic.py", line 1297, in store
+    return self._store_legacy(ptr, val, mask, boundary_check, cache, eviction)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/semantic.py", line 1253, in _store_legacy
+    raise ValueError("Value argument cannot be block type if pointer argument is not a block")
+ValueError: Value argument cannot be block type if pointer argument is not a block
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 576, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20260114_053857_18_Matmul_Sum_Max_AvgPool_LogSumExp_LogSumExp_openai_deepseek/18_Matmul_Sum_Max_AvgPool_LogSumExp_LogSumExp/code/kernel_20260114_053917.py", line 116, in forward
+    return fused_linear_sum(x, self.linear.weight, self.linear.bias)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20260114_053857_18_Matmul_Sum_Max_AvgPool_LogSumExp_LogSumExp_openai_deepseek/18_Matmul_Sum_Max_AvgPool_LogSumExp_LogSumExp/code/kernel_20260114_053917.py", line 98, in fused_linear_sum
+    fused_linear_sum_kernel_v2[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 419, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 733, in run
+    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 861, in _do_compile
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 300, in compile
+    module = src.make_ir(target, options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 80, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 37:4:
+
+            # Load weight block [BLOCK_N, BLOCK_K]
+            w_ptrs = weight_ptr + n_offs[:, None] * stride_wn + k_offs[None, :]
+            w_vals = tl.load(w_ptrs, mask=mask_n[:, None] & mask_k[None, :], other=0.0)
+
+            acc += tl.sum(w_vals * x_vals[None, :], axis=1)
+
+        bias_vals = tl.load(bias_ptr + n_offs, mask=mask_n, other=0.0)
+        acc += bias_vals
+        total_sum += tl.sum(tl.where(mask_n, acc, 0.0))
+
+    tl.store(out_ptr + pid_m, total_sum)
+    ^
+Value argument cannot be block type if pointer argument is not a block
+
+[seed_0] failed. See metrics.message for details.
+[seed_0] metrics saved to: /home/hyc/LLMKernel/run/20260114_053857_18_Matmul_Sum_Max_AvgPool_LogSumExp_LogSumExp_openai_deepseek/18_Matmul_Sum_Max_AvgPool_LogSumExp_LogSumExp/evaluation/eval_0000.json
+[Seed 1] Failed, attempting repair...
+[92mFinish reason: stop[0m
+Usage: In=3356, Out=1447, Total=4803
+[seed_0_repair_1] score=0.0111 (baseline=3.2022ms)
+[seed_0_repair_1] metrics saved to: /home/hyc/LLMKernel/run/20260114_053857_18_Matmul_Sum_Max_AvgPool_LogSumExp_LogSumExp_openai_deepseek/18_Matmul_Sum_Max_AvgPool_LogSumExp_LogSumExp/evaluation/eval_0001.json
+[Seed 1 Repair] Score: 0.0111 ✓
+[Seed 1] Final score: 0.0111 ✓
+[Seed 2/2] Generating...
+[92mFinish reason: stop[0m
+Usage: In=2270, Out=1317, Total=3587
+[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 43, in wrapper
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 2192, in store
+    return _semantic.store(pointer, value, mask, boundary_check, cache_modifier, eviction_policy)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/semantic.py", line 1297, in store
+    return self._store_legacy(ptr, val, mask, boundary_check, cache, eviction)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/semantic.py", line 1253, in _store_legacy
+    raise ValueError("Value argument cannot be block type if pointer argument is not a block")
+ValueError: Value argument cannot be block type if pointer argument is not a block
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 576, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20260114_053857_18_Matmul_Sum_Max_AvgPool_LogSumExp_LogSumExp_openai_deepseek/18_Matmul_Sum_Max_AvgPool_LogSumExp_LogSumExp/code/kernel_20260114_054001.py", line 68, in forward
+    result = fused_linear_sum(x, w_sum, bias_sum)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20260114_053857_18_Matmul_Sum_Max_AvgPool_LogSumExp_LogSumExp_openai_deepseek/18_Matmul_Sum_Max_AvgPool_LogSumExp_LogSumExp/code/kernel_20260114_054001.py", line 43, in fused_linear_sum
+    fused_linear_sum_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 419, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 733, in run
+    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 861, in _do_compile
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 300, in compile
+    module = src.make_ir(target, options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 80, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 27:4:
+
+        x_vals = tl.load(x_ptr + pid_b * stride_xb + offs_k * stride_xk, mask=mask, other=0.0)
+        w_vals = tl.load(w_sum_ptr + offs_k, mask=mask, other=0.0)
+
+        acc += tl.sum(x_vals * w_vals, axis=0)
+
+    # Add bias sum
+    bias_sum = tl.load(bias_sum_ptr)
+    result = acc + bias_sum
+
+    # Store result
+    tl.store(out_ptr + pid_b, result)
+    ^
+Value argument cannot be block type if pointer argument is not a block
+
+[seed_1] failed. See metrics.message for details.
+[seed_1] metrics saved to: /home/hyc/LLMKernel/run/20260114_053857_18_Matmul_Sum_Max_AvgPool_LogSumExp_LogSumExp_openai_deepseek/18_Matmul_Sum_Max_AvgPool_LogSumExp_LogSumExp/evaluation/eval_0002.json
+[Seed 2] Failed, attempting repair...
+[92mFinish reason: stop[0m
+Usage: In=2731, Out=885, Total=3616
+[seed_1_repair_1] score=9.1218 (baseline=3.2036ms)
+[seed_1_repair_1] metrics saved to: /home/hyc/LLMKernel/run/20260114_053857_18_Matmul_Sum_Max_AvgPool_LogSumExp_LogSumExp_openai_deepseek/18_Matmul_Sum_Max_AvgPool_LogSumExp_LogSumExp/evaluation/eval_0003.json
+[Seed 2 Repair] Score: 9.1218 ✓
+[Seed 2] Final score: 9.1218 ✓
+
+================================================================================
+[Hybrid Strategy] Analyzing all seeds for algorithmic optimization...
+[Hybrid Strategy] - 1 seed(s) with score < 1.0 (rescue)
+[Hybrid Strategy] - 1 seed(s) with score >= 1.0 (further optimization)
+================================================================================
+
+[Hybrid] Seed 1: score=0.0111 < 1.0
+[Hybrid] Attempting algorithm analysis rescue...
+[ncu] Using GPU device 1 (CUDA_VISIBLE_DEVICES=1)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_2683483.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_2683483.py /home/hyc/LLMKernel/KernelBench/tt/18_Matmul_Sum_Max_AvgPool_LogSumExp_LogSumExp.py /home/hyc/LLMKernel/run/20260114_053857_18_Matmul_Sum_Max_AvgPool_LogSumExp_LogSumExp_openai_deepseek/18_Matmul_Sum_Max_AvgPool_LogSumExp_LogSumExp/code/test_kernel_analysis_seed0.py --repeat 1
+[ncu stdout]: [bench] Completed 1 iterations successfully
+
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_2683483.csv
+[Hybrid] Requesting LLM analysis for seed 1...
+[92mFinish reason: stop[0m
+Usage: In=2793, Out=385, Total=3178
+[Hybrid] Worth optimizing: yes
+[Hybrid] Reason: The kernel processes output features sequentially (N=8192 iterations) with poor parallelism, achieving only 67.95% SM throughput despite 99.9% L2 cache hit rate, indicating compute-bound inefficiency from serial loop structure.
+[Hybrid] Analysis complete for seed 1, generating optimized kernel...
+[Hybrid] Bottleneck: The inner loop `for n in range(N)` processes 8192 output features sequentially w...
+[Hybrid] Optimization: Algorithm Replacement: Exploit the mathematical identity that sum(linear(x)) = d...
+[Hybrid] Expected speedup: 8000x reduction in arithmetic operations (from N*K to K), expected 50-100x wall-clock speedup after accounting for the precomputation overhead which amortizes across batch.
+[92mFinish reason: stop[0m
+Usage: In=2959, Out=1328, Total=4287
+[algorithm_optimized_seed0] score=9.0676 (baseline=3.2024ms)
+[algorithm_optimized_seed0] metrics saved to: /home/hyc/LLMKernel/run/20260114_053857_18_Matmul_Sum_Max_AvgPool_LogSumExp_LogSumExp_openai_deepseek/18_Matmul_Sum_Max_AvgPool_LogSumExp_LogSumExp/evaluation/eval_0004.json
+[Hybrid] ✓ Rescue successful: 0.0111 → 9.0676
+
+[Hybrid] Seed 2: score=9.1218 >= 1.0
+[Hybrid] Attempting algorithm analysis for further optimization...
+[ncu] Using GPU device 1 (CUDA_VISIBLE_DEVICES=1)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_2683483.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_2683483.py /home/hyc/LLMKernel/KernelBench/tt/18_Matmul_Sum_Max_AvgPool_LogSumExp_LogSumExp.py /home/hyc/LLMKernel/run/20260114_053857_18_Matmul_Sum_Max_AvgPool_LogSumExp_LogSumExp_openai_deepseek/18_Matmul_Sum_Max_AvgPool_LogSumExp_LogSumExp/code/test_kernel_analysis_seed1.py --repeat 1
+[ncu stdout]: [bench] Completed 1 iterations successfully
+
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_2683483.csv
+[Hybrid] Requesting LLM analysis for seed 2...
+[92mFinish reason: stop[0m
+Usage: In=2115, Out=270, Total=2385
+[Hybrid] Worth optimizing: yes
+[Hybrid] Reason: The kernel achieves only 3.51% SM throughput while being memory-bound (90.84% DRAM throughput), indicating poor compute utilization and potential for better memory access patterns.
+[Hybrid] Analysis complete for seed 2, generating optimized kernel...
+[Hybrid] Bottleneck: Each thread block processes one batch element independently, loading w_sum redun...
+[Hybrid] Optimization: Memory Layout Optimization - Load w_sum into shared memory once per block and re...
+[Hybrid] Expected speedup: 40-60%
+[92mFinish reason: stop[0m
+Usage: In=2306, Out=2199, Total=4505
+[algorithm_optimized_seed1] score=9.1019 (baseline=3.2015ms)
+[algorithm_optimized_seed1] metrics saved to: /home/hyc/LLMKernel/run/20260114_053857_18_Matmul_Sum_Max_AvgPool_LogSumExp_LogSumExp_openai_deepseek/18_Matmul_Sum_Max_AvgPool_LogSumExp_LogSumExp/evaluation/eval_0005.json
+[Hybrid] ✓ Rescue successful: 9.1218 → 9.1019
+
+================================================================================
+[Hybrid] Candidate Selection
+================================================================================
+[Hybrid] Total candidates: 4
+  [1] seed 1: 0.0111
+  [2] seed 2: 9.1218
+  [3] algo-optimized (from seed 1): 9.0676
+  [4] algo-optimized (from seed 2): 9.1019
+
+[Hybrid] ★ Selected best candidate: score=9.1218
+
+[Optimization] Starting 3-stage optimization...
+
+================================================================================
+[Stage 1/3] grid_and_parallel
+Description: Optimize grid layout and parallel work distribution across SMs.
+Current candidates: 1, best score: 9.1218
+================================================================================
+[Stage 1] Profiling best candidate...
+[ncu] Using GPU device 1 (CUDA_VISIBLE_DEVICES=1)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_2683483.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_2683483.py /home/hyc/LLMKernel/KernelBench/tt/18_Matmul_Sum_Max_AvgPool_LogSumExp_LogSumExp.py /home/hyc/LLMKernel/run/20260114_053857_18_Matmul_Sum_Max_AvgPool_LogSumExp_LogSumExp_openai_deepseek/18_Matmul_Sum_Max_AvgPool_LogSumExp_LogSumExp/code/test_kernel_analysis_seed1.py --repeat 1
+[ncu stdout]: [bench] Completed 1 iterations successfully
+
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_2683483.csv
+[Stage 1] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=1663, Out=1647, Total=3310
+[stage1_grid_and_parallel] score=9.1659 (baseline=3.2092ms)
+[stage1_grid_and_parallel] metrics saved to: /home/hyc/LLMKernel/run/20260114_053857_18_Matmul_Sum_Max_AvgPool_LogSumExp_LogSumExp_openai_deepseek/18_Matmul_Sum_Max_AvgPool_LogSumExp_LogSumExp/evaluation/eval_0006.json
+  Optimized kernel score: 9.1659 ✓
+[Stage 1] ★ New best score: 9.1659
+
+================================================================================
+[Stage 2/3] block_tiling
+Description: Tune BLOCK_M/N/K sizes for optimal register/memory balance.
+Current candidates: 1, best score: 9.1659
+================================================================================
+[Stage 2] Profiling best candidate...
+[ncu] Using GPU device 1 (CUDA_VISIBLE_DEVICES=1)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_2683483.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_2683483.py /home/hyc/LLMKernel/KernelBench/tt/18_Matmul_Sum_Max_AvgPool_LogSumExp_LogSumExp.py /home/hyc/LLMKernel/run/20260114_053857_18_Matmul_Sum_Max_AvgPool_LogSumExp_LogSumExp_openai_deepseek/18_Matmul_Sum_Max_AvgPool_LogSumExp_LogSumExp/code/test_kernel_analysis_seed1.py --repeat 1
+[ncu stdout]: [bench] Completed 1 iterations successfully
+
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_2683483.csv
+[Stage 2] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=2383, Out=1863, Total=4246
+[stage2_block_tiling] score=8.9316 (baseline=3.2067ms)
+[stage2_block_tiling] metrics saved to: /home/hyc/LLMKernel/run/20260114_053857_18_Matmul_Sum_Max_AvgPool_LogSumExp_LogSumExp_openai_deepseek/18_Matmul_Sum_Max_AvgPool_LogSumExp_LogSumExp/evaluation/eval_0007.json
+  Optimized kernel score: 8.9316 ✓
+[Stage 2] Current: 8.9316 (global best: 9.1659)
+
+================================================================================
+[Stage 3/3] memory_and_tuning
+Description: Optimize memory access patterns and fine-tune num_stages/num_warps.
+Current candidates: 1, best score: 9.1659
+================================================================================
+[Stage 3] Profiling best candidate...
+[ncu] Using GPU device 1 (CUDA_VISIBLE_DEVICES=1)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_2683483.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_2683483.py /home/hyc/LLMKernel/KernelBench/tt/18_Matmul_Sum_Max_AvgPool_LogSumExp_LogSumExp.py /home/hyc/LLMKernel/run/20260114_053857_18_Matmul_Sum_Max_AvgPool_LogSumExp_LogSumExp_openai_deepseek/18_Matmul_Sum_Max_AvgPool_LogSumExp_LogSumExp/code/test_kernel_analysis_seed1.py --repeat 1

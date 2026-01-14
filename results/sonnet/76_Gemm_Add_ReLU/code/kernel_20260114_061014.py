@@ -1,0 +1,112 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def fused_gemm_add_relu_kernel(
+    a_ptr, b_ptr, bias_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    
+    # Simple 2D grid mapping without swizzle for correctness
+    pid_m = pid // num_pid_n
+    pid_n = pid % num_pid_n
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    # Initialize accumulator
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    # Loop over K dimension
+    for k in range(0, K, BLOCK_K):
+        offs_k = k + tl.arange(0, BLOCK_K)
+        
+        # Load A tile
+        a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+        a_mask = (offs_m[:, None] < M) & (offs_k[None, :] < K)
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        
+        # Load B tile
+        b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+        b_mask = (offs_k[:, None] < K) & (offs_n[None, :] < N)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+        
+        # Accumulate
+        acc += tl.dot(a, b, allow_tf32=True)
+
+    # Fused: add bias
+    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc = acc + bias[None, :]
+
+    # Fused: ReLU
+    acc = tl.maximum(acc, 0.0)
+
+    # Store result
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, acc, mask=mask)
+
+
+def fused_gemm_add_relu(x, weight_t, bias):
+    """
+    Fused GEMM + bias + ReLU operation.
+    
+    Args:
+        x: Input tensor of shape (M, K)
+        weight_t: Pre-transposed weight tensor of shape (K, N) = (in_features, out_features)
+        bias: Bias tensor of shape (N,)
+    
+    Returns:
+        Output tensor of shape (M, N)
+    """
+    M, K = x.shape
+    N = weight_t.shape[1]
+    c = torch.empty((M, N), device=x.device, dtype=x.dtype)
+    
+    BLOCK_M = 64
+    BLOCK_N = 64
+    BLOCK_K = 32
+    
+    num_pid_m = triton.cdiv(M, BLOCK_M)
+    num_pid_n = triton.cdiv(N, BLOCK_N)
+    grid = (num_pid_m * num_pid_n,)
+    
+    fused_gemm_add_relu_kernel[grid](
+        x, weight_t, bias, c,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        weight_t.stride(0), weight_t.stride(1),
+        c.stride(0), c.stride(1),
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+    )
+    return c
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model using fused Triton kernel for matrix multiplication, bias addition, and ReLU.
+    Weight is stored in transposed layout (in_features, out_features) to avoid per-forward transpose.
+    """
+    def __init__(self, in_features, out_features, bias_shape):
+        super(ModelNew, self).__init__()
+        # Store weight in transposed layout: (in_features, out_features)
+        # This eliminates the need for .t().contiguous() in every forward pass
+        self.weight_t = nn.Parameter(torch.randn(in_features, out_features))
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input tensor with shape (batch_size, in_features).
+        Returns:
+            torch.Tensor: Output tensor with shape (batch_size, out_features).
+        """
+        return fused_gemm_add_relu(x, self.weight_t, self.bias)

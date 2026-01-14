@@ -1,0 +1,224 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def fused_linear_relu_div_kernel(
+    x_ptr, weight_ptr, bias_ptr, out_ptr,
+    M, N, K,
+    divisor,
+    stride_xm, stride_xk,
+    stride_wn, stride_wk,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """
+    Optimized fused matmul + bias + ReLU + division kernel.
+    
+    Key optimizations:
+    1. Reduced BLOCK_M/N to 64 to lower register pressure
+    2. Increased BLOCK_K to 64 for better memory coalescing
+    3. Reordered operations to minimize intermediate storage
+    4. Optimized memory access patterns
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    
+    # Compute output block offsets
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    
+    # Boundary masks for output
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+    
+    # Accumulator for matmul - use float32 for better precision
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    # Matmul loop over K dimension with larger BLOCK_K
+    for k in range(0, K, BLOCK_K):
+        offs_k = k + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < K
+        
+        # Load x block: [BLOCK_M, BLOCK_K]
+        x_ptrs = x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk
+        x_mask = mask_m[:, None] & mask_k[None, :]
+        x = tl.load(x_ptrs, mask=x_mask, other=0.0)
+        
+        # Load weight block: [BLOCK_N, BLOCK_K] (transposed access)
+        w_ptrs = weight_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk
+        w_mask = mask_n[:, None] & mask_k[None, :]
+        w = tl.load(w_ptrs, mask=w_mask, other=0.0)
+        
+        # Accumulate: x @ w.T
+        acc += tl.dot(x, tl.trans(w))
+    
+    # Load bias once: [BLOCK_N]
+    bias_ptrs = bias_ptr + offs_n
+    bias = tl.load(bias_ptrs, mask=mask_n, other=0.0)
+    
+    # Fused operations: bias + ReLU + div in one pass
+    # Recompute divisor multiplication instead of storing intermediate
+    inv_divisor = 1.0 / divisor
+    
+    # Add bias (broadcast)
+    result = acc + bias[None, :]
+    
+    # ReLU + division fused
+    result = tl.maximum(result, 0.0) * inv_divisor
+    
+    # Store output
+    out_ptrs = out_ptr + offs_m[:, None] * N + offs_n[None, :]
+    out_mask = mask_m[:, None] & mask_n[None, :]
+    tl.store(out_ptrs, result, mask=out_mask)
+
+
+def fused_linear_relu_div(x, weight, bias, divisor):
+    """
+    Fully fused linear + ReLU + division in a single Triton kernel.
+    Optimized for RTX 4090 with register pressure awareness.
+    """
+    M, K = x.shape
+    N = weight.shape[0]
+    
+    # Ensure contiguous for optimal memory access
+    x = x.contiguous()
+    weight = weight.contiguous()
+    bias = bias.contiguous()
+    
+    out = torch.empty((M, N), device=x.device, dtype=x.dtype)
+    
+    # Optimized block sizes for RTX 4090
+    # Reduced BLOCK_M/N to 64 to reduce register pressure
+    # Increased BLOCK_K to 64 for better memory throughput
+    BLOCK_M = 64
+    BLOCK_N = 64
+    BLOCK_K = 64
+    
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+    
+    fused_linear_relu_div_kernel[grid](
+        x, weight, bias, out,
+        M, N, K,
+        divisor,
+        x.stride(0), x.stride(1),
+        weight.stride(0), weight.stride(1),
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+    )
+    
+    return out
+
+
+@triton.jit
+def fused_linear_relu_div_kernel_large(
+    x_ptr, weight_ptr, bias_ptr, out_ptr,
+    M, N, K,
+    divisor,
+    stride_xm, stride_xk,
+    stride_wn, stride_wk,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """
+    Alternative kernel with larger blocks for high occupancy scenarios.
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+    
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    for k in range(0, K, BLOCK_K):
+        offs_k = k + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < K
+        
+        x_ptrs = x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk
+        x_mask = mask_m[:, None] & mask_k[None, :]
+        x = tl.load(x_ptrs, mask=x_mask, other=0.0)
+        
+        w_ptrs = weight_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk
+        w_mask = mask_n[:, None] & mask_k[None, :]
+        w = tl.load(w_ptrs, mask=w_mask, other=0.0)
+        
+        acc += tl.dot(x, tl.trans(w))
+    
+    bias_ptrs = bias_ptr + offs_n
+    bias = tl.load(bias_ptrs, mask=mask_n, other=0.0)
+    
+    inv_divisor = 1.0 / divisor
+    result = acc + bias[None, :]
+    result = tl.maximum(result, 0.0) * inv_divisor
+    
+    out_ptrs = out_ptr + offs_m[:, None] * N + offs_n[None, :]
+    out_mask = mask_m[:, None] & mask_n[None, :]
+    tl.store(out_ptrs, result, mask=out_mask)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, divisor):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.bias = nn.Parameter(torch.randn(out_features))
+        self.divisor = divisor
+
+    def forward(self, x):
+        M, K = x.shape
+        N = self.weight.shape[0]
+        
+        # Ensure contiguous
+        x = x.contiguous()
+        weight = self.weight.contiguous()
+        bias = self.bias.contiguous()
+        
+        out = torch.empty((M, N), device=x.device, dtype=x.dtype)
+        
+        # Adaptive block size selection based on problem size
+        if M * N > 1024 * 1024:
+            # Large problem: use larger blocks for better occupancy
+            BLOCK_M = 128
+            BLOCK_N = 128
+            BLOCK_K = 32
+            
+            grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+            
+            fused_linear_relu_div_kernel_large[grid](
+                x, weight, bias, out,
+                M, N, K,
+                self.divisor,
+                x.stride(0), x.stride(1),
+                weight.stride(0), weight.stride(1),
+                BLOCK_M=BLOCK_M,
+                BLOCK_N=BLOCK_N,
+                BLOCK_K=BLOCK_K,
+            )
+        else:
+            # Small/medium problem: use smaller blocks to reduce register pressure
+            BLOCK_M = 64
+            BLOCK_N = 64
+            BLOCK_K = 64
+            
+            grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+            
+            fused_linear_relu_div_kernel[grid](
+                x, weight, bias, out,
+                M, N, K,
+                self.divisor,
+                x.stride(0), x.stride(1),
+                weight.stride(0), weight.stride(1),
+                BLOCK_M=BLOCK_M,
+                BLOCK_N=BLOCK_N,
+                BLOCK_K=BLOCK_K,
+            )
+        
+        return out

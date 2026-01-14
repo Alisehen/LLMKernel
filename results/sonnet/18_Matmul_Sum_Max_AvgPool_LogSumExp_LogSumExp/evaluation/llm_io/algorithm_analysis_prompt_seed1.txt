@@ -1,0 +1,194 @@
+You are a GPU kernel optimization architect. Analyze the kernel and identify **ONE high-level algorithmic optimization**.
+
+# PyTorch Reference
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs a sequence of operations:
+        - Matrix multiplication
+        - Summation
+        - Max
+        - Average pooling
+        - LogSumExp
+        - LogSumExp
+    """
+    def __init__(self, in_features, out_features):
+        super(Model, self).__init__()
+        self.linear = nn.Linear(in_features, out_features)
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_features).
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, 1).
+        """
+        x = self.linear(x)  # (batch_size, out_features)
+        x = torch.sum(x, dim=1, keepdim=True) # (batch_size, 1)
+        x = torch.max(x, dim=1, keepdim=True)[0] # (batch_size, 1)
+        x = torch.mean(x, dim=1, keepdim=True) # (batch_size, 1)
+        x = torch.logsumexp(x, dim=1, keepdim=True) # (batch_size, 1)
+        x = torch.logsumexp(x, dim=1, keepdim=True) # (batch_size, 1)
+        return x
+
+batch_size = 1024
+in_features  = 8192  
+out_features = 8192
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features)]
+
+def get_init_inputs():
+    return [in_features, out_features]
+```
+
+# Current Triton Kernel
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def fused_linear_sum_kernel(
+    x_ptr, w_sum_ptr, bias_sum_ptr, out_ptr,
+    B, K,
+    stride_xb, stride_xk,
+    BLOCK_K: tl.constexpr,
+):
+    # Each program handles one batch element
+    pid_b = tl.program_id(0)
+    
+    # Compute dot product of x[pid_b, :] with w_sum[:]
+    acc = tl.zeros((BLOCK_K,), dtype=tl.float32)
+    
+    for k_start in range(0, K, BLOCK_K):
+        offs_k = k_start + tl.arange(0, BLOCK_K)
+        mask = offs_k < K
+        
+        x_vals = tl.load(x_ptr + pid_b * stride_xb + offs_k * stride_xk, mask=mask, other=0.0)
+        w_vals = tl.load(w_sum_ptr + offs_k, mask=mask, other=0.0)
+        
+        acc += x_vals * w_vals
+    
+    # Sum the accumulator to get scalar result
+    result_sum = tl.sum(acc, axis=0)
+    
+    # Add bias sum
+    bias_sum = tl.load(bias_sum_ptr)
+    result = result_sum + bias_sum
+    
+    # Store result - out_ptr + pid_b is a scalar pointer, result is now scalar
+    tl.store(out_ptr + pid_b, result)
+
+
+def fused_linear_sum(x, w_sum, bias_sum):
+    B, K = x.shape
+    out = torch.empty((B,), device=x.device, dtype=x.dtype)
+    
+    BLOCK_K = 1024
+    grid = (B,)
+    
+    fused_linear_sum_kernel[grid](
+        x, w_sum, bias_sum, out,
+        B, K,
+        x.stride(0), x.stride(1),
+        BLOCK_K=BLOCK_K,
+    )
+    return out.unsqueeze(1)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features):
+        super(ModelNew, self).__init__()
+        self.linear = nn.Linear(in_features, out_features)
+        self.in_features = in_features
+        self.out_features = out_features
+        
+    def forward(self, x):
+        # Precompute the sum of weights across output dimension
+        # W is (out_features, in_features), we need sum over dim=0 -> (in_features,)
+        w_sum = self.linear.weight.sum(dim=0)  # (in_features,)
+        bias_sum = self.linear.bias.sum().view(1)  # scalar as 1-element tensor
+        
+        # The result is x @ w_sum + bias_sum
+        # x: (B, in_features), w_sum: (in_features,) -> result: (B,)
+        result = fused_linear_sum(x, w_sum, bias_sum)
+        
+        return result
+```
+
+# NCU Metrics
+{
+  "fused_linear_sum_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 3.51,
+    "launch__grid_size": 1024,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 64.14,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 90.84,
+    "lts__t_sector_hit_rate.pct": 11.51
+  }
+}
+
+
+---
+
+## Analysis Steps
+
+1. **Code Analysis**: Count kernels, identify operations, check for inefficiencies
+2. **Performance Diagnosis**: Use metrics/latency to identify bottleneck type
+3. **Root Cause**: Combine code + performance to find the core issue
+
+## Optimization Categories (pick ONE if worth optimizing):
+
+### 1. Operator Fusion
+Fuse consecutive ops into fewer kernels to reduce memory traffic and launch overhead.
+
+### 2. Algorithm Replacement
+Replace naive algorithm with optimized variant.
+- For Attention: Flash Attention, online softmax
+- For Convolution: Winograd, im2col
+- **For RNN/GRU/LSTM**: Persistent kernel with HYBRID computation
+  - **CRITICAL**: Use hybrid approach for best performance:
+    * Precompute input-side gates ONCE (outside kernel): `gates_x = (T*B, In) @ W_ih`
+    * Persistent kernel (inside): only recurrent-side: `for t: gates_h = h @ W_hh`
+  - Time loop `for t in range(T)` must be inside kernel, NOT in Python
+  - Launch kernel once per layer, not once per timestep
+  - Expected speedup: 10-100x (vs per-timestep launches)
+
+### 3. Kernel Launch Reduction
+Combine multiple small kernels to reduce overhead.
+- **For RNN/GRU/LSTM**: See "Algorithm Replacement" above for persistent kernel approach
+
+### 4. Memory Layout Optimization
+Use in-place operations, buffer reuse, or better layouts.
+
+## Should We Optimize?
+
+Before proposing optimization, determine if it's worthwhile:
+- **Not worth optimizing** if:
+  - Code is already near-optimal (expected speedup < 10%)
+  - Bottleneck cannot be addressed (hardware limited, already optimal algorithm)
+  - Optimization would add significant complexity with minimal gain
+
+- **Worth optimizing** if:
+  - Clear algorithmic inefficiency exists (multiple kernels, suboptimal algorithm)
+  - Expected speedup >= 20%
+  - Concrete optimization path available
+
+## Output (JSON)
+
+```json
+{
+  "worth_optimizing": "yes/no",
+  "reason": "<Why worth or not worth optimizing, 1 sentence>",
+  "bottleneck": "<Root cause in 1-2 sentences, empty if not worth optimizing>",
+  "optimisation method": "<Specific optimization in 1-2 sentences, empty if not worth optimizing>",
+  "modification plan": "<Implementation steps in 2-3 sentences, empty if not worth optimizing>",
+  "expected_speedup": "<e.g., '30-40%', empty if not worth optimizing>"
+}
+```
+
+Return JSON only.

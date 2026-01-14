@@ -1,0 +1,109 @@
+Looking at this problem, I need to optimize a model that performs:
+1. 3D convolution
+2. Multiply by scaling_factor
+3. tanh activation
+4. Multiply by bias
+5. sigmoid activation
+
+The convolution is complex to implement efficiently in Triton, so I'll keep using PyTorch's optimized Conv3d. However, I can fuse operations 2-5 into a single Triton kernel to avoid multiple memory round-trips.
+
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def fused_scale_tanh_mul_sigmoid_kernel(
+    x_ptr,
+    scaling_factor_ptr,
+    bias_ptr,
+    out_ptr,
+    num_elements,
+    C,  # number of channels
+    spatial_size,  # D * H * W
+    BLOCK_SIZE: tl.constexpr,
+):
+    # Each program handles a block of elements
+    pid = tl.program_id(0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < num_elements
+    
+    # Load input values
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    
+    # Calculate channel index for each element
+    # Layout is (N, C, D, H, W) - we need to find which channel each element belongs to
+    # Element index within batch: offsets % (C * spatial_size)
+    # Channel index: (offsets % (C * spatial_size)) // spatial_size
+    channel_idx = (offsets % (C * spatial_size)) // spatial_size
+    
+    # Load scaling_factor and bias for the corresponding channels
+    # scaling_factor and bias have shape (C, 1, 1, 1), so we just index by channel
+    scaling_factor = tl.load(scaling_factor_ptr + channel_idx, mask=mask, other=1.0)
+    bias = tl.load(bias_ptr + channel_idx, mask=mask, other=1.0)
+    
+    # Apply operations:
+    # 1. Scale by scaling_factor
+    x = x * scaling_factor
+    
+    # 2. tanh: (exp(2x) - 1) / (exp(2x) + 1)
+    exp_2x = tl.exp(2.0 * x)
+    x = (exp_2x - 1.0) / (exp_2x + 1.0)
+    
+    # 3. Multiply by bias
+    x = x * bias
+    
+    # 4. sigmoid: 1 / (1 + exp(-x))
+    x = 1.0 / (1.0 + tl.exp(-x))
+    
+    # Store result
+    tl.store(out_ptr + offsets, x, mask=mask)
+
+
+def fused_scale_tanh_mul_sigmoid(x, scaling_factor, bias):
+    # x shape: (N, C, D, H, W)
+    # scaling_factor, bias shape: (C, 1, 1, 1)
+    N, C, D, H, W = x.shape
+    spatial_size = D * H * W
+    num_elements = x.numel()
+    
+    out = torch.empty_like(x)
+    
+    BLOCK_SIZE = 1024
+    grid = (triton.cdiv(num_elements, BLOCK_SIZE),)
+    
+    # Flatten scaling_factor and bias to 1D for easier indexing
+    scaling_factor_flat = scaling_factor.view(-1).contiguous()
+    bias_flat = bias.view(-1).contiguous()
+    
+    fused_scale_tanh_mul_sigmoid_kernel[grid](
+        x,
+        scaling_factor_flat,
+        bias_flat,
+        out,
+        num_elements,
+        C,
+        spatial_size,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    
+    return out
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs a 3D convolution, then fuses scale, tanh, multiply, and sigmoid operations.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, scaling_factor, bias_shape):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size)
+        self.scaling_factor = nn.Parameter(torch.randn(bias_shape))
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = fused_scale_tanh_mul_sigmoid(x, self.scaling_factor, self.bias)
+        return x
+```

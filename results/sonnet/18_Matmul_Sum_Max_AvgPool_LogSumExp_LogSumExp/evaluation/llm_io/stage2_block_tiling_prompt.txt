@@ -1,0 +1,202 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU: 4090
+
+[OPTIMIZATION STAGE]
+
+## Current Optimization Stage
+
+Focus: BLOCK_SIZE with register pressure awareness.
+
+Key Principle:
+- Fusion increases register usage (intermediates stay in registers)
+- Spill to local memory kills fusion benefit
+
+Register Pressure Signals (from NCU):
+- launch__registers_per_thread > 128 → likely spilling
+- launch__occupancy_limit_registers < other limits → register-bound
+
+Rules:
+- Start conservative: BLOCK_SIZE ∈ {256, 512} for element-wise
+- For matmul fusion: BLOCK_M/N ∈ {32, 64}, BLOCK_K ∈ {32}
+- If registers > 128: reduce BLOCK_* by half
+- Trade-off: recompute cheap ops (e.g., x*0.5) vs store intermediate
+
+When to Recompute vs Keep:
+- Keep: expensive ops (exp, log, div, sqrt)
+- Recompute: cheap ops (add, mul, max) if register pressure high
+- Example: `y = relu(x); z = y * scale` → keep y
+- Example: `y = x * 0.5; z = y + bias` → can recompute y if needed
+
+Autotune:
+- 2-3 BLOCK_SIZE configs, always include smaller fallback
+
+
+
+[CURRENT CODE]
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def fused_linear_sum_kernel_v2(
+    x_ptr, w_sum_ptr, bias_sum_ptr, out_ptr,
+    B, K,
+    stride_xb, stride_xk,
+    BLOCK_B: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # Each program handles BLOCK_B batch elements
+    pid = tl.program_id(0)
+    
+    # Batch indices this block handles
+    offs_b = pid * BLOCK_B + tl.arange(0, BLOCK_B)
+    mask_b = offs_b < B
+    
+    # Initialize accumulators for each batch element
+    acc = tl.zeros((BLOCK_B,), dtype=tl.float32)
+    
+    # Process K dimension in chunks
+    for k_start in range(0, K, BLOCK_K):
+        offs_k = k_start + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < K
+        
+        # Load w_sum chunk once (shared across all batch elements)
+        w_vals = tl.load(w_sum_ptr + offs_k, mask=mask_k, other=0.0)  # [BLOCK_K]
+        
+        # Load x values for all batch elements in this block
+        # x_ptr[b, k] = x_ptr + b * stride_xb + k * stride_xk
+        x_ptrs = x_ptr + offs_b[:, None] * stride_xb + offs_k[None, :] * stride_xk
+        combined_mask = mask_b[:, None] & mask_k[None, :]
+        x_vals = tl.load(x_ptrs, mask=combined_mask, other=0.0)  # [BLOCK_B, BLOCK_K]
+        
+        # Multiply and accumulate
+        acc += tl.sum(x_vals * w_vals[None, :], axis=1)
+    
+    # Add bias sum
+    bias_sum = tl.load(bias_sum_ptr)
+    result = acc + bias_sum
+    
+    # Store results
+    tl.store(out_ptr + offs_b, result, mask=mask_b)
+
+
+@triton.jit
+def fused_linear_sum_kernel_v3(
+    x_ptr, w_sum_ptr, bias_sum_ptr, out_ptr,
+    B, K,
+    stride_xb, stride_xk,
+    BLOCK_K: tl.constexpr,
+):
+    # One block per batch element, but use all threads for reduction
+    pid_b = tl.program_id(0)
+    
+    if pid_b >= B:
+        return
+    
+    # Each thread handles part of K
+    offs_k = tl.arange(0, BLOCK_K)
+    
+    acc = tl.zeros((BLOCK_K,), dtype=tl.float32)
+    
+    # Vectorized load and multiply
+    num_chunks = tl.cdiv(K, BLOCK_K)
+    for i in range(num_chunks):
+        k_idx = i * BLOCK_K + offs_k
+        mask = k_idx < K
+        
+        x_vals = tl.load(x_ptr + pid_b * stride_xb + k_idx * stride_xk, mask=mask, other=0.0)
+        w_vals = tl.load(w_sum_ptr + k_idx, mask=mask, other=0.0)
+        
+        acc += x_vals * w_vals
+    
+    # Reduce
+    result_sum = tl.sum(acc, axis=0)
+    
+    # Add bias
+    bias_sum = tl.load(bias_sum_ptr)
+    result = result_sum + bias_sum
+    
+    tl.store(out_ptr + pid_b, result)
+
+
+def fused_linear_sum(x, w_sum, bias_sum):
+    B, K = x.shape
+    out = torch.empty((B,), device=x.device, dtype=x.dtype)
+    
+    # Use batched version for better memory reuse
+    BLOCK_B = 8
+    BLOCK_K = 256
+    
+    grid = (triton.cdiv(B, BLOCK_B),)
+    
+    fused_linear_sum_kernel_v2[grid](
+        x, w_sum, bias_sum, out,
+        B, K,
+        x.stride(0), x.stride(1),
+        BLOCK_B=BLOCK_B,
+        BLOCK_K=BLOCK_K,
+    )
+    return out.unsqueeze(1)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features):
+        super(ModelNew, self).__init__()
+        self.linear = nn.Linear(in_features, out_features)
+        self.in_features = in_features
+        self.out_features = out_features
+        # Pre-register buffers for w_sum and bias_sum
+        self.register_buffer('w_sum', None)
+        self.register_buffer('bias_sum_tensor', None)
+        
+    def forward(self, x):
+        # Compute w_sum and bias_sum (could be cached if weights don't change)
+        w_sum = self.linear.weight.sum(dim=0)  # (in_features,)
+        bias_sum = self.linear.bias.sum().view(1)  # scalar as 1-element tensor
+        
+        # Fused kernel: x @ w_sum + bias_sum
+        result = fused_linear_sum(x, w_sum, bias_sum)
+        
+        return result
+```
+
+[NCU PROFILING METRICS]
+{
+  "fused_linear_sum_kernel_v2": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 11.99,
+    "launch__grid_size": 128,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 8.33,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 90.34,
+    "lts__t_sector_hit_rate.pct": 11.56
+  }
+}
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+## CRITICAL — Code MUST compile and run:
+1. EVERY kernel function MUST have `@triton.jit` decorator
+2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+3. BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+4. `tl.program_id(axis)` only supports axis = 0, 1, 2
+5. No `continue`, `break`, `return` inside loops — use masking
+6. No tensor indexing with loop vars: `x[:, i]` is INVALID
+7. mask shape MUST match data shape in tl.load/tl.store
+
+## Missing Triton Functions (implement manually):
+- tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+## OUTPUT FORMAT (STRICT):
+1. Imports: torch, torch.nn, triton, triton.language as tl
+2. @triton.jit decorated kernel function(s)
+3. Wrapper function(s) for grid calculation and kernel launch
+4. class ModelNew(nn.Module) that calls your kernels
+
+Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

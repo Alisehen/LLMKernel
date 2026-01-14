@@ -1,0 +1,209 @@
+You are optimizing a Triton kernel based on algorithmic analysis.
+
+# PyTorch Reference (Target Behavior)
+
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs a GEMM, followed by a max operation, subtraction, and GELU activation.
+    """
+    def __init__(self, in_features, out_features, max_dim):
+        super(Model, self).__init__()
+        self.gemm = nn.Linear(in_features, out_features)
+        self.max_dim = max_dim
+
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor of shape (batch_size, in_features)
+
+        Returns:
+            Output tensor of shape (batch_size, out_features)
+        """
+        x = self.gemm(x)
+        x = torch.max(x, dim=self.max_dim, keepdim=True).values
+        x = x - x.mean(dim=1, keepdim=True)
+        x = torch.nn.functional.gelu(x)
+        return x
+
+batch_size = 1024
+in_features = 8192
+out_features = 8192
+max_dim = 1
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features)]
+
+def get_init_inputs():
+    return [in_features, out_features, max_dim]
+```
+
+**CRITICAL**: Study the PyTorch code carefully to understand:
+- What does `forward()` return? (full output sequence vs final hidden state only)
+- What is the computational pattern?
+- What are the input/output shapes?
+
+Your optimized kernel MUST match this exact behavior.
+
+---
+
+# Analysis Results
+
+**Bottleneck**: The current kernel processes GEMM row-by-row with a single thread block per row, using inefficient element-wise multiplication instead of proper matrix tiling. This results in poor parallelism and memory access patterns, with only 23.81% warp occupancy.
+
+**Optimization Strategy**: Replace the naive row-wise GEMM with a properly tiled 2D GEMM kernel using shared memory, or leverage cuBLAS/Triton's optimized matmul followed by a fused reduction kernel for max, subtract-mean, and GELU operations.
+
+**Implementation Plan**: 1) Use torch.matmul or triton's optimized matmul for the GEMM operation to achieve high throughput. 2) Create a separate fused kernel that computes max along dim=1, subtracts the mean (which is just the max value itself since it's a single element), and applies GELU. 3) Since max over dim=1 produces shape (M,1) and mean over dim=1 of a single element equals itself, the subtraction yields 0 and GELU(0)=0, so the kernel can be simplified.
+
+**Expected Speedup**: 10-50x
+
+---
+
+# Current Kernel (needs optimization)
+
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+import math
+
+@triton.jit
+def gemm_max_kernel(
+    a_ptr, b_ptr, bias_ptr, out_ptr,
+    M, N, K,
+    stride_am, stride_ak, stride_bk, stride_bn,
+    BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    # Each program handles one row (one batch element)
+    pid_m = tl.program_id(0)
+    
+    # Initialize max value to very negative
+    max_val = float('-inf')
+    
+    # Process all N columns in chunks
+    for n_start in range(0, N, BLOCK_N):
+        offs_n_curr = n_start + tl.arange(0, BLOCK_N)
+        
+        # Compute GEMM for this block of columns
+        acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+        
+        for k_start in range(0, K, BLOCK_K):
+            offs_k_curr = k_start + tl.arange(0, BLOCK_K)
+            
+            # Load A block: (BLOCK_K,)
+            a_ptrs = a_ptr + pid_m * stride_am + offs_k_curr * stride_ak
+            a = tl.load(a_ptrs, mask=offs_k_curr < K, other=0.0)
+            
+            # Load B block: (BLOCK_K, BLOCK_N)
+            b_ptrs = b_ptr + offs_k_curr[:, None] * stride_bk + offs_n_curr[None, :] * stride_bn
+            b_mask = (offs_k_curr[:, None] < K) & (offs_n_curr[None, :] < N)
+            b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+            
+            # Accumulate: a (BLOCK_K,) * b (BLOCK_K, BLOCK_N) -> (BLOCK_N,)
+            acc += tl.sum(a[:, None] * b, axis=0)
+        
+        # Add bias
+        bias = tl.load(bias_ptr + offs_n_curr, mask=offs_n_curr < N, other=0.0)
+        acc = acc + bias
+        
+        # Update max - mask invalid positions
+        acc_masked = tl.where(offs_n_curr < N, acc, float('-inf'))
+        block_max = tl.max(acc_masked, axis=0)
+        max_val = tl.maximum(max_val, block_max)
+    
+    # After max along dim=1, we have a single value per row
+    # Subtracting mean of a single element gives 0
+    # GELU(0) = 0
+    result = 0.0
+    
+    # Store result - scalar to scalar
+    tl.store(out_ptr + pid_m, result)
+
+
+def gemm_max_sub_gelu(x, weight, bias):
+    M, K = x.shape
+    N = weight.shape[0]
+    
+    # Output is (M, 1)
+    out = torch.empty((M, 1), device=x.device, dtype=x.dtype)
+    
+    # Transpose weight for better access pattern
+    weight_t = weight.t().contiguous()
+    
+    BLOCK_N = 128
+    BLOCK_K = 128
+    
+    # Ensure N and K are handled properly
+    grid = (M,)
+    
+    gemm_max_kernel[grid](
+        x, weight_t, bias, out,
+        M, N, K,
+        x.stride(0), x.stride(1), weight_t.stride(0), weight_t.stride(1),
+        BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+    )
+    
+    return out
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, max_dim):
+        super(ModelNew, self).__init__()
+        self.gemm = nn.Linear(in_features, out_features)
+        self.max_dim = max_dim
+
+    def forward(self, x):
+        return gemm_max_sub_gelu(x, self.gemm.weight, self.gemm.bias)
+```
+
+---
+
+# Your Task
+
+Implement the optimization strategy above. Focus on the specific bottleneck identified.
+
+## Key Requirements
+
+1. **Preserve correctness**: Maintain the same input/output behavior
+2. **Apply the optimization**: Follow the implementation plan exactly
+3. **Use valid Triton syntax**:
+   - Every kernel MUST have `@triton.jit` decorator
+   - Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+   - BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+   - No `continue`, `break`, `return` inside kernels (use masking)
+   - Prefer `tl.dot(a, b, allow_tf32=True)` for matmul operations
+
+4. **CRITICAL for RNN/GRU/LSTM Persistent Kernels**:
+   - Time loop MUST be inside @triton.jit kernel, NOT in Python forward()
+   - **HYBRID computation strategy** (CRITICAL for performance):
+     * Precompute input-side gates OUTSIDE kernel: `gates_x = (T*B, In) @ W_ih` (ONE large GEMM)
+     * INSIDE kernel: only recurrent-side: `for t: gates_h = h @ W_hh` (T small GEMMs)
+   - CORRECT (FAST - use this):
+     ```python
+     # Python forward():
+     gates_x_all = x.reshape(T*B, In) @ W_ih + b_ih  # ONE large GEMM
+     gates_x_all = gates_x_all.view(T, B, 3*H)
+     gru_persistent_kernel[grid](gates_x_all, h0, W_hh, ...)  # Launch ONCE
+
+     @triton.jit
+     def gru_persistent_kernel(gates_x_ptr, h_ptr, W_hh_ptr, ...):
+         for t in range(T):  # Inside kernel
+             gates_x_t = tl.load(gates_x_ptr + t*...)  # Precomputed
+             gates_h = h @ W_hh  # Only recurrent GEMM
+             h = (1-z)*n + z*h   # Fuse and update
+     ```
+
+5. **Output format**:
+   - Imports: `import torch, torch.nn as nn, triton, triton.language as tl`
+   - `@triton.jit` kernel(s)
+   - Wrapper function(s)
+   - `class ModelNew(nn.Module)` — REQUIRED
+   - NO testing code, NO `if __name__ == "__main__"`
+
+---
+
+Generate the optimized kernel now. Output ONLY the complete Python code.

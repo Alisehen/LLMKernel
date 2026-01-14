@@ -1,0 +1,107 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def fused_scale_bn_gap_kernel(
+    input_ptr, output_ptr,
+    gamma_ptr, beta_ptr, mean_ptr, var_ptr,
+    scale_factor, eps,
+    batch_size, channels, spatial_size,
+    stride_b, stride_c, stride_s,
+    BLOCK_SIZE: tl.constexpr,
+):
+    # Each program handles one (batch, channel) pair
+    pid = tl.program_id(0)
+    batch_idx = pid // channels
+    channel_idx = pid % channels
+    
+    # Load batch norm parameters for this channel
+    gamma = tl.load(gamma_ptr + channel_idx)
+    beta = tl.load(beta_ptr + channel_idx)
+    mean = tl.load(mean_ptr + channel_idx)
+    var = tl.load(var_ptr + channel_idx)
+    
+    # Compute normalization factor
+    inv_std = 1.0 / tl.sqrt(var + eps)
+    
+    # Base pointer for this (batch, channel)
+    base_ptr = input_ptr + batch_idx * stride_b + channel_idx * stride_c
+    
+    # Accumulate sum over spatial dimensions
+    acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+    
+    for start in range(0, spatial_size, BLOCK_SIZE):
+        offs = start + tl.arange(0, BLOCK_SIZE)
+        mask = offs < spatial_size
+        
+        # Load input values
+        x = tl.load(base_ptr + offs * stride_s, mask=mask, other=0.0)
+        
+        # Apply scale
+        x = x * scale_factor
+        
+        # Apply batch norm: (x - mean) * inv_std * gamma + beta
+        x = (x - mean) * inv_std * gamma + beta
+        
+        # Accumulate for global average pooling
+        acc += tl.where(mask, x, 0.0)
+    
+    # Sum reduction and compute average
+    total_sum = tl.sum(acc, axis=0)
+    avg = total_sum / spatial_size
+    
+    # Store result
+    tl.store(output_ptr + batch_idx * channels + channel_idx, avg)
+
+
+def fused_scale_bn_gap(x, gamma, beta, running_mean, running_var, scale_factor, eps):
+    batch_size, channels, D, H, W = x.shape
+    spatial_size = D * H * W
+    
+    # Output shape: (batch_size, channels, 1, 1, 1)
+    output = torch.empty((batch_size, channels, 1, 1, 1), device=x.device, dtype=x.dtype)
+    
+    # Flatten spatial dimensions for easier processing
+    x_flat = x.view(batch_size, channels, spatial_size).contiguous()
+    
+    BLOCK_SIZE = 1024
+    grid = (batch_size * channels,)
+    
+    fused_scale_bn_gap_kernel[grid](
+        x_flat, output,
+        gamma, beta, running_mean, running_var,
+        scale_factor, eps,
+        batch_size, channels, spatial_size,
+        x_flat.stride(0), x_flat.stride(1), x_flat.stride(2),
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    
+    return output
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, scale_factor, eps=1e-5, momentum=0.1):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size)
+        self.scale_factor = scale_factor
+        self.batch_norm = nn.BatchNorm3d(out_channels, eps=eps, momentum=momentum)
+        self.eps = eps
+
+    def forward(self, x):
+        # Use cuDNN for transposed convolution
+        x = self.conv_transpose(x)
+        
+        # Fused scale + batch norm + global average pooling
+        x = fused_scale_bn_gap(
+            x,
+            self.batch_norm.weight,
+            self.batch_norm.bias,
+            self.batch_norm.running_mean,
+            self.batch_norm.running_var,
+            self.scale_factor,
+            self.eps
+        )
+        
+        return x

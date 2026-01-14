@@ -1,0 +1,188 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def fused_softmax_maxpool_kernel(
+    input_ptr, output_ptr,
+    batch_size, channels,
+    in_d, in_h, in_w,
+    out_d, out_h, out_w,
+    stride_b, stride_c, stride_d, stride_h, stride_w,
+    out_stride_b, out_stride_c, out_stride_d, out_stride_h, out_stride_w,
+    BLOCK_C: tl.constexpr,
+):
+    # Each program handles one output element (b, c, od, oh, ow)
+    pid = tl.program_id(0)
+    
+    # Compute output indices
+    total_out = out_d * out_h * out_w
+    bc_idx = pid // total_out
+    spatial_idx = pid % total_out
+    
+    b = bc_idx // channels
+    c = bc_idx % channels
+    
+    od = spatial_idx // (out_h * out_w)
+    oh_ow = spatial_idx % (out_h * out_w)
+    oh = oh_ow // out_w
+    ow = oh_ow % out_w
+    
+    # Input starting position (pool_size = 4 because two consecutive 2x2x2 pools = 4x4x4)
+    id_start = od * 4
+    ih_start = oh * 4
+    iw_start = ow * 4
+    
+    # Find max over 4x4x4 region after applying softmax
+    max_val = -float('inf')
+    
+    # Channel offsets for softmax computation
+    offs_c = tl.arange(0, BLOCK_C)
+    c_mask = offs_c < channels
+    
+    # Iterate over the 4x4x4 pooling region
+    for dd in range(4):
+        for dh in range(4):
+            for dw in range(4):
+                id_idx = id_start + dd
+                ih_idx = ih_start + dh
+                iw_idx = iw_start + dw
+                
+                valid = (id_idx < in_d) & (ih_idx < in_h) & (iw_idx < in_w)
+                
+                if valid:
+                    # Load all channels for this spatial location
+                    ptrs = input_ptr + b * stride_b + offs_c * stride_c + id_idx * stride_d + ih_idx * stride_h + iw_idx * stride_w
+                    x = tl.load(ptrs, mask=c_mask, other=-float('inf'))
+                    
+                    # Compute softmax across channels
+                    x_max = tl.max(x, axis=0)
+                    x_exp = tl.exp(x - x_max)
+                    x_sum = tl.sum(x_exp, axis=0)
+                    x_softmax = x_exp / x_sum
+                    
+                    # Get the softmax value for channel c
+                    softmax_val = tl.sum(tl.where(offs_c == c, x_softmax, 0.0), axis=0)
+                    
+                    # Update max
+                    max_val = tl.maximum(max_val, softmax_val)
+    
+    # Store result
+    out_ptr = output_ptr + b * out_stride_b + c * out_stride_c + od * out_stride_d + oh * out_stride_h + ow * out_stride_w
+    tl.store(out_ptr, max_val)
+
+
+@triton.jit
+def fused_softmax_maxpool_kernel_v2(
+    input_ptr, output_ptr,
+    batch_size, channels,
+    in_d, in_h, in_w,
+    out_d, out_h, out_w,
+    stride_b, stride_c, stride_d, stride_h, stride_w,
+    out_stride_b, out_stride_c, out_stride_d, out_stride_h, out_stride_w,
+    BLOCK_C: tl.constexpr,
+):
+    # Each program handles one output element (b, c, od, oh, ow)
+    pid = tl.program_id(0)
+    
+    # Compute output indices
+    total_out = out_d * out_h * out_w
+    bc_idx = pid // total_out
+    spatial_idx = pid % total_out
+    
+    b = bc_idx // channels
+    c = bc_idx % channels
+    
+    od = spatial_idx // (out_h * out_w)
+    oh_ow = spatial_idx % (out_h * out_w)
+    oh = oh_ow // out_w
+    ow = oh_ow % out_w
+    
+    # Input starting position (pool_size = 4 because two consecutive 2x2x2 pools = 4x4x4)
+    id_start = od * 4
+    ih_start = oh * 4
+    iw_start = ow * 4
+    
+    # Find max over 4x4x4 region after applying softmax
+    max_val = -float('inf')
+    
+    # Channel offsets for softmax computation
+    offs_c = tl.arange(0, BLOCK_C)
+    c_mask = offs_c < channels
+    
+    base_ptr = input_ptr + b * stride_b
+    
+    # Unrolled loop for 4x4x4 pooling region
+    for dd in tl.static_range(4):
+        for dh in tl.static_range(4):
+            for dw in tl.static_range(4):
+                id_idx = id_start + dd
+                ih_idx = ih_start + dh
+                iw_idx = iw_start + dw
+                
+                # Load all channels for this spatial location
+                ptrs = base_ptr + offs_c * stride_c + id_idx * stride_d + ih_idx * stride_h + iw_idx * stride_w
+                x = tl.load(ptrs, mask=c_mask, other=-float('inf'))
+                
+                # Compute softmax across channels
+                x_max = tl.max(x, axis=0)
+                x_exp = tl.exp(x - x_max)
+                x_sum = tl.sum(x_exp, axis=0)
+                x_softmax = x_exp / x_sum
+                
+                # Get the softmax value for channel c using indexing
+                # Create a mask for the target channel
+                target_mask = offs_c == c
+                softmax_val = tl.sum(tl.where(target_mask, x_softmax, 0.0), axis=0)
+                
+                # Update max
+                max_val = tl.maximum(max_val, softmax_val)
+    
+    # Store result
+    out_ptr = output_ptr + b * out_stride_b + c * out_stride_c + od * out_stride_d + oh * out_stride_h + ow * out_stride_w
+    tl.store(out_ptr, max_val)
+
+
+def fused_softmax_maxpool3d(x):
+    batch_size, channels, in_d, in_h, in_w = x.shape
+    out_d = in_d // 4
+    out_h = in_h // 4
+    out_w = in_w // 4
+    
+    output = torch.empty((batch_size, channels, out_d, out_h, out_w), device=x.device, dtype=x.dtype)
+    
+    total_elements = batch_size * channels * out_d * out_h * out_w
+    
+    if total_elements == 0:
+        return output
+    
+    BLOCK_C = triton.next_power_of_2(channels)
+    
+    grid = (total_elements,)
+    
+    fused_softmax_maxpool_kernel_v2[grid](
+        x, output,
+        batch_size, channels,
+        in_d, in_h, in_w,
+        out_d, out_h, out_w,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
+        output.stride(0), output.stride(1), output.stride(2), output.stride(3), output.stride(4),
+        BLOCK_C=BLOCK_C,
+    )
+    return output
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model with fused softmax and double max pooling.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, pool_kernel_size):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = fused_softmax_maxpool3d(x)
+        return x

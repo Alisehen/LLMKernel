@@ -1,0 +1,155 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+import math
+
+@triton.jit
+def fused_gemm_bias_hardtanh_mish_kernel(
+    a_ptr, b_ptr, bias_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k in range(0, K, BLOCK_K):
+        mask_a = (offs_m[:, None] < M) & (offs_k[None, :] < K - k)
+        mask_b = (offs_k[:, None] < K - k) & (offs_n[None, :] < N)
+        a = tl.load(a_ptrs, mask=mask_a, other=0.0)
+        b = tl.load(b_ptrs, mask=mask_b, other=0.0)
+        acc += tl.dot(a, b, allow_tf32=True)
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Fused: add bias
+    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc += bias[None, :]
+
+    # Fused: Hardtanh (clamp between -1 and 1)
+    acc = tl.minimum(tl.maximum(acc, -1.0), 1.0)
+
+    # Fused: Mish = x * tanh(softplus(x)) = x * tanh(ln(1 + exp(x)))
+    # For numerical stability, use: softplus(x) = ln(1 + exp(x)) ≈ x for large x
+    # tanh(x) = (exp(2x) - 1) / (exp(2x) + 1)
+    softplus = tl.log(1.0 + tl.exp(acc))
+    tanh_sp = (tl.exp(2.0 * softplus) - 1.0) / (tl.exp(2.0 * softplus) + 1.0)
+    acc = acc * tanh_sp
+
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    mask_c = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, acc, mask=mask_c)
+
+
+@triton.jit
+def group_norm_kernel(
+    x_ptr, out_ptr, weight_ptr, bias_ptr,
+    M, N, num_groups,
+    stride_xm, stride_xn, stride_om, stride_on,
+    eps: tl.constexpr, BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    
+    batch_idx = pid // num_groups
+    group_idx = pid % num_groups
+    
+    group_size = N // num_groups
+    start_idx = group_idx * group_size
+    
+    # Compute mean
+    mean_acc = 0.0
+    for i in range(0, group_size, BLOCK_SIZE):
+        offs = start_idx + i + tl.arange(0, BLOCK_SIZE)
+        mask = offs < start_idx + group_size
+        x_ptrs = x_ptr + batch_idx * stride_xm + offs * stride_xn
+        x = tl.load(x_ptrs, mask=mask, other=0.0)
+        mean_acc += tl.sum(x)
+    mean = mean_acc / group_size
+    
+    # Compute variance
+    var_acc = 0.0
+    for i in range(0, group_size, BLOCK_SIZE):
+        offs = start_idx + i + tl.arange(0, BLOCK_SIZE)
+        mask = offs < start_idx + group_size
+        x_ptrs = x_ptr + batch_idx * stride_xm + offs * stride_xn
+        x = tl.load(x_ptrs, mask=mask, other=0.0)
+        diff = x - mean
+        var_acc += tl.sum(diff * diff)
+    var = var_acc / group_size
+    
+    # Normalize and apply affine transform
+    rstd = 1.0 / tl.sqrt(var + eps)
+    for i in range(0, group_size, BLOCK_SIZE):
+        offs = start_idx + i + tl.arange(0, BLOCK_SIZE)
+        mask = offs < start_idx + group_size
+        x_ptrs = x_ptr + batch_idx * stride_xm + offs * stride_xn
+        out_ptrs = out_ptr + batch_idx * stride_om + offs * stride_on
+        
+        x = tl.load(x_ptrs, mask=mask, other=0.0)
+        weight = tl.load(weight_ptr + offs, mask=mask, other=1.0)
+        bias_val = tl.load(bias_ptr + offs, mask=mask, other=0.0)
+        
+        normalized = (x - mean) * rstd
+        out = normalized * weight + bias_val
+        tl.store(out_ptrs, out, mask=mask)
+
+
+def fused_gemm_bias_hardtanh_mish(x, weight, bias):
+    M, K = x.shape
+    N = weight.shape[0]
+    c = torch.empty((M, N), device=x.device, dtype=x.dtype)
+    b = weight.t().contiguous()
+    
+    BLOCK_M = 128
+    BLOCK_N = 128
+    BLOCK_K = 32
+    
+    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']), triton.cdiv(N, META['BLOCK_N']))
+    fused_gemm_bias_hardtanh_mish_kernel[grid](
+        x, b, bias, c, M, N, K,
+        x.stride(0), x.stride(1), b.stride(0), b.stride(1), c.stride(0), c.stride(1),
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+    )
+    return c
+
+
+def group_norm_triton(x, weight, bias, num_groups, eps=1e-5):
+    M, N = x.shape
+    out = torch.empty_like(x)
+    
+    BLOCK_SIZE = 256
+    grid = (M * num_groups,)
+    
+    group_norm_kernel[grid](
+        x, out, weight, bias,
+        M, N, num_groups,
+        x.stride(0), x.stride(1), out.stride(0), out.stride(1),
+        eps=eps, BLOCK_SIZE=BLOCK_SIZE,
+    )
+    return out
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, bias_shape, num_groups):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.num_groups = num_groups
+        self.gn_weight = nn.Parameter(torch.ones(out_features))
+        self.gn_bias = nn.Parameter(torch.zeros(out_features))
+
+    def forward(self, x):
+        # Fused GEMM + BiasAdd + Hardtanh + Mish
+        x = fused_gemm_bias_hardtanh_mish(x, self.weight, self.bias)
+        # GroupNorm
+        x = group_norm_triton(x, self.gn_weight, self.gn_bias, self.num_groups)
+        return x

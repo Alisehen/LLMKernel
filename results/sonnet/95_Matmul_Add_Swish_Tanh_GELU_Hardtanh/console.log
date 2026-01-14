@@ -1,0 +1,152 @@
+[Seed] Generating seed kernel...
+[Seed 1/2] Generating...
+[92mFinish reason: stop[0m
+Usage: In=2185, Out=1356, Total=3541
+[seed_0] score=0.8920 (baseline=3.3299ms)
+[seed_0] metrics saved to: /home/hyc/LLMKernel/run/20260114_074156_95_Matmul_Add_Swish_Tanh_GELU_Hardtanh_openai_deepseek/95_Matmul_Add_Swish_Tanh_GELU_Hardtanh/evaluation/eval_0000.json
+[Seed 1] Final score: 0.8920 ✓
+[Seed 2/2] Generating...
+[92mFinish reason: stop[0m
+Usage: In=2185, Out=1356, Total=3541
+[seed_1] score=0.8927 (baseline=3.3299ms)
+[seed_1] metrics saved to: /home/hyc/LLMKernel/run/20260114_074156_95_Matmul_Add_Swish_Tanh_GELU_Hardtanh_openai_deepseek/95_Matmul_Add_Swish_Tanh_GELU_Hardtanh/evaluation/eval_0001.json
+[Seed 2] Final score: 0.8927 ✓
+
+================================================================================
+[Hybrid Strategy] Analyzing all seeds for algorithmic optimization...
+[Hybrid Strategy] - 2 seed(s) with score < 1.0 (rescue)
+================================================================================
+
+[Hybrid] Seed 1: score=0.8920 < 1.0
+[Hybrid] Attempting algorithm analysis rescue...
+[ncu] Using GPU device 5 (CUDA_VISIBLE_DEVICES=5)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_3044674.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_3044674.py /home/hyc/LLMKernel/KernelBench/level2/95_Matmul_Add_Swish_Tanh_GELU_Hardtanh.py /home/hyc/LLMKernel/run/20260114_074156_95_Matmul_Add_Swish_Tanh_GELU_Hardtanh_openai_deepseek/95_Matmul_Add_Swish_Tanh_GELU_Hardtanh/code/test_kernel_analysis_seed0.py --repeat 1
+[ncu stdout]: [bench] Completed 1 iterations successfully
+
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_3044674.csv
+[Hybrid] Requesting LLM analysis for seed 1...
+[92mFinish reason: stop[0m
+Usage: In=2470, Out=92, Total=2562
+[Hybrid] Worth optimizing: no
+[Hybrid] Reason: The kernel is already well-optimized with full operator fusion and the performance gap is primarily due to suboptimal block sizes rather than algorithmic inefficiency.
+[Hybrid] ⊘ Skipping optimization for seed 1 (not worth optimizing)
+
+[Hybrid] Seed 2: score=0.8927 < 1.0
+[Hybrid] Attempting algorithm analysis rescue...
+[ncu] Using GPU device 5 (CUDA_VISIBLE_DEVICES=5)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_3044674.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_3044674.py /home/hyc/LLMKernel/KernelBench/level2/95_Matmul_Add_Swish_Tanh_GELU_Hardtanh.py /home/hyc/LLMKernel/run/20260114_074156_95_Matmul_Add_Swish_Tanh_GELU_Hardtanh_openai_deepseek/95_Matmul_Add_Swish_Tanh_GELU_Hardtanh/code/test_kernel_analysis_seed1.py --repeat 1
+[ncu stdout]: [bench] Completed 1 iterations successfully
+
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_3044674.csv
+[Hybrid] Requesting LLM analysis for seed 2...
+[92mFinish reason: stop[0m
+Usage: In=2470, Out=99, Total=2569
+[Hybrid] Worth optimizing: no
+[Hybrid] Reason: The kernel is already well-optimized with full operator fusion and the performance gap is primarily due to suboptimal block sizes and register pressure from complex activation chains, not algorithmic inefficiency.
+[Hybrid] ⊘ Skipping optimization for seed 2 (not worth optimizing)
+
+================================================================================
+[Hybrid] Candidate Selection
+================================================================================
+[Hybrid] Total candidates: 2
+  [1] seed 1: 0.8920
+  [2] seed 2: 0.8927
+
+[Hybrid] ★ Selected best candidate: score=0.8927
+
+[Optimization] Starting 3-stage optimization...
+
+================================================================================
+[Stage 1/3] grid_and_parallel
+Description: Optimize grid layout and parallel work distribution across SMs.
+Current candidates: 1, best score: 0.8927
+================================================================================
+[Stage 1] Profiling best candidate...
+[ncu] Using GPU device 5 (CUDA_VISIBLE_DEVICES=5)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_3044674.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_3044674.py /home/hyc/LLMKernel/KernelBench/level2/95_Matmul_Add_Swish_Tanh_GELU_Hardtanh.py /home/hyc/LLMKernel/run/20260114_074156_95_Matmul_Add_Swish_Tanh_GELU_Hardtanh_openai_deepseek/95_Matmul_Add_Swish_Tanh_GELU_Hardtanh/code/test_kernel_analysis_seed1.py --repeat 1
+[ncu stdout]: [bench] Completed 1 iterations successfully
+
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_3044674.csv
+[Stage 1] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=2195, Out=1511, Total=3706
+[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 576, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20260114_074156_95_Matmul_Add_Swish_Tanh_GELU_Hardtanh_openai_deepseek/95_Matmul_Add_Swish_Tanh_GELU_Hardtanh/code/kernel_20260114_074749.py", line 111, in forward
+    return fused_matmul_activations(x, self.weight, self.add_value)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20260114_074156_95_Matmul_Add_Swish_Tanh_GELU_Hardtanh_openai_deepseek/95_Matmul_Add_Swish_Tanh_GELU_Hardtanh/code/kernel_20260114_074749.py", line 91, in fused_matmul_activations
+    fused_matmul_activations_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 419, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 756, in run
+    launch_metadata = kernel.launch_metadata(grid, stream, *bound_args.values())
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 490, in launch_metadata
+    self._init_handles()
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 464, in _init_handles
+    raise_(OutOfResources(self.metadata.shared, max_shared, "shared memory"))
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 456, in raise_
+    raise err
+triton.runtime.errors.OutOfResources: out of resource: shared memory, Required: 196608, Hardware limit: 101376. Reducing block sizes or `num_stages` may help.
+
+[stage1_grid_and_parallel] failed. See metrics.message for details.
+[stage1_grid_and_parallel] metrics saved to: /home/hyc/LLMKernel/run/20260114_074156_95_Matmul_Add_Swish_Tanh_GELU_Hardtanh_openai_deepseek/95_Matmul_Add_Swish_Tanh_GELU_Hardtanh/evaluation/eval_0002.json
+  Optimization failed, attempting repair...
+[92mFinish reason: stop[0m
+Usage: In=2893, Out=1551, Total=4444
+[stage1_grid_and_parallel_repair] score=0.7532 (baseline=3.3299ms)
+[stage1_grid_and_parallel_repair] metrics saved to: /home/hyc/LLMKernel/run/20260114_074156_95_Matmul_Add_Swish_Tanh_GELU_Hardtanh_openai_deepseek/95_Matmul_Add_Swish_Tanh_GELU_Hardtanh/evaluation/eval_0003.json
+  Optimized kernel score: 0.7532 ✓
+[Stage 1] Current: 0.7532 (global best: 0.8927)
+
+================================================================================
+[Stage 2/3] block_tiling
+Description: Tune BLOCK_M/N/K sizes for optimal register/memory balance.
+Current candidates: 1, best score: 0.8927
+================================================================================
+[Stage 2] Profiling best candidate...
+[ncu] Using GPU device 5 (CUDA_VISIBLE_DEVICES=5)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_3044674.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_3044674.py /home/hyc/LLMKernel/KernelBench/level2/95_Matmul_Add_Swish_Tanh_GELU_Hardtanh.py /home/hyc/LLMKernel/run/20260114_074156_95_Matmul_Add_Swish_Tanh_GELU_Hardtanh_openai_deepseek/95_Matmul_Add_Swish_Tanh_GELU_Hardtanh/code/test_kernel_analysis_seed1.py --repeat 1
+[ncu stdout]: [bench] Completed 1 iterations successfully
+
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_3044674.csv
+[Stage 2] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=2483, Out=1540, Total=4023
+[stage2_block_tiling] score=0.8772 (baseline=3.3299ms)
+[stage2_block_tiling] metrics saved to: /home/hyc/LLMKernel/run/20260114_074156_95_Matmul_Add_Swish_Tanh_GELU_Hardtanh_openai_deepseek/95_Matmul_Add_Swish_Tanh_GELU_Hardtanh/evaluation/eval_0004.json
+  Optimized kernel score: 0.8772 ✓
+[Stage 2] Current: 0.8772 (global best: 0.8927)
+
+================================================================================
+[Stage 3/3] memory_and_tuning
+Description: Optimize memory access patterns and fine-tune num_stages/num_warps.
+Current candidates: 1, best score: 0.8927
+================================================================================
+[Stage 3] Profiling best candidate...
+[ncu] Using GPU device 5 (CUDA_VISIBLE_DEVICES=5)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_3044674.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_3044674.py /home/hyc/LLMKernel/KernelBench/level2/95_Matmul_Add_Swish_Tanh_GELU_Hardtanh.py /home/hyc/LLMKernel/run/20260114_074156_95_Matmul_Add_Swish_Tanh_GELU_Hardtanh_openai_deepseek/95_Matmul_Add_Swish_Tanh_GELU_Hardtanh/code/test_kernel_analysis_seed1.py --repeat 1
+[ncu stdout]: [bench] Completed 1 iterations successfully
+
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_3044674.csv
+[Stage 3] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=2586, Out=1554, Total=4140
+[stage3_memory_and_tuning] score=0.8802 (baseline=3.3299ms)
+[stage3_memory_and_tuning] metrics saved to: /home/hyc/LLMKernel/run/20260114_074156_95_Matmul_Add_Swish_Tanh_GELU_Hardtanh_openai_deepseek/95_Matmul_Add_Swish_Tanh_GELU_Hardtanh/evaluation/eval_0005.json
+  Optimized kernel score: 0.8802 ✓
+[Stage 3] Current: 0.8802 (global best: 0.8927)
+[95_Matmul_Add_Swish_Tanh_GELU_Hardtanh.py] Figure saved to: /home/hyc/LLMKernel/run/20260114_074156_95_Matmul_Add_Swish_Tanh_GELU_Hardtanh_openai_deepseek/95_Matmul_Add_Swish_Tanh_GELU_Hardtanh/figures/95_Matmul_Add_Swish_Tanh_GELU_Hardtanh_score.png

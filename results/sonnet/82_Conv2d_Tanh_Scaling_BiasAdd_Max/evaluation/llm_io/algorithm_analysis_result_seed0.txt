@@ -1,0 +1,10 @@
+```json
+{
+  "worth_optimizing": "yes",
+  "reason": "The max pooling kernel performs redundant work by computing indices and loading data inefficiently, and can be fused with the preceding operations to eliminate an intermediate memory round-trip.",
+  "bottleneck": "The max_pool2d_kernel computes 4D tensor indices (n, c, h_out, w_out) from a flat offset for every element, then performs nested loops with strided memory accesses. This causes excessive address computation overhead and poor memory access patterns.",
+  "optimisation method": "Fuse max pooling directly into the tanh-scale-bias kernel to eliminate the intermediate buffer write/read, and restructure the pooling computation to work on 2D tiles with better memory locality and reduced index arithmetic.",
+  "modification plan": "Create a single fused kernel that: (1) loads conv output in tiles corresponding to pooling windows, (2) applies tanh-scale-bias element-wise, (3) immediately computes max reduction within each pooling window using shared memory or registers, (4) writes final pooled output. Use 2D thread blocks mapped to output spatial dimensions to naturally align with pooling windows and minimize index calculations.",
+  "expected_speedup": "25-35%"
+}
+```

@@ -1,0 +1,10 @@
+```json
+{
+  "worth_optimizing": "yes",
+  "reason": "The avgpool_gelu_scale_max_kernel has extremely low SM throughput (0.35%) and poor cache hit rate (3.57%), indicating severe memory inefficiency from repeated loads of matmul output.",
+  "bottleneck": "The second kernel loads the entire matmul output (1024×8192 elements) repeatedly for pooling operations, causing massive redundant memory traffic. Each batch row is accessed N_pooled × pool_kernel_size times instead of once.",
+  "optimisation method": "Fuse avgpool+GELU+scale+max directly into the matmul kernel's output stage. As each matmul tile computes results, immediately apply pooling/GELU/scale within shared memory before writing to global memory, eliminating the intermediate 1024×8192 buffer entirely.",
+  "modification plan": "Modify matmul_kernel to accumulate pooled results in registers: for each BLOCK_N tile, compute pool groups, apply GELU+scale in registers, and maintain running max per row. After all N tiles complete, write only the final max value (1024 elements) instead of full matmul output (8M elements). This reduces global memory writes by 8000× and eliminates the second kernel entirely.",
+  "expected_speedup": "60-80%"
+}
+```

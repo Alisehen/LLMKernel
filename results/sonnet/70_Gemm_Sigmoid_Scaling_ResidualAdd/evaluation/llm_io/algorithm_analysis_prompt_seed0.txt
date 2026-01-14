@@ -1,0 +1,206 @@
+You are a GPU kernel optimization architect. Analyze the kernel and identify **ONE high-level algorithmic optimization**.
+
+# PyTorch Reference
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model implementing the pattern "Gemm_Sigmoid_Scaling_ResidualAdd".
+    """
+    def __init__(self, input_size, hidden_size, scaling_factor):
+        super(Model, self).__init__()
+        self.gemm = nn.Linear(input_size, hidden_size)
+        self.scaling_factor = scaling_factor
+
+    def forward(self, x):
+        """
+        Forward pass of the model.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, input_size).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, hidden_size).
+        """
+        x = self.gemm(x)
+        original_x = x
+        x = torch.sigmoid(x)
+        x = x * self.scaling_factor
+        x = x + original_x
+        return x
+
+batch_size = 1024
+input_size = 8192
+hidden_size = 8192
+scaling_factor = 2.0
+
+def get_inputs():
+    return [torch.rand(batch_size, input_size)]
+
+def get_init_inputs():
+    return [input_size, hidden_size, scaling_factor]
+```
+
+# Current Triton Kernel
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def fused_gemm_sigmoid_scale_residual_kernel(
+    a_ptr, b_ptr, c_ptr,
+    M, N, K,
+    scaling_factor,
+    stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k in range(0, K, BLOCK_K):
+        mask_a = (offs_m[:, None] < M) & (offs_k[None, :] < K - k)
+        mask_b = (offs_k[:, None] < K - k) & (offs_n[None, :] < N)
+        a = tl.load(a_ptrs, mask=mask_a, other=0.0)
+        b = tl.load(b_ptrs, mask=mask_b, other=0.0)
+        acc += tl.dot(a, b, allow_tf32=True)
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Store original_x (gemm result)
+    original_x = acc
+    
+    # Fused: sigmoid
+    x = 1.0 / (1.0 + tl.exp(-acc))
+    
+    # Fused: scaling
+    x = x * scaling_factor
+    
+    # Fused: residual add
+    x = x + original_x
+
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    mask_c = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, x, mask=mask_c)
+
+
+def fused_gemm_sigmoid_scale_residual(x, weight, bias, scaling_factor):
+    M, K = x.shape
+    N = weight.shape[0]
+    
+    # Add bias to weight using standard PyTorch (minimal overhead)
+    # We'll fuse gemm + sigmoid + scale + residual in Triton
+    c = torch.empty((M, N), device=x.device, dtype=torch.float32)
+    
+    # Transpose weight for efficient memory access
+    b = weight.t().contiguous()
+    
+    grid = lambda META: (
+        triton.cdiv(M, META['BLOCK_M']), 
+        triton.cdiv(N, META['BLOCK_N'])
+    )
+    
+    fused_gemm_sigmoid_scale_residual_kernel[grid](
+        x, b, c,
+        M, N, K,
+        scaling_factor,
+        x.stride(0), x.stride(1), 
+        b.stride(0), b.stride(1), 
+        c.stride(0), c.stride(1),
+        BLOCK_M=128, BLOCK_N=128, BLOCK_K=32,
+    )
+    
+    # Add bias after kernel (could be fused but keeping it simple for correctness)
+    if bias is not None:
+        c = c + bias
+    
+    return c
+
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_size, scaling_factor):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.randn(hidden_size, input_size))
+        self.bias = nn.Parameter(torch.randn(hidden_size))
+        self.scaling_factor = scaling_factor
+
+    def forward(self, x):
+        return fused_gemm_sigmoid_scale_residual(x, self.weight, self.bias, self.scaling_factor)
+```
+
+# Performance
+- **PyTorch baseline**: 3.27 ms
+- **Current Triton**: 4.30 ms
+- **Current speedup**: 0.76x (-31.6% vs baseline)
+
+
+---
+
+## Analysis Steps
+
+1. **Code Analysis**: Count kernels, identify operations, check for inefficiencies
+2. **Performance Diagnosis**: Use metrics/latency to identify bottleneck type
+3. **Root Cause**: Combine code + performance to find the core issue
+
+## Optimization Categories (pick ONE if worth optimizing):
+
+### 1. Operator Fusion
+Fuse consecutive ops into fewer kernels to reduce memory traffic and launch overhead.
+
+### 2. Algorithm Replacement
+Replace naive algorithm with optimized variant.
+- For Attention: Flash Attention, online softmax
+- For Convolution: Winograd, im2col
+- **For RNN/GRU/LSTM**: Persistent kernel with HYBRID computation
+  - **CRITICAL**: Use hybrid approach for best performance:
+    * Precompute input-side gates ONCE (outside kernel): `gates_x = (T*B, In) @ W_ih`
+    * Persistent kernel (inside): only recurrent-side: `for t: gates_h = h @ W_hh`
+  - Time loop `for t in range(T)` must be inside kernel, NOT in Python
+  - Launch kernel once per layer, not once per timestep
+  - Expected speedup: 10-100x (vs per-timestep launches)
+
+### 3. Kernel Launch Reduction
+Combine multiple small kernels to reduce overhead.
+- **For RNN/GRU/LSTM**: See "Algorithm Replacement" above for persistent kernel approach
+
+### 4. Memory Layout Optimization
+Use in-place operations, buffer reuse, or better layouts.
+
+## Should We Optimize?
+
+Before proposing optimization, determine if it's worthwhile:
+- **Not worth optimizing** if:
+  - Code is already near-optimal (expected speedup < 10%)
+  - Bottleneck cannot be addressed (hardware limited, already optimal algorithm)
+  - Optimization would add significant complexity with minimal gain
+
+- **Worth optimizing** if:
+  - Clear algorithmic inefficiency exists (multiple kernels, suboptimal algorithm)
+  - Expected speedup >= 20%
+  - Concrete optimization path available
+
+## Output (JSON)
+
+```json
+{
+  "worth_optimizing": "yes/no",
+  "reason": "<Why worth or not worth optimizing, 1 sentence>",
+  "bottleneck": "<Root cause in 1-2 sentences, empty if not worth optimizing>",
+  "optimisation method": "<Specific optimization in 1-2 sentences, empty if not worth optimizing>",
+  "modification plan": "<Implementation steps in 2-3 sentences, empty if not worth optimizing>",
+  "expected_speedup": "<e.g., '30-40%', empty if not worth optimizing>"
+}
+```
+
+Return JSON only.

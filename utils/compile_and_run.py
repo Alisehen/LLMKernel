@@ -179,19 +179,27 @@ def _seed_everything(seed: int | None, device_idx: int | None = None):
 
     random.seed(seed)
     np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        if device_idx is not None:
-            torch.cuda.set_device(device_idx)
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
 
-        # 更强可复现（如不需要可注释掉）
-        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")  # 或 ":16:8"
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-        # 某些算子无确定性实现时仅告警不报错
-        torch.use_deterministic_algorithms(True, warn_only=True)
+    try:
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            if device_idx is not None:
+                torch.cuda.set_device(device_idx)
+            torch.cuda.manual_seed(seed)
+            torch.cuda.manual_seed_all(seed)
+
+            # 更强可复现（如不需要可注释掉）
+            os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")  # 或 ":16:8"
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+            # 某些算子无确定性实现时仅告警不报错
+            torch.use_deterministic_algorithms(True, warn_only=True)
+    except (torch.cuda.CudaError, RuntimeError) as e:
+        # CUDA context 可能已被之前的 kernel 破坏（如 illegal memory access）
+        raise RuntimeError(
+            f"Failed to set random seed. CUDA context may be corrupted from a previous kernel error. "
+            f"Original error: {type(e).__name__}: {str(e)}"
+        ) from e
 
 
 # ====================== 参数对齐（通用 + 类名/导出名专用） ======================
@@ -464,11 +472,24 @@ def compare_and_bench(
     if TORCH_DEVICE == "cuda":
         torch.cuda.set_device(dev)
         # Clear GPU cache before test to avoid OOM from previous runs
+        # 如果这里失败，说明 CUDA context 已经被破坏，应该立即失败而不是继续
         try:
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
-        except Exception:
-            pass
+        except (torch.cuda.CudaError, RuntimeError) as e:
+            # 如果是 illegal memory access 等严重错误，直接抛出
+            if "illegal memory access" in str(e).lower() or "cudaerrorillegaladdress" in str(e).lower():
+                raise RuntimeError(
+                    f"CUDA context is corrupted (likely from a previous kernel error). "
+                    f"Cannot proceed with benchmarking. Original error: {type(e).__name__}: {str(e)}"
+                ) from e
+            # 其他错误（如 OOM）可以继续，但记录警告
+            import warnings
+            warnings.warn(f"Failed to sync/clear CUDA cache: {e}", RuntimeWarning)
+        except Exception as e:
+            # 其他未预期的错误，记录但继续
+            import warnings
+            warnings.warn(f"Unexpected error during CUDA initialization: {e}", RuntimeWarning)
 
     # 若需要通过环境变量控制 seed
     if seed is None:

@@ -1,0 +1,10 @@
+```json
+{
+  "worth_optimizing": "yes",
+  "reason": "The max_pool3d_kernel shows high DRAM throughput (84%) and poor cache hit rate (15.72%), indicating memory-bound behavior that can be improved through kernel fusion.",
+  "bottleneck": "Two separate max pooling operations followed by channel summation create three kernel launches with intermediate materialization to global memory. The max_pool3d_kernel is severely memory-bound (84% DRAM throughput) with poor spatial locality (15.72% cache hit rate).",
+  "optimisation method": "Operator Fusion: Fuse the two consecutive max pooling operations and the channel sum into a single kernel. This eliminates two intermediate global memory round-trips and allows the second pooling to operate on data still in registers/cache from the first pooling.",
+  "modification plan": "Create a fused kernel that performs both pooling operations sequentially on each spatial location before writing to memory, then immediately accumulates across channels. The kernel processes each output spatial location by: (1) applying first max pool with kernel=2, (2) applying second max pool with kernel=3 on the intermediate result kept in registers, (3) accumulating across channels, (4) writing final result once. This reduces memory traffic from 3 full tensor materializations to 1.",
+  "expected_speedup": "40-60%"
+}
+```

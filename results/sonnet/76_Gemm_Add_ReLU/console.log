@@ -1,0 +1,193 @@
+[Seed] Generating seed kernel...
+[Seed 1/2] Generating...
+[92mFinish reason: stop[0m
+Usage: In=2144, Out=1341, Total=3485
+[seed_0] score=0.8433 (baseline=3.3070ms)
+[seed_0] metrics saved to: /home/hyc/LLMKernel/run/20260114_060846_batch_range74to97_openai_deepseek/76_Gemm_Add_ReLU/evaluation/eval_0000.json
+[Seed 1] Final score: 0.8433 ✓
+[Seed 2/2] Generating...
+[92mFinish reason: stop[0m
+Usage: In=2144, Out=1323, Total=3467
+[seed_1] score=0.8520 (baseline=3.3070ms)
+[seed_1] metrics saved to: /home/hyc/LLMKernel/run/20260114_060846_batch_range74to97_openai_deepseek/76_Gemm_Add_ReLU/evaluation/eval_0001.json
+[Seed 2] Final score: 0.8520 ✓
+
+================================================================================
+[Hybrid Strategy] Analyzing all seeds for algorithmic optimization...
+[Hybrid Strategy] - 2 seed(s) with score < 1.0 (rescue)
+================================================================================
+
+[Hybrid] Seed 1: score=0.8433 < 1.0
+[Hybrid] Attempting algorithm analysis rescue...
+[ncu] Using GPU device 2 (CUDA_VISIBLE_DEVICES=2)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_2758768.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_2758768.py /home/hyc/LLMKernel/KernelBench/tt/76_Gemm_Add_ReLU.py /home/hyc/LLMKernel/run/20260114_060846_batch_range74to97_openai_deepseek/76_Gemm_Add_ReLU/code/test_kernel_analysis_seed0.py --repeat 1
+[ncu stdout]: [bench] Completed 1 iterations successfully
+
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_2758768.csv
+[Hybrid] Requesting LLM analysis for seed 1...
+[92mFinish reason: stop[0m
+Usage: In=2414, Out=255, Total=2669
+[Hybrid] Worth optimizing: yes
+[Hybrid] Reason: The kernel performs an expensive weight transpose (.t().contiguous()) on every forward pass, creating unnecessary memory allocation and copy overhead.
+[Hybrid] Analysis complete for seed 1, generating optimized kernel...
+[Hybrid] Bottleneck: The weight matrix is transposed and copied to a new contiguous tensor on every f...
+[Hybrid] Optimization: Memory Layout Optimization: Store the weight matrix in the transposed layout (in...
+[Hybrid] Expected speedup: 15-25%
+[92mFinish reason: stop[0m
+Usage: In=2697, Out=1474, Total=4171
+[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 665, in compare_and_bench
+    raise ValueError(
+ValueError: Outputs are not close (atol=1, rtol=1). max_abs_err=1.574e+01, mean_abs_err=1.917e-01
+
+[algorithm_optimized_seed0] failed. See metrics.message for details.
+[algorithm_optimized_seed0] metrics saved to: /home/hyc/LLMKernel/run/20260114_060846_batch_range74to97_openai_deepseek/76_Gemm_Add_ReLU/evaluation/eval_0002.json
+[Hybrid] Algorithm-optimized kernel failed, attempting repair...
+[92mFinish reason: stop[0m
+Usage: In=2011, Out=1508, Total=3519
+[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 665, in compare_and_bench
+    raise ValueError(
+ValueError: Outputs are not close (atol=1, rtol=1). max_abs_err=1.574e+01, mean_abs_err=1.917e-01
+
+[algorithm_optimized_seed0_repair1] failed. See metrics.message for details.
+[algorithm_optimized_seed0_repair1] metrics saved to: /home/hyc/LLMKernel/run/20260114_060846_batch_range74to97_openai_deepseek/76_Gemm_Add_ReLU/evaluation/eval_0003.json
+[Hybrid] ✗ Rescue failed, keeping original seed
+
+[Hybrid] Seed 2: score=0.8520 < 1.0
+[Hybrid] Attempting algorithm analysis rescue...
+[ncu] Using GPU device 2 (CUDA_VISIBLE_DEVICES=2)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_2758768.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_2758768.py /home/hyc/LLMKernel/KernelBench/tt/76_Gemm_Add_ReLU.py /home/hyc/LLMKernel/run/20260114_060846_batch_range74to97_openai_deepseek/76_Gemm_Add_ReLU/code/test_kernel_analysis_seed1.py --repeat 1
+[ncu stdout]: [bench] Completed 1 iterations successfully
+
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_2758768.csv
+[Hybrid] Requesting LLM analysis for seed 2...
+[92mFinish reason: stop[0m
+Usage: In=2396, Out=304, Total=2700
+[Hybrid] Worth optimizing: yes
+[Hybrid] Reason: The current Triton kernel is 17% slower than PyTorch baseline, indicating suboptimal tile sizes and memory access patterns for this large GEMM (1024x8192x8192).
+[Hybrid] Analysis complete for seed 2, generating optimized kernel...
+[Hybrid] Bottleneck: The block sizes (BLOCK_M=128, BLOCK_N=128, BLOCK_K=32) and swizzle pattern are n...
+[Hybrid] Optimization: Use autotuning to find optimal block sizes for this specific GEMM shape, and sto...
+[Hybrid] Expected speedup: 20-40%
+[92mFinish reason: stop[0m
+Usage: In=2710, Out=1879, Total=4589
+[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 665, in compare_and_bench
+    raise ValueError(
+ValueError: Outputs are not close (atol=1, rtol=1). max_abs_err=1.574e+01, mean_abs_err=1.917e-01
+
+[algorithm_optimized_seed1] failed. See metrics.message for details.
+[algorithm_optimized_seed1] metrics saved to: /home/hyc/LLMKernel/run/20260114_060846_batch_range74to97_openai_deepseek/76_Gemm_Add_ReLU/evaluation/eval_0004.json
+[Hybrid] Algorithm-optimized kernel failed, attempting repair...
+[92mFinish reason: stop[0m
+Usage: In=2416, Out=1876, Total=4292
+[algorithm_optimized_seed1_repair1] score=0.8581 (baseline=3.3070ms)
+[algorithm_optimized_seed1_repair1] metrics saved to: /home/hyc/LLMKernel/run/20260114_060846_batch_range74to97_openai_deepseek/76_Gemm_Add_ReLU/evaluation/eval_0005.json
+[Hybrid] ✓ Repair successful for algorithm-optimized seed 2
+[Hybrid] ✓ Rescue successful: 0.8520 → 0.8581
+
+================================================================================
+[Hybrid] Candidate Selection
+================================================================================
+[Hybrid] Total candidates: 3
+  [1] seed 1: 0.8433
+  [2] seed 2: 0.8520
+  [3] algo-optimized (from seed 1): 0.8581
+
+[Hybrid] ★ Selected best candidate: score=0.8581
+
+[Optimization] Starting 3-stage optimization...
+
+================================================================================
+[Stage 1/3] grid_and_parallel
+Description: Optimize grid layout and parallel work distribution across SMs.
+Current candidates: 1, best score: 0.8581
+================================================================================
+[Stage 1] Profiling best candidate...
+[ncu] Using GPU device 2 (CUDA_VISIBLE_DEVICES=2)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_2758768.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_2758768.py /home/hyc/LLMKernel/KernelBench/tt/76_Gemm_Add_ReLU.py /home/hyc/LLMKernel/run/20260114_060846_batch_range74to97_openai_deepseek/76_Gemm_Add_ReLU/code/test_kernel_analysis_seed1.py --repeat 1
+[ncu stdout]: [bench] Completed 1 iterations successfully
+
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_2758768.csv
+[Stage 1] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=2626, Out=2461, Total=5087
+[91mTest Error (RuntimeError):[0m Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 576, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20260114_060846_batch_range74to97_openai_deepseek/76_Gemm_Add_ReLU/code/kernel_20260114_061217.py", line 134, in forward
+    return fused_gemm_add_relu(x, self.weight, self.bias)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20260114_060846_batch_range74to97_openai_deepseek/76_Gemm_Add_ReLU/code/kernel_20260114_061217.py", line 108, in fused_gemm_add_relu
+    fused_gemm_add_relu_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 419, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/autotuner.py", line 250, in run
+    ret = self.fn.run(
+          ^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 756, in run
+    launch_metadata = kernel.launch_metadata(grid, stream, *bound_args.values())
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 490, in launch_metadata
+    self._init_handles()
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 464, in _init_handles
+    raise_(OutOfResources(self.metadata.shared, max_shared, "shared memory"))
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 456, in raise_
+    raise err
+triton.runtime.errors.OutOfResources: out of resource: shared memory, Required: 196608, Hardware limit: 101376. Reducing block sizes or `num_stages` may help.
+
+[stage1_grid_and_parallel] failed. See metrics.message for details.
+[stage1_grid_and_parallel] metrics saved to: /home/hyc/LLMKernel/run/20260114_060846_batch_range74to97_openai_deepseek/76_Gemm_Add_ReLU/evaluation/eval_0006.json
+  Optimization failed, attempting repair...
+[92mFinish reason: stop[0m
+Usage: In=3414, Out=2139, Total=5553
+[91mTest Error (CompilationError):[0m invalid syntax (kernel_20260114_061244.py, line 1)
+[stage1_grid_and_parallel_repair] failed. See metrics.message for details.
+[stage1_grid_and_parallel_repair] metrics saved to: /home/hyc/LLMKernel/run/20260114_060846_batch_range74to97_openai_deepseek/76_Gemm_Add_ReLU/evaluation/eval_0007.json
+  Optimization failed, keeping previous candidate ✗
+[Stage 1] Current: 0.8581 (global best: 0.8581)
+
+================================================================================
+[Stage 2/3] block_tiling
+Description: Tune BLOCK_M/N/K sizes for optimal register/memory balance.
+Current candidates: 1, best score: 0.8581
+================================================================================
+[Stage 2] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=2718, Out=1956, Total=4674
+[stage2_block_tiling] score=1.4815 (baseline=3.3070ms)
+[stage2_block_tiling] metrics saved to: /home/hyc/LLMKernel/run/20260114_060846_batch_range74to97_openai_deepseek/76_Gemm_Add_ReLU/evaluation/eval_0008.json
+  Optimized kernel score: 1.4815 ✓
+[Stage 2] ★ New best score: 1.4815
+
+================================================================================
+[Stage 3/3] memory_and_tuning
+Description: Optimize memory access patterns and fine-tune num_stages/num_warps.
+Current candidates: 1, best score: 1.4815
+================================================================================
+[Stage 3] Profiling best candidate...
+[ncu] Using GPU device 2 (CUDA_VISIBLE_DEVICES=2)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_2758768.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_2758768.py /home/hyc/LLMKernel/KernelBench/tt/76_Gemm_Add_ReLU.py /home/hyc/LLMKernel/run/20260114_060846_batch_range74to97_openai_deepseek/76_Gemm_Add_ReLU/code/test_kernel_analysis_seed1.py --repeat 1
+[ncu stdout]: [bench] Completed 1 iterations successfully
+
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_2758768.csv
+[Stage 3] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=2838, Out=2263, Total=5101
+[stage3_memory_and_tuning] score=1.5241 (baseline=3.3070ms)
+[stage3_memory_and_tuning] metrics saved to: /home/hyc/LLMKernel/run/20260114_060846_batch_range74to97_openai_deepseek/76_Gemm_Add_ReLU/evaluation/eval_0009.json
+  Optimized kernel score: 1.5241 ✓
+[Stage 3] ★ New best score: 1.5241
+[76_Gemm_Add_ReLU.py] Figure saved to: /home/hyc/LLMKernel/run/20260114_060846_batch_range74to97_openai_deepseek/76_Gemm_Add_ReLU/figures/76_Gemm_Add_ReLU_score.png

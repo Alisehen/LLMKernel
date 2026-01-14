@@ -1,0 +1,63 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def fused_relu_div_kernel(
+    x_ptr, out_ptr,
+    N,
+    divisor,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < N
+    
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    
+    # Fused: ReLU
+    x = tl.maximum(x, 0.0)
+    
+    # Fused: divide by constant
+    x = x / divisor
+    
+    tl.store(out_ptr + offsets, x, mask=mask)
+
+
+def fused_linear_relu_div(x, weight, bias, divisor):
+    # Stage 1: Use cuBLAS for GEMM + bias
+    # torch.matmul leverages cuBLAS which is highly optimized
+    linear_out = torch.matmul(x, weight.t()) + bias
+    
+    # Stage 2: Fused elementwise operations (ReLU + division)
+    M, N = linear_out.shape
+    total_elements = M * N
+    out = torch.empty_like(linear_out)
+    
+    BLOCK_SIZE = 1024
+    grid = lambda meta: (triton.cdiv(total_elements, meta['BLOCK_SIZE']),)
+    
+    fused_relu_div_kernel[grid](
+        linear_out, out,
+        total_elements,
+        divisor,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    
+    return out
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, divisor):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.bias = nn.Parameter(torch.randn(out_features))
+        self.divisor = divisor
+
+    def forward(self, x):
+        return fused_linear_relu_div(x, self.weight, self.bias, self.divisor)
+```

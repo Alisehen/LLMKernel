@@ -1,0 +1,10 @@
+```json
+{
+  "worth_optimizing": "yes",
+  "reason": "The maxpool2d kernel has inefficient memory access patterns with redundant index calculations and poor memory coalescing.",
+  "bottleneck": "The maxpool2d_kernel decomposes linear indices into 4D coordinates (b,c,oh,ow) then recomputes input indices for each kernel window element, causing scattered memory accesses and redundant arithmetic operations across threads.",
+  "optimisation method": "Restructure maxpool2d kernel to use 2D grid launch where each thread block handles a spatial tile, enabling coalesced memory loads of input windows and shared memory caching to eliminate redundant global memory accesses.",
+  "modification plan": "Launch kernel with 2D grid (batch*channels, out_h*out_w) where each program loads a contiguous input tile into shared memory once, then multiple threads cooperatively compute pooling outputs from the cached tile. This reduces global memory transactions by ~kernel_size² and improves memory coalescing by processing spatially adjacent outputs together.",
+  "expected_speedup": "25-35%"
+}
+```

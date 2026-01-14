@@ -1,0 +1,200 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def group_norm_stats_kernel(
+    x_ptr,
+    mean_ptr,
+    var_ptr,
+    N, C, D, H, W,
+    groups,
+    elements_per_group: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Compute mean and variance for each group."""
+    # Each program handles one (batch, group) pair
+    pid = tl.program_id(0)
+    batch_idx = pid // groups
+    group_idx = pid % groups
+    
+    channels_per_group = C // groups
+    
+    # Compute sum and sum of squares
+    sum_val = 0.0
+    sum_sq = 0.0
+    
+    # Iterate over all elements in this group
+    for c_offset in range(channels_per_group):
+        c = group_idx * channels_per_group + c_offset
+        for block_start in range(0, D * H * W, BLOCK_SIZE):
+            offsets = block_start + tl.arange(0, BLOCK_SIZE)
+            mask = offsets < D * H * W
+            
+            # Compute linear index
+            idx = batch_idx * C * D * H * W + c * D * H * W + offsets
+            
+            x = tl.load(x_ptr + idx, mask=mask, other=0.0)
+            sum_val += tl.sum(tl.where(mask, x, 0.0))
+            sum_sq += tl.sum(tl.where(mask, x * x, 0.0))
+    
+    # Compute mean and variance
+    mean = sum_val / elements_per_group
+    var = sum_sq / elements_per_group - mean * mean
+    
+    # Store results
+    tl.store(mean_ptr + pid, mean)
+    tl.store(var_ptr + pid, var)
+
+
+@triton.jit
+def fused_groupnorm_minclamp_dropout_kernel(
+    x_ptr,
+    output_ptr,
+    mean_ptr,
+    var_ptr,
+    gamma_ptr,
+    beta_ptr,
+    N, C, D, H, W,
+    groups,
+    eps,
+    min_value,
+    max_value,
+    dropout_p,
+    seed,
+    training: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Fused GroupNorm normalization + min + clamp + dropout."""
+    pid = tl.program_id(0)
+    
+    # Total elements
+    total_elements = N * C * D * H * W
+    spatial_size = D * H * W
+    channels_per_group = C // groups
+    
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < total_elements
+    
+    # Load input
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    
+    # Compute indices
+    # offsets = n * C * D * H * W + c * D * H * W + spatial_idx
+    n = offsets // (C * spatial_size)
+    remainder = offsets % (C * spatial_size)
+    c = remainder // spatial_size
+    
+    # Compute group index
+    group_idx = c // channels_per_group
+    
+    # Load mean and variance for this group
+    stats_idx = n * groups + group_idx
+    mean = tl.load(mean_ptr + stats_idx, mask=mask, other=0.0)
+    var = tl.load(var_ptr + stats_idx, mask=mask, other=1.0)
+    
+    # Load gamma and beta (per channel)
+    gamma = tl.load(gamma_ptr + c, mask=mask, other=1.0)
+    beta = tl.load(beta_ptr + c, mask=mask, other=0.0)
+    
+    # Normalize
+    inv_std = 1.0 / tl.sqrt(var + eps)
+    x_norm = (x - mean) * inv_std
+    
+    # Apply affine transform
+    x_out = x_norm * gamma + beta
+    
+    # Min operation: x = min(x, min_value)
+    x_out = tl.minimum(x_out, min_value)
+    
+    # Clamp operation: x = clamp(x, min_value, max_value)
+    x_out = tl.maximum(x_out, min_value)
+    x_out = tl.minimum(x_out, max_value)
+    
+    # Dropout (only during training)
+    if training:
+        random = tl.rand(seed, offsets)
+        dropout_mask = random > dropout_p
+        scale = 1.0 / (1.0 - dropout_p)
+        x_out = tl.where(dropout_mask, x_out * scale, 0.0)
+    
+    tl.store(output_ptr + offsets, x_out, mask=mask)
+
+
+def fused_groupnorm_min_clamp_dropout(x, gamma, beta, groups, eps, min_value, max_value, dropout_p, training):
+    N, C, D, H, W = x.shape
+    output = torch.empty_like(x)
+    
+    elements_per_group = (C // groups) * D * H * W
+    
+    # Allocate buffers for mean and variance
+    mean = torch.empty(N * groups, device=x.device, dtype=x.dtype)
+    var = torch.empty(N * groups, device=x.device, dtype=x.dtype)
+    
+    # First pass: compute statistics
+    BLOCK_SIZE_STATS = 256
+    grid_stats = (N * groups,)
+    
+    group_norm_stats_kernel[grid_stats](
+        x, mean, var,
+        N, C, D, H, W,
+        groups,
+        elements_per_group,
+        BLOCK_SIZE=BLOCK_SIZE_STATS,
+    )
+    
+    # Second pass: normalize and apply operations
+    total_elements = x.numel()
+    BLOCK_SIZE = 1024
+    grid = (triton.cdiv(total_elements, BLOCK_SIZE),)
+    
+    seed = torch.randint(0, 2**31 - 1, (1,), device=x.device).item() if training else 0
+    
+    fused_groupnorm_minclamp_dropout_kernel[grid](
+        x, output,
+        mean, var,
+        gamma, beta,
+        N, C, D, H, W,
+        groups,
+        eps,
+        min_value, max_value,
+        dropout_p, seed,
+        training,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    
+    return output
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model with fused GroupNorm + min + clamp + dropout operations.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, groups, min_value, max_value, dropout_p):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size)
+        self.groups = groups
+        self.out_channels = out_channels
+        self.min_value = min_value
+        self.max_value = max_value
+        self.dropout_p = dropout_p
+        self.eps = 1e-5
+        
+        # GroupNorm parameters
+        self.gamma = nn.Parameter(torch.ones(out_channels))
+        self.beta = nn.Parameter(torch.zeros(out_channels))
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = fused_groupnorm_min_clamp_dropout(
+            x, self.gamma, self.beta, 
+            self.groups, self.eps,
+            self.min_value, self.max_value, 
+            self.dropout_p, self.training
+        )
+        return x
+```

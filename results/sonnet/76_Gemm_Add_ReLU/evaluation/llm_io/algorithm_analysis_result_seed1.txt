@@ -1,0 +1,10 @@
+```json
+{
+  "worth_optimizing": "yes",
+  "reason": "The current Triton kernel is 17% slower than PyTorch baseline, indicating suboptimal tile sizes and memory access patterns for this large GEMM (1024x8192x8192).",
+  "bottleneck": "The block sizes (BLOCK_M=128, BLOCK_N=128, BLOCK_K=32) and swizzle pattern are not optimal for this problem size. The weight transpose `weight.t().contiguous()` also adds overhead by creating a copy.",
+  "optimisation method": "Use autotuning to find optimal block sizes for this specific GEMM shape, and store weights in transposed layout to avoid runtime transpose. Increase BLOCK_K to improve arithmetic intensity and reduce K-loop iterations.",
+  "modification plan": "1) Add @triton.autotune decorator with multiple configurations (e.g., BLOCK_M/N in {64,128,256}, BLOCK_K in {32,64,128}) and num_warps/stages options. 2) Store weight as (K, N) layout in __init__ to eliminate runtime transpose. 3) Tune the swizzle group size based on problem dimensions.",
+  "expected_speedup": "20-40%"
+}
+```

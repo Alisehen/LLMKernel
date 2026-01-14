@@ -1,0 +1,10 @@
+```json
+{
+  "worth_optimizing": "yes",
+  "reason": "The conv_transpose operation is still a separate kernel launch, and the current fusion only covers scale+bn+avgpool, leaving significant room for further fusion.",
+  "bottleneck": "The 3D transposed convolution runs as a separate cuDNN kernel, followed by the fused scale+bn+avgpool kernel. This requires writing the full conv output (N*C*D*H*W elements) to global memory and reading it back, creating a memory bandwidth bottleneck.",
+  "optimisation method": "Fuse the transposed convolution output directly with scale+bn+avgpool using a tiled approach where each tile computes partial conv outputs, applies the fused operations, and accumulates for the final average without materializing the full intermediate tensor.",
+  "modification plan": "Implement a fused kernel that computes transposed convolution tiles on-the-fly, immediately applies scale*gamma*inv_std + bias transformation, and accumulates partial sums for average pooling. Use shared memory to cache input tiles and weights. Each program handles one (batch, output_channel) pair, iterating over spatial positions while accumulating the sum.",
+  "expected_speedup": "40-60%"
+}
+```

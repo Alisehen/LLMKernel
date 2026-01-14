@@ -1,0 +1,10 @@
+```json
+{
+  "worth_optimizing": "yes",
+  "reason": "The kernel recomputes the entire GEMM+BN+Scale pipeline three times (for max, sum, and final output), causing 8.5x slowdown.",
+  "bottleneck": "The softmax implementation requires three full passes through GEMM+BN+Scale operations because intermediate results are not cached. Each pass recomputes matrix multiplication (8192x8192) and batch normalization from scratch.",
+  "optimisation method": "Cache GEMM+BN+Scale results in shared memory or registers during the first pass, then reuse for max computation, sum computation, and final softmax normalization, reducing from 3 full passes to 1 pass plus lightweight softmax operations.",
+  "modification plan": "Restructure kernel to: (1) Compute GEMM+BN+Scale once per row block and store results in a temporary buffer or accumulator array, (2) Perform online softmax using stored values (compute max, then exp and sum in single additional pass over cached data), (3) Normalize and write final output. This eliminates redundant GEMM recomputation.",
+  "expected_speedup": "600-700%"
+}
+```

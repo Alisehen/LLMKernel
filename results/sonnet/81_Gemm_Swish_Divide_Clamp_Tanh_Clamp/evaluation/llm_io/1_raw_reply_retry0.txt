@@ -1,0 +1,134 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def fused_gemm_swish_ops_kernel(
+    a_ptr, b_ptr, bias_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+    has_bias: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    # Unrolled K loop for better instruction-level parallelism
+    for k in range(0, K, BLOCK_K):
+        k_remaining = K - k
+        mask_a = (offs_m[:, None] < M) & (offs_k[None, :] < k_remaining)
+        mask_b = (offs_k[:, None] < k_remaining) & (offs_n[None, :] < N)
+        
+        a = tl.load(a_ptrs, mask=mask_a, other=0.0)
+        b = tl.load(b_ptrs, mask=mask_b, other=0.0)
+        
+        acc = tl.dot(a, b, acc=acc, allow_tf32=True)
+        
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Shared offsets and mask for all fused operations
+    mask_out = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    
+    # Add bias if present - uses same mask
+    if has_bias:
+        bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+        acc = acc + bias[None, :]
+
+    # Fused operations with optimized math
+    # Swish: x * sigmoid(x) = x / (1 + exp(-x))
+    # Use fast approximation for sigmoid to reduce exp calls
+    neg_acc = -acc
+    sigmoid_acc = tl.where(
+        neg_acc > 20.0,
+        0.0,
+        tl.where(
+            neg_acc < -20.0,
+            1.0,
+            1.0 / (1.0 + tl.exp(neg_acc))
+        )
+    )
+    acc = acc * sigmoid_acc
+    
+    # Divide by 2.0 and clamp [-1, 1]
+    acc = acc * 0.5
+    acc = tl.maximum(tl.minimum(acc, 1.0), -1.0)
+    
+    # Tanh using optimized formula
+    # For values in [-1, 1], tanh is well-behaved
+    acc_2x = acc + acc
+    exp_2x = tl.exp(acc_2x)
+    exp_neg_2x = tl.exp(-acc_2x)
+    acc = (exp_2x - exp_neg_2x) / (exp_2x + exp_neg_2x)
+    
+    # Final clamp [-1, 1]
+    acc = tl.maximum(tl.minimum(acc, 1.0), -1.0)
+
+    # Store with shared mask
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    tl.store(c_ptrs, acc, mask=mask_out)
+
+
+def fused_gemm_swish_ops(x, weight, bias):
+    M, K = x.shape
+    N = weight.shape[0]
+    c = torch.empty((M, N), device=x.device, dtype=x.dtype)
+    b = weight.t().contiguous()
+    
+    has_bias = bias is not None
+    bias_ptr = bias if has_bias else x
+    
+    # Optimized block sizes for RTX 4090
+    # 4090 has 128 SMs, 128KB L1 per SM, high register count
+    # Target: maximize occupancy and memory throughput
+    if M >= 2048 and N >= 2048 and K >= 2048:
+        # Large matrices: prioritize memory coalescing
+        BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 64
+    elif M >= 1024 and N >= 1024:
+        # Medium matrices: balance compute and memory
+        BLOCK_M, BLOCK_N, BLOCK_K = 128, 64, 64
+    elif K >= 4096:
+        # Wide K: increase K blocking
+        BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 128
+    else:
+        # Small matrices: smaller blocks for better occupancy
+        BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 64
+    
+    grid = (
+        triton.cdiv(M, BLOCK_M), 
+        triton.cdiv(N, BLOCK_N)
+    )
+    
+    fused_gemm_swish_ops_kernel[grid](
+        x, b, bias_ptr, c, M, N, K,
+        x.stride(0), x.stride(1), 
+        b.stride(0), b.stride(1), 
+        c.stride(0), c.stride(1),
+        has_bias,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        num_warps=8,
+        num_stages=3,
+    )
+    return c
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, bias=True):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.bias = nn.Parameter(torch.randn(out_features)) if bias else None
+
+    def forward(self, x):
+        return fused_gemm_swish_ops(x, self.weight, self.bias)
+```

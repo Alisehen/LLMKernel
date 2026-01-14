@@ -1,0 +1,261 @@
+You are a GPU kernel optimization architect. Analyze the kernel and identify **ONE high-level algorithmic optimization**.
+
+# PyTorch Reference
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs a 3D convolution, applies Softmax, and performs two max pooling operations.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, pool_kernel_size):
+        super(Model, self).__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size)
+        self.pool1 = nn.MaxPool3d(pool_kernel_size)
+        self.pool2 = nn.MaxPool3d(pool_kernel_size)
+
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor of shape (batch_size, in_channels, depth, height, width)
+        Returns:
+            Output tensor of shape (batch_size, out_channels, depth', height', width') where depth', height', width' are the dimensions after pooling.
+        """
+        x = self.conv(x)
+        x = torch.softmax(x, dim=1)
+        x = self.pool1(x)
+        x = self.pool2(x)
+        return x
+
+batch_size = 128
+in_channels = 3
+out_channels = 16
+depth, height, width = 16, 32, 32
+kernel_size = 3
+pool_kernel_size = 2
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, depth, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, pool_kernel_size]
+```
+
+# Current Triton Kernel
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def softmax_kernel(
+    input_ptr, output_ptr,
+    batch_size, channels, depth, height, width,
+    stride_b, stride_c, stride_d, stride_h, stride_w,
+    BLOCK_C: tl.constexpr,
+):
+    # Each program handles one spatial location across all channels
+    pid = tl.program_id(0)
+    
+    # Compute batch, depth, height, width indices
+    total_spatial = depth * height * width
+    b = pid // total_spatial
+    spatial_idx = pid % total_spatial
+    d = spatial_idx // (height * width)
+    hw_idx = spatial_idx % (height * width)
+    h = hw_idx // width
+    w = hw_idx % width
+    
+    # Load all channel values for this spatial location
+    offs_c = tl.arange(0, BLOCK_C)
+    mask = offs_c < channels
+    
+    ptrs = input_ptr + b * stride_b + offs_c * stride_c + d * stride_d + h * stride_h + w * stride_w
+    x = tl.load(ptrs, mask=mask, other=-float('inf'))
+    
+    # Softmax computation
+    x_max = tl.max(x, axis=0)
+    x_exp = tl.exp(x - x_max)
+    x_sum = tl.sum(x_exp, axis=0)
+    x_softmax = x_exp / x_sum
+    
+    out_ptrs = output_ptr + b * stride_b + offs_c * stride_c + d * stride_d + h * stride_h + w * stride_w
+    tl.store(out_ptrs, x_softmax, mask=mask)
+
+
+@triton.jit
+def fused_maxpool3d_2x_kernel(
+    input_ptr, output_ptr,
+    batch_size, channels, 
+    in_d, in_h, in_w,
+    out_d, out_h, out_w,
+    stride_b, stride_c, stride_d, stride_h, stride_w,
+    out_stride_b, out_stride_c, out_stride_d, out_stride_h, out_stride_w,
+    BLOCK_SIZE: tl.constexpr,
+):
+    # Each program handles one output element
+    pid = tl.program_id(0)
+    
+    # Compute output indices
+    total_out = out_d * out_h * out_w
+    bc_idx = pid // total_out
+    spatial_idx = pid % total_out
+    
+    b = bc_idx // channels
+    c = bc_idx % channels
+    
+    od = spatial_idx // (out_h * out_w)
+    oh_ow = spatial_idx % (out_h * out_w)
+    oh = oh_ow // out_w
+    ow = oh_ow % out_w
+    
+    # Input starting position (pool_size = 4 because two consecutive 2x2x2 pools = 4x4x4)
+    id_start = od * 4
+    ih_start = oh * 4
+    iw_start = ow * 4
+    
+    # Find max over 4x4x4 region
+    max_val = -float('inf')
+    
+    base_ptr = input_ptr + b * stride_b + c * stride_c
+    
+    # Unrolled 4x4x4 max pooling
+    for dd in range(4):
+        for dh in range(4):
+            for dw in range(4):
+                id_idx = id_start + dd
+                ih_idx = ih_start + dh
+                iw_idx = iw_start + dw
+                
+                valid = (id_idx < in_d) & (ih_idx < in_h) & (iw_idx < in_w)
+                ptr = base_ptr + id_idx * stride_d + ih_idx * stride_h + iw_idx * stride_w
+                val = tl.load(ptr, mask=valid, other=-float('inf'))
+                max_val = tl.maximum(max_val, val)
+    
+    # Store result
+    out_ptr = output_ptr + b * out_stride_b + c * out_stride_c + od * out_stride_d + oh * out_stride_h + ow * out_stride_w
+    tl.store(out_ptr, max_val)
+
+
+def softmax_3d(x):
+    batch_size, channels, depth, height, width = x.shape
+    output = torch.empty_like(x)
+    
+    total_spatial = batch_size * depth * height * width
+    BLOCK_C = triton.next_power_of_2(channels)
+    
+    grid = (total_spatial,)
+    softmax_kernel[grid](
+        x, output,
+        batch_size, channels, depth, height, width,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
+        BLOCK_C=BLOCK_C,
+    )
+    return output
+
+
+def fused_maxpool3d_2x(x):
+    batch_size, channels, in_d, in_h, in_w = x.shape
+    out_d = in_d // 4
+    out_h = in_h // 4
+    out_w = in_w // 4
+    
+    output = torch.empty((batch_size, channels, out_d, out_h, out_w), device=x.device, dtype=x.dtype)
+    
+    total_elements = batch_size * channels * out_d * out_h * out_w
+    grid = (total_elements,)
+    
+    fused_maxpool3d_2x_kernel[grid](
+        x, output,
+        batch_size, channels,
+        in_d, in_h, in_w,
+        out_d, out_h, out_w,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
+        output.stride(0), output.stride(1), output.stride(2), output.stride(3), output.stride(4),
+        BLOCK_SIZE=64,
+    )
+    return output
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model with fused softmax and double max pooling.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, pool_kernel_size):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = softmax_3d(x)
+        x = fused_maxpool3d_2x(x)
+        return x
+```
+
+# Performance
+- **PyTorch baseline**: 1.30 ms
+- **Current Triton**: 3.10 ms
+- **Current speedup**: 0.42x (-138.6% vs baseline)
+
+
+---
+
+## Analysis Steps
+
+1. **Code Analysis**: Count kernels, identify operations, check for inefficiencies
+2. **Performance Diagnosis**: Use metrics/latency to identify bottleneck type
+3. **Root Cause**: Combine code + performance to find the core issue
+
+## Optimization Categories (pick ONE if worth optimizing):
+
+### 1. Operator Fusion
+Fuse consecutive ops into fewer kernels to reduce memory traffic and launch overhead.
+
+### 2. Algorithm Replacement
+Replace naive algorithm with optimized variant.
+- For Attention: Flash Attention, online softmax
+- For Convolution: Winograd, im2col
+- **For RNN/GRU/LSTM**: Persistent kernel with HYBRID computation
+  - **CRITICAL**: Use hybrid approach for best performance:
+    * Precompute input-side gates ONCE (outside kernel): `gates_x = (T*B, In) @ W_ih`
+    * Persistent kernel (inside): only recurrent-side: `for t: gates_h = h @ W_hh`
+  - Time loop `for t in range(T)` must be inside kernel, NOT in Python
+  - Launch kernel once per layer, not once per timestep
+  - Expected speedup: 10-100x (vs per-timestep launches)
+
+### 3. Kernel Launch Reduction
+Combine multiple small kernels to reduce overhead.
+- **For RNN/GRU/LSTM**: See "Algorithm Replacement" above for persistent kernel approach
+
+### 4. Memory Layout Optimization
+Use in-place operations, buffer reuse, or better layouts.
+
+## Should We Optimize?
+
+Before proposing optimization, determine if it's worthwhile:
+- **Not worth optimizing** if:
+  - Code is already near-optimal (expected speedup < 10%)
+  - Bottleneck cannot be addressed (hardware limited, already optimal algorithm)
+  - Optimization would add significant complexity with minimal gain
+
+- **Worth optimizing** if:
+  - Clear algorithmic inefficiency exists (multiple kernels, suboptimal algorithm)
+  - Expected speedup >= 20%
+  - Concrete optimization path available
+
+## Output (JSON)
+
+```json
+{
+  "worth_optimizing": "yes/no",
+  "reason": "<Why worth or not worth optimizing, 1 sentence>",
+  "bottleneck": "<Root cause in 1-2 sentences, empty if not worth optimizing>",
+  "optimisation method": "<Specific optimization in 1-2 sentences, empty if not worth optimizing>",
+  "modification plan": "<Implementation steps in 2-3 sentences, empty if not worth optimizing>",
+  "expected_speedup": "<e.g., '30-40%', empty if not worth optimizing>"
+}
+```
+
+Return JSON only.

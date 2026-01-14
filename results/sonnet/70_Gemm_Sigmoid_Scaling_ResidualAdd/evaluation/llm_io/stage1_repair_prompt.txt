@@ -1,0 +1,172 @@
+Fix the Triton kernel errors. Generate correct code.
+
+## ERROR LOG
+```
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 576, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20260114_080330_batch_range70to70_openai_deepseek/70_Gemm_Sigmoid_Scaling_ResidualAdd/code/kernel_20260114_080540.py", line 108, in forward
+    return fused_gemm_bias_sigmoid_scale_residual(x, self.weight, self.bias, self.scaling_factor)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20260114_080330_batch_range70to70_openai_deepseek/70_Gemm_Sigmoid_Scaling_ResidualAdd/code/kernel_20260114_080540.py", line 88, in fused_gemm_bias_sigmoid_scale_residual
+    fused_gemm_bias_sigmoid_scale_residual_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 419, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 756, in run
+    launch_metadata = kernel.launch_metadata(grid, stream, *bound_args.values())
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 490, in launch_metadata
+    self._init_handles()
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 464, in _init_handles
+    raise_(OutOfResources(self.metadata.shared, max_shared, "shared memory"))
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 456, in raise_
+    raise err
+triton.runtime.errors.OutOfResources: out of resource: shared memory, Required: 131072, Hardware limit: 101376. Reducing block sizes or `num_stages` may help.
+```
+
+## Broken Code
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def fused_gemm_bias_sigmoid_scale_residual_kernel(
+    a_ptr, b_ptr, bias_ptr, c_ptr,
+    M, N, K,
+    scaling_factor,
+    stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    # Unrolled GEMM loop for better instruction-level parallelism
+    for k in range(0, K, BLOCK_K):
+        k_remaining = K - k
+        mask_k = offs_k < k_remaining
+        
+        mask_a = (offs_m[:, None] < M) & (mask_k[None, :])
+        mask_b = (mask_k[:, None]) & (offs_n[None, :] < N)
+        
+        a = tl.load(a_ptrs, mask=mask_a, other=0.0)
+        b = tl.load(b_ptrs, mask=mask_b, other=0.0)
+        
+        acc += tl.dot(a, b, allow_tf32=True)
+        
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Load bias once with proper masking
+    bias_mask = offs_n < N
+    bias = tl.load(bias_ptr + offs_n, mask=bias_mask, other=0.0)
+    
+    # Add bias (broadcast along M dimension)
+    acc += bias[None, :]
+    
+    # Store original for residual
+    original_x = acc
+    
+    # Fused sigmoid: 1 / (1 + exp(-x))
+    # Optimized: use fast_divide and avoid overflow
+    neg_acc = -acc
+    exp_neg = tl.exp(neg_acc)
+    x = 1.0 / (1.0 + exp_neg)
+    
+    # Fused scaling
+    x = x * scaling_factor
+    
+    # Fused residual add
+    x = x + original_x
+
+    # Store result with shared mask
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    mask_c = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, x, mask=mask_c)
+
+
+def fused_gemm_bias_sigmoid_scale_residual(x, weight, bias, scaling_factor):
+    M, K = x.shape
+    N = weight.shape[0]
+    
+    c = torch.empty((M, N), device=x.device, dtype=x.dtype)
+    b = weight.t().contiguous()
+    
+    # Optimized block sizes for RTX 4090
+    # Larger blocks for better occupancy and memory coalescing
+    BLOCK_M = 128
+    BLOCK_N = 128
+    BLOCK_K = 64
+    
+    grid = lambda META: (
+        triton.cdiv(M, META['BLOCK_M']), 
+        triton.cdiv(N, META['BLOCK_N'])
+    )
+    
+    fused_gemm_bias_sigmoid_scale_residual_kernel[grid](
+        x, b, bias, c, M, N, K,
+        scaling_factor,
+        x.stride(0), x.stride(1), 
+        b.stride(0), b.stride(1), 
+        c.stride(0), c.stride(1),
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+    )
+    
+    return c
+
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_size, scaling_factor):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.randn(hidden_size, input_size))
+        self.bias = nn.Parameter(torch.randn(hidden_size))
+        self.scaling_factor = scaling_factor
+
+    def forward(self, x):
+        return fused_gemm_bias_sigmoid_scale_residual(x, self.weight, self.bias, self.scaling_factor)
+```
+
+## CRITICAL — These cause 60%+ of failures:
+1. EVERY kernel function MUST have `@triton.jit` decorator — MANDATORY
+2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+3. BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+4. `tl.program_id(axis)` only supports axis = 0, 1, 2
+5. No `continue`, `break`, `return` inside loops — use masking
+6. No tensor indexing with loop vars: `x[:, i]` is INVALID
+7. mask shape MUST match data shape in tl.load/tl.store
+
+## Missing Triton Functions (implement manually):
+- tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+## OUTPUT FORMAT (STRICT):
+1. Imports: torch, torch.nn, triton, triton.language as tl (and math if needed)
+2. @triton.jit decorated kernel function(s)
+3. Wrapper function(s) for grid calculation and kernel launch
+4. class ModelNew(nn.Module) — REQUIRED
+
+Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <corrected code>
+```

@@ -1,0 +1,10 @@
+```json
+{
+  "worth_optimizing": "yes",
+  "reason": "The transposed convolution dominates runtime and the current fusion only covers post-conv operations, missing the main bottleneck.",
+  "bottleneck": "The 3D transposed convolution (ConvTranspose3d) is the dominant operation, taking most of the ~30ms runtime. The fused kernel only handles scale+BN+GAP which operates on the conv output, but the conv itself uses cuDNN and cannot be further optimized through this fusion approach.",
+  "optimisation method": "Fuse the transposed convolution output directly with scale+BN+GAP in a single pass by implementing an implicit GEMM-based transposed convolution that streams output directly into the BN+GAP reduction, avoiding the intermediate materialization of the full conv output tensor.",
+  "modification plan": "Implement a fused kernel that computes transposed convolution tiles and immediately applies scale, batch norm, and accumulates for global average pooling without writing the intermediate conv output to global memory. Use tiled matrix multiplication for the implicit GEMM approach, with each thread block handling a portion of spatial outputs and accumulating partial sums for GAP.",
+  "expected_speedup": "20-40%"
+}
+```

@@ -1,0 +1,10 @@
+```json
+{
+  "worth_optimizing": "yes",
+  "reason": "The Mish activation and BatchNorm are executed as separate kernels with intermediate materialization, causing redundant memory traffic.",
+  "bottleneck": "After convolution, the Mish activation writes full output to global memory, then BatchNorm reads it back entirely. This creates unnecessary round-trip memory traffic for the large intermediate tensor (64×128×126×126 ≈ 130M elements).",
+  "optimisation method": "Fuse Mish activation directly into the BatchNorm kernel. Load conv output once, apply Mish inline, then immediately normalize without storing intermediate results.",
+  "modification plan": "Modify batchnorm_forward_kernel to accept raw conv output and apply Mish (softplus + tanh + multiply) inline before normalization. This eliminates the separate fused_mish_kernel launch and the intermediate tensor write/read. The fused kernel performs: load x → mish(x) → normalize → store, all in one pass.",
+  "expected_speedup": "15-25%"
+}
+```

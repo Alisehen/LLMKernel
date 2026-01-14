@@ -1,0 +1,221 @@
+You are optimizing a Triton kernel based on algorithmic analysis.
+
+# PyTorch Reference (Target Behavior)
+
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs a 3D transposed convolution, scales the output, applies batch normalization, 
+    and then performs global average pooling. 
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, scale_factor, eps=1e-5, momentum=0.1):
+        super(Model, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size)
+        self.scale_factor = scale_factor
+        self.batch_norm = nn.BatchNorm3d(out_channels, eps=eps, momentum=momentum)
+        self.global_avg_pool = nn.AdaptiveAvgPool3d((1, 1, 1))
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = x * self.scale_factor
+        x = self.batch_norm(x)
+        x = self.global_avg_pool(x)
+        return x
+
+batch_size = 16
+in_channels = 64
+out_channels = 128
+depth, height, width = 16, 32, 32
+kernel_size = 5
+scale_factor = 2.0
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, depth, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, scale_factor]
+```
+
+**CRITICAL**: Study the PyTorch code carefully to understand:
+- What does `forward()` return? (full output sequence vs final hidden state only)
+- What is the computational pattern?
+- What are the input/output shapes?
+
+Your optimized kernel MUST match this exact behavior.
+
+---
+
+# Analysis Results
+
+**Bottleneck**: The 3D transposed convolution (ConvTranspose3d) is the dominant operation, taking most of the ~30ms runtime. The fused kernel only handles scale+BN+GAP which operates on the conv output, but the conv itself uses cuDNN and cannot be further optimized through this fusion approach.
+
+**Optimization Strategy**: Fuse the transposed convolution output directly with scale+BN+GAP in a single pass by implementing an implicit GEMM-based transposed convolution that streams output directly into the BN+GAP reduction, avoiding the intermediate materialization of the full conv output tensor.
+
+**Implementation Plan**: Implement a fused kernel that computes transposed convolution tiles and immediately applies scale, batch norm, and accumulates for global average pooling without writing the intermediate conv output to global memory. Use tiled matrix multiplication for the implicit GEMM approach, with each thread block handling a portion of spatial outputs and accumulating partial sums for GAP.
+
+**Expected Speedup**: 20-40%
+
+---
+
+# Current Kernel (needs optimization)
+
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def fused_scale_bn_gap_kernel(
+    input_ptr, output_ptr,
+    gamma_ptr, beta_ptr, mean_ptr, var_ptr,
+    scale_factor, eps,
+    batch_size, channels, spatial_size,
+    stride_b, stride_c, stride_s,
+    BLOCK_SIZE: tl.constexpr,
+):
+    # Each program handles one (batch, channel) pair
+    pid = tl.program_id(0)
+    batch_idx = pid // channels
+    channel_idx = pid % channels
+    
+    # Load batch norm parameters for this channel
+    gamma = tl.load(gamma_ptr + channel_idx)
+    beta = tl.load(beta_ptr + channel_idx)
+    mean = tl.load(mean_ptr + channel_idx)
+    var = tl.load(var_ptr + channel_idx)
+    
+    # Compute normalization factor
+    inv_std = 1.0 / tl.sqrt(var + eps)
+    
+    # Base pointer for this (batch, channel)
+    base_ptr = input_ptr + batch_idx * stride_b + channel_idx * stride_c
+    
+    # Accumulate sum over spatial dimensions
+    acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+    
+    for start in range(0, spatial_size, BLOCK_SIZE):
+        offs = start + tl.arange(0, BLOCK_SIZE)
+        mask = offs < spatial_size
+        
+        # Load input values
+        x = tl.load(base_ptr + offs * stride_s, mask=mask, other=0.0)
+        
+        # Apply scale
+        x = x * scale_factor
+        
+        # Apply batch norm: (x - mean) * inv_std * gamma + beta
+        x = (x - mean) * inv_std * gamma + beta
+        
+        # Accumulate for global average pooling
+        acc += tl.where(mask, x, 0.0)
+    
+    # Sum reduction and compute average
+    total_sum = tl.sum(acc, axis=0)
+    avg = total_sum / spatial_size
+    
+    # Store result
+    tl.store(output_ptr + batch_idx * channels + channel_idx, avg)
+
+
+def fused_scale_bn_gap(x, gamma, beta, running_mean, running_var, scale_factor, eps):
+    batch_size, channels, D, H, W = x.shape
+    spatial_size = D * H * W
+    
+    # Output shape: (batch_size, channels, 1, 1, 1)
+    output = torch.empty((batch_size, channels, 1, 1, 1), device=x.device, dtype=x.dtype)
+    
+    # Flatten spatial dimensions for easier processing
+    x_flat = x.view(batch_size, channels, spatial_size).contiguous()
+    
+    BLOCK_SIZE = 1024
+    grid = (batch_size * channels,)
+    
+    fused_scale_bn_gap_kernel[grid](
+        x_flat, output,
+        gamma, beta, running_mean, running_var,
+        scale_factor, eps,
+        batch_size, channels, spatial_size,
+        x_flat.stride(0), x_flat.stride(1), x_flat.stride(2),
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    
+    return output
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, scale_factor, eps=1e-5, momentum=0.1):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size)
+        self.scale_factor = scale_factor
+        self.batch_norm = nn.BatchNorm3d(out_channels, eps=eps, momentum=momentum)
+        self.eps = eps
+
+    def forward(self, x):
+        # Use cuDNN for transposed convolution
+        x = self.conv_transpose(x)
+        
+        # Fused scale + batch norm + global average pooling
+        x = fused_scale_bn_gap(
+            x,
+            self.batch_norm.weight,
+            self.batch_norm.bias,
+            self.batch_norm.running_mean,
+            self.batch_norm.running_var,
+            self.scale_factor,
+            self.eps
+        )
+        
+        return x
+```
+
+---
+
+# Your Task
+
+Implement the optimization strategy above. Focus on the specific bottleneck identified.
+
+## Key Requirements
+
+1. **Preserve correctness**: Maintain the same input/output behavior
+2. **Apply the optimization**: Follow the implementation plan exactly
+3. **Use valid Triton syntax**:
+   - Every kernel MUST have `@triton.jit` decorator
+   - Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+   - BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+   - No `continue`, `break`, `return` inside kernels (use masking)
+   - Prefer `tl.dot(a, b, allow_tf32=True)` for matmul operations
+
+4. **CRITICAL for RNN/GRU/LSTM Persistent Kernels**:
+   - Time loop MUST be inside @triton.jit kernel, NOT in Python forward()
+   - **HYBRID computation strategy** (CRITICAL for performance):
+     * Precompute input-side gates OUTSIDE kernel: `gates_x = (T*B, In) @ W_ih` (ONE large GEMM)
+     * INSIDE kernel: only recurrent-side: `for t: gates_h = h @ W_hh` (T small GEMMs)
+   - CORRECT (FAST - use this):
+     ```python
+     # Python forward():
+     gates_x_all = x.reshape(T*B, In) @ W_ih + b_ih  # ONE large GEMM
+     gates_x_all = gates_x_all.view(T, B, 3*H)
+     gru_persistent_kernel[grid](gates_x_all, h0, W_hh, ...)  # Launch ONCE
+
+     @triton.jit
+     def gru_persistent_kernel(gates_x_ptr, h_ptr, W_hh_ptr, ...):
+         for t in range(T):  # Inside kernel
+             gates_x_t = tl.load(gates_x_ptr + t*...)  # Precomputed
+             gates_h = h @ W_hh  # Only recurrent GEMM
+             h = (1-z)*n + z*h   # Fuse and update
+     ```
+
+5. **Output format**:
+   - Imports: `import torch, torch.nn as nn, triton, triton.language as tl`
+   - `@triton.jit` kernel(s)
+   - Wrapper function(s)
+   - `class ModelNew(nn.Module)` — REQUIRED
+   - NO testing code, NO `if __name__ == "__main__"`
+
+---
+
+Generate the optimized kernel now. Output ONLY the complete Python code.

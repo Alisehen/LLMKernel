@@ -1,0 +1,10 @@
+```json
+{
+  "worth_optimizing": "yes",
+  "reason": "The avgpool_gelu_scale_max_kernel has extremely low SM throughput (0.35%) and poor cache hit rate (0.79%), indicating severe memory access inefficiency from redundant loads.",
+  "bottleneck": "The second kernel loads matmul_out data N_pooled times (512 times for pool_kernel_size=16, N=8192) with no data reuse, causing massive redundant DRAM traffic. Each element is loaded once per pooled output, then the max reduction requires another full pass.",
+  "optimisation method": "Fuse avgpool+GELU+scale+max into the matmul kernel epilogue. As each matmul output element is computed, immediately apply pooling accumulation, GELU, scaling in registers, then perform a final max reduction, eliminating the intermediate 1024x8192 buffer and all redundant loads.",
+  "modification plan": "Modify matmul_kernel to accumulate pooled sums in shared memory as outputs are computed (group N outputs by pool_kernel_size). After matmul completes, each thread block applies GELU+scale to its pooled values in shared memory, then performs block-wide max reduction using tl.max with axis parameter. Output one value per row instead of full matrix.",
+  "expected_speedup": "60-80%"
+}
+```

@@ -1,0 +1,307 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU: 4090
+
+[OPTIMIZATION STAGE]
+
+## Current Optimization Stage
+
+Focus: Memory pattern and parameter tuning for fused operations.
+
+Key Principle:
+- Fusion benefit = eliminated INTERMEDIATE stores
+- Multiple input loads are OK; intermediate stores are NOT
+
+Memory Rules:
+- ✅ Multiple tl.load() for different inputs (x, weight, bias) - OK
+- ❌ tl.store() for intermediate results - NEVER (this is what fusion eliminates)
+- ✅ Single tl.store() for final output - required
+
+Verification:
+- Count tl.store() calls: should equal number of OUTPUT tensors (usually 1)
+- Intermediate values: must stay in registers between ops
+- If you see store-then-load pattern for same data → BUG, refactor
+
+Parameters to tune:
+- num_warps ∈ {4, 8}
+- num_stages ∈ {2, 3}
+
+Conditional Tuning Rules:
+
+IF register pressure LOW (regs < 96, no spill):
+  - Try num_warps=8 for compute-bound fusion
+  - num_stages=3 may help hide latency
+
+IF register pressure HIGH (regs > 128 or occupancy_limit_registers):
+  - Use num_warps=4 (fewer warps = more registers per warp)
+  - Keep num_stages=2 (higher stages need more registers)
+
+IF multi-input fusion (3+ distinct loads):
+  - num_stages=2 preferred (each stage buffers all inputs)
+  - num_warps=4 often better than 8
+
+Autotune:
+- Max 3-4 configs combining num_stages and num_warps
+- Always include conservative baseline (num_warps=4, num_stages=2)
+- Revert if gain < 2%
+
+
+
+[CURRENT CODE]
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def matmul_kernel(
+    x_ptr, weight_ptr, bias_ptr, output_ptr,
+    M, N, K,
+    stride_xm, stride_xk,
+    stride_wn, stride_wk,
+    stride_om, stride_on,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    
+    x_ptrs = x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk
+    w_ptrs = weight_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk
+    
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    for k in range(0, K, BLOCK_K):
+        mask_k = offs_k < K - k
+        mask_x = (offs_m[:, None] < M) & (mask_k[None, :])
+        mask_w = (offs_n[:, None] < N) & (mask_k[None, :])
+        
+        x_block = tl.load(x_ptrs, mask=mask_x, other=0.0)
+        w_block = tl.load(w_ptrs, mask=mask_w, other=0.0)
+        
+        acc += tl.dot(x_block, tl.trans(w_block), allow_tf32=True)
+        
+        x_ptrs += BLOCK_K * stride_xk
+        w_ptrs += BLOCK_K * stride_wk
+    
+    bias_vals = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc += bias_vals[None, :]
+    
+    output_ptrs = output_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
+    mask_out = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(output_ptrs, acc, mask=mask_out)
+
+
+@triton.jit
+def avgpool_gelu_scale_max_kernel_optimized(
+    input_ptr, output_ptr,
+    M, N,
+    pool_kernel_size, scale_factor,
+    stride_m, stride_n,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_m = offs_m < M
+    
+    N_pooled = N // pool_kernel_size
+    
+    inv_pool_size = 1.0 / tl.cast(pool_kernel_size, tl.float32)
+    sqrt_2_over_pi = 0.7978845608028654
+    c = 0.044715
+    
+    max_val = tl.full((BLOCK_M,), -float('inf'), dtype=tl.float32)
+    
+    n_pool_start = pid_n * BLOCK_N
+    n_pool_end = tl.minimum(n_pool_start + BLOCK_N, N_pooled)
+    
+    for n_pool_offset in range(BLOCK_N):
+        n_pool = n_pool_start + n_pool_offset
+        
+        pool_sum = tl.zeros((BLOCK_M,), dtype=tl.float32)
+        
+        is_valid_pool = n_pool < N_pooled
+        
+        base_n = n_pool * pool_kernel_size
+        
+        for k in range(pool_kernel_size):
+            n_idx = base_n + k
+            ptrs = input_ptr + offs_m * stride_m + n_idx * stride_n
+            vals = tl.load(ptrs, mask=mask_m & is_valid_pool, other=0.0)
+            pool_sum += vals
+        
+        pool_avg = pool_sum * inv_pool_size
+        
+        x = pool_avg
+        x_sq = x * x
+        x_cubed = x_sq * x
+        tanh_arg = sqrt_2_over_pi * (x + c * x_cubed)
+        
+        tanh_arg = tl.where(tanh_arg > 10.0, 10.0, tanh_arg)
+        tanh_arg = tl.where(tanh_arg < -10.0, -10.0, tanh_arg)
+        
+        exp_2x = tl.exp(2.0 * tanh_arg)
+        tanh_val = (exp_2x - 1.0) / (exp_2x + 1.0)
+        
+        gelu_val = 0.5 * x * (1.0 + tanh_val)
+        scaled_val = gelu_val * scale_factor
+        
+        max_val = tl.where(is_valid_pool, tl.maximum(max_val, scaled_val), max_val)
+    
+    output_ptrs = output_ptr + offs_m * N_pooled + pid_n
+    tl.store(output_ptrs, max_val, mask=mask_m)
+
+
+@triton.jit
+def reduce_max_kernel(
+    input_ptr, output_ptr,
+    M, N_pooled,
+    BLOCK_M: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    
+    offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offs_m < M
+    
+    max_val = tl.full((BLOCK_M,), -float('inf'), dtype=tl.float32)
+    
+    for n in range(N_pooled):
+        ptrs = input_ptr + offs_m * N_pooled + n
+        vals = tl.load(ptrs, mask=mask_m, other=-float('inf'))
+        max_val = tl.maximum(max_val, vals)
+    
+    output_ptrs = output_ptr + offs_m
+    tl.store(output_ptrs, max_val, mask=mask_m)
+
+
+def fused_forward(x, weight, bias, pool_kernel_size, scale_factor):
+    M, K = x.shape
+    N = weight.shape[0]
+    
+    matmul_out = torch.empty((M, N), device=x.device, dtype=x.dtype)
+    
+    BLOCK_M = 64
+    BLOCK_N = 64
+    BLOCK_K = 32
+    
+    grid_matmul = (
+        triton.cdiv(M, BLOCK_M),
+        triton.cdiv(N, BLOCK_N)
+    )
+    
+    matmul_kernel[grid_matmul](
+        x, weight, bias, matmul_out,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        weight.stride(0), weight.stride(1),
+        matmul_out.stride(0), matmul_out.stride(1),
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+    )
+    
+    N_pooled = N // pool_kernel_size
+    
+    BLOCK_M_POOL = 256
+    BLOCK_N_POOL = 32
+    
+    temp_output = torch.empty((M, N_pooled), device=x.device, dtype=x.dtype)
+    
+    grid_pool = (
+        triton.cdiv(M, BLOCK_M_POOL),
+        triton.cdiv(N_pooled, BLOCK_N_POOL)
+    )
+    
+    avgpool_gelu_scale_max_kernel_optimized[grid_pool](
+        matmul_out, temp_output,
+        M, N,
+        pool_kernel_size, scale_factor,
+        matmul_out.stride(0), matmul_out.stride(1),
+        BLOCK_M=BLOCK_M_POOL,
+        BLOCK_N=BLOCK_N_POOL,
+    )
+    
+    output = torch.empty((M,), device=x.device, dtype=x.dtype)
+    
+    BLOCK_M_REDUCE = 256
+    grid_reduce = (triton.cdiv(M, BLOCK_M_REDUCE),)
+    
+    reduce_max_kernel[grid_reduce](
+        temp_output, output,
+        M, N_pooled,
+        BLOCK_M=BLOCK_M_REDUCE,
+    )
+    
+    return output
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, pool_kernel_size, scale_factor):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.bias = nn.Parameter(torch.randn(out_features))
+        self.pool_kernel_size = pool_kernel_size
+        self.scale_factor = scale_factor
+
+    def forward(self, x):
+        return fused_forward(x, self.weight, self.bias, self.pool_kernel_size, self.scale_factor)
+```
+
+[NCU PROFILING METRICS]
+{
+  "matmul_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 44.72,
+    "launch__grid_size": 2048,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 23.92,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 17.64,
+    "lts__t_sector_hit_rate.pct": 96.13
+  },
+  "avgpool_gelu_scale_max_kernel_optimized": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 1.45,
+    "launch__grid_size": 64,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 8.14,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 27.0,
+    "lts__t_sector_hit_rate.pct": 2.53
+  },
+  "reduce_max_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 0.17,
+    "launch__grid_size": 4,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 8.29,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 3.21,
+    "lts__t_sector_hit_rate.pct": 7.17
+  }
+}
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+## CRITICAL — Code MUST compile and run:
+1. EVERY kernel function MUST have `@triton.jit` decorator
+2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+3. BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+4. `tl.program_id(axis)` only supports axis = 0, 1, 2
+5. No `continue`, `break`, `return` inside loops — use masking
+6. No tensor indexing with loop vars: `x[:, i]` is INVALID
+7. mask shape MUST match data shape in tl.load/tl.store
+
+## Missing Triton Functions (implement manually):
+- tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+## OUTPUT FORMAT (STRICT):
+1. Imports: torch, torch.nn, triton, triton.language as tl
+2. @triton.jit decorated kernel function(s)
+3. Wrapper function(s) for grid calculation and kernel launch
+4. class ModelNew(nn.Module) that calls your kernels
+
+Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

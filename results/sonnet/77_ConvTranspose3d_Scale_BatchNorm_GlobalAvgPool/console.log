@@ -1,0 +1,134 @@
+[Seed] Generating seed kernel...
+[Seed 1/2] Generating...
+[92mFinish reason: stop[0m
+Usage: In=2220, Out=1424, Total=3644
+[seed_0] score=0.9957 (baseline=30.5562ms)
+[seed_0] metrics saved to: /home/hyc/LLMKernel/run/20260114_061155_batch_range77to97_openai_deepseek/77_ConvTranspose3d_Scale_BatchNorm_GlobalAvgPool/evaluation/eval_0000.json
+[Seed 1] Final score: 0.9957 ✓
+[Seed 2/2] Generating...
+[92mFinish reason: stop[0m
+Usage: In=2220, Out=1584, Total=3804
+[seed_1] score=1.0565 (baseline=30.5562ms)
+[seed_1] metrics saved to: /home/hyc/LLMKernel/run/20260114_061155_batch_range77to97_openai_deepseek/77_ConvTranspose3d_Scale_BatchNorm_GlobalAvgPool/evaluation/eval_0001.json
+[Seed 2] Final score: 1.0565 ✓
+
+================================================================================
+[Hybrid Strategy] Analyzing all seeds for algorithmic optimization...
+[Hybrid Strategy] - 1 seed(s) with score < 1.0 (rescue)
+[Hybrid Strategy] - 1 seed(s) with score >= 1.0 (further optimization)
+================================================================================
+
+[Hybrid] Seed 1: score=0.9957 < 1.0
+[Hybrid] Attempting algorithm analysis rescue...
+[ncu] Using GPU device 4 (CUDA_VISIBLE_DEVICES=4)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_2771454.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_2771454.py /home/hyc/LLMKernel/KernelBench/t/77_ConvTranspose3d_Scale_BatchNorm_GlobalAvgPool.py /home/hyc/LLMKernel/run/20260114_061155_batch_range77to97_openai_deepseek/77_ConvTranspose3d_Scale_BatchNorm_GlobalAvgPool/code/test_kernel_analysis_seed0.py --repeat 1
+[ncu stdout]: [bench] Completed 1 iterations successfully
+
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_2771454.csv
+[Hybrid] Requesting LLM analysis for seed 1...
+[92mFinish reason: stop[0m
+Usage: In=2294, Out=293, Total=2587
+[Hybrid] Worth optimizing: yes
+[Hybrid] Reason: The transposed convolution dominates runtime and the current fusion only covers post-conv operations, missing the main bottleneck.
+[Hybrid] Analysis complete for seed 1, generating optimized kernel...
+[Hybrid] Bottleneck: The 3D transposed convolution (ConvTranspose3d) is the dominant operation, takin...
+[Hybrid] Optimization: Fuse the transposed convolution output directly with scale+BN+GAP in a single pa...
+[Hybrid] Expected speedup: 20-40%
+[92mFinish reason: stop[0m
+Usage: In=2614, Out=2671, Total=5285
+[algorithm_optimized_seed0] score=1.0291 (baseline=30.5562ms)
+[algorithm_optimized_seed0] metrics saved to: /home/hyc/LLMKernel/run/20260114_061155_batch_range77to97_openai_deepseek/77_ConvTranspose3d_Scale_BatchNorm_GlobalAvgPool/evaluation/eval_0002.json
+[Hybrid] ✓ Rescue successful: 0.9957 → 1.0291
+
+[Hybrid] Seed 2: score=1.0565 >= 1.0
+[Hybrid] Attempting algorithm analysis for further optimization...
+[ncu] Using GPU device 4 (CUDA_VISIBLE_DEVICES=4)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_2771454.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_2771454.py /home/hyc/LLMKernel/KernelBench/t/77_ConvTranspose3d_Scale_BatchNorm_GlobalAvgPool.py /home/hyc/LLMKernel/run/20260114_061155_batch_range77to97_openai_deepseek/77_ConvTranspose3d_Scale_BatchNorm_GlobalAvgPool/code/test_kernel_analysis_seed1.py --repeat 1
+[ncu stdout]: [bench] Completed 1 iterations successfully
+
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_2771454.csv
+[Hybrid] Requesting LLM analysis for seed 2...
+[92mFinish reason: stop[0m
+Usage: In=2475, Out=292, Total=2767
+[Hybrid] Worth optimizing: yes
+[Hybrid] Reason: The conv_transpose operation is still a separate kernel launch, and the current fusion only covers scale+bn+avgpool, leaving significant room for further fusion.
+[Hybrid] Analysis complete for seed 2, generating optimized kernel...
+[Hybrid] Bottleneck: The 3D transposed convolution runs as a separate cuDNN kernel, followed by the f...
+[Hybrid] Optimization: Fuse the transposed convolution output directly with scale+bn+avgpool using a ti...
+[Hybrid] Expected speedup: 40-60%
+[92mFinish reason: stop[0m
+Usage: In=2788, Out=2779, Total=5567
+[algorithm_optimized_seed1] score=1.0698 (baseline=30.5562ms)
+[algorithm_optimized_seed1] metrics saved to: /home/hyc/LLMKernel/run/20260114_061155_batch_range77to97_openai_deepseek/77_ConvTranspose3d_Scale_BatchNorm_GlobalAvgPool/evaluation/eval_0003.json
+[Hybrid] ✓ Rescue successful: 1.0565 → 1.0698
+
+================================================================================
+[Hybrid] Candidate Selection
+================================================================================
+[Hybrid] Total candidates: 4
+  [1] seed 1: 0.9957
+  [2] seed 2: 1.0565
+  [3] algo-optimized (from seed 1): 1.0291
+  [4] algo-optimized (from seed 2): 1.0698
+
+[Hybrid] ★ Selected best candidate: score=1.0698
+
+[Optimization] Starting 3-stage optimization...
+
+================================================================================
+[Stage 1/3] grid_and_parallel
+Description: Optimize grid layout and parallel work distribution across SMs.
+Current candidates: 1, best score: 1.0698
+================================================================================
+[Stage 1] Profiling best candidate...
+[ncu] Using GPU device 4 (CUDA_VISIBLE_DEVICES=4)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_2771454.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_2771454.py /home/hyc/LLMKernel/KernelBench/t/77_ConvTranspose3d_Scale_BatchNorm_GlobalAvgPool.py /home/hyc/LLMKernel/run/20260114_061155_batch_range77to97_openai_deepseek/77_ConvTranspose3d_Scale_BatchNorm_GlobalAvgPool/code/test_kernel_analysis_seed1.py --repeat 1
+[ncu stdout]: [bench] Completed 1 iterations successfully
+
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_2771454.csv
+[Stage 1] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=3488, Out=2542, Total=6030
+[stage1_grid_and_parallel] score=1.0340 (baseline=30.5562ms)
+[stage1_grid_and_parallel] metrics saved to: /home/hyc/LLMKernel/run/20260114_061155_batch_range77to97_openai_deepseek/77_ConvTranspose3d_Scale_BatchNorm_GlobalAvgPool/evaluation/eval_0004.json
+  Optimized kernel score: 1.0340 ✓
+[Stage 1] Current: 1.0340 (global best: 1.0698)
+
+================================================================================
+[Stage 2/3] block_tiling
+Description: Tune BLOCK_M/N/K sizes for optimal register/memory balance.
+Current candidates: 1, best score: 1.0698
+================================================================================
+[Stage 2] Profiling best candidate...
+[ncu] Using GPU device 4 (CUDA_VISIBLE_DEVICES=4)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_2771454.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_2771454.py /home/hyc/LLMKernel/KernelBench/t/77_ConvTranspose3d_Scale_BatchNorm_GlobalAvgPool.py /home/hyc/LLMKernel/run/20260114_061155_batch_range77to97_openai_deepseek/77_ConvTranspose3d_Scale_BatchNorm_GlobalAvgPool/code/test_kernel_analysis_seed1.py --repeat 1
+[ncu stdout]: [bench] Completed 1 iterations successfully
+
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_2771454.csv
+[Stage 2] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=3385, Out=2266, Total=5651
+[stage2_block_tiling] score=1.0064 (baseline=30.5562ms)
+[stage2_block_tiling] metrics saved to: /home/hyc/LLMKernel/run/20260114_061155_batch_range77to97_openai_deepseek/77_ConvTranspose3d_Scale_BatchNorm_GlobalAvgPool/evaluation/eval_0005.json
+  Optimized kernel score: 1.0064 ✓
+[Stage 2] Current: 1.0064 (global best: 1.0698)
+
+================================================================================
+[Stage 3/3] memory_and_tuning
+Description: Optimize memory access patterns and fine-tune num_stages/num_warps.
+Current candidates: 1, best score: 1.0698
+================================================================================
+[Stage 3] Profiling best candidate...
+[ncu] Using GPU device 4 (CUDA_VISIBLE_DEVICES=4)
+[ncu] running: /usr/local/cuda/bin/ncu --csv --page=raw --target-processes=all --replay-mode=kernel --profile-from-start=on --log-file=/home/hyc/LLMKernel/ncu_temp_2771454.csv --metrics=sm__throughput.avg.pct_of_peak_sustained_elapsed,launch__grid_size,sm__warps_active.avg.pct_of_peak_sustained_active,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__t_sector_hit_rate.pct,smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct /home/hyc/miniconda3/envs/sglang/bin/python bench_ref_inputs_2771454.py /home/hyc/LLMKernel/KernelBench/t/77_ConvTranspose3d_Scale_BatchNorm_GlobalAvgPool.py /home/hyc/LLMKernel/run/20260114_061155_batch_range77to97_openai_deepseek/77_ConvTranspose3d_Scale_BatchNorm_GlobalAvgPool/code/test_kernel_analysis_seed1.py --repeat 1
+[ncu stdout]: [bench] Completed 1 iterations successfully
+
+[ok] CSV written: /home/hyc/LLMKernel/ncu_temp_2771454.csv
+[Stage 3] Generating optimized kernel...
+[92mFinish reason: stop[0m
+Usage: In=3105, Out=3023, Total=6128
+[stage3_memory_and_tuning] score=1.0178 (baseline=30.5562ms)
+[stage3_memory_and_tuning] metrics saved to: /home/hyc/LLMKernel/run/20260114_061155_batch_range77to97_openai_deepseek/77_ConvTranspose3d_Scale_BatchNorm_GlobalAvgPool/evaluation/eval_0006.json
+  Optimized kernel score: 1.0178 ✓
+[Stage 3] Current: 1.0178 (global best: 1.0698)
+[77_ConvTranspose3d_Scale_BatchNorm_GlobalAvgPool.py] Figure saved to: /home/hyc/LLMKernel/run/20260114_061155_batch_range77to97_openai_deepseek/77_ConvTranspose3d_Scale_BatchNorm_GlobalAvgPool/figures/77_ConvTranspose3d_Scale_BatchNorm_GlobalAvgPool_score.png

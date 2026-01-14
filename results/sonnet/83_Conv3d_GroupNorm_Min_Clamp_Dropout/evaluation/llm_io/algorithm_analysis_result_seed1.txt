@@ -1,0 +1,10 @@
+```json
+{
+  "worth_optimizing": "yes",
+  "reason": "The current implementation still launches separate kernels for Conv3d and GroupNorm, which dominate the runtime; fusing GroupNorm with the post-processing operations could reduce memory traffic significantly.",
+  "bottleneck": "The Conv3d and GroupNorm operations are executed as separate PyTorch kernels, requiring multiple global memory reads/writes. The fused min_clamp_dropout kernel only handles lightweight operations after the expensive normalization.",
+  "optimisation method": "Operator Fusion: Fuse GroupNorm with the min/clamp/dropout operations into a single kernel. GroupNorm requires computing mean/variance per group, then normalizing - this can be combined with the subsequent element-wise operations to avoid an extra memory round-trip.",
+  "modification plan": "Implement a fused GroupNorm + min + clamp + dropout kernel: (1) First pass computes per-group mean and variance using parallel reduction, (2) Second pass normalizes each element, applies affine transform (gamma/beta), then immediately applies min, clamp, and dropout in the same kernel. This eliminates the intermediate tensor write/read between GroupNorm and post-processing.",
+  "expected_speedup": "15-25%"
+}
+```

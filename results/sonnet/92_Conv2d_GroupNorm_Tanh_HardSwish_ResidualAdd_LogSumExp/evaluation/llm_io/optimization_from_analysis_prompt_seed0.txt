@@ -1,0 +1,307 @@
+You are optimizing a Triton kernel based on algorithmic analysis.
+
+# PyTorch Reference (Target Behavior)
+
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs a convolution, applies Group Normalization, Tanh, HardSwish, 
+    Residual Addition, and LogSumExp.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, groups, eps=1e-5):
+        super(Model, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.group_norm = nn.GroupNorm(groups, out_channels, eps=eps)
+        self.tanh = nn.Tanh()
+        self.hard_swish = nn.Hardswish()
+
+    def forward(self, x):
+        # Convolution
+        x_conv = self.conv(x)
+        # Group Normalization
+        x_norm = self.group_norm(x_conv)
+        # Tanh
+        x_tanh = self.tanh(x_norm)
+        # HardSwish
+        x_hard_swish = self.hard_swish(x_tanh)
+        # Residual Addition
+        x_res = x_conv + x_hard_swish
+        # LogSumExp
+        x_logsumexp = torch.logsumexp(x_res, dim=1, keepdim=True)
+        return x_logsumexp
+
+batch_size = 128
+in_channels = 8
+out_channels = 64
+height, width = 128, 128
+kernel_size = 3
+groups = 16
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, groups]
+```
+
+**CRITICAL**: Study the PyTorch code carefully to understand:
+- What does `forward()` return? (full output sequence vs final hidden state only)
+- What is the computational pattern?
+- What are the input/output shapes?
+
+Your optimized kernel MUST match this exact behavior.
+
+---
+
+# Analysis Results
+
+**Bottleneck**: The fused_groupnorm_tanh_hardswish_residual kernel writes full (N, C, H, W) tensor to global memory, then logsumexp_kernel reads it back entirely. This intermediate materialization causes redundant DRAM traffic of ~128*64*128*128*4 bytes = 512MB per forward pass.
+
+**Optimization Strategy**: Fuse logsumexp reduction directly into the groupnorm kernel by computing running max and sum_exp accumulators during the normalization pass, eliminating the intermediate tensor write/read and reducing memory traffic by ~50%.
+
+**Implementation Plan**: Extend fused_groupnorm_tanh_hardswish_residual_kernel to maintain per-(N,HW) max and sum_exp accumulators across the channel dimension during the second pass. After computing x_res for each channel, immediately update the logsumexp accumulators instead of storing to memory. Add a final write that outputs both x_res (if needed downstream) and the logsumexp result, or only logsumexp if x_res is not reused.
+
+**Expected Speedup**: 25-35%
+
+---
+
+# Current Kernel (needs optimization)
+
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+import math
+
+@triton.jit
+def fused_groupnorm_tanh_hardswish_residual_kernel(
+    x_conv_ptr, output_ptr,
+    gamma_ptr, beta_ptr,
+    N, C, HW, groups,
+    eps,
+    stride_n, stride_c, stride_hw,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+):
+    pid_n = tl.program_id(0)
+    pid_g = tl.program_id(1)
+    
+    C_per_group = C // groups
+    group_start = pid_g * C_per_group
+    
+    # Compute mean and variance for this group
+    mean_val = 0.0
+    var_val = 0.0
+    count = C_per_group * HW
+    
+    for c_offset in range(0, C_per_group, BLOCK_C):
+        c_block = tl.arange(0, BLOCK_C)
+        c_idx = group_start + c_offset + c_block
+        c_mask = (c_offset + c_block) < C_per_group
+        
+        for hw_offset in range(0, HW, BLOCK_SIZE):
+            hw_block = tl.arange(0, BLOCK_SIZE)
+            hw_idx = hw_offset + hw_block
+            hw_mask = hw_idx < HW
+            
+            mask = c_mask[:, None] & hw_mask[None, :]
+            ptrs = x_conv_ptr + pid_n * stride_n + c_idx[:, None] * stride_c + hw_idx[None, :] * stride_hw
+            vals = tl.load(ptrs, mask=mask, other=0.0)
+            mean_val += tl.sum(vals)
+            var_val += tl.sum(vals * vals)
+    
+    mean_val = mean_val / count
+    var_val = var_val / count - mean_val * mean_val
+    rstd = 1.0 / tl.sqrt(var_val + eps)
+    
+    # Apply normalization, tanh, hardswish, residual, and store
+    for c_offset in range(0, C_per_group, BLOCK_C):
+        c_block = tl.arange(0, BLOCK_C)
+        c_idx = group_start + c_offset + c_block
+        c_mask = (c_offset + c_block) < C_per_group
+        
+        gamma = tl.load(gamma_ptr + c_idx, mask=c_mask, other=1.0)
+        beta = tl.load(beta_ptr + c_idx, mask=c_mask, other=0.0)
+        
+        for hw_offset in range(0, HW, BLOCK_SIZE):
+            hw_block = tl.arange(0, BLOCK_SIZE)
+            hw_idx = hw_offset + hw_block
+            hw_mask = hw_idx < HW
+            
+            mask = c_mask[:, None] & hw_mask[None, :]
+            ptrs = x_conv_ptr + pid_n * stride_n + c_idx[:, None] * stride_c + hw_idx[None, :] * stride_hw
+            x_conv = tl.load(ptrs, mask=mask, other=0.0)
+            
+            # Group normalization
+            x_norm = (x_conv - mean_val) * rstd
+            x_norm = x_norm * gamma[:, None] + beta[:, None]
+            
+            # Tanh using exp
+            exp_2x = tl.exp(2.0 * x_norm)
+            x_tanh = (exp_2x - 1.0) / (exp_2x + 1.0)
+            
+            # HardSwish: x * relu6(x + 3) / 6
+            x_plus_3 = x_tanh + 3.0
+            relu6_val = tl.minimum(tl.maximum(x_plus_3, 0.0), 6.0)
+            x_hard_swish = x_tanh * relu6_val / 6.0
+            
+            # Residual addition
+            x_res = x_conv + x_hard_swish
+            
+            out_ptrs = output_ptr + pid_n * stride_n + c_idx[:, None] * stride_c + hw_idx[None, :] * stride_hw
+            tl.store(out_ptrs, x_res, mask=mask)
+
+
+@triton.jit
+def logsumexp_kernel(
+    input_ptr, output_ptr,
+    N, C, HW,
+    stride_n, stride_c, stride_hw,
+    BLOCK_C: tl.constexpr,
+):
+    pid_n = tl.program_id(0)
+    pid_hw = tl.program_id(1)
+    
+    hw_idx = pid_hw
+    
+    # Find max for numerical stability
+    max_val = -1e20
+    for c_offset in range(0, C, BLOCK_C):
+        c_block = tl.arange(0, BLOCK_C)
+        c_idx = c_offset + c_block
+        c_mask = c_idx < C
+        
+        ptrs = input_ptr + pid_n * stride_n + c_idx * stride_c + hw_idx * stride_hw
+        vals = tl.load(ptrs, mask=c_mask, other=-1e20)
+        block_max = tl.max(tl.where(c_mask, vals, -1e20))
+        max_val = tl.maximum(max_val, block_max)
+    
+    # Compute sum of exp(x - max)
+    sum_exp = 0.0
+    for c_offset in range(0, C, BLOCK_C):
+        c_block = tl.arange(0, BLOCK_C)
+        c_idx = c_offset + c_block
+        c_mask = c_idx < C
+        
+        ptrs = input_ptr + pid_n * stride_n + c_idx * stride_c + hw_idx * stride_hw
+        vals = tl.load(ptrs, mask=c_mask, other=0.0)
+        exp_vals = tl.exp(vals - max_val)
+        sum_exp += tl.sum(tl.where(c_mask, exp_vals, 0.0))
+    
+    result = max_val + tl.log(sum_exp)
+    out_ptr = output_ptr + pid_n * HW + hw_idx
+    tl.store(out_ptr, result)
+
+
+def fused_groupnorm_tanh_hardswish_residual(x_conv, gamma, beta, groups, eps):
+    N, C, H, W = x_conv.shape
+    HW = H * W
+    output = torch.empty_like(x_conv)
+    
+    BLOCK_SIZE = 256
+    BLOCK_C = 16
+    
+    grid = (N, groups)
+    fused_groupnorm_tanh_hardswish_residual_kernel[grid](
+        x_conv, output,
+        gamma, beta,
+        N, C, HW, groups,
+        eps,
+        x_conv.stride(0), x_conv.stride(1), 1,
+        BLOCK_SIZE=BLOCK_SIZE,
+        BLOCK_C=BLOCK_C,
+    )
+    return output
+
+
+def logsumexp_triton(x):
+    N, C, H, W = x.shape
+    HW = H * W
+    output = torch.empty((N, 1, H, W), device=x.device, dtype=x.dtype)
+    
+    BLOCK_C = 64
+    grid = (N, HW)
+    logsumexp_kernel[grid](
+        x, output,
+        N, C, HW,
+        x.stride(0), x.stride(1), 1,
+        BLOCK_C=BLOCK_C,
+    )
+    return output
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, groups, eps=1e-5):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.gamma = nn.Parameter(torch.ones(out_channels))
+        self.beta = nn.Parameter(torch.zeros(out_channels))
+        self.groups = groups
+        self.eps = eps
+
+    def forward(self, x):
+        # Convolution
+        x_conv = self.conv(x)
+        
+        # Fused: Group Normalization + Tanh + HardSwish + Residual Addition
+        x_res = fused_groupnorm_tanh_hardswish_residual(
+            x_conv, self.gamma, self.beta, self.groups, self.eps
+        )
+        
+        # LogSumExp
+        x_logsumexp = logsumexp_triton(x_res)
+        
+        return x_logsumexp
+```
+
+---
+
+# Your Task
+
+Implement the optimization strategy above. Focus on the specific bottleneck identified.
+
+## Key Requirements
+
+1. **Preserve correctness**: Maintain the same input/output behavior
+2. **Apply the optimization**: Follow the implementation plan exactly
+3. **Use valid Triton syntax**:
+   - Every kernel MUST have `@triton.jit` decorator
+   - Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+   - BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+   - No `continue`, `break`, `return` inside kernels (use masking)
+   - Prefer `tl.dot(a, b, allow_tf32=True)` for matmul operations
+
+4. **CRITICAL for RNN/GRU/LSTM Persistent Kernels**:
+   - Time loop MUST be inside @triton.jit kernel, NOT in Python forward()
+   - **HYBRID computation strategy** (CRITICAL for performance):
+     * Precompute input-side gates OUTSIDE kernel: `gates_x = (T*B, In) @ W_ih` (ONE large GEMM)
+     * INSIDE kernel: only recurrent-side: `for t: gates_h = h @ W_hh` (T small GEMMs)
+   - CORRECT (FAST - use this):
+     ```python
+     # Python forward():
+     gates_x_all = x.reshape(T*B, In) @ W_ih + b_ih  # ONE large GEMM
+     gates_x_all = gates_x_all.view(T, B, 3*H)
+     gru_persistent_kernel[grid](gates_x_all, h0, W_hh, ...)  # Launch ONCE
+
+     @triton.jit
+     def gru_persistent_kernel(gates_x_ptr, h_ptr, W_hh_ptr, ...):
+         for t in range(T):  # Inside kernel
+             gates_x_t = tl.load(gates_x_ptr + t*...)  # Precomputed
+             gates_h = h @ W_hh  # Only recurrent GEMM
+             h = (1-z)*n + z*h   # Fuse and update
+     ```
+
+5. **Output format**:
+   - Imports: `import torch, torch.nn as nn, triton, triton.language as tl`
+   - `@triton.jit` kernel(s)
+   - Wrapper function(s)
+   - `class ModelNew(nn.Module)` — REQUIRED
+   - NO testing code, NO `if __name__ == "__main__"`
+
+---
+
+Generate the optimized kernel now. Output ONLY the complete Python code.

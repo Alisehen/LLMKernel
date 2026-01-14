@@ -65,3 +65,14 @@ if __name__ == "__main__":
 
     print("\n3. Kernel execution complete!")
     print("=" * 60)
+
+  a = tl.load(a_ptrs) 
+  for k in range(K_tiles - 1):
+      b = tl.load(b_ptrs)
+      a_next = tl.load(a_ptrs + BLOCK_K)
+      acc = tl.dot(a, b, acc)
+      a = a_next
+  num_warps=8, num_stages=4 
+
+
+

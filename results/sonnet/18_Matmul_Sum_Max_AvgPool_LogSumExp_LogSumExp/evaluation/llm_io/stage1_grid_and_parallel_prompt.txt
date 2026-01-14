@@ -1,0 +1,140 @@
+You are a Triton kernel optimization specialist. Generate the FASTEST possible kernel.
+
+# Target GPU: 4090
+
+[OPTIMIZATION STAGE]
+
+## Current Optimization Stage
+
+Focus: Grid layout & indexing for FUSED operations.
+
+Key Principle:
+- All fused ops share the SAME grid AND the SAME (offsets, mask) tuple
+- Grid covers OUTPUT tensor dimensions
+
+Hard Rules:
+- Every fused op MUST use identical offset calculation
+- Every fused op MUST use identical boundary mask
+- If broadcast needed: explicit `[None, :]` or `[:, None]`, NOT different offsets
+- Element-wise: 1D grid, single `offs = pid * BLOCK + tl.arange(0, BLOCK)`
+- Matmul fusion: 2D grid, `offs_m/offs_n` shared by bias add & activation
+
+Verification:
+- Check: all tl.load/tl.store use same `offsets` variable
+- Check: all masks derived from same boundary condition
+- If ANY op needs different indexing → do NOT fuse, split kernel
+
+
+
+[CURRENT CODE]
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def fused_linear_sum_kernel(
+    x_ptr, w_sum_ptr, bias_sum_ptr, out_ptr,
+    B, K,
+    stride_xb, stride_xk,
+    BLOCK_K: tl.constexpr,
+):
+    # Each program handles one batch element
+    pid_b = tl.program_id(0)
+    
+    # Compute dot product of x[pid_b, :] with w_sum[:]
+    acc = tl.zeros((BLOCK_K,), dtype=tl.float32)
+    
+    for k_start in range(0, K, BLOCK_K):
+        offs_k = k_start + tl.arange(0, BLOCK_K)
+        mask = offs_k < K
+        
+        x_vals = tl.load(x_ptr + pid_b * stride_xb + offs_k * stride_xk, mask=mask, other=0.0)
+        w_vals = tl.load(w_sum_ptr + offs_k, mask=mask, other=0.0)
+        
+        acc += x_vals * w_vals
+    
+    # Sum the accumulator to get scalar result
+    result_sum = tl.sum(acc, axis=0)
+    
+    # Add bias sum
+    bias_sum = tl.load(bias_sum_ptr)
+    result = result_sum + bias_sum
+    
+    # Store result - out_ptr + pid_b is a scalar pointer, result is now scalar
+    tl.store(out_ptr + pid_b, result)
+
+
+def fused_linear_sum(x, w_sum, bias_sum):
+    B, K = x.shape
+    out = torch.empty((B,), device=x.device, dtype=x.dtype)
+    
+    BLOCK_K = 1024
+    grid = (B,)
+    
+    fused_linear_sum_kernel[grid](
+        x, w_sum, bias_sum, out,
+        B, K,
+        x.stride(0), x.stride(1),
+        BLOCK_K=BLOCK_K,
+    )
+    return out.unsqueeze(1)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features):
+        super(ModelNew, self).__init__()
+        self.linear = nn.Linear(in_features, out_features)
+        self.in_features = in_features
+        self.out_features = out_features
+        
+    def forward(self, x):
+        # Precompute the sum of weights across output dimension
+        # W is (out_features, in_features), we need sum over dim=0 -> (in_features,)
+        w_sum = self.linear.weight.sum(dim=0)  # (in_features,)
+        bias_sum = self.linear.bias.sum().view(1)  # scalar as 1-element tensor
+        
+        # The result is x @ w_sum + bias_sum
+        # x: (B, in_features), w_sum: (in_features,) -> result: (B,)
+        result = fused_linear_sum(x, w_sum, bias_sum)
+        
+        return result
+```
+
+[NCU PROFILING METRICS]
+{
+  "fused_linear_sum_kernel": {
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": 3.51,
+    "launch__grid_size": 1024,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 64.11,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 91.53,
+    "lts__t_sector_hit_rate.pct": 11.52
+  }
+}
+
+**Task**: Analyze the NCU metrics and current code, then generate optimized code that maximizes performance.
+
+## CRITICAL — Code MUST compile and run:
+1. EVERY kernel function MUST have `@triton.jit` decorator
+2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+3. BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+4. `tl.program_id(axis)` only supports axis = 0, 1, 2
+5. No `continue`, `break`, `return` inside loops — use masking
+6. No tensor indexing with loop vars: `x[:, i]` is INVALID
+7. mask shape MUST match data shape in tl.load/tl.store
+
+## Missing Triton Functions (implement manually):
+- tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+## OUTPUT FORMAT (STRICT):
+1. Imports: torch, torch.nn, triton, triton.language as tl
+2. @triton.jit decorated kernel function(s)
+3. Wrapper function(s) for grid calculation and kernel launch
+4. class ModelNew(nn.Module) that calls your kernels
+
+Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <optimized Triton code>
+```

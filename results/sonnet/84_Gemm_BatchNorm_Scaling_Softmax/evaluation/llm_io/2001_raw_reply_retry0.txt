@@ -1,0 +1,169 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def fused_gemm_bn_scale_softmax_kernel(
+    a_ptr, b_ptr, bias_ptr, bn_weight_ptr, bn_bias_ptr, bn_mean_ptr, bn_var_ptr,
+    scale_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+    bn_eps: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    # 2D tiling: pid_m handles M dimension, pid_n handles N dimension
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    
+    # Compute offsets for this tile
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    
+    # Initialize accumulator for GEMM
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    # K-reduction loop for GEMM
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+    
+    for k in range(0, K, BLOCK_K):
+        a_mask = (offs_m[:, None] < M) & ((k + offs_k[None, :]) < K)
+        b_mask = ((k + offs_k[:, None]) < K) & (offs_n[None, :] < N)
+        
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+        
+        acc += tl.dot(a, b, allow_tf32=True)
+        
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+    
+    # Add bias
+    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc += bias[None, :]
+    
+    # Batch normalization
+    bn_mean = tl.load(bn_mean_ptr + offs_n, mask=offs_n < N, other=0.0)
+    bn_var = tl.load(bn_var_ptr + offs_n, mask=offs_n < N, other=0.0)
+    bn_weight = tl.load(bn_weight_ptr + offs_n, mask=offs_n < N, other=1.0)
+    bn_bias = tl.load(bn_bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    
+    acc = (acc - bn_mean[None, :]) / tl.sqrt(bn_var[None, :] + bn_eps)
+    acc = acc * bn_weight[None, :] + bn_bias[None, :]
+    
+    # Scale
+    scale = tl.load(scale_ptr)
+    acc = scale * acc
+    
+    # Store result
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, acc, mask=c_mask)
+
+
+@triton.jit
+def online_softmax_kernel(
+    x_ptr, output_ptr,
+    M, N,
+    stride_xm, stride_xn, stride_om, stride_on,
+    BLOCK_N: tl.constexpr,
+):
+    # Each program handles one row
+    pid_m = tl.program_id(0)
+    
+    offs_m = pid_m
+    offs_n = tl.arange(0, BLOCK_N)
+    
+    # Online algorithm: single pass for max
+    max_val = float('-inf')
+    for n in range(0, N, BLOCK_N):
+        curr_offs_n = n + offs_n
+        mask = curr_offs_n < N
+        x_ptrs = x_ptr + offs_m * stride_xm + curr_offs_n * stride_xn
+        x = tl.load(x_ptrs, mask=mask, other=float('-inf'))
+        max_val = tl.maximum(max_val, tl.max(x, axis=0))
+    
+    # Single pass for sum of exp
+    sum_exp = 0.0
+    for n in range(0, N, BLOCK_N):
+        curr_offs_n = n + offs_n
+        mask = curr_offs_n < N
+        x_ptrs = x_ptr + offs_m * stride_xm + curr_offs_n * stride_xn
+        x = tl.load(x_ptrs, mask=mask, other=0.0)
+        exp_x = tl.exp(x - max_val)
+        sum_exp += tl.sum(tl.where(mask, exp_x, 0.0), axis=0)
+    
+    # Normalize and store
+    for n in range(0, N, BLOCK_N):
+        curr_offs_n = n + offs_n
+        mask = curr_offs_n < N
+        x_ptrs = x_ptr + offs_m * stride_xm + curr_offs_n * stride_xn
+        x = tl.load(x_ptrs, mask=mask, other=0.0)
+        exp_x = tl.exp(x - max_val)
+        output = exp_x / sum_exp
+        
+        output_ptrs = output_ptr + offs_m * stride_om + curr_offs_n * stride_on
+        tl.store(output_ptrs, output, mask=mask)
+
+
+def fused_gemm_bn_scale_softmax(x, weight, bias, bn_weight, bn_bias, bn_mean, bn_var, scale, bn_eps):
+    M, K = x.shape
+    N = weight.shape[0]
+    
+    # Intermediate output after gemm+bn+scale
+    intermediate = torch.empty((M, N), device=x.device, dtype=x.dtype)
+    b = weight.t().contiguous()
+    
+    # Optimized block sizes for 2D tiling
+    BLOCK_M = 128
+    BLOCK_N = 128
+    BLOCK_K = 32
+    
+    # 2D grid for GEMM
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+    fused_gemm_bn_scale_softmax_kernel[grid](
+        x, b, bias, bn_weight, bn_bias, bn_mean, bn_var, scale, intermediate,
+        M, N, K,
+        x.stride(0), x.stride(1), b.stride(0), b.stride(1), 
+        intermediate.stride(0), intermediate.stride(1),
+        bn_eps,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+    )
+    
+    # Softmax pass with online algorithm
+    output = torch.empty((M, N), device=x.device, dtype=x.dtype)
+    grid = (M,)
+    online_softmax_kernel[grid](
+        intermediate, output,
+        M, N,
+        intermediate.stride(0), intermediate.stride(1),
+        output.stride(0), output.stride(1),
+        BLOCK_N=128,
+    )
+    
+    return output
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, bn_eps=1e-5, bn_momentum=0.1, scale_shape=(1,)):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.bias = nn.Parameter(torch.randn(out_features))
+        self.bn_weight = nn.Parameter(torch.ones(out_features))
+        self.bn_bias = nn.Parameter(torch.zeros(out_features))
+        self.register_buffer('bn_mean', torch.zeros(out_features))
+        self.register_buffer('bn_var', torch.ones(out_features))
+        self.scale = nn.Parameter(torch.ones(scale_shape))
+        self.bn_eps = bn_eps
+
+    def forward(self, x):
+        return fused_gemm_bn_scale_softmax(
+            x, self.weight, self.bias, 
+            self.bn_weight, self.bn_bias, self.bn_mean, self.bn_var,
+            self.scale, self.bn_eps
+        )
+```

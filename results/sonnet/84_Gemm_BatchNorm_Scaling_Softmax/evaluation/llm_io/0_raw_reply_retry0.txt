@@ -1,0 +1,193 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+import math
+
+
+@triton.jit
+def fused_gemm_bn_scale_softmax_kernel(
+    a_ptr, b_ptr, bias_ptr, bn_weight_ptr, bn_bias_ptr, bn_mean_ptr, bn_var_ptr,
+    scale_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+    bn_eps,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    
+    # Allocate accumulator for the full row
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    # Gemm computation - process full row
+    for n in range(0, N, BLOCK_N):
+        curr_offs_n = n + offs_n
+        acc_block = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        
+        a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+        b_ptrs = b_ptr + offs_k[:, None] * stride_bk + curr_offs_n[None, :] * stride_bn
+        
+        for k in range(0, K, BLOCK_K):
+            a = tl.load(a_ptrs, mask=(offs_m[:, None] < M) & (offs_k[None, :] < K - k), other=0.0)
+            b = tl.load(b_ptrs, mask=(offs_k[:, None] < K - k) & (curr_offs_n[None, :] < N), other=0.0)
+            acc_block += tl.dot(a, b, allow_tf32=True)
+            a_ptrs += BLOCK_K * stride_ak
+            b_ptrs += BLOCK_K * stride_bk
+        
+        # Add bias
+        bias = tl.load(bias_ptr + curr_offs_n, mask=curr_offs_n < N, other=0.0)
+        acc_block += bias[None, :]
+        
+        # Batch normalization
+        bn_mean = tl.load(bn_mean_ptr + curr_offs_n, mask=curr_offs_n < N, other=0.0)
+        bn_var = tl.load(bn_var_ptr + curr_offs_n, mask=curr_offs_n < N, other=0.0)
+        bn_weight = tl.load(bn_weight_ptr + curr_offs_n, mask=curr_offs_n < N, other=1.0)
+        bn_bias = tl.load(bn_bias_ptr + curr_offs_n, mask=curr_offs_n < N, other=0.0)
+        
+        acc_block = (acc_block - bn_mean[None, :]) / tl.sqrt(bn_var[None, :] + bn_eps)
+        acc_block = acc_block * bn_weight[None, :] + bn_bias[None, :]
+        
+        # Scale
+        scale = tl.load(scale_ptr)
+        acc_block = scale * acc_block
+        
+        # Store in accumulator for softmax
+        if n == 0:
+            acc = acc_block
+        else:
+            acc = tl.where(curr_offs_n[None, :] < N, acc_block, acc)
+    
+    # Softmax: compute max for numerical stability
+    row_max = tl.max(acc, axis=1)
+    
+    # Compute exp and sum
+    row_sum = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    for n in range(0, N, BLOCK_N):
+        curr_offs_n = n + offs_n
+        
+        # Reload the block
+        acc_block = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        
+        a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+        b_ptrs = b_ptr + offs_k[:, None] * stride_bk + curr_offs_n[None, :] * stride_bn
+        
+        for k in range(0, K, BLOCK_K):
+            a = tl.load(a_ptrs, mask=(offs_m[:, None] < M) & (offs_k[None, :] < K - k), other=0.0)
+            b = tl.load(b_ptrs, mask=(offs_k[:, None] < K - k) & (curr_offs_n[None, :] < N), other=0.0)
+            acc_block += tl.dot(a, b, allow_tf32=True)
+            a_ptrs += BLOCK_K * stride_ak
+            b_ptrs += BLOCK_K * stride_bk
+        
+        bias = tl.load(bias_ptr + curr_offs_n, mask=curr_offs_n < N, other=0.0)
+        acc_block += bias[None, :]
+        
+        bn_mean = tl.load(bn_mean_ptr + curr_offs_n, mask=curr_offs_n < N, other=0.0)
+        bn_var = tl.load(bn_var_ptr + curr_offs_n, mask=curr_offs_n < N, other=0.0)
+        bn_weight = tl.load(bn_weight_ptr + curr_offs_n, mask=curr_offs_n < N, other=1.0)
+        bn_bias = tl.load(bn_bias_ptr + curr_offs_n, mask=curr_offs_n < N, other=0.0)
+        
+        acc_block = (acc_block - bn_mean[None, :]) / tl.sqrt(bn_var[None, :] + bn_eps)
+        acc_block = acc_block * bn_weight[None, :] + bn_bias[None, :]
+        
+        scale = tl.load(scale_ptr)
+        acc_block = scale * acc_block
+        
+        # Compute exp(x - max)
+        exp_block = tl.exp(acc_block - row_max[:, None])
+        
+        # Accumulate sum
+        mask = (offs_m[:, None] < M) & (curr_offs_n[None, :] < N)
+        row_sum += tl.sum(tl.where(mask, exp_block, 0.0), axis=1)
+    
+    # Final pass: compute softmax and store
+    for n in range(0, N, BLOCK_N):
+        curr_offs_n = n + offs_n
+        
+        acc_block = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        
+        a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+        b_ptrs = b_ptr + offs_k[:, None] * stride_bk + curr_offs_n[None, :] * stride_bn
+        
+        for k in range(0, K, BLOCK_K):
+            a = tl.load(a_ptrs, mask=(offs_m[:, None] < M) & (offs_k[None, :] < K - k), other=0.0)
+            b = tl.load(b_ptrs, mask=(offs_k[:, None] < K - k) & (curr_offs_n[None, :] < N), other=0.0)
+            acc_block += tl.dot(a, b, allow_tf32=True)
+            a_ptrs += BLOCK_K * stride_ak
+            b_ptrs += BLOCK_K * stride_bk
+        
+        bias = tl.load(bias_ptr + curr_offs_n, mask=curr_offs_n < N, other=0.0)
+        acc_block += bias[None, :]
+        
+        bn_mean = tl.load(bn_mean_ptr + curr_offs_n, mask=curr_offs_n < N, other=0.0)
+        bn_var = tl.load(bn_var_ptr + curr_offs_n, mask=curr_offs_n < N, other=0.0)
+        bn_weight = tl.load(bn_weight_ptr + curr_offs_n, mask=curr_offs_n < N, other=1.0)
+        bn_bias = tl.load(bn_bias_ptr + curr_offs_n, mask=curr_offs_n < N, other=0.0)
+        
+        acc_block = (acc_block - bn_mean[None, :]) / tl.sqrt(bn_var[None, :] + bn_eps)
+        acc_block = acc_block * bn_weight[None, :] + bn_bias[None, :]
+        
+        scale = tl.load(scale_ptr)
+        acc_block = scale * acc_block
+        
+        exp_block = tl.exp(acc_block - row_max[:, None])
+        softmax_block = exp_block / row_sum[:, None]
+        
+        c_ptrs = c_ptr + offs_m[:, None] * stride_cm + curr_offs_n[None, :] * stride_cn
+        tl.store(c_ptrs, softmax_block, mask=(offs_m[:, None] < M) & (curr_offs_n[None, :] < N))
+
+
+def fused_gemm_bn_scale_softmax(x, weight, bias, bn_weight, bn_bias, bn_mean, bn_var, scale, bn_eps):
+    M, K = x.shape
+    N = weight.shape[0]
+    c = torch.empty((M, N), device=x.device, dtype=x.dtype)
+    b = weight.t().contiguous()
+    
+    BLOCK_M = 32
+    BLOCK_N = 128
+    BLOCK_K = 64
+    
+    grid = lambda META: (triton.cdiv(M, BLOCK_M),)
+    
+    fused_gemm_bn_scale_softmax_kernel[grid](
+        x, b, bias, bn_weight, bn_bias, bn_mean, bn_var, scale, c,
+        M, N, K,
+        x.stride(0), x.stride(1), b.stride(0), b.stride(1), c.stride(0), c.stride(1),
+        bn_eps,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+    )
+    return c
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, bn_eps=1e-5, bn_momentum=0.1, scale_shape=(1,)):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.bias = nn.Parameter(torch.randn(out_features))
+        self.bn_weight = nn.Parameter(torch.ones(out_features))
+        self.bn_bias = nn.Parameter(torch.zeros(out_features))
+        self.register_buffer('bn_mean', torch.zeros(out_features))
+        self.register_buffer('bn_var', torch.ones(out_features))
+        self.scale = nn.Parameter(torch.ones(scale_shape))
+        self.bn_eps = bn_eps
+        self.bn_momentum = bn_momentum
+
+    def forward(self, x):
+        if self.training:
+            with torch.no_grad():
+                gemm_out = torch.nn.functional.linear(x, self.weight, self.bias)
+                batch_mean = gemm_out.mean(dim=0)
+                batch_var = gemm_out.var(dim=0, unbiased=False)
+                self.bn_mean = (1 - self.bn_momentum) * self.bn_mean + self.bn_momentum * batch_mean
+                self.bn_var = (1 - self.bn_momentum) * self.bn_var + self.bn_momentum * batch_var
+        
+        return fused_gemm_bn_scale_softmax(
+            x, self.weight, self.bias, 
+            self.bn_weight, self.bn_bias, self.bn_mean, self.bn_var,
+            self.scale, self.bn_eps
+        )
+```

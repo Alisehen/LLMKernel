@@ -1,0 +1,10 @@
+```json
+{
+  "worth_optimizing": "yes",
+  "reason": "Current implementation has catastrophic performance (379x slower) due to scalar operations and nested loops in Triton kernels without vectorization.",
+  "bottleneck": "The conv2d_kernel and avgpool_sigmoid_sum_kernel use deeply nested scalar loops (5-6 levels) with single-element loads/stores, causing massive underutilization of GPU parallelism and memory bandwidth. Each thread computes one output element serially instead of leveraging SIMD operations.",
+  "optimisation method": "Replace naive convolution with im2col + matrix multiplication approach: transform input patches into columns, perform batched GEMM for convolution, then fuse pooling/sigmoid/sum with vectorized operations across spatial dimensions using proper thread blocking.",
+  "modification plan": "1) Implement im2col transformation kernel to extract sliding windows into a 2D matrix. 2) Use Triton's matrix multiplication primitives (tl.dot) for the convolution GEMM with proper tile sizes (64x64 or 128x128). 3) Fuse avgpool+sigmoid+sum into a single vectorized kernel that processes multiple spatial locations per thread using tl.load with masks and block-level reductions.",
+  "expected_speedup": "300-500x (bringing performance from 10200ms to 20-35ms, matching or beating PyTorch baseline)"
+}
+```

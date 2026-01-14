@@ -1,0 +1,234 @@
+Fix the Triton kernel errors. Generate correct code.
+
+## ERROR LOG
+```
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 576, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20260114_071332_batch_range78to84_openai_deepseek/78_ConvTranspose3d_Max_Max_Sum/code/kernel_20260114_071351.py", line 150, in forward
+    x = max_pool3d_triton(x, kernel_size=2)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20260114_071332_batch_range78to84_openai_deepseek/78_ConvTranspose3d_Max_Max_Sum/code/kernel_20260114_071351.py", line 111, in max_pool3d_triton
+    max_pool3d_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 419, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 733, in run
+    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 861, in _do_compile
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 300, in compile
+    module = src.make_ir(target, options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 80, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 30:12:
+    c = rem // (out_d * out_h * out_w)
+    rem = rem % (out_d * out_h * out_w)
+    od = rem // (out_h * out_w)
+    rem = rem % (out_h * out_w)
+    oh = rem // out_w
+    ow = rem % out_w
+
+    max_val = -1e20
+
+    for kd in range(kernel_d):
+        for kh in range(kernel_h):
+            for kw in range(kernel_w):
+            ^
+AssertionError("Loop-carried variable max_val has initial type fp32 but is re-assigned to <['256'], fp32> in loop! Please make sure that the type stays consistent.")
+```
+
+## Broken Code
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def max_pool3d_kernel(
+    input_ptr, output_ptr,
+    batch, channels, in_d, in_h, in_w,
+    out_d, out_h, out_w,
+    kernel_d, kernel_h, kernel_w,
+    stride_d, stride_h, stride_w,
+    stride_bn, stride_bc, stride_bd, stride_bh, stride_bw,
+    stride_on, stride_oc, stride_od, stride_oh, stride_ow,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    total_elements = batch * channels * out_d * out_h * out_w
+    
+    idx = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = idx < total_elements
+    
+    n = idx // (channels * out_d * out_h * out_w)
+    rem = idx % (channels * out_d * out_h * out_w)
+    c = rem // (out_d * out_h * out_w)
+    rem = rem % (out_d * out_h * out_w)
+    od = rem // (out_h * out_w)
+    rem = rem % (out_h * out_w)
+    oh = rem // out_w
+    ow = rem % out_w
+    
+    max_val = -1e20
+    
+    for kd in range(kernel_d):
+        for kh in range(kernel_h):
+            for kw in range(kernel_w):
+                id = od * stride_d + kd
+                ih = oh * stride_h + kh
+                iw = ow * stride_w + kw
+                
+                valid = (id < in_d) & (ih < in_h) & (iw < in_w)
+                
+                input_offset = (n * stride_bn + c * stride_bc + 
+                               id * stride_bd + ih * stride_bh + iw * stride_bw)
+                val = tl.load(input_ptr + input_offset, mask=mask & valid, other=-1e20)
+                max_val = tl.maximum(max_val, val)
+    
+    output_offset = (n * stride_on + c * stride_oc + 
+                    od * stride_od + oh * stride_oh + ow * stride_ow)
+    tl.store(output_ptr + output_offset, max_val, mask=mask)
+
+@triton.jit
+def sum_channels_kernel(
+    input_ptr, output_ptr,
+    batch, channels, depth, height, width,
+    stride_bn, stride_bc, stride_bd, stride_bh, stride_bw,
+    stride_on, stride_oc, stride_od, stride_oh, stride_ow,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    total_elements = batch * depth * height * width
+    
+    idx = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = idx < total_elements
+    
+    n = idx // (depth * height * width)
+    rem = idx % (depth * height * width)
+    d = rem // (height * width)
+    rem = rem % (height * width)
+    h = rem // width
+    w = rem % width
+    
+    sum_val = 0.0
+    for c in range(channels):
+        input_offset = (n * stride_bn + c * stride_bc + 
+                       d * stride_bd + h * stride_bh + w * stride_bw)
+        val = tl.load(input_ptr + input_offset, mask=mask, other=0.0)
+        sum_val += val
+    
+    output_offset = (n * stride_on + 0 * stride_oc + 
+                    d * stride_od + h * stride_oh + w * stride_ow)
+    tl.store(output_ptr + output_offset, sum_val, mask=mask)
+
+def max_pool3d_triton(x, kernel_size, stride=None):
+    if stride is None:
+        stride = kernel_size
+    
+    batch, channels, in_d, in_h, in_w = x.shape
+    
+    if isinstance(kernel_size, int):
+        kernel_d = kernel_h = kernel_w = kernel_size
+    else:
+        kernel_d, kernel_h, kernel_w = kernel_size
+    
+    if isinstance(stride, int):
+        stride_d = stride_h = stride_w = stride
+    else:
+        stride_d, stride_h, stride_w = stride
+    
+    out_d = (in_d - kernel_d) // stride_d + 1
+    out_h = (in_h - kernel_h) // stride_h + 1
+    out_w = (in_w - kernel_w) // stride_w + 1
+    
+    output = torch.empty((batch, channels, out_d, out_h, out_w), 
+                         device=x.device, dtype=x.dtype)
+    
+    total_elements = batch * channels * out_d * out_h * out_w
+    BLOCK_SIZE = 256
+    grid = lambda meta: (triton.cdiv(total_elements, BLOCK_SIZE),)
+    
+    max_pool3d_kernel[grid](
+        x, output,
+        batch, channels, in_d, in_h, in_w,
+        out_d, out_h, out_w,
+        kernel_d, kernel_h, kernel_w,
+        stride_d, stride_h, stride_w,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
+        output.stride(0), output.stride(1), output.stride(2), output.stride(3), output.stride(4),
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    
+    return output
+
+def sum_channels_triton(x):
+    batch, channels, depth, height, width = x.shape
+    output = torch.empty((batch, 1, depth, height, width), 
+                         device=x.device, dtype=x.dtype)
+    
+    total_elements = batch * depth * height * width
+    BLOCK_SIZE = 256
+    grid = lambda meta: (triton.cdiv(total_elements, BLOCK_SIZE),)
+    
+    sum_channels_kernel[grid](
+        x, output,
+        batch, channels, depth, height, width,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
+        output.stride(0), output.stride(1), output.stride(2), output.stride(3), output.stride(4),
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    
+    return output
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding)
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = max_pool3d_triton(x, kernel_size=2)
+        x = max_pool3d_triton(x, kernel_size=3)
+        x = sum_channels_triton(x)
+        return x
+```
+
+## CRITICAL — These cause 60%+ of failures:
+1. EVERY kernel function MUST have `@triton.jit` decorator — MANDATORY
+2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+3. BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+4. `tl.program_id(axis)` only supports axis = 0, 1, 2
+5. No `continue`, `break`, `return` inside loops — use masking
+6. No tensor indexing with loop vars: `x[:, i]` is INVALID
+7. mask shape MUST match data shape in tl.load/tl.store
+
+## Missing Triton Functions (implement manually):
+- tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+## OUTPUT FORMAT (STRICT):
+1. Imports: torch, torch.nn, triton, triton.language as tl (and math if needed)
+2. @triton.jit decorated kernel function(s)
+3. Wrapper function(s) for grid calculation and kernel launch
+4. class ModelNew(nn.Module) — REQUIRED
+
+Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <corrected code>
+```

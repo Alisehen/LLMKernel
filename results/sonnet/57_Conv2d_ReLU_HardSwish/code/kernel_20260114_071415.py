@@ -1,0 +1,53 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def fused_relu_hardswish_kernel(
+    x_ptr, out_ptr,
+    N,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < N
+    
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+    
+    # Fused ReLU
+    x = tl.maximum(x, 0.0)
+    
+    # Fused HardSwish: x * clamp((x + 3) / 6, 0, 1)
+    x_plus_3 = x + 3.0
+    x_plus_3_div_6 = x_plus_3 / 6.0
+    clamped = tl.minimum(tl.maximum(x_plus_3_div_6, 0.0), 1.0)
+    result = x * clamped
+    
+    tl.store(out_ptr + offs, result, mask=mask)
+
+
+def fused_relu_hardswish(x):
+    N = x.numel()
+    out = torch.empty_like(x)
+    
+    BLOCK_SIZE = 1024
+    grid = lambda meta: (triton.cdiv(N, meta['BLOCK_SIZE']),)
+    
+    fused_relu_hardswish_kernel[grid](
+        x, out,
+        N,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    return out
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = fused_relu_hardswish(x)
+        return x

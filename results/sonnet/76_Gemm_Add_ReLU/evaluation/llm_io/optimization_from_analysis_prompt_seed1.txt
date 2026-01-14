@@ -1,0 +1,209 @@
+You are optimizing a Triton kernel based on algorithmic analysis.
+
+# PyTorch Reference (Target Behavior)
+
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs a matrix multiplication, adds a bias term, and applies ReLU.
+    """
+    def __init__(self, in_features, out_features, bias_shape):
+        super(Model, self).__init__()
+        self.gemm = nn.Linear(in_features, out_features, bias=False)
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input tensor with shape (batch_size, in_features).
+        Returns:
+            torch.Tensor: Output tensor with shape (batch_size, out_features).
+        """
+        x = self.gemm(x)
+        x = x + self.bias
+        x = torch.relu(x)
+        return x
+
+batch_size = 1024
+in_features = 8192
+out_features = 8192
+bias_shape = (out_features,)
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features)]
+
+def get_init_inputs():
+    return [in_features, out_features, bias_shape]
+```
+
+**CRITICAL**: Study the PyTorch code carefully to understand:
+- What does `forward()` return? (full output sequence vs final hidden state only)
+- What is the computational pattern?
+- What are the input/output shapes?
+
+Your optimized kernel MUST match this exact behavior.
+
+---
+
+# Analysis Results
+
+**Bottleneck**: The block sizes (BLOCK_M=128, BLOCK_N=128, BLOCK_K=32) and swizzle pattern are not optimal for this problem size. The weight transpose `weight.t().contiguous()` also adds overhead by creating a copy.
+
+**Optimization Strategy**: Use autotuning to find optimal block sizes for this specific GEMM shape, and store weights in transposed layout to avoid runtime transpose. Increase BLOCK_K to improve arithmetic intensity and reduce K-loop iterations.
+
+**Implementation Plan**: 1) Add @triton.autotune decorator with multiple configurations (e.g., BLOCK_M/N in {64,128,256}, BLOCK_K in {32,64,128}) and num_warps/stages options. 2) Store weight as (K, N) layout in __init__ to eliminate runtime transpose. 3) Tune the swizzle group size based on problem dimensions.
+
+**Expected Speedup**: 20-40%
+
+---
+
+# Current Kernel (needs optimization)
+
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def fused_gemm_add_relu_kernel(
+    a_ptr, b_ptr, bias_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    
+    # Swizzle for better L2 cache utilization
+    num_pid_in_group = 8
+    group_id = pid // (num_pid_in_group * num_pid_n)
+    first_pid_m = group_id * num_pid_in_group
+    group_size_m = min(num_pid_m - first_pid_m, num_pid_in_group)
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % (num_pid_in_group * num_pid_n)) // group_size_m
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    for k in range(0, K, BLOCK_K):
+        k_remaining = K - k
+        a = tl.load(a_ptrs, mask=(offs_m[:, None] < M) & (offs_k[None, :] < k_remaining), other=0.0)
+        b = tl.load(b_ptrs, mask=(offs_k[:, None] < k_remaining) & (offs_n[None, :] < N), other=0.0)
+        acc += tl.dot(a, b, allow_tf32=True)
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Fused: add bias
+    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc += bias[None, :]
+
+    # Fused: ReLU
+    acc = tl.maximum(acc, 0.0)
+
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, acc, mask=mask)
+
+
+def fused_gemm_add_relu(x, weight, bias):
+    M, K = x.shape
+    N = weight.shape[0]
+    c = torch.empty((M, N), device=x.device, dtype=x.dtype)
+    
+    # Transpose weight to get (K, N) layout
+    b = weight.t().contiguous()
+    
+    BLOCK_M = 128
+    BLOCK_N = 128
+    BLOCK_K = 32
+    
+    grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),)
+    
+    fused_gemm_add_relu_kernel[grid](
+        x, b, bias, c,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        b.stride(0), b.stride(1),
+        c.stride(0), c.stride(1),
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+    )
+    return c
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that fuses matrix multiplication, bias addition, and ReLU using Triton.
+    """
+    def __init__(self, in_features, out_features, bias_shape):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input tensor with shape (batch_size, in_features).
+        Returns:
+            torch.Tensor: Output tensor with shape (batch_size, out_features).
+        """
+        return fused_gemm_add_relu(x, self.weight, self.bias)
+```
+
+---
+
+# Your Task
+
+Implement the optimization strategy above. Focus on the specific bottleneck identified.
+
+## Key Requirements
+
+1. **Preserve correctness**: Maintain the same input/output behavior
+2. **Apply the optimization**: Follow the implementation plan exactly
+3. **Use valid Triton syntax**:
+   - Every kernel MUST have `@triton.jit` decorator
+   - Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+   - BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+   - No `continue`, `break`, `return` inside kernels (use masking)
+   - Prefer `tl.dot(a, b, allow_tf32=True)` for matmul operations
+
+4. **CRITICAL for RNN/GRU/LSTM Persistent Kernels**:
+   - Time loop MUST be inside @triton.jit kernel, NOT in Python forward()
+   - **HYBRID computation strategy** (CRITICAL for performance):
+     * Precompute input-side gates OUTSIDE kernel: `gates_x = (T*B, In) @ W_ih` (ONE large GEMM)
+     * INSIDE kernel: only recurrent-side: `for t: gates_h = h @ W_hh` (T small GEMMs)
+   - CORRECT (FAST - use this):
+     ```python
+     # Python forward():
+     gates_x_all = x.reshape(T*B, In) @ W_ih + b_ih  # ONE large GEMM
+     gates_x_all = gates_x_all.view(T, B, 3*H)
+     gru_persistent_kernel[grid](gates_x_all, h0, W_hh, ...)  # Launch ONCE
+
+     @triton.jit
+     def gru_persistent_kernel(gates_x_ptr, h_ptr, W_hh_ptr, ...):
+         for t in range(T):  # Inside kernel
+             gates_x_t = tl.load(gates_x_ptr + t*...)  # Precomputed
+             gates_h = h @ W_hh  # Only recurrent GEMM
+             h = (1-z)*n + z*h   # Fuse and update
+     ```
+
+5. **Output format**:
+   - Imports: `import torch, torch.nn as nn, triton, triton.language as tl`
+   - `@triton.jit` kernel(s)
+   - Wrapper function(s)
+   - `class ModelNew(nn.Module)` — REQUIRED
+   - NO testing code, NO `if __name__ == "__main__"`
+
+---
+
+Generate the optimized kernel now. Output ONLY the complete Python code.

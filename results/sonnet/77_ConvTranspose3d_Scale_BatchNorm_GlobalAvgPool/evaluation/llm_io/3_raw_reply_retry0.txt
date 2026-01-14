@@ -1,0 +1,269 @@
+Looking at the NCU metrics, I can see:
+- SM throughput is only 31.29% - there's room for improvement
+- DRAM throughput is 89.81% - memory bound
+- L2 cache hit rate is very low (0.24%) - poor locality
+- Warp occupancy is 71.67%
+
+The kernel is memory-bound with poor cache utilization. The main issues are:
+1. Non-coalesced memory access due to 3D index computation
+2. Each thread block processes one (batch, channel) pair, leading to scattered access patterns
+3. The loop-based reduction with dynamic bounds hurts performance
+
+Let me optimize by:
+1. Using larger blocks with better memory coalescing
+2. Tuning num_warps and num_stages for the memory-bound workload
+3. Simplifying the index computation
+4. Using vectorized loads where possible
+
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 2048}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8, num_stages=2),
+    ],
+    key=['total_elements'],
+)
+@triton.jit
+def fused_scale_bn_avgpool_kernel(
+    x_ptr, out_ptr,
+    gamma_ptr, beta_ptr, mean_ptr, var_ptr,
+    scale_factor, eps,
+    N, C, D, H, W,
+    stride_n, stride_c, stride_d, stride_h, stride_w,
+    total_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    batch_idx = pid // C
+    channel_idx = pid % C
+    
+    # Load batch norm parameters for this channel
+    gamma = tl.load(gamma_ptr + channel_idx)
+    beta = tl.load(beta_ptr + channel_idx)
+    mean = tl.load(mean_ptr + channel_idx)
+    var = tl.load(var_ptr + channel_idx)
+    
+    # Precompute coefficients - fuse scale into BN
+    inv_std = 1.0 / tl.sqrt(var + eps)
+    coeff = scale_factor * gamma * inv_std
+    bias = beta - mean * gamma * inv_std
+    
+    # Precompute constants
+    HW = H * W
+    
+    # Base pointer for this (batch, channel)
+    base_ptr = x_ptr + batch_idx * stride_n + channel_idx * stride_c
+    
+    # Accumulate sum using register-based reduction
+    acc = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+    
+    # Process elements in chunks
+    for start in range(0, total_elements, BLOCK_SIZE):
+        offs = start + tl.arange(0, BLOCK_SIZE)
+        mask = offs < total_elements
+        
+        # Convert linear index to 3D indices
+        d_idx = offs // HW
+        hw_rem = offs % HW
+        h_idx = hw_rem // W
+        w_idx = hw_rem % W
+        
+        # Compute pointers
+        ptrs = base_ptr + d_idx * stride_d + h_idx * stride_h + w_idx * stride_w
+        
+        # Load and transform
+        x_vals = tl.load(ptrs, mask=mask, other=0.0)
+        y_vals = x_vals * coeff + bias
+        
+        # Accumulate with mask
+        acc += tl.where(mask, y_vals, 0.0)
+    
+    # Reduce and compute average
+    total_sum = tl.sum(acc, axis=0)
+    avg = total_sum / total_elements
+    tl.store(out_ptr + pid, avg)
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_D': 8, 'BLOCK_HW': 128}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_D': 4, 'BLOCK_HW': 256}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_D': 8, 'BLOCK_HW': 256}, num_warps=8, num_stages=2),
+    ],
+    key=['D', 'H', 'W'],
+)
+@triton.jit
+def fused_scale_bn_avgpool_kernel_v2(
+    x_ptr, out_ptr,
+    gamma_ptr, beta_ptr, mean_ptr, var_ptr,
+    scale_factor, eps,
+    N, C, D, H, W,
+    stride_n, stride_c, stride_d, stride_h, stride_w,
+    BLOCK_D: tl.constexpr,
+    BLOCK_HW: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    batch_idx = pid // C
+    channel_idx = pid % C
+    
+    # Load batch norm parameters
+    gamma = tl.load(gamma_ptr + channel_idx)
+    beta = tl.load(beta_ptr + channel_idx)
+    mean = tl.load(mean_ptr + channel_idx)
+    var = tl.load(var_ptr + channel_idx)
+    
+    # Precompute coefficients
+    inv_std = 1.0 / tl.sqrt(var + eps)
+    coeff = scale_factor * gamma * inv_std
+    bias = beta - mean * gamma * inv_std
+    
+    HW = H * W
+    total_elements = D * HW
+    
+    # Base pointer
+    base_ptr = x_ptr + batch_idx * stride_n + channel_idx * stride_c
+    
+    acc = 0.0
+    
+    # Iterate over depth
+    for d_start in range(0, D, BLOCK_D):
+        d_offs = d_start + tl.arange(0, BLOCK_D)
+        d_mask = d_offs < D
+        
+        # Iterate over HW
+        for hw_start in range(0, HW, BLOCK_HW):
+            hw_offs = hw_start + tl.arange(0, BLOCK_HW)
+            hw_mask = hw_offs < HW
+            
+            h_idx = hw_offs // W
+            w_idx = hw_offs % W
+            
+            # Process BLOCK_D x BLOCK_HW elements
+            for di in range(BLOCK_D):
+                d_val = d_start + di
+                d_valid = d_val < D
+                
+                ptrs = base_ptr + d_val * stride_d + h_idx * stride_h + w_idx * stride_w
+                mask = hw_mask & d_valid
+                
+                x_vals = tl.load(ptrs, mask=mask, other=0.0)
+                y_vals = x_vals * coeff + bias
+                
+                acc += tl.sum(tl.where(mask, y_vals, 0.0), axis=0)
+    
+    avg = acc / total_elements
+    tl.store(out_ptr + pid, avg)
+
+
+@triton.jit
+def fused_scale_bn_avgpool_contiguous_kernel(
+    x_ptr, out_ptr,
+    gamma_ptr, beta_ptr, mean_ptr, var_ptr,
+    scale_factor, eps,
+    N, C, spatial_size,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Optimized kernel for contiguous memory layout"""
+    pid = tl.program_id(0)
+    batch_idx = pid // C
+    channel_idx = pid % C
+    
+    # Load batch norm parameters
+    gamma = tl.load(gamma_ptr + channel_idx)
+    beta = tl.load(beta_ptr + channel_idx)
+    mean = tl.load(mean_ptr + channel_idx)
+    var = tl.load(var_ptr + channel_idx)
+    
+    # Precompute coefficients
+    inv_std = 1.0 / tl.sqrt(var + eps)
+    coeff = scale_factor * gamma * inv_std
+    bias = beta - mean * gamma * inv_std
+    
+    # Base pointer for contiguous access
+    base_ptr = x_ptr + (batch_idx * C + channel_idx) * spatial_size
+    
+    acc = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+    
+    for start in range(0, spatial_size, BLOCK_SIZE):
+        offs = start + tl.arange(0, BLOCK_SIZE)
+        mask = offs < spatial_size
+        
+        x_vals = tl.load(base_ptr + offs, mask=mask, other=0.0)
+        y_vals = x_vals * coeff + bias
+        
+        acc += tl.where(mask, y_vals, 0.0)
+    
+    total_sum = tl.sum(acc, axis=0)
+    avg = total_sum / spatial_size
+    tl.store(out_ptr + pid, avg)
+
+
+def fused_scale_bn_avgpool(x, gamma, beta, running_mean, running_var, scale_factor, eps):
+    N, C, D, H, W = x.shape
+    out = torch.empty((N, C, 1, 1, 1), device=x.device, dtype=x.dtype)
+    
+    total_elements = D * H * W
+    grid = (N * C,)
+    
+    # Check if tensor is contiguous
+    if x.is_contiguous():
+        # Use optimized contiguous kernel
+        BLOCK_SIZE = 1024
+        fused_scale_bn_avgpool_contiguous_kernel[grid](
+            x, out.view(-1),
+            gamma, beta, running_mean, running_var,
+            scale_factor, eps,
+            N, C, total_elements,
+            BLOCK_SIZE=BLOCK_SIZE,
+            num_warps=4,
+            num_stages=2,
+        )
+    else:
+        # Use general kernel with stride support
+        fused_scale_bn_avgpool_kernel[grid](
+            x, out.view(-1),
+            gamma, beta, running_mean, running_var,
+            scale_factor, eps,
+            N, C, D, H, W,
+            x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
+            total_elements,
+        )
+    
+    return out
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, scale_factor, eps=1e-5, momentum=0.1):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size)
+        self.scale_factor = scale_factor
+        self.batch_norm = nn.BatchNorm3d(out_channels, eps=eps, momentum=momentum)
+        self.eps = eps
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        
+        if self.training:
+            x = x * self.scale_factor
+            x = self.batch_norm(x)
+            x = torch.mean(x, dim=[2, 3, 4], keepdim=True)
+            return x
+        else:
+            return fused_scale_bn_avgpool(
+                x,
+                self.batch_norm.weight,
+                self.batch_norm.bias,
+                self.batch_norm.running_mean,
+                self.batch_norm.running_var,
+                self.scale_factor,
+                self.eps
+            )
+```

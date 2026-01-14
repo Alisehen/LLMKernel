@@ -1,0 +1,10 @@
+```json
+{
+  "worth_optimizing": "yes",
+  "reason": "The kernel launches GroupNorm with M*num_groups (1024*256=262,144) separate program instances, each performing redundant loads and small computations, causing massive launch overhead and poor memory access patterns.",
+  "bottleneck": "GroupNorm kernel launches 262,144 program instances (one per batch-group pair), where each instance performs 3 separate passes over the same data (mean, variance, normalize), resulting in 3x redundant memory reads and excessive kernel launch overhead.",
+  "optimisation method": "Restructure GroupNorm to launch M programs (one per batch), where each program processes all groups for that batch in a single pass using online/Welford algorithm to compute mean/variance in one traversal, then normalize in a second pass, reducing from 3 passes to 2 and from 262K launches to 1K launches.",
+  "modification plan": "Modify group_norm_kernel to iterate over all groups within a single batch program (pid=batch_idx). Use online algorithm to compute mean/variance for all groups in first pass with shared memory/registers. Apply normalization in second pass. This reduces kernel launches by 256x and memory traffic by 33%, while improving memory coalescing.",
+  "expected_speedup": "40-60%"
+}
+```

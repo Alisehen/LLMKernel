@@ -1,0 +1,10 @@
+```json
+{
+  "worth_optimizing": "yes",
+  "reason": "The kernel uses suboptimal GEMM blocking parameters and accumulates in float32 while storing intermediate results, causing memory bandwidth bottleneck.",
+  "bottleneck": "The BLOCK_K=32 is too small for the K=8192 dimension, requiring 256 iterations of the accumulation loop with excessive memory traffic. Additionally, the kernel performs GEMM accumulation in float32 but the elementwise operations could benefit from maintaining higher precision throughout.",
+  "optimisation method": "Increase BLOCK_K from 32 to 64 or 128 to reduce loop iterations and improve memory coalescing, and tune BLOCK_M/BLOCK_N to better utilize shared memory and register resources for the large 8192x8192 GEMM.",
+  "modification plan": "Change blocking parameters to BLOCK_M=64, BLOCK_N=64, BLOCK_K=64 or BLOCK_M=128, BLOCK_N=64, BLOCK_K=64 to reduce the K-loop iterations from 256 to 128 or 64. This increases arithmetic intensity by loading more data per iteration and reduces global memory transactions. Add autotuning to find optimal configuration for this specific problem size.",
+  "expected_speedup": "40-60%"
+}
+```

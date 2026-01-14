@@ -94,7 +94,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--work_dir", type=Path, default=Path("run"), help="Output root directory")
     p.add_argument("--device", type=int, default=0, help="CUDA device index for benchmarking")
     p.add_argument("--warmup", type=int, default=2, help="Warm-up iterations")
-    p.add_argument("--repeat", type=int, default=5, help="Timed iterations per benchmark")
+    p.add_argument("--repeat", type=int, default=2, help="Timed iterations per benchmark")
     p.add_argument("--tol", type=float, default=1, help="Absolute tolerance for accuracy check")
     p.add_argument("--rtol", type=float, default=1, help="Relative tolerance")
     p.add_argument("--max_tokens", type=int, default=16000, help="LLM max new tokens")

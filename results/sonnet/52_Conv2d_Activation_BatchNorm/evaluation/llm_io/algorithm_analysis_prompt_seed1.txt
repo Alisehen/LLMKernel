@@ -1,0 +1,248 @@
+You are a GPU kernel optimization architect. Analyze the kernel and identify **ONE high-level algorithmic optimization**.
+
+# PyTorch Reference
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs a convolution, applies activation, and then applies Batch Normalization.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, eps=1e-5, momentum=0.1):
+        super(Model, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.bn = nn.BatchNorm2d(out_channels, eps=eps, momentum=momentum)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = torch.multiply(torch.tanh(torch.nn.functional.softplus(x)), x)
+        x = self.bn(x)
+        return x
+
+batch_size = 64
+in_channels = 64
+out_channels = 128
+height, width = 128, 128
+kernel_size = 3
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size]
+```
+
+# Current Triton Kernel
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+import math
+
+@triton.jit
+def fused_mish_kernel(
+    x_ptr, out_ptr,
+    N,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < N
+    
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+    
+    # Mish activation: x * tanh(softplus(x))
+    # softplus(x) = log(1 + exp(x))
+    # For numerical stability, use: softplus(x) = x if x > 20 else log(1 + exp(x))
+    softplus = tl.where(x > 20.0, x, tl.log(1.0 + tl.exp(x)))
+    
+    # tanh(x) = (exp(2*x) - 1) / (exp(2*x) + 1)
+    exp_2x = tl.exp(2.0 * softplus)
+    tanh_val = (exp_2x - 1.0) / (exp_2x + 1.0)
+    
+    out = x * tanh_val
+    
+    tl.store(out_ptr + offs, out, mask=mask)
+
+@triton.jit
+def batchnorm_forward_kernel(
+    x_ptr, out_ptr, weight_ptr, bias_ptr,
+    running_mean_ptr, running_var_ptr,
+    mean_ptr, var_ptr,
+    N, C, HW,
+    eps: tl.constexpr,
+    momentum: tl.constexpr,
+    training: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid_c = tl.program_id(0)
+    pid_hw = tl.program_id(1)
+    
+    offs_hw = pid_hw * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask_hw = offs_hw < HW
+    
+    if training == 1:
+        # Load mean and var computed for this channel
+        mean = tl.load(mean_ptr + pid_c)
+        var = tl.load(var_ptr + pid_c)
+    else:
+        # Use running statistics
+        mean = tl.load(running_mean_ptr + pid_c)
+        var = tl.load(running_var_ptr + pid_c)
+    
+    weight = tl.load(weight_ptr + pid_c)
+    bias = tl.load(bias_ptr + pid_c)
+    
+    # Process all N samples for this channel and HW block
+    for n in range(N):
+        idx = n * C * HW + pid_c * HW + offs_hw
+        x = tl.load(x_ptr + idx, mask=mask_hw, other=0.0)
+        
+        # Normalize
+        x_norm = (x - mean) / tl.sqrt(var + eps)
+        
+        # Scale and shift
+        out = weight * x_norm + bias
+        
+        tl.store(out_ptr + idx, out, mask=mask_hw)
+
+def fused_mish(x):
+    N = x.numel()
+    out = torch.empty_like(x)
+    
+    BLOCK_SIZE = 1024
+    grid = (triton.cdiv(N, BLOCK_SIZE),)
+    
+    fused_mish_kernel[grid](
+        x, out,
+        N,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    return out
+
+def batchnorm2d_triton(x, weight, bias, running_mean, running_var, training, momentum, eps):
+    N, C, H, W = x.shape
+    HW = H * W
+    out = torch.empty_like(x)
+    
+    if training:
+        # Compute mean and var per channel
+        x_reshaped = x.view(N, C, HW)
+        mean = x_reshaped.mean(dim=[0, 2])
+        var = x_reshaped.var(dim=[0, 2], unbiased=False)
+        
+        # Update running statistics
+        with torch.no_grad():
+            running_mean.mul_(1 - momentum).add_(mean * momentum)
+            running_var.mul_(1 - momentum).add_(var * momentum)
+        
+        mean_ptr = mean.contiguous()
+        var_ptr = var.contiguous()
+    else:
+        mean_ptr = running_mean
+        var_ptr = running_var
+    
+    BLOCK_SIZE = 256
+    grid = (C, triton.cdiv(HW, BLOCK_SIZE))
+    
+    batchnorm_forward_kernel[grid](
+        x, out, weight, bias,
+        running_mean, running_var,
+        mean_ptr, var_ptr,
+        N, C, HW,
+        eps=eps,
+        momentum=momentum,
+        training=1 if training else 0,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    return out
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, eps=1e-5, momentum=0.1):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.bn_weight = nn.Parameter(torch.ones(out_channels))
+        self.bn_bias = nn.Parameter(torch.zeros(out_channels))
+        self.register_buffer('running_mean', torch.zeros(out_channels))
+        self.register_buffer('running_var', torch.ones(out_channels))
+        self.eps = eps
+        self.momentum = momentum
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = fused_mish(x)
+        x = batchnorm2d_triton(
+            x, self.bn_weight, self.bn_bias,
+            self.running_mean, self.running_var,
+            self.training, self.momentum, self.eps
+        )
+        return x
+```
+
+# Performance
+- **PyTorch baseline**: 9.83 ms
+- **Current Triton**: 7.76 ms
+- **Current speedup**: 1.27x (+21.0% vs baseline)
+
+
+---
+
+## Analysis Steps
+
+1. **Code Analysis**: Count kernels, identify operations, check for inefficiencies
+2. **Performance Diagnosis**: Use metrics/latency to identify bottleneck type
+3. **Root Cause**: Combine code + performance to find the core issue
+
+## Optimization Categories (pick ONE if worth optimizing):
+
+### 1. Operator Fusion
+Fuse consecutive ops into fewer kernels to reduce memory traffic and launch overhead.
+
+### 2. Algorithm Replacement
+Replace naive algorithm with optimized variant.
+- For Attention: Flash Attention, online softmax
+- For Convolution: Winograd, im2col
+- **For RNN/GRU/LSTM**: Persistent kernel with HYBRID computation
+  - **CRITICAL**: Use hybrid approach for best performance:
+    * Precompute input-side gates ONCE (outside kernel): `gates_x = (T*B, In) @ W_ih`
+    * Persistent kernel (inside): only recurrent-side: `for t: gates_h = h @ W_hh`
+  - Time loop `for t in range(T)` must be inside kernel, NOT in Python
+  - Launch kernel once per layer, not once per timestep
+  - Expected speedup: 10-100x (vs per-timestep launches)
+
+### 3. Kernel Launch Reduction
+Combine multiple small kernels to reduce overhead.
+- **For RNN/GRU/LSTM**: See "Algorithm Replacement" above for persistent kernel approach
+
+### 4. Memory Layout Optimization
+Use in-place operations, buffer reuse, or better layouts.
+
+## Should We Optimize?
+
+Before proposing optimization, determine if it's worthwhile:
+- **Not worth optimizing** if:
+  - Code is already near-optimal (expected speedup < 10%)
+  - Bottleneck cannot be addressed (hardware limited, already optimal algorithm)
+  - Optimization would add significant complexity with minimal gain
+
+- **Worth optimizing** if:
+  - Clear algorithmic inefficiency exists (multiple kernels, suboptimal algorithm)
+  - Expected speedup >= 20%
+  - Concrete optimization path available
+
+## Output (JSON)
+
+```json
+{
+  "worth_optimizing": "yes/no",
+  "reason": "<Why worth or not worth optimizing, 1 sentence>",
+  "bottleneck": "<Root cause in 1-2 sentences, empty if not worth optimizing>",
+  "optimisation method": "<Specific optimization in 1-2 sentences, empty if not worth optimizing>",
+  "modification plan": "<Implementation steps in 2-3 sentences, empty if not worth optimizing>",
+  "expected_speedup": "<e.g., '30-40%', empty if not worth optimizing>"
+}
+```
+
+Return JSON only.

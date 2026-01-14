@@ -1,0 +1,192 @@
+Fix the Triton kernel errors. Generate correct code.
+
+## ERROR LOG
+```
+Traceback (most recent call last):
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 43, in wrapper
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/core.py", line 2192, in store
+    return _semantic.store(pointer, value, mask, boundary_check, cache_modifier, eviction_policy)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/semantic.py", line 1297, in store
+    return self._store_legacy(ptr, val, mask, boundary_check, cache, eviction)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/language/semantic.py", line 1253, in _store_legacy
+    raise ValueError("Value argument cannot be block type if pointer argument is not a block")
+ValueError: Value argument cannot be block type if pointer argument is not a block
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 576, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20260114_061155_batch_range77to97_openai_deepseek/80_Gemm_Max_Subtract_GELU/code/kernel_20260114_062459.py", line 95, in forward
+    return gemm_max_sub_gelu(x, self.gemm.weight, self.gemm.bias)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20260114_061155_batch_range77to97_openai_deepseek/80_Gemm_Max_Subtract_GELU/code/kernel_20260114_062459.py", line 78, in gemm_max_sub_gelu
+    gemm_max_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 419, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 733, in run
+    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 861, in _do_compile
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 300, in compile
+    module = src.make_ir(target, options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 80, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 52:4:
+
+        # Update max
+        acc_masked = tl.where(offs_n_curr < N, acc, float('-inf'))
+        block_max = tl.max(acc_masked, axis=0)
+        max_val = tl.maximum(max_val, block_max)
+
+    # After max and mean subtraction of single element, result is 0
+    # GELU(0) = 0
+    result = tl.zeros((1,), dtype=tl.float32)
+
+    # Store result
+    tl.store(out_ptr + pid_m, result)
+    ^
+Value argument cannot be block type if pointer argument is not a block
+```
+
+## Broken Code
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+import math
+
+@triton.jit
+def gemm_max_kernel(
+    a_ptr, b_ptr, bias_ptr, out_ptr,
+    M, N, K,
+    stride_am, stride_ak, stride_bk, stride_bn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    # Each program handles one row (one batch element)
+    pid_m = tl.program_id(0)
+    
+    offs_k = tl.arange(0, BLOCK_K)
+    offs_n = tl.arange(0, BLOCK_N)
+    
+    # Initialize max value to very negative
+    max_val = tl.full((1,), float('-inf'), dtype=tl.float32)
+    
+    # Process all N columns in chunks
+    for n_start in range(0, N, BLOCK_N):
+        offs_n_curr = n_start + tl.arange(0, BLOCK_N)
+        
+        # Compute GEMM for this block of columns
+        acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+        
+        for k_start in range(0, K, BLOCK_K):
+            offs_k_curr = k_start + tl.arange(0, BLOCK_K)
+            
+            # Load A block: (BLOCK_K,)
+            a_ptrs = a_ptr + pid_m * stride_am + offs_k_curr * stride_ak
+            a = tl.load(a_ptrs, mask=offs_k_curr < K, other=0.0)
+            
+            # Load B block: (BLOCK_K, BLOCK_N)
+            b_ptrs = b_ptr + offs_k_curr[:, None] * stride_bk + offs_n_curr[None, :] * stride_bn
+            b_mask = (offs_k_curr[:, None] < K) & (offs_n_curr[None, :] < N)
+            b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+            
+            # Accumulate: a (BLOCK_K,) * b (BLOCK_K, BLOCK_N) -> (BLOCK_N,)
+            acc += tl.sum(a[:, None] * b, axis=0)
+        
+        # Add bias
+        bias = tl.load(bias_ptr + offs_n_curr, mask=offs_n_curr < N, other=0.0)
+        acc = acc + bias
+        
+        # Update max
+        acc_masked = tl.where(offs_n_curr < N, acc, float('-inf'))
+        block_max = tl.max(acc_masked, axis=0)
+        max_val = tl.maximum(max_val, block_max)
+    
+    # After max and mean subtraction of single element, result is 0
+    # GELU(0) = 0
+    result = tl.zeros((1,), dtype=tl.float32)
+    
+    # Store result
+    tl.store(out_ptr + pid_m, result)
+
+
+def gemm_max_sub_gelu(x, weight, bias):
+    M, K = x.shape
+    N = weight.shape[0]
+    
+    # Output is (M, 1) but after mean subtraction becomes 0
+    out = torch.zeros((M, 1), device=x.device, dtype=x.dtype)
+    
+    # Transpose weight for better access pattern
+    weight_t = weight.t().contiguous()
+    
+    BLOCK_M = 1
+    BLOCK_N = 128
+    BLOCK_K = 128
+    
+    grid = (M,)
+    
+    gemm_max_kernel[grid](
+        x, weight_t, bias, out,
+        M, N, K,
+        x.stride(0), x.stride(1), weight_t.stride(0), weight_t.stride(1),
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+    )
+    
+    return out
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, max_dim):
+        super(ModelNew, self).__init__()
+        self.gemm = nn.Linear(in_features, out_features)
+        self.max_dim = max_dim
+
+    def forward(self, x):
+        return gemm_max_sub_gelu(x, self.gemm.weight, self.gemm.bias)
+```
+
+## CRITICAL — These cause 60%+ of failures:
+1. EVERY kernel function MUST have `@triton.jit` decorator — MANDATORY
+2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+3. BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+4. `tl.program_id(axis)` only supports axis = 0, 1, 2
+5. No `continue`, `break`, `return` inside loops — use masking
+6. No tensor indexing with loop vars: `x[:, i]` is INVALID
+7. mask shape MUST match data shape in tl.load/tl.store
+
+## Missing Triton Functions (implement manually):
+- tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+## OUTPUT FORMAT (STRICT):
+1. Imports: torch, torch.nn, triton, triton.language as tl (and math if needed)
+2. @triton.jit decorated kernel function(s)
+3. Wrapper function(s) for grid calculation and kernel launch
+4. class ModelNew(nn.Module) — REQUIRED
+
+Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <corrected code>
+```

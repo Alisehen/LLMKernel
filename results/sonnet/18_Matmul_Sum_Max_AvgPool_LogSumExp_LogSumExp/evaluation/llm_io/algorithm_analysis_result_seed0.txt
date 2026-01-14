@@ -1,0 +1,10 @@
+```json
+{
+  "worth_optimizing": "yes",
+  "reason": "The kernel processes output features sequentially (N=8192 iterations) with poor parallelism, achieving only 67.95% SM throughput despite 99.9% L2 cache hit rate, indicating compute-bound inefficiency from serial loop structure.",
+  "bottleneck": "The inner loop `for n in range(N)` processes 8192 output features sequentially within each thread block, severely limiting parallelism. Each iteration loads weight vectors independently and accumulates scalar results, wasting SIMD capabilities.",
+  "optimisation method": "Algorithm Replacement: Exploit the mathematical identity that sum(linear(x)) = dot(x, sum(W, dim=0)) + sum(bias). Precompute weight_sum = W.sum(dim=0) once, then the kernel becomes a simple dot product of x with weight_sum, reducing O(N*K) to O(K) per batch element.",
+  "modification plan": "1) Precompute weight_sum = weight.sum(dim=0) and bias_sum = bias.sum() outside the kernel (can be cached). 2) Replace the fused kernel with a simple parallel reduction: each batch row computes dot(x[m], weight_sum) + bias_sum. 3) Use standard tiled dot product with BLOCK_K parallelism, eliminating the N-loop entirely.",
+  "expected_speedup": "8000x reduction in arithmetic operations (from N*K to K), expected 50-100x wall-clock speedup after accounting for the precomputation overhead which amortizes across batch."
+}
+```

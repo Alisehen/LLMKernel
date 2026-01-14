@@ -1,0 +1,139 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def fused_pool_pool_sum_kernel(
+    input_ptr, output_ptr,
+    batch, channels, in_d, in_h, in_w,
+    out_d, out_h, out_w,
+    stride_bn, stride_bc, stride_bd, stride_bh, stride_bw,
+    stride_on, stride_od, stride_oh, stride_ow,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    total_elements = batch * out_d * out_h * out_w
+    
+    idx = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = idx < total_elements
+    
+    n = idx // (out_d * out_h * out_w)
+    rem = idx % (out_d * out_h * out_w)
+    od = rem // (out_h * out_w)
+    rem = rem % (out_h * out_w)
+    oh = rem // out_w
+    ow = rem % out_w
+    
+    sum_val = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+    
+    for c in range(channels):
+        # First max pool (kernel=2, stride=2)
+        # Output position (od, oh, ow) maps to input region starting at (od*2, oh*2, ow*2)
+        max_val_pool1 = tl.full([BLOCK_SIZE], -1e20, dtype=tl.float32)
+        
+        for kd1 in range(2):
+            for kh1 in range(2):
+                for kw1 in range(2):
+                    id1 = od * 2 + kd1
+                    ih1 = oh * 2 + kh1
+                    iw1 = ow * 2 + kw1
+                    
+                    valid1 = (id1 < in_d) & (ih1 < in_h) & (iw1 < in_w) & mask
+                    
+                    input_offset = (n * stride_bn + c * stride_bc + 
+                                   id1 * stride_bd + ih1 * stride_bh + iw1 * stride_bw)
+                    val = tl.load(input_ptr + input_offset, mask=valid1, other=-1e20)
+                    max_val_pool1 = tl.maximum(max_val_pool1, val)
+        
+        # Second max pool (kernel=3, stride=3) on the result of first pool
+        # The first pool output has dimensions:
+        # pool1_d = (in_d - 2) // 2 + 1
+        # pool1_h = (in_h - 2) // 2 + 1
+        # pool1_w = (in_w - 2) // 2 + 1
+        # But we don't materialize it - we compute on-the-fly
+        
+        # For second pool, we need to consider all positions in pool1 space
+        # that contribute to output position (od, oh, ow)
+        max_val_pool2 = tl.full([BLOCK_SIZE], -1e20, dtype=tl.float32)
+        
+        for kd2 in range(3):
+            for kh2 in range(3):
+                for kw2 in range(3):
+                    # Position in pool1 output space
+                    pool1_d = od * 3 + kd2
+                    pool1_h = oh * 3 + kh2
+                    pool1_w = ow * 3 + kw2
+                    
+                    # Compute pool1 dimensions
+                    pool1_out_d = (in_d - 2) // 2 + 1
+                    pool1_out_h = (in_h - 2) // 2 + 1
+                    pool1_out_w = (in_w - 2) // 2 + 1
+                    
+                    valid_pool1_pos = (pool1_d < pool1_out_d) & (pool1_h < pool1_out_h) & (pool1_w < pool1_out_w) & mask
+                    
+                    # Compute max pool1 value at this position
+                    max_at_pool1_pos = tl.full([BLOCK_SIZE], -1e20, dtype=tl.float32)
+                    
+                    for kd1 in range(2):
+                        for kh1 in range(2):
+                            for kw1 in range(2):
+                                id1 = pool1_d * 2 + kd1
+                                ih1 = pool1_h * 2 + kh1
+                                iw1 = pool1_w * 2 + kw1
+                                
+                                valid1 = (id1 < in_d) & (ih1 < in_h) & (iw1 < in_w) & valid_pool1_pos
+                                
+                                input_offset = (n * stride_bn + c * stride_bc + 
+                                               id1 * stride_bd + ih1 * stride_bh + iw1 * stride_bw)
+                                val = tl.load(input_ptr + input_offset, mask=valid1, other=-1e20)
+                                max_at_pool1_pos = tl.maximum(max_at_pool1_pos, val)
+                    
+                    max_val_pool2 = tl.maximum(max_val_pool2, max_at_pool1_pos)
+        
+        sum_val += max_val_pool2
+    
+    output_offset = (n * stride_on + 0 * 1 + 
+                    od * stride_od + oh * stride_oh + ow * stride_ow)
+    tl.store(output_ptr + output_offset, sum_val, mask=mask)
+
+def fused_pool_pool_sum_triton(x):
+    batch, channels, in_d, in_h, in_w = x.shape
+    
+    # First pool: kernel=2, stride=2
+    pool1_d = (in_d - 2) // 2 + 1
+    pool1_h = (in_h - 2) // 2 + 1
+    pool1_w = (in_w - 2) // 2 + 1
+    
+    # Second pool: kernel=3, stride=3
+    out_d = (pool1_d - 3) // 3 + 1
+    out_h = (pool1_h - 3) // 3 + 1
+    out_w = (pool1_w - 3) // 3 + 1
+    
+    output = torch.empty((batch, 1, out_d, out_h, out_w), 
+                         device=x.device, dtype=x.dtype)
+    
+    total_elements = batch * out_d * out_h * out_w
+    BLOCK_SIZE = 256
+    grid = lambda meta: (triton.cdiv(total_elements, BLOCK_SIZE),)
+    
+    fused_pool_pool_sum_kernel[grid](
+        x, output,
+        batch, channels, in_d, in_h, in_w,
+        out_d, out_h, out_w,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
+        output.stride(0), output.stride(2), output.stride(3), output.stride(4),
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    
+    return output
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding)
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = fused_pool_pool_sum_triton(x)
+        return x

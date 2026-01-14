@@ -1,0 +1,145 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def fused_tanh_scale_bias_kernel(
+    x_ptr, bias_ptr, out_ptr,
+    N, C, H, W,
+    scaling_factor,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_on, stride_oc, stride_oh, stride_ow,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    num_elements = N * C * H * W
+    
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < num_elements
+    
+    # Load input
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+    
+    # Tanh activation: (exp(2*x) - 1) / (exp(2*x) + 1)
+    exp_2x = tl.exp(2.0 * x)
+    x = (exp_2x - 1.0) / (exp_2x + 1.0)
+    
+    # Scaling
+    x = x * scaling_factor
+    
+    # Compute channel index for bias
+    c_idx = (offs // (H * W)) % C
+    bias = tl.load(bias_ptr + c_idx, mask=mask, other=0.0)
+    
+    # Add bias
+    x = x + bias
+    
+    # Store output
+    tl.store(out_ptr + offs, x, mask=mask)
+
+@triton.jit
+def max_pool2d_kernel(
+    x_ptr, out_ptr,
+    N, C, H_in, W_in, H_out, W_out,
+    kernel_size,
+    stride_xn, stride_xc, stride_xh, stride_xw,
+    stride_on, stride_oc, stride_oh, stride_ow,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    num_elements = N * C * H_out * W_out
+    
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < num_elements
+    
+    # Compute indices
+    n = offs // (C * H_out * W_out)
+    c = (offs // (H_out * W_out)) % C
+    h_out = (offs // W_out) % H_out
+    w_out = offs % W_out
+    
+    # Compute input starting positions
+    h_in_start = h_out * kernel_size
+    w_in_start = w_out * kernel_size
+    
+    # Initialize max value with very negative number
+    max_val = tl.full((BLOCK_SIZE,), float('-inf'), dtype=tl.float32)
+    
+    # Max pooling loop
+    for kh in range(kernel_size):
+        for kw in range(kernel_size):
+            h_in = h_in_start + kh
+            w_in = w_in_start + kw
+            
+            # Compute input offset
+            in_offs = (n * stride_xn + c * stride_xc + 
+                      h_in * stride_xh + w_in * stride_xw)
+            
+            # Load and update max
+            valid = mask & (h_in < H_in) & (w_in < W_in)
+            val = tl.load(x_ptr + in_offs, mask=valid, other=float('-inf'))
+            max_val = tl.maximum(max_val, val)
+    
+    # Store output
+    tl.store(out_ptr + offs, max_val, mask=mask)
+
+def fused_tanh_scale_bias(x, bias, scaling_factor):
+    N, C, H, W = x.shape
+    out = torch.empty_like(x)
+    
+    num_elements = N * C * H * W
+    BLOCK_SIZE = 1024
+    grid = lambda meta: (triton.cdiv(num_elements, meta['BLOCK_SIZE']),)
+    
+    fused_tanh_scale_bias_kernel[grid](
+        x, bias, out,
+        N, C, H, W,
+        scaling_factor,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    return out
+
+def max_pool2d_triton(x, kernel_size):
+    N, C, H_in, W_in = x.shape
+    H_out = H_in // kernel_size
+    W_out = W_in // kernel_size
+    
+    out = torch.empty((N, C, H_out, W_out), device=x.device, dtype=x.dtype)
+    
+    num_elements = N * C * H_out * W_out
+    BLOCK_SIZE = 256
+    grid = lambda meta: (triton.cdiv(num_elements, meta['BLOCK_SIZE']),)
+    
+    max_pool2d_kernel[grid](
+        x, out,
+        N, C, H_in, W_in, H_out, W_out,
+        kernel_size,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    return out
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, scaling_factor, bias_shape, pool_kernel_size):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.scaling_factor = scaling_factor
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.pool_kernel_size = pool_kernel_size
+
+    def forward(self, x):
+        # Convolution (using PyTorch as it's highly optimized)
+        x = self.conv(x)
+        
+        # Fused: Tanh + Scaling + Bias addition
+        bias_flat = self.bias.view(-1)
+        x = fused_tanh_scale_bias(x, bias_flat, self.scaling_factor)
+        
+        # Max-pooling
+        x = max_pool2d_triton(x, self.pool_kernel_size)
+        
+        return x

@@ -1,0 +1,231 @@
+You are optimizing a Triton kernel based on algorithmic analysis.
+
+# PyTorch Reference (Target Behavior)
+
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs a 3D transposed convolution, scales the output, applies batch normalization, 
+    and then performs global average pooling. 
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, scale_factor, eps=1e-5, momentum=0.1):
+        super(Model, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size)
+        self.scale_factor = scale_factor
+        self.batch_norm = nn.BatchNorm3d(out_channels, eps=eps, momentum=momentum)
+        self.global_avg_pool = nn.AdaptiveAvgPool3d((1, 1, 1))
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = x * self.scale_factor
+        x = self.batch_norm(x)
+        x = self.global_avg_pool(x)
+        return x
+
+batch_size = 16
+in_channels = 64
+out_channels = 128
+depth, height, width = 16, 32, 32
+kernel_size = 5
+scale_factor = 2.0
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, depth, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, scale_factor]
+```
+
+**CRITICAL**: Study the PyTorch code carefully to understand:
+- What does `forward()` return? (full output sequence vs final hidden state only)
+- What is the computational pattern?
+- What are the input/output shapes?
+
+Your optimized kernel MUST match this exact behavior.
+
+---
+
+# Analysis Results
+
+**Bottleneck**: The 3D transposed convolution runs as a separate cuDNN kernel, followed by the fused scale+bn+avgpool kernel. This requires writing the full conv output (N*C*D*H*W elements) to global memory and reading it back, creating a memory bandwidth bottleneck.
+
+**Optimization Strategy**: Fuse the transposed convolution output directly with scale+bn+avgpool using a tiled approach where each tile computes partial conv outputs, applies the fused operations, and accumulates for the final average without materializing the full intermediate tensor.
+
+**Implementation Plan**: Implement a fused kernel that computes transposed convolution tiles on-the-fly, immediately applies scale*gamma*inv_std + bias transformation, and accumulates partial sums for average pooling. Use shared memory to cache input tiles and weights. Each program handles one (batch, output_channel) pair, iterating over spatial positions while accumulating the sum.
+
+**Expected Speedup**: 40-60%
+
+---
+
+# Current Kernel (needs optimization)
+
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def fused_scale_bn_avgpool_kernel(
+    x_ptr, out_ptr,
+    gamma_ptr, beta_ptr, mean_ptr, var_ptr,
+    scale_factor, eps,
+    N, C, D, H, W,
+    stride_n, stride_c, stride_d, stride_h, stride_w,
+    BLOCK_SIZE: tl.constexpr,
+):
+    # Each program handles one (batch, channel) pair
+    pid = tl.program_id(0)
+    batch_idx = pid // C
+    channel_idx = pid % C
+    
+    # Load batch norm parameters for this channel
+    gamma = tl.load(gamma_ptr + channel_idx)
+    beta = tl.load(beta_ptr + channel_idx)
+    mean = tl.load(mean_ptr + channel_idx)
+    var = tl.load(var_ptr + channel_idx)
+    
+    # Precompute batch norm coefficients with scale fused in
+    inv_std = 1.0 / tl.sqrt(var + eps)
+    # y = (x * scale - mean) * inv_std * gamma + beta
+    # y = x * (scale * gamma * inv_std) + (beta - mean * gamma * inv_std)
+    coeff = scale_factor * gamma * inv_std
+    bias = beta - mean * gamma * inv_std
+    
+    # Compute sum for average pooling
+    total_elements = D * H * W
+    accumulator = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+    
+    base_ptr = x_ptr + batch_idx * stride_n + channel_idx * stride_c
+    
+    # Process elements in blocks
+    for start in range(0, total_elements, BLOCK_SIZE):
+        offs = start + tl.arange(0, BLOCK_SIZE)
+        mask = offs < total_elements
+        
+        # Convert linear index to 3D indices
+        d_idx = offs // (H * W)
+        hw_rem = offs % (H * W)
+        h_idx = hw_rem // W
+        w_idx = hw_rem % W
+        
+        # Load values
+        ptrs = base_ptr + d_idx * stride_d + h_idx * stride_h + w_idx * stride_w
+        x_vals = tl.load(ptrs, mask=mask, other=0.0)
+        
+        # Apply fused scale + batch norm
+        y_vals = x_vals * coeff + bias
+        
+        # Accumulate for average
+        accumulator += tl.where(mask, y_vals, 0.0)
+    
+    # Compute final average
+    total_sum = tl.sum(accumulator, axis=0)
+    avg = total_sum / total_elements
+    
+    # Store result
+    out_offset = batch_idx * C + channel_idx
+    tl.store(out_ptr + out_offset, avg)
+
+
+def fused_scale_bn_avgpool(x, gamma, beta, running_mean, running_var, scale_factor, eps):
+    N, C, D, H, W = x.shape
+    out = torch.empty((N, C, 1, 1, 1), device=x.device, dtype=x.dtype)
+    
+    total_elements = D * H * W
+    BLOCK_SIZE = min(1024, triton.next_power_of_2(total_elements))
+    
+    grid = (N * C,)
+    
+    fused_scale_bn_avgpool_kernel[grid](
+        x, out,
+        gamma, beta, running_mean, running_var,
+        scale_factor, eps,
+        N, C, D, H, W,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    
+    return out
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, scale_factor, eps=1e-5, momentum=0.1):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size)
+        self.scale_factor = scale_factor
+        self.batch_norm = nn.BatchNorm3d(out_channels, eps=eps, momentum=momentum)
+        self.eps = eps
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        
+        if self.training:
+            # During training, use standard ops for correct running stats update
+            x = x * self.scale_factor
+            x = self.batch_norm(x)
+            x = torch.mean(x, dim=[2, 3, 4], keepdim=True)
+            return x
+        else:
+            # During inference, use fused kernel
+            return fused_scale_bn_avgpool(
+                x,
+                self.batch_norm.weight,
+                self.batch_norm.bias,
+                self.batch_norm.running_mean,
+                self.batch_norm.running_var,
+                self.scale_factor,
+                self.eps
+            )
+```
+
+---
+
+# Your Task
+
+Implement the optimization strategy above. Focus on the specific bottleneck identified.
+
+## Key Requirements
+
+1. **Preserve correctness**: Maintain the same input/output behavior
+2. **Apply the optimization**: Follow the implementation plan exactly
+3. **Use valid Triton syntax**:
+   - Every kernel MUST have `@triton.jit` decorator
+   - Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+   - BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+   - No `continue`, `break`, `return` inside kernels (use masking)
+   - Prefer `tl.dot(a, b, allow_tf32=True)` for matmul operations
+
+4. **CRITICAL for RNN/GRU/LSTM Persistent Kernels**:
+   - Time loop MUST be inside @triton.jit kernel, NOT in Python forward()
+   - **HYBRID computation strategy** (CRITICAL for performance):
+     * Precompute input-side gates OUTSIDE kernel: `gates_x = (T*B, In) @ W_ih` (ONE large GEMM)
+     * INSIDE kernel: only recurrent-side: `for t: gates_h = h @ W_hh` (T small GEMMs)
+   - CORRECT (FAST - use this):
+     ```python
+     # Python forward():
+     gates_x_all = x.reshape(T*B, In) @ W_ih + b_ih  # ONE large GEMM
+     gates_x_all = gates_x_all.view(T, B, 3*H)
+     gru_persistent_kernel[grid](gates_x_all, h0, W_hh, ...)  # Launch ONCE
+
+     @triton.jit
+     def gru_persistent_kernel(gates_x_ptr, h_ptr, W_hh_ptr, ...):
+         for t in range(T):  # Inside kernel
+             gates_x_t = tl.load(gates_x_ptr + t*...)  # Precomputed
+             gates_h = h @ W_hh  # Only recurrent GEMM
+             h = (1-z)*n + z*h   # Fuse and update
+     ```
+
+5. **Output format**:
+   - Imports: `import torch, torch.nn as nn, triton, triton.language as tl`
+   - `@triton.jit` kernel(s)
+   - Wrapper function(s)
+   - `class ModelNew(nn.Module)` — REQUIRED
+   - NO testing code, NO `if __name__ == "__main__"`
+
+---
+
+Generate the optimized kernel now. Output ONLY the complete Python code.

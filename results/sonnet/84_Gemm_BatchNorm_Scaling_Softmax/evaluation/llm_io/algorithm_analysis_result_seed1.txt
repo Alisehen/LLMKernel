@@ -1,0 +1,10 @@
+```json
+{
+  "worth_optimizing": "yes",
+  "reason": "The current implementation uses two separate kernel launches and processes the GEMM in inefficient N-tiles, causing 5.6x slowdown versus PyTorch.",
+  "bottleneck": "The GEMM kernel incorrectly tiles across N dimension with inner K-loops, destroying data reuse and requiring intermediate materialization. The separate softmax kernel adds unnecessary memory round-trips.",
+  "optimisation method": "Replace with standard tiled GEMM (tile M and N in 2D grid, reduce K) followed by fused row-wise BatchNorm+Scale+Softmax in a single pass, eliminating intermediate storage.",
+  "modification plan": "Implement 2D-tiled GEMM kernel (pid_m, pid_n grid) with proper K-reduction and accumulation. Fuse BatchNorm, scaling, and online softmax (single-pass max/sum reduction) into the GEMM output stage before storing final results. This reduces from 2 kernels with poor memory patterns to 1 optimized kernel.",
+  "expected_speedup": "400-500%"
+}
+```

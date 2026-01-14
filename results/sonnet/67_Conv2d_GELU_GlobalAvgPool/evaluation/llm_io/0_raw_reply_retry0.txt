@@ -1,0 +1,145 @@
+Looking at this problem, I need to optimize a model that performs:
+1. 2D Convolution
+2. GELU activation
+3. Global average pooling
+4. Squeeze operations
+
+The key optimization opportunity is fusing GELU and global average pooling into a single kernel, since after convolution we need to apply GELU element-wise and then reduce spatially.
+
+Let me create an optimized implementation:
+
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+import math
+
+@triton.jit
+def fused_gelu_global_avg_pool_kernel(
+    input_ptr,
+    output_ptr,
+    batch_size,
+    channels,
+    spatial_size,
+    stride_b,
+    stride_c,
+    stride_h,
+    BLOCK_SIZE: tl.constexpr,
+):
+    # Each program handles one (batch, channel) pair
+    pid = tl.program_id(0)
+    batch_idx = pid // channels
+    channel_idx = pid % channels
+    
+    # Base pointer for this (batch, channel)
+    base_ptr = input_ptr + batch_idx * stride_b + channel_idx * stride_c
+    
+    # Accumulate sum over spatial dimensions
+    acc = tl.zeros((1,), dtype=tl.float32)
+    
+    # Process spatial elements in blocks
+    for start in range(0, spatial_size, BLOCK_SIZE):
+        offs = start + tl.arange(0, BLOCK_SIZE)
+        mask = offs < spatial_size
+        
+        # Load values
+        x = tl.load(base_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        
+        # GELU: x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+        # Using approximation: x * sigmoid(1.702 * x) is faster but less accurate
+        # Using exact formula with tanh
+        sqrt_2_over_pi = 0.7978845608028654  # sqrt(2/pi)
+        coeff = 0.044715
+        
+        x3 = x * x * x
+        inner = sqrt_2_over_pi * (x + coeff * x3)
+        
+        # tanh implementation: (exp(2x) - 1) / (exp(2x) + 1)
+        exp_2inner = tl.exp(2.0 * inner)
+        tanh_val = (exp_2inner - 1.0) / (exp_2inner + 1.0)
+        
+        gelu_out = 0.5 * x * (1.0 + tanh_val)
+        
+        # Accumulate for average
+        acc += tl.sum(gelu_out, axis=0)
+    
+    # Compute average
+    avg = acc / spatial_size
+    
+    # Store result
+    out_offset = batch_idx * channels + channel_idx
+    tl.store(output_ptr + out_offset, avg)
+
+
+def fused_gelu_global_avg_pool(x):
+    batch_size, channels, height, width = x.shape
+    spatial_size = height * width
+    
+    # Reshape to (batch, channels, spatial)
+    x_flat = x.view(batch_size, channels, spatial_size).contiguous()
+    
+    output = torch.empty((batch_size, channels), device=x.device, dtype=x.dtype)
+    
+    # One program per (batch, channel) pair
+    num_programs = batch_size * channels
+    
+    BLOCK_SIZE = 1024
+    
+    fused_gelu_global_avg_pool_kernel[(num_programs,)](
+        x_flat,
+        output,
+        batch_size,
+        channels,
+        spatial_size,
+        x_flat.stride(0),
+        x_flat.stride(1),
+        1,  # stride_h is 1 for contiguous flattened spatial
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    
+    return output
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model with fused GELU and global average pooling.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor of shape (batch_size, in_channels, height, width)
+        Returns:
+            Output tensor of shape (batch_size, out_channels)
+        """
+        # Use PyTorch conv (highly optimized via cuDNN)
+        x = self.conv(x)
+        # Fused GELU + global average pooling
+        x = fused_gelu_global_avg_pool(x)
+        return x
+```
+
+This implementation:
+
+1. **Keeps the convolution in PyTorch** - cuDNN is highly optimized for convolutions and hard to beat with custom kernels.
+
+2. **Fuses GELU and global average pooling** - Instead of:
+   - Writing GELU output to memory
+   - Reading it back for pooling
+   - Writing pooling output
+   
+   We now:
+   - Read conv output once
+   - Compute GELU in registers
+   - Accumulate for averaging in registers
+   - Write final averaged result once
+
+3. **Efficient parallelization** - Each program handles one (batch, channel) pair, which gives us `128 * 64 = 8192` parallel programs - plenty for GPU utilization.
+
+4. **Block-based spatial reduction** - Processes spatial elements in blocks of 1024, accumulating the sum efficiently.
+
+5. **Proper GELU implementation** - Uses the exact GELU formula with tanh approximation: `x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))`

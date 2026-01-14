@@ -1,0 +1,10 @@
+```json
+{
+  "worth_optimizing": "yes",
+  "reason": "The current Triton kernel is 2.7x slower than PyTorch baseline, indicating a fundamental algorithmic inefficiency in the GEMM implementation.",
+  "bottleneck": "The naive GEMM implementation uses small BLOCK_K=32 with inefficient accumulation patterns and lacks proper tiling strategies. PyTorch's cuBLAS uses highly optimized matrix multiplication with better blocking, register tiling, and memory coalescing.",
+  "optimisation method": "Replace the custom GEMM implementation with a call to optimized cuBLAS/CUTLASS via torch.matmul, then fuse only the post-GEMM elementwise operations (swish, div, clamp, tanh) in a separate lightweight Triton kernel.",
+  "modification plan": "Split into two stages: (1) Use torch.matmul for the GEMM operation to leverage cuBLAS optimization, (2) Launch a simple Triton kernel that performs only the elementwise operations (swish → div → clamp → tanh → clamp) on the GEMM output. This hybrid approach combines cuBLAS's optimized GEMM with Triton's fusion benefits for elementwise ops.",
+  "expected_speedup": "200-250%"
+}
+```

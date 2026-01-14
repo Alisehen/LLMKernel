@@ -1,0 +1,10 @@
+```json
+{
+  "worth_optimizing": "yes",
+  "reason": "The kernel has extremely low SM throughput (8.68%) and warp occupancy (8.33%), indicating severe underutilization due to poor parallelization strategy.",
+  "bottleneck": "The kernel processes all N columns sequentially within each thread block (for n_start in range(0, N, BLOCK_N)), meaning only 32 thread blocks are launched for M=1024 rows with BLOCK_M=32. This creates massive serialization where each block must iterate through all 8192 output columns, severely limiting parallelism.",
+  "optimisation method": "Algorithm Replacement: Split the computation into two kernels - (1) a highly parallel GEMM kernel that computes the full output matrix with proper 2D tiling across both M and N dimensions, (2) a reduction kernel that computes max, mean subtraction, and GELU. This enables full GPU utilization during the compute-heavy GEMM phase.",
+  "modification plan": "Replace the fused kernel with: First, use a standard 2D-tiled GEMM kernel with grid=(cdiv(M,BLOCK_M), cdiv(N,BLOCK_N)) to compute the full (M,N) output with proper parallelism. Second, launch a separate reduction kernel that computes max along dim=1, subtracts mean, and applies GELU. The GEMM will dominate runtime and benefit from full GPU parallelism.",
+  "expected_speedup": "5-10x"
+}
+```

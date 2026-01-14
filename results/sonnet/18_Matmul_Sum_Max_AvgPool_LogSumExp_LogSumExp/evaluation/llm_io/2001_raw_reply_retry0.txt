@@ -1,0 +1,162 @@
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.jit
+def fused_linear_sum_kernel_tiled(
+    x_ptr, w_sum_ptr, bias_sum_ptr, out_ptr,
+    B, K,
+    stride_xb, stride_xk,
+    BLOCK_K: tl.constexpr,
+    BATCH_PER_BLOCK: tl.constexpr,
+):
+    # Each program handles BATCH_PER_BLOCK batch elements
+    pid = tl.program_id(0)
+    
+    # Batch indices this block handles
+    batch_start = pid * BATCH_PER_BLOCK
+    batch_offs = tl.arange(0, BATCH_PER_BLOCK)
+    batch_ids = batch_start + batch_offs
+    batch_mask = batch_ids < B
+    
+    # Initialize accumulators for each batch element in this block
+    acc = tl.zeros((BATCH_PER_BLOCK,), dtype=tl.float32)
+    
+    # Process K dimension in tiles, loading w_sum once per tile for all batch elements
+    for k_start in range(0, K, BLOCK_K):
+        offs_k = k_start + tl.arange(0, BLOCK_K)
+        k_mask = offs_k < K
+        
+        # Load w_sum tile once - shared across all batch elements
+        w_vals = tl.load(w_sum_ptr + offs_k, mask=k_mask, other=0.0)  # (BLOCK_K,)
+        
+        # Process each batch element using the cached w_vals
+        for b in range(BATCH_PER_BLOCK):
+            b_idx = batch_start + b
+            if b_idx < B:
+                # Load x values for this batch element
+                x_vals = tl.load(x_ptr + b_idx * stride_xb + offs_k * stride_xk, mask=k_mask, other=0.0)
+                # Accumulate dot product
+                partial = tl.sum(x_vals * w_vals, axis=0)
+                acc = tl.where(batch_offs == b, acc + partial, acc)
+    
+    # Add bias sum
+    bias_sum = tl.load(bias_sum_ptr)
+    result = acc + bias_sum
+    
+    # Store results
+    tl.store(out_ptr + batch_ids, result, mask=batch_mask)
+
+
+@triton.jit
+def fused_linear_sum_kernel_v2(
+    x_ptr, w_sum_ptr, bias_sum_ptr, out_ptr,
+    B, K,
+    stride_xb, stride_xk,
+    BLOCK_K: tl.constexpr,
+    BATCH_PER_BLOCK: tl.constexpr,
+):
+    # Each program handles BATCH_PER_BLOCK batch elements
+    pid = tl.program_id(0)
+    
+    # Batch indices this block handles
+    batch_start = pid * BATCH_PER_BLOCK
+    
+    # Initialize accumulators for each batch element
+    acc0 = tl.zeros((BLOCK_K,), dtype=tl.float32)
+    acc1 = tl.zeros((BLOCK_K,), dtype=tl.float32)
+    acc2 = tl.zeros((BLOCK_K,), dtype=tl.float32)
+    acc3 = tl.zeros((BLOCK_K,), dtype=tl.float32)
+    
+    # Process K dimension in tiles
+    for k_start in range(0, K, BLOCK_K):
+        offs_k = k_start + tl.arange(0, BLOCK_K)
+        k_mask = offs_k < K
+        
+        # Load w_sum tile once - shared across all batch elements
+        w_vals = tl.load(w_sum_ptr + offs_k, mask=k_mask, other=0.0)
+        
+        # Load and accumulate for batch element 0
+        b_idx0 = batch_start + 0
+        mask0 = (b_idx0 < B) & k_mask
+        x_vals0 = tl.load(x_ptr + b_idx0 * stride_xb + offs_k * stride_xk, mask=mask0, other=0.0)
+        acc0 += x_vals0 * w_vals
+        
+        # Load and accumulate for batch element 1
+        b_idx1 = batch_start + 1
+        mask1 = (b_idx1 < B) & k_mask
+        x_vals1 = tl.load(x_ptr + b_idx1 * stride_xb + offs_k * stride_xk, mask=mask1, other=0.0)
+        acc1 += x_vals1 * w_vals
+        
+        # Load and accumulate for batch element 2
+        b_idx2 = batch_start + 2
+        mask2 = (b_idx2 < B) & k_mask
+        x_vals2 = tl.load(x_ptr + b_idx2 * stride_xb + offs_k * stride_xk, mask=mask2, other=0.0)
+        acc2 += x_vals2 * w_vals
+        
+        # Load and accumulate for batch element 3
+        b_idx3 = batch_start + 3
+        mask3 = (b_idx3 < B) & k_mask
+        x_vals3 = tl.load(x_ptr + b_idx3 * stride_xb + offs_k * stride_xk, mask=mask3, other=0.0)
+        acc3 += x_vals3 * w_vals
+    
+    # Sum accumulators and add bias
+    bias_sum = tl.load(bias_sum_ptr)
+    
+    result0 = tl.sum(acc0, axis=0) + bias_sum
+    result1 = tl.sum(acc1, axis=0) + bias_sum
+    result2 = tl.sum(acc2, axis=0) + bias_sum
+    result3 = tl.sum(acc3, axis=0) + bias_sum
+    
+    # Store results with masking
+    b_idx0 = batch_start + 0
+    b_idx1 = batch_start + 1
+    b_idx2 = batch_start + 2
+    b_idx3 = batch_start + 3
+    
+    tl.store(out_ptr + b_idx0, result0, mask=b_idx0 < B)
+    tl.store(out_ptr + b_idx1, result1, mask=b_idx1 < B)
+    tl.store(out_ptr + b_idx2, result2, mask=b_idx2 < B)
+    tl.store(out_ptr + b_idx3, result3, mask=b_idx3 < B)
+
+
+def fused_linear_sum(x, w_sum, bias_sum):
+    B, K = x.shape
+    out = torch.empty((B,), device=x.device, dtype=x.dtype)
+    
+    BLOCK_K = 1024
+    BATCH_PER_BLOCK = 4
+    
+    grid = (triton.cdiv(B, BATCH_PER_BLOCK),)
+    
+    fused_linear_sum_kernel_v2[grid](
+        x, w_sum, bias_sum, out,
+        B, K,
+        x.stride(0), x.stride(1),
+        BLOCK_K=BLOCK_K,
+        BATCH_PER_BLOCK=BATCH_PER_BLOCK,
+    )
+    return out.unsqueeze(1)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features):
+        super(ModelNew, self).__init__()
+        self.linear = nn.Linear(in_features, out_features)
+        self.in_features = in_features
+        self.out_features = out_features
+        
+    def forward(self, x):
+        # Precompute the sum of weights across output dimension
+        # W is (out_features, in_features), we need sum over dim=0 -> (in_features,)
+        w_sum = self.linear.weight.sum(dim=0)  # (in_features,)
+        bias_sum = self.linear.bias.sum().view(1)  # scalar as 1-element tensor
+        
+        # The result is x @ w_sum + bias_sum
+        # x: (B, in_features), w_sum: (in_features,) -> result: (B,)
+        result = fused_linear_sum(x, w_sum, bias_sum)
+        
+        return result
+```

@@ -1,0 +1,10 @@
+```json
+{
+  "worth_optimizing": "yes",
+  "reason": "The sum reduction kernel performs a serial reduction per batch element with poor parallelism, and the avgpool+sigmoid kernel has suboptimal memory access patterns.",
+  "bottleneck": "The sum_reduction_kernel launches only batch-many threads (128 threads for batch=128), leaving most GPU compute idle. Each thread serially iterates through 64*96*96=589,824 elements, resulting in poor parallelization of the reduction operation.",
+  "optimisation method": "Replace the serial per-batch reduction with a parallel two-stage tree reduction: first reduce spatially across channels/height/width with many thread blocks, then perform a final reduction per batch element. This exploits GPU parallelism by launching thousands of threads instead of just 128.",
+  "modification plan": "Implement a two-stage reduction kernel: Stage 1 launches grid=(batch, num_blocks_per_batch) where each block reduces a tile of the C*H*W elements using shared memory tree reduction, writing partial sums. Stage 2 reduces the partial sums per batch element. This increases parallelism from 128 threads to ~10,000+ threads working concurrently.",
+  "expected_speedup": "25-35%"
+}
+```
