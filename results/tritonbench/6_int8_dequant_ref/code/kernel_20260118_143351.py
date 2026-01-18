@@ -6,17 +6,17 @@ import triton.language as tl
 @triton.jit
 def int8_matmul_dequant_kernel(
     # Pointers
-    x_ptr, weight_ptr, scale_x_ptr, scale_w_ptr, bias_ptr, output_ptr,
+    x_ptr, weight_t_ptr, scale_x_ptr, scale_w_ptr, bias_ptr, output_ptr,
     # Dimensions
     M, N, K,
     # Strides
     stride_xm, stride_xk,
-    stride_wn, stride_wk,
+    stride_wtk, stride_wtn,
     stride_om, stride_on,
     # Constants
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
-    """Fused INT8 matmul with dequantization kernel."""
+    """Fused INT8 matmul with dequantization kernel - optimized with pre-transposed weights."""
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
     
@@ -28,10 +28,10 @@ def int8_matmul_dequant_kernel(
     # Initialize accumulator
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     
-    # Pointers for x and weight
+    # Pointers for x [M, K] and weight_t [K, N] (pre-transposed)
     x_ptrs = x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk
-    # weight is [N, K], we want weight[n, k]
-    w_ptrs = weight_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk
+    # weight_t is [K, N], we load [BLOCK_K, BLOCK_N] directly
+    w_ptrs = weight_t_ptr + offs_k[:, None] * stride_wtk + offs_n[None, :] * stride_wtn
     
     # Main loop over K dimension
     for k in range(0, K, BLOCK_K):
@@ -42,20 +42,17 @@ def int8_matmul_dequant_kernel(
         x_block = tl.load(x_ptrs, mask=mask_x, other=0)
         x_float = x_block.to(tl.float32)
         
-        # Load weight block [BLOCK_N, BLOCK_K] and transpose to [BLOCK_K, BLOCK_N]
-        mask_w = (offs_n[:, None] < N) & (offs_k[None, :] < k_remaining)
+        # Load weight block [BLOCK_K, BLOCK_N] directly (no transpose needed)
+        mask_w = (offs_k[:, None] < k_remaining) & (offs_n[None, :] < N)
         w_block = tl.load(w_ptrs, mask=mask_w, other=0)
         w_float = w_block.to(tl.float32)
         
-        # Transpose weight: [BLOCK_N, BLOCK_K] -> [BLOCK_K, BLOCK_N]
-        w_t = tl.trans(w_float)
-        
         # Accumulate: [BLOCK_M, BLOCK_K] @ [BLOCK_K, BLOCK_N] -> [BLOCK_M, BLOCK_N]
-        acc += tl.dot(x_float, w_t, allow_tf32=True)
+        acc += tl.dot(x_float, w_float, allow_tf32=True)
         
         # Advance pointers
         x_ptrs += BLOCK_K * stride_xk
-        w_ptrs += BLOCK_K * stride_wk
+        w_ptrs += BLOCK_K * stride_wtk
     
     # Apply dequantization
     divfactor = 1.0 / (127.0 * 127.0)
@@ -82,9 +79,22 @@ def int8_matmul_dequant_kernel(
     tl.store(out_ptrs, output, mask=mask_out)
 
 
-def int8_matmul_dequant(x, weight_int8, scale_x, scale_w, bias):
+def int8_matmul_dequant(x, weight_t, scale_x, scale_w, bias):
+    """
+    Perform INT8 matmul with dequantization using pre-transposed weights.
+    
+    Args:
+        x: Input tensor [M, K], dtype=int8
+        weight_t: Pre-transposed weight tensor [K, N], dtype=int8
+        scale_x: Per-row scale [M], dtype=float32
+        scale_w: Per-column scale [N], dtype=float32
+        bias: Bias tensor [N], dtype=float16
+    
+    Returns:
+        Output tensor [M, N], dtype=float16
+    """
     M, K = x.shape
-    N = weight_int8.shape[0]
+    K_w, N = weight_t.shape
     
     output = torch.empty((M, N), device=x.device, dtype=torch.float16)
     
@@ -95,10 +105,10 @@ def int8_matmul_dequant(x, weight_int8, scale_x, scale_w, bias):
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
     
     int8_matmul_dequant_kernel[grid](
-        x, weight_int8, scale_x, scale_w, bias, output,
+        x, weight_t, scale_x, scale_w, bias, output,
         M, N, K,
         x.stride(0), x.stride(1),
-        weight_int8.stride(0), weight_int8.stride(1),
+        weight_t.stride(0), weight_t.stride(1),
         output.stride(0), output.stride(1),
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
     )
@@ -107,13 +117,23 @@ def int8_matmul_dequant(x, weight_int8, scale_x, scale_w, bias):
 
 
 class ModelNew(nn.Module):
+    """
+    INT8 MatMul with Row-wise Dequantization - Optimized Triton Implementation
+    
+    Optimization: Pre-transpose weight matrix to [K, N] layout to eliminate
+    per-iteration transpose in the kernel and improve memory coalescing.
+    """
     def __init__(self, in_features=2048, out_features=2048):
         super(ModelNew, self).__init__()
         self.in_features = in_features
         self.out_features = out_features
 
-        self.weight_int8 = nn.Parameter(
-            torch.randint(-128, 127, (out_features, in_features), dtype=torch.int8),
+        # Original weight matrix [N, K]
+        weight_int8 = torch.randint(-128, 127, (out_features, in_features), dtype=torch.int8)
+        
+        # Pre-transpose weight to [K, N] for optimized memory access
+        self.weight_t = nn.Parameter(
+            weight_int8.t().contiguous(),
             requires_grad=False
         )
 
@@ -128,13 +148,23 @@ class ModelNew(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, scale_x: torch.Tensor) -> torch.Tensor:
+        """
+        Perform INT8 matrix multiplication with dequantization.
+
+        Args:
+            x (torch.Tensor): Quantized input of shape (M, K), dtype=int8
+            scale_x (torch.Tensor): Per-row scale for input of shape (M,), dtype=float32
+
+        Returns:
+            torch.Tensor: Dequantized output of shape (M, out_features), dtype=float16
+        """
         # Ensure inputs are on CUDA and contiguous
         x = x.cuda().contiguous()
         scale_x = scale_x.cuda().contiguous()
         
         return int8_matmul_dequant(
             x, 
-            self.weight_int8, 
+            self.weight_t,  # Pre-transposed weight [K, N]
             scale_x, 
             self.scale_w, 
             self.bias

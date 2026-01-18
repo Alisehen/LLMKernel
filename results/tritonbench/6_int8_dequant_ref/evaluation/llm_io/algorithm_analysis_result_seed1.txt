@@ -1,0 +1,10 @@
+```json
+{
+  "worth_optimizing": "yes",
+  "reason": "The kernel performs weight transpose on every forward pass and casts INT8 to FP32 for computation instead of using native INT8 tensor cores.",
+  "bottleneck": "Two inefficiencies: (1) weight_int8.t().contiguous() creates a new tensor every forward pass, and (2) the kernel casts INT8 inputs to FP32 before tl.dot, missing the opportunity to use INT8 tensor core instructions that provide 2x throughput.",
+  "optimisation method": "Pre-transpose weights during initialization and use native INT8 dot product accumulation. Store weight_int8 in [K, N] layout permanently, and use tl.dot with INT8 inputs directly (accumulating to INT32) which leverages tensor core INT8 instructions.",
+  "modification plan": "1) In __init__, store weight as [K, N] layout: self.weight_int8_t = weight_int8.t().contiguous(). 2) In kernel, remove FP32 casts and use tl.dot(a, b, acc) with INT8 inputs directly - Triton will use INT8 tensor cores and accumulate to INT32. 3) Cast accumulator to FP32 only after the K-loop for dequantization.",
+  "expected_speedup": "25-40%"
+}
+```

@@ -1,20 +1,3 @@
-Looking at the NCU metrics, I can see several issues:
-
-1. **Very low SM throughput (6.8%)** - The kernel is severely underutilizing the GPU
-2. **Very low warp occupancy (8.33%)** - Not enough parallelism
-3. **Small grid size (16)** - Only 16 blocks for a 4090 with 128 SMs
-4. **Low DRAM throughput (13.82%)** - Memory bandwidth underutilized
-5. **Moderate L2 hit rate (52%)** - Could be improved
-
-The main problem is that with M=N=K=2048 and BLOCK_M=BLOCK_N=128, we only get (2048/128)² = 256 blocks, but the grid shows only 16 blocks, suggesting the kernel launch is misconfigured or the problem size is smaller.
-
-Let me optimize with:
-1. Smaller block sizes to increase parallelism and reduce register pressure
-2. Autotuning for different configurations
-3. Better memory access patterns
-4. Proper grid sizing
-
-```python
 import torch
 import torch.nn as nn
 import triton
@@ -22,11 +5,15 @@ import triton.language as tl
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+        # Conservative baseline
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=2, num_warps=4),
+        # Higher warps for compute-bound
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=2, num_warps=8),
+        # Smaller blocks for better occupancy
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=2, num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=2, num_warps=4),
+        # Try 3 stages with lower warps
         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=4),
-        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=5, num_warps=2),
     ],
     key=['M', 'N', 'K'],
 )
@@ -64,12 +51,17 @@ def int8_matmul_dequant_kernel(
     # Accumulator in int32 for int8 matmul
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
     
+    # Precompute masks for M and N dimensions (constant across K loop)
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+    
     # Main loop over K dimension
     for k in range(0, K, BLOCK_K):
         k_remaining = K - k
         # Masks for boundary conditions
-        a_mask = (offs_m[:, None] < M) & (offs_k[None, :] < k_remaining)
-        b_mask = (offs_k[:, None] < k_remaining) & (offs_n[None, :] < N)
+        mask_k = offs_k < k_remaining
+        a_mask = mask_m[:, None] & mask_k[None, :]
+        b_mask = mask_k[:, None] & mask_n[None, :]
         
         # Load A and B blocks as int8
         a = tl.load(a_ptrs, mask=a_mask, other=0)
@@ -85,20 +77,16 @@ def int8_matmul_dequant_kernel(
     # Convert accumulator to float32 for dequantization
     acc_f32 = acc.to(tl.float32)
     
-    # Load scales
-    mask_m = offs_m < M
-    mask_n = offs_n < N
-    
+    # Load scales - reuse precomputed masks
     scale_x = tl.load(scale_x_ptr + offs_m, mask=mask_m, other=1.0)
     scale_w = tl.load(scale_w_ptr + offs_n, mask=mask_n, other=1.0)
     
     # Dequantization: scale_w * scale_x * (result / (127 * 127))
-    # Precompute constant
-    divfactor = 1.0 / 16129.0  # 1/(127*127)
+    # Precompute constant - fused into single multiply
+    DIVFACTOR: tl.constexpr = 1.0 / 16129.0  # 1/(127*127)
     
-    # Apply scales with proper broadcasting - fused multiply
-    combined_scale = scale_x[:, None] * scale_w[None, :] * divfactor
-    output = acc_f32 * combined_scale
+    # Apply scales with proper broadcasting - all in registers
+    output = acc_f32 * (scale_x[:, None] * scale_w[None, :] * DIVFACTOR)
     
     # Load and add bias
     bias = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0)
@@ -107,9 +95,9 @@ def int8_matmul_dequant_kernel(
     # Convert to float16 for output
     output_f16 = output.to(tl.float16)
     
-    # Store result
+    # Store result - single store for final output
     c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :]
-    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    c_mask = mask_m[:, None] & mask_n[None, :]
     tl.store(c_ptrs, output_f16, mask=c_mask)
 
 
@@ -189,4 +177,3 @@ class ModelNew(nn.Module):
             self.scale_w, 
             self.bias
         )
-```

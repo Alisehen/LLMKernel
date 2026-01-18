@@ -1,20 +1,3 @@
-Looking at the NCU metrics, I can see several issues:
-
-1. **Very low SM throughput (6.8%)** - The kernel is severely underutilizing the GPU
-2. **Very low warp occupancy (8.33%)** - Not enough parallelism
-3. **Small grid size (16)** - Only 16 blocks for a 4090 with 128 SMs
-4. **Low DRAM throughput (13.82%)** - Memory bandwidth underutilized
-5. **Moderate L2 hit rate (52%)** - Could be improved
-
-The main problem is that with M=N=K=2048 and BLOCK_M=BLOCK_N=128, we only get (2048/128)² = 256 blocks, but the grid shows only 16 blocks, suggesting the kernel launch is misconfigured or the problem size is smaller.
-
-Let me optimize with:
-1. Smaller block sizes to increase parallelism and reduce register pressure
-2. Autotuning for different configurations
-3. Better memory access patterns
-4. Proper grid sizing
-
-```python
 import torch
 import torch.nn as nn
 import triton
@@ -189,4 +172,3 @@ class ModelNew(nn.Module):
             self.scale_w, 
             self.bias
         )
-```

@@ -1,35 +1,8 @@
-Looking at the NCU metrics, I can see several issues:
-
-1. **Very low SM throughput (6.8%)** - The kernel is severely underutilizing the GPU
-2. **Very low warp occupancy (8.33%)** - Not enough parallelism
-3. **Small grid size (16)** - Only 16 blocks for a 4090 with 128 SMs
-4. **Low DRAM throughput (13.82%)** - Memory bandwidth underutilized
-5. **Moderate L2 hit rate (52%)** - Could be improved
-
-The main problem is that with M=N=K=2048 and BLOCK_M=BLOCK_N=128, we only get (2048/128)² = 256 blocks, but the grid shows only 16 blocks, suggesting the kernel launch is misconfigured or the problem size is smaller.
-
-Let me optimize with:
-1. Smaller block sizes to increase parallelism and reduce register pressure
-2. Autotuning for different configurations
-3. Better memory access patterns
-4. Proper grid sizing
-
-```python
 import torch
 import torch.nn as nn
 import triton
 import triton.language as tl
 
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=4),
-        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=5, num_warps=2),
-    ],
-    key=['M', 'N', 'K'],
-)
 @triton.jit
 def int8_matmul_dequant_kernel(
     a_ptr, b_ptr, scale_x_ptr, scale_w_ptr, bias_ptr, c_ptr,
@@ -40,6 +13,10 @@ def int8_matmul_dequant_kernel(
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
     GROUP_M: tl.constexpr,
 ):
+    """
+    Optimized INT8 matmul with fused dequantization and bias addition.
+    Uses grouped ordering for better L2 cache utilization.
+    """
     pid = tl.program_id(0)
     num_pid_m = tl.cdiv(M, BLOCK_M)
     num_pid_n = tl.cdiv(N, BLOCK_N)
@@ -49,7 +26,7 @@ def int8_matmul_dequant_kernel(
     group_id = pid // num_pid_in_group
     first_pid_m = group_id * GROUP_M
     group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
-    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_m = first_pid_m + (pid % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
     
     # Offsets for this block
@@ -66,10 +43,9 @@ def int8_matmul_dequant_kernel(
     
     # Main loop over K dimension
     for k in range(0, K, BLOCK_K):
-        k_remaining = K - k
         # Masks for boundary conditions
-        a_mask = (offs_m[:, None] < M) & (offs_k[None, :] < k_remaining)
-        b_mask = (offs_k[:, None] < k_remaining) & (offs_n[None, :] < N)
+        a_mask = (offs_m[:, None] < M) & ((k + offs_k[None, :]) < K)
+        b_mask = ((k + offs_k[:, None]) < K) & (offs_n[None, :] < N)
         
         # Load A and B blocks as int8
         a = tl.load(a_ptrs, mask=a_mask, other=0)
@@ -85,29 +61,27 @@ def int8_matmul_dequant_kernel(
     # Convert accumulator to float32 for dequantization
     acc_f32 = acc.to(tl.float32)
     
-    # Load scales
+    # Load scales - using same offs_m, offs_n for consistency
     mask_m = offs_m < M
     mask_n = offs_n < N
     
-    scale_x = tl.load(scale_x_ptr + offs_m, mask=mask_m, other=1.0)
-    scale_w = tl.load(scale_w_ptr + offs_n, mask=mask_n, other=1.0)
+    scale_x = tl.load(scale_x_ptr + offs_m, mask=mask_m, other=0.0)
+    scale_w = tl.load(scale_w_ptr + offs_n, mask=mask_n, other=0.0)
     
     # Dequantization: scale_w * scale_x * (result / (127 * 127))
-    # Precompute constant
-    divfactor = 1.0 / 16129.0  # 1/(127*127)
+    divfactor = 1.0 / (127.0 * 127.0)
     
-    # Apply scales with proper broadcasting - fused multiply
-    combined_scale = scale_x[:, None] * scale_w[None, :] * divfactor
-    output = acc_f32 * combined_scale
+    # Apply scales with proper broadcasting
+    output = (scale_x[:, None] * scale_w[None, :]) * (acc_f32 * divfactor)
     
     # Load and add bias
     bias = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0)
-    output = output + bias[None, :]
+    output = output + bias[None, :].to(tl.float32)
     
     # Convert to float16 for output
     output_f16 = output.to(tl.float16)
     
-    # Store result
+    # Store result using same offsets
     c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :]
     c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
     tl.store(c_ptrs, output_f16, mask=c_mask)
@@ -123,9 +97,14 @@ def int8_matmul_dequant(x, weight_int8_t, scale_x, scale_w, bias):
     # Output tensor
     c = torch.empty((M, N), device=x.device, dtype=torch.float16)
     
-    # Grid calculation - ensure we cover all output elements
-    def grid(META):
-        return (triton.cdiv(M, META['BLOCK_M']) * triton.cdiv(N, META['BLOCK_N']),)
+    # Optimized block sizes for 4090
+    BLOCK_M = 128
+    BLOCK_N = 128
+    BLOCK_K = 64
+    GROUP_M = 8
+    
+    # 1D grid with grouped ordering
+    grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),)
     
     int8_matmul_dequant_kernel[grid](
         x, weight_int8_t, scale_x, scale_w, bias, c,
@@ -133,6 +112,8 @@ def int8_matmul_dequant(x, weight_int8_t, scale_x, scale_w, bias):
         x.stride(0), x.stride(1),
         weight_int8_t.stride(0), weight_int8_t.stride(1),
         c.stride(0), c.stride(1),
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        GROUP_M=GROUP_M,
     )
     
     return c
@@ -156,15 +137,15 @@ class ModelNew(nn.Module):
             requires_grad=False
         )
 
-        # Per-column scale for weights (float32 for precision)
+        # Per-column scale for weights
         self.scale_w = nn.Parameter(
             torch.randn(out_features, dtype=torch.float32).abs() * 0.01,
             requires_grad=False
         )
 
-        # Bias (float32 for kernel compatibility)
+        # Bias
         self.bias = nn.Parameter(
-            (torch.randn(out_features, dtype=torch.float32) * 0.01),
+            torch.randn(out_features, dtype=torch.float16) * 0.01,
             requires_grad=False
         )
 
@@ -178,10 +159,6 @@ class ModelNew(nn.Module):
         if not scale_x.is_contiguous():
             scale_x = scale_x.contiguous()
         
-        # Ensure scale_x is float32
-        if scale_x.dtype != torch.float32:
-            scale_x = scale_x.float()
-        
         return int8_matmul_dequant(
             x, 
             self.weight_int8_t,
@@ -189,4 +166,3 @@ class ModelNew(nn.Module):
             self.scale_w, 
             self.bias
         )
-```
