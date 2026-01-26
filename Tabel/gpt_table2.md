@@ -70,7 +70,7 @@
 | 68_conv_transposed_3D_square_input_asymmetric_kernel | 0.2 | ✅ |
 | 69_conv_transposed_2D_asymmetric_input_asymmetric_kernel | 0 | ✅ |
 | 70_conv_transposed_3D_asymmetric_input_square_kernel | 1.659 | ✅ |
-| 71_conv_transposed_2D_asymmetric_input_square_kernel | 2.729 | ✅ |
+| 71_conv_transposed_2D_asymmetric_input_square_kernel | 0 | ✅ |
 | 72_conv_transposed_3D_asymmetric_strided_padded_grouped | 0 | ✅ |
 | 73_conv_transposed_3D_asymmetric_square_strided_padded_grouped | 0 | ✅ |
 | 74_conv_transposed_1D_dilated | 0 | ✅ |

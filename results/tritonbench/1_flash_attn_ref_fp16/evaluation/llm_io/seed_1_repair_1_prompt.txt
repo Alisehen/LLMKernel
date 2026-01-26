@@ -1,0 +1,231 @@
+Fix the Triton kernel errors. Generate correct code.
+
+## ERROR LOG
+```
+Traceback (most recent call last):
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 576, in compare_and_bench
+    test_out, _ = _run_once(test_model, inp, dev)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/utils/compile_and_run.py", line 132, in _run_once
+    out = model(*inp)
+          ^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20260118_172537_1_flash_attn_ref_fp16_openai_deepseek/1_flash_attn_ref_fp16/code/kernel_20260118_172624.py", line 150, in forward
+    return flash_attention(Q, K, V)
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/LLMKernel/run/20260118_172537_1_flash_attn_ref_fp16_openai_deepseek/1_flash_attn_ref_fp16/code/kernel_20260118_172624.py", line 117, in flash_attention
+    flash_attention_kernel[grid](
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 419, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 733, in run
+    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/runtime/jit.py", line 861, in _do_compile
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 300, in compile
+    module = src.make_ir(target, options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hyc/miniconda3/envs/sglang/lib/python3.11/site-packages/triton/compiler/compiler.py", line 80, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 16:42:
+    stride_vb, stride_vh, stride_vn, stride_vk,
+    stride_ob, stride_oh, stride_om, stride_ok,
+    seq_len, head_dim,
+    scale,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    # Program IDs
+    pid_batch_head = tl.program_id(0)
+    pid_m = tl.program_id(1)
+
+    # Compute batch and head indices
+    batch_idx = pid_batch_head // tl.load(Q_ptr - Q_ptr)  # Trick to get n_heads
+                                          ^
+IncompatibleTypeErrorImpl('invalid operands of type pointer<fp16> and pointer<fp16>')
+```
+
+## Broken Code
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+import math
+
+@triton.jit
+def flash_attention_kernel(
+    Q_ptr, K_ptr, V_ptr, O_ptr,
+    stride_qb, stride_qh, stride_qm, stride_qk,
+    stride_kb, stride_kh, stride_kn, stride_kk,
+    stride_vb, stride_vh, stride_vn, stride_vk,
+    stride_ob, stride_oh, stride_om, stride_ok,
+    seq_len, head_dim,
+    scale,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    # Program IDs
+    pid_batch_head = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    
+    # Compute batch and head indices
+    batch_idx = pid_batch_head // tl.load(Q_ptr - Q_ptr)  # Trick to get n_heads
+    # Actually we pass n_heads as a parameter implicitly through strides
+    
+    # Offsets for the current block of queries
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_k = tl.arange(0, BLOCK_K)
+    offs_n = tl.arange(0, BLOCK_N)
+    
+    # Base pointers for this batch/head
+    q_base = Q_ptr + pid_batch_head * stride_qh
+    k_base = K_ptr + pid_batch_head * stride_kh
+    v_base = V_ptr + pid_batch_head * stride_vh
+    o_base = O_ptr + pid_batch_head * stride_oh
+    
+    # Load Q block [BLOCK_M, head_dim]
+    q_ptrs = q_base + offs_m[:, None] * stride_qm + offs_k[None, :] * stride_qk
+    q_mask = (offs_m[:, None] < seq_len) & (offs_k[None, :] < head_dim)
+    q = tl.load(q_ptrs, mask=q_mask, other=0.0)
+    
+    # Initialize accumulators
+    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float('inf')
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, BLOCK_K], dtype=tl.float32)
+    
+    # Iterate over K, V blocks
+    for start_n in range(0, seq_len, BLOCK_N):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+        offs_n_curr = start_n + tl.arange(0, BLOCK_N)
+        
+        # Load K block [BLOCK_N, head_dim] -> transpose to [head_dim, BLOCK_N] for matmul
+        k_ptrs = k_base + offs_n_curr[None, :] * stride_kn + offs_k[:, None] * stride_kk
+        k_mask = (offs_n_curr[None, :] < seq_len) & (offs_k[:, None] < head_dim)
+        k = tl.load(k_ptrs, mask=k_mask, other=0.0)
+        
+        # Compute attention scores: Q @ K^T -> [BLOCK_M, BLOCK_N]
+        qk = tl.dot(q, k, allow_tf32=True)
+        qk = qk * scale
+        
+        # Mask out-of-bounds
+        qk_mask = (offs_m[:, None] < seq_len) & (offs_n_curr[None, :] < seq_len)
+        qk = tl.where(qk_mask, qk, float('-inf'))
+        
+        # Online softmax update
+        m_ij = tl.max(qk, axis=1)
+        m_new = tl.maximum(m_i, m_ij)
+        
+        alpha = tl.exp(m_i - m_new)
+        beta = tl.exp(m_ij - m_new)
+        
+        l_new = alpha * l_i + beta * tl.sum(tl.exp(qk - m_ij[:, None]), axis=1)
+        
+        # Update accumulator
+        p = tl.exp(qk - m_new[:, None])
+        
+        # Load V block [BLOCK_N, head_dim]
+        v_ptrs = v_base + offs_n_curr[:, None] * stride_vn + offs_k[None, :] * stride_vk
+        v_mask = (offs_n_curr[:, None] < seq_len) & (offs_k[None, :] < head_dim)
+        v = tl.load(v_ptrs, mask=v_mask, other=0.0)
+        
+        # Scale previous accumulator and add new contribution
+        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v, allow_tf32=True)
+        
+        m_i = m_new
+        l_i = l_new
+    
+    # Final normalization
+    acc = acc / l_i[:, None]
+    
+    # Store output
+    o_ptrs = o_base + offs_m[:, None] * stride_om + offs_k[None, :] * stride_ok
+    o_mask = (offs_m[:, None] < seq_len) & (offs_k[None, :] < head_dim)
+    tl.store(o_ptrs, acc.to(tl.float16), mask=o_mask)
+
+
+def flash_attention(Q, K, V):
+    batch, n_heads, seq_len, head_dim = Q.shape
+    
+    O = torch.empty_like(Q)
+    
+    scale = 1.0 / math.sqrt(head_dim)
+    
+    BLOCK_M = 64
+    BLOCK_N = 64
+    BLOCK_K = head_dim  # Must cover full head_dim
+    
+    # Grid: (batch * n_heads, ceil(seq_len / BLOCK_M))
+    grid = (batch * n_heads, triton.cdiv(seq_len, BLOCK_M))
+    
+    # Flatten batch and heads for easier indexing
+    Q_flat = Q.view(batch * n_heads, seq_len, head_dim)
+    K_flat = K.view(batch * n_heads, seq_len, head_dim)
+    V_flat = V.view(batch * n_heads, seq_len, head_dim)
+    O_flat = O.view(batch * n_heads, seq_len, head_dim)
+    
+    flash_attention_kernel[grid](
+        Q_flat, K_flat, V_flat, O_flat,
+        Q_flat.stride(0), Q_flat.stride(0), Q_flat.stride(1), Q_flat.stride(2),
+        K_flat.stride(0), K_flat.stride(0), K_flat.stride(1), K_flat.stride(2),
+        V_flat.stride(0), V_flat.stride(0), V_flat.stride(1), V_flat.stride(2),
+        O_flat.stride(0), O_flat.stride(0), O_flat.stride(1), O_flat.stride(2),
+        seq_len, head_dim,
+        scale,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+    )
+    
+    return O
+
+
+class ModelNew(nn.Module):
+    """
+    Flash Attention FP16 - Optimized with Triton
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+
+    def forward(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, causal: bool = False) -> torch.Tensor:
+        # Ensure inputs are contiguous and on CUDA
+        Q = Q.contiguous().cuda()
+        K = K.contiguous().cuda()
+        V = V.contiguous().cuda()
+        
+        # Convert to float16 if not already
+        if Q.dtype != torch.float16:
+            Q = Q.half()
+            K = K.half()
+            V = V.half()
+        
+        return flash_attention(Q, K, V)
+```
+
+## CRITICAL — These cause 60%+ of failures:
+1. EVERY kernel function MUST have `@triton.jit` decorator — MANDATORY
+2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+3. BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+4. `tl.program_id(axis)` only supports axis = 0, 1, 2
+5. No `continue`, `break`, `return` inside loops — use masking
+6. No tensor indexing with loop vars: `x[:, i]` is INVALID
+7. mask shape MUST match data shape in tl.load/tl.store
+
+## Missing Triton Functions (implement manually):
+- tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+
+## OUTPUT FORMAT (STRICT):
+1. Imports: torch, torch.nn, triton, triton.language as tl (and math if needed)
+2. @triton.jit decorated kernel function(s)
+3. Wrapper function(s) for grid calculation and kernel launch
+4. class ModelNew(nn.Module) — REQUIRED
+
+Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+
+```python
+# <corrected code>
+```

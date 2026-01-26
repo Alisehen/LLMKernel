@@ -2,6 +2,8 @@ from __future__ import annotations
 """
 compare_and_bench.py – single-GPU benchmark (**full compile + runtime traceback**).
 
+FIXED VERSION: Optimized benchmark performance by eliminating per-iteration synchronization overhead.
+
 Key features
 ------------
 * Dynamically imports two PyTorch models (reference & candidate) and **captures
@@ -11,6 +13,7 @@ Key features
   `RuntimeError(traceback.format_exc())` so callers get the *entire*
   traceback – not just `str(exc)`.
 * Benchmarks on CUDA (default) or CPU (`--cpu`).
+* **FIXED**: Batch Event submission with single final synchronization for accurate timing.
 """
 
 import argparse
@@ -25,7 +28,7 @@ import tempfile
 import traceback
 from datetime import datetime
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Dict, Any
 
 import torch
 
@@ -140,10 +143,18 @@ def _bench(model: torch.nn.Module,
            dev: torch.device,
            warm: int,
            rep: int) -> List[float]:
+    """
+    Benchmark model with optimized CUDA Event timing.
+
+    FIXED: Batch all iterations and synchronize only once at the end,
+    eliminating per-iteration synchronization overhead (~15μs per sync).
+    This provides more accurate measurements of actual kernel performance.
+    """
     model.to(dev).eval()
     # Only move tensors to device, leave other types (float, int, etc.) as-is
     inp = [x.to(dev) if isinstance(x, torch.Tensor) else x for x in inp]
 
+    # Warmup
     for _ in range(warm):
         model(*inp)
 
@@ -155,15 +166,20 @@ def _bench(model: torch.nn.Module,
             res.append((datetime.now() - t0).total_seconds() * 1_000)
         return res
 
+    # FIXED: Batch Event submission - submit all kernels first, then synchronize once
     torch.cuda.synchronize(dev)
-    s, e = torch.cuda.Event(True), torch.cuda.Event(True)
-    times: List[float] = []
+    events = []
     for _ in range(rep):
+        s = torch.cuda.Event(enable_timing=True)
+        e = torch.cuda.Event(enable_timing=True)
         s.record()
         model(*inp)
         e.record()
-        e.synchronize()
-        times.append(s.elapsed_time(e))
+        events.append((s, e))
+
+    # Only synchronize once at the end (instead of rep times)
+    torch.cuda.synchronize(dev)
+    times = [s.elapsed_time(e) for s, e in events]
     return times
 
 
@@ -295,7 +311,7 @@ def align_params_generic(ref_model: nn.Module, test_model: nn.Module) -> dict[st
     for n, t in ref_named.items():
         shape2ref[tuple(t.shape)].append((n, t))
     for n, t in test_named.items():
-        if n in aligned_test: 
+        if n in aligned_test:
             continue
         shape2test[tuple(t.shape)].append((n, t))
 
@@ -328,7 +344,7 @@ def align_params_generic(ref_model: nn.Module, test_model: nn.Module) -> dict[st
         "skipped": skipped,
     }
 
-# ——（可选）按类名/导出名注册“专用对齐器”：Model → ModelNew ——
+# ——（可选）按类名/导出名注册"专用对齐器"：Model → ModelNew ——
 _PAIR_ALIGNERS: dict[tuple[str, str], callable] = {}
 
 def register_pair_aligner(ref_key: str, test_key: str):
@@ -462,6 +478,8 @@ def compare_and_bench(
 
     仅从 reference 脚本读取 get_init_inputs()，并对 ref/test 使用同一组初始化参数。
     同时：固定随机性 + 参数对齐（支持 Model→ModelNew 专用对齐 & 通用对齐）。
+
+    FIXED: Uses optimized _bench function with batch Event submission.
     """
     import os
     import contextlib
@@ -552,12 +570,12 @@ def compare_and_bench(
             ref_model  = RefModel(*init_args, **init_kwargs)
             # # torch.compile 加速
             # ref_model = torch.compile(ref_model)
-            
+
             _seed_everything(seed, device_idx)
             test_model = ModelNew(*init_args, **init_kwargs)
             # # torch.compile 加速
-            # test_model = torch.compile(test_model)   
-            
+            # test_model = torch.compile(test_model)
+
             # ★ 参数对齐（优先 Model→ModelNew 专用对齐，其次任务自定义，最后通用对齐）
             align_stats = try_align_params(ref_model, test_model, ref_mod=ref_mod, test_mod=test_mod)
 
@@ -685,7 +703,7 @@ def compare_and_bench(
             if TORCH_DEVICE == "cuda":
                 torch.cuda.empty_cache()
 
-            # 计时
+            # 计时 - FIXED: 使用优化的 _bench 函数
             ref_t  = _bench(ref_model,  inp, dev, warmup, repeat)
             test_t = _bench(test_model, inp, dev, warmup, repeat)
 
@@ -759,7 +777,7 @@ def compare_and_bench(
 
 # =========================== CLI wrapper ==================================
 def _cli():
-    p = argparse.ArgumentParser(description="Compare & bench two model files.")
+    p = argparse.ArgumentParser(description="Compare & bench two model files (FIXED version).")
     p.add_argument("reference", type=Path, help="Path to reference .py")
     p.add_argument("candidate", type=Path, help="Path to candidate .py")
     p.add_argument("--device", type=int, default=0, help="CUDA device index")
@@ -786,4 +804,3 @@ def _cli():
 
 if __name__ == "__main__":
     _cli()
-

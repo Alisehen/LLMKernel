@@ -1,0 +1,156 @@
+Looking at the error, the issue is on line 16 where there's an invalid operation `tl.load(Q_ptr - Q_ptr)` which tries to subtract two pointers. This was a misguided attempt to get `n_heads`. Let me fix the kernel properly.
+
+The main issues are:
+1. Invalid pointer arithmetic to get `n_heads`
+2. The stride parameters are being passed incorrectly (using the same stride for batch and head)
+3. Need to properly handle the batch/head indexing
+
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+import math
+
+@triton.jit
+def flash_attention_kernel(
+    Q_ptr, K_ptr, V_ptr, O_ptr,
+    stride_qbh, stride_qm, stride_qk,
+    stride_kbh, stride_kn, stride_kk,
+    stride_vbh, stride_vn, stride_vk,
+    stride_obh, stride_om, stride_ok,
+    seq_len, head_dim,
+    scale,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    # Program IDs
+    pid_batch_head = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    
+    # Offsets for the current block of queries
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_k = tl.arange(0, BLOCK_K)
+    offs_n = tl.arange(0, BLOCK_N)
+    
+    # Base pointers for this batch/head
+    q_base = Q_ptr + pid_batch_head * stride_qbh
+    k_base = K_ptr + pid_batch_head * stride_kbh
+    v_base = V_ptr + pid_batch_head * stride_vbh
+    o_base = O_ptr + pid_batch_head * stride_obh
+    
+    # Load Q block [BLOCK_M, BLOCK_K]
+    q_ptrs = q_base + offs_m[:, None] * stride_qm + offs_k[None, :] * stride_qk
+    q_mask = (offs_m[:, None] < seq_len) & (offs_k[None, :] < head_dim)
+    q = tl.load(q_ptrs, mask=q_mask, other=0.0)
+    
+    # Initialize accumulators
+    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float('inf')
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, BLOCK_K], dtype=tl.float32)
+    
+    # Iterate over K, V blocks
+    for start_n in range(0, seq_len, BLOCK_N):
+        offs_n_curr = start_n + tl.arange(0, BLOCK_N)
+        
+        # Load K block transposed: [BLOCK_K, BLOCK_N] for Q @ K^T
+        k_ptrs = k_base + offs_n_curr[None, :] * stride_kn + offs_k[:, None] * stride_kk
+        k_mask = (offs_n_curr[None, :] < seq_len) & (offs_k[:, None] < head_dim)
+        k = tl.load(k_ptrs, mask=k_mask, other=0.0)
+        
+        # Compute attention scores: Q @ K^T -> [BLOCK_M, BLOCK_N]
+        qk = tl.dot(q, k, allow_tf32=True)
+        qk = qk * scale
+        
+        # Mask out-of-bounds
+        qk_mask = (offs_m[:, None] < seq_len) & (offs_n_curr[None, :] < seq_len)
+        qk = tl.where(qk_mask, qk, float('-inf'))
+        
+        # Online softmax update
+        m_ij = tl.max(qk, axis=1)
+        m_new = tl.maximum(m_i, m_ij)
+        
+        alpha = tl.exp(m_i - m_new)
+        beta = tl.exp(m_ij - m_new)
+        
+        p_sum = tl.sum(tl.exp(qk - m_ij[:, None]), axis=1)
+        l_new = alpha * l_i + beta * p_sum
+        
+        # Update accumulator
+        p = tl.exp(qk - m_new[:, None])
+        
+        # Load V block [BLOCK_N, BLOCK_K]
+        v_ptrs = v_base + offs_n_curr[:, None] * stride_vn + offs_k[None, :] * stride_vk
+        v_mask = (offs_n_curr[:, None] < seq_len) & (offs_k[None, :] < head_dim)
+        v = tl.load(v_ptrs, mask=v_mask, other=0.0)
+        
+        # Scale previous accumulator and add new contribution
+        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v, allow_tf32=True)
+        
+        m_i = m_new
+        l_i = l_new
+    
+    # Final normalization
+    acc = acc / l_i[:, None]
+    
+    # Store output
+    o_ptrs = o_base + offs_m[:, None] * stride_om + offs_k[None, :] * stride_ok
+    o_mask = (offs_m[:, None] < seq_len) & (offs_k[None, :] < head_dim)
+    tl.store(o_ptrs, acc.to(tl.float16), mask=o_mask)
+
+
+def flash_attention(Q, K, V):
+    batch, n_heads, seq_len, head_dim = Q.shape
+    
+    O = torch.empty_like(Q)
+    
+    scale = 1.0 / math.sqrt(head_dim)
+    
+    # BLOCK_K must be power of 2 and cover head_dim
+    BLOCK_M = 64
+    BLOCK_N = 64
+    BLOCK_K = triton.next_power_of_2(head_dim)
+    
+    # Grid: (batch * n_heads, ceil(seq_len / BLOCK_M))
+    grid = (batch * n_heads, triton.cdiv(seq_len, BLOCK_M))
+    
+    # Flatten batch and heads for easier indexing
+    Q_flat = Q.view(batch * n_heads, seq_len, head_dim)
+    K_flat = K.view(batch * n_heads, seq_len, head_dim)
+    V_flat = V.view(batch * n_heads, seq_len, head_dim)
+    O_flat = O.view(batch * n_heads, seq_len, head_dim)
+    
+    flash_attention_kernel[grid](
+        Q_flat, K_flat, V_flat, O_flat,
+        Q_flat.stride(0), Q_flat.stride(1), Q_flat.stride(2),
+        K_flat.stride(0), K_flat.stride(1), K_flat.stride(2),
+        V_flat.stride(0), V_flat.stride(1), V_flat.stride(2),
+        O_flat.stride(0), O_flat.stride(1), O_flat.stride(2),
+        seq_len, head_dim,
+        scale,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+    )
+    
+    return O
+
+
+class ModelNew(nn.Module):
+    """
+    Flash Attention FP16 - Optimized with Triton
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+
+    def forward(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, causal: bool = False) -> torch.Tensor:
+        # Ensure inputs are contiguous and on CUDA
+        Q = Q.contiguous()
+        K = K.contiguous()
+        V = V.contiguous()
+        
+        # Convert to float16 if not already
+        if Q.dtype != torch.float16:
+            Q = Q.half()
+            K = K.half()
+            V = V.half()
+        
+        return flash_attention(Q, K, V)
+```

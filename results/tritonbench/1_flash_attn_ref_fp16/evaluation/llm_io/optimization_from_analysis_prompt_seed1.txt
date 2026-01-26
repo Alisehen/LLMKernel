@@ -1,0 +1,276 @@
+You are optimizing a Triton kernel based on algorithmic analysis.
+
+# PyTorch Reference (Target Behavior)
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+class Model(nn.Module):
+    """
+    Flash Attention FP16 Reference - Memory-efficient attention mechanism
+    Computes scaled dot-product attention: softmax(Q @ K^T / sqrt(d)) @ V
+    Uses FP16 precision for computation
+    """
+    def __init__(self):
+        super(Model, self).__init__()
+
+    def forward(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, causal: bool = False) -> torch.Tensor:
+        """
+        Performs scaled dot-product attention with FP16 precision.
+
+        Args:
+            Q (torch.Tensor): Query tensor of shape (batch, n_heads, seq_len, head_dim) in FP16
+            K (torch.Tensor): Key tensor of shape (batch, n_heads, seq_len, head_dim) in FP16
+            V (torch.Tensor): Value tensor of shape (batch, n_heads, seq_len, head_dim) in FP16
+            causal (bool): Whether to apply causal masking
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch, n_heads, seq_len, head_dim) in FP16
+        """
+        batch, n_heads, seq_len, head_dim = Q.shape
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(head_dim)
+        # Softmax
+        attn_weights = F.softmax(scores, dim=-1)
+        # Multiply by V
+        output = torch.matmul(attn_weights, V)
+
+        return output
+
+BATCH = 2
+N_HEADS = 2
+SEQ_LEN = 128
+HEAD_DIM = 64
+
+def get_inputs():
+    Q = torch.randn(BATCH, N_HEADS, SEQ_LEN, HEAD_DIM)
+    K = torch.randn(BATCH, N_HEADS, SEQ_LEN, HEAD_DIM)
+    V = torch.randn(BATCH, N_HEADS, SEQ_LEN, HEAD_DIM)
+    return [Q, K, V]
+
+def get_init_inputs():
+    return []
+```
+
+**CRITICAL**: Study the PyTorch code carefully to understand:
+- What does `forward()` return? (full output sequence vs final hidden state only)
+- What is the computational pattern?
+- What are the input/output shapes?
+
+Your optimized kernel MUST match this exact behavior.
+
+---
+
+# Analysis Results
+
+**Bottleneck**: The current implementation loads K transposed inefficiently by computing k_ptrs with swapped indices, causing non-coalesced memory accesses. Additionally, the fixed BLOCK_M=64, BLOCK_N=64 may not be optimal for the given problem size (seq_len=128, head_dim=64).
+
+**Optimization Strategy**: Memory Layout Optimization: Pre-transpose K in shared memory or use a tiled loading pattern that ensures coalesced global memory reads. Also implement autotuning for block sizes to find optimal configuration for the specific hardware and problem dimensions.
+
+**Implementation Plan**: 1) Add explicit shared memory staging for K blocks to enable coalesced loads followed by local transpose. 2) Implement @triton.autotune decorator with multiple BLOCK_M/BLOCK_N configurations (32, 64, 128) to find optimal tiling. 3) Consider swapping the loop order to iterate over K/V blocks in the outer dimension for better L2 cache reuse when seq_len is small.
+
+**Expected Speedup**: 15-30%
+
+---
+
+# Current Kernel (needs optimization)
+
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+import math
+
+@triton.jit
+def flash_attention_kernel(
+    Q_ptr, K_ptr, V_ptr, O_ptr,
+    stride_qbh, stride_qm, stride_qk,
+    stride_kbh, stride_kn, stride_kk,
+    stride_vbh, stride_vn, stride_vk,
+    stride_obh, stride_om, stride_ok,
+    seq_len, head_dim,
+    scale,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    # Program IDs
+    pid_batch_head = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    
+    # Offsets for the current block of queries
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_k = tl.arange(0, BLOCK_K)
+    offs_n = tl.arange(0, BLOCK_N)
+    
+    # Base pointers for this batch/head
+    q_base = Q_ptr + pid_batch_head * stride_qbh
+    k_base = K_ptr + pid_batch_head * stride_kbh
+    v_base = V_ptr + pid_batch_head * stride_vbh
+    o_base = O_ptr + pid_batch_head * stride_obh
+    
+    # Load Q block [BLOCK_M, BLOCK_K]
+    q_ptrs = q_base + offs_m[:, None] * stride_qm + offs_k[None, :] * stride_qk
+    q_mask = (offs_m[:, None] < seq_len) & (offs_k[None, :] < head_dim)
+    q = tl.load(q_ptrs, mask=q_mask, other=0.0)
+    
+    # Initialize accumulators
+    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float('inf')
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, BLOCK_K], dtype=tl.float32)
+    
+    # Iterate over K, V blocks
+    for start_n in range(0, seq_len, BLOCK_N):
+        offs_n_curr = start_n + tl.arange(0, BLOCK_N)
+        
+        # Load K block transposed: [BLOCK_K, BLOCK_N] for Q @ K^T
+        k_ptrs = k_base + offs_n_curr[None, :] * stride_kn + offs_k[:, None] * stride_kk
+        k_mask = (offs_n_curr[None, :] < seq_len) & (offs_k[:, None] < head_dim)
+        k = tl.load(k_ptrs, mask=k_mask, other=0.0)
+        
+        # Compute attention scores: Q @ K^T -> [BLOCK_M, BLOCK_N]
+        qk = tl.dot(q, k, allow_tf32=True)
+        qk = qk * scale
+        
+        # Mask out-of-bounds
+        qk_mask = (offs_m[:, None] < seq_len) & (offs_n_curr[None, :] < seq_len)
+        qk = tl.where(qk_mask, qk, float('-inf'))
+        
+        # Online softmax update
+        m_ij = tl.max(qk, axis=1)
+        m_new = tl.maximum(m_i, m_ij)
+        
+        alpha = tl.exp(m_i - m_new)
+        beta = tl.exp(m_ij - m_new)
+        
+        p_sum = tl.sum(tl.exp(qk - m_ij[:, None]), axis=1)
+        l_new = alpha * l_i + beta * p_sum
+        
+        # Update accumulator
+        p = tl.exp(qk - m_new[:, None])
+        
+        # Load V block [BLOCK_N, BLOCK_K]
+        v_ptrs = v_base + offs_n_curr[:, None] * stride_vn + offs_k[None, :] * stride_vk
+        v_mask = (offs_n_curr[:, None] < seq_len) & (offs_k[None, :] < head_dim)
+        v = tl.load(v_ptrs, mask=v_mask, other=0.0)
+        
+        # Scale previous accumulator and add new contribution
+        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v, allow_tf32=True)
+        
+        m_i = m_new
+        l_i = l_new
+    
+    # Final normalization
+    acc = acc / l_i[:, None]
+    
+    # Store output
+    o_ptrs = o_base + offs_m[:, None] * stride_om + offs_k[None, :] * stride_ok
+    o_mask = (offs_m[:, None] < seq_len) & (offs_k[None, :] < head_dim)
+    tl.store(o_ptrs, acc.to(tl.float16), mask=o_mask)
+
+
+def flash_attention(Q, K, V):
+    batch, n_heads, seq_len, head_dim = Q.shape
+    
+    O = torch.empty_like(Q)
+    
+    scale = 1.0 / math.sqrt(head_dim)
+    
+    # BLOCK_K must be power of 2 and cover head_dim
+    BLOCK_M = 64
+    BLOCK_N = 64
+    BLOCK_K = triton.next_power_of_2(head_dim)
+    
+    # Grid: (batch * n_heads, ceil(seq_len / BLOCK_M))
+    grid = (batch * n_heads, triton.cdiv(seq_len, BLOCK_M))
+    
+    # Flatten batch and heads for easier indexing
+    Q_flat = Q.view(batch * n_heads, seq_len, head_dim)
+    K_flat = K.view(batch * n_heads, seq_len, head_dim)
+    V_flat = V.view(batch * n_heads, seq_len, head_dim)
+    O_flat = O.view(batch * n_heads, seq_len, head_dim)
+    
+    flash_attention_kernel[grid](
+        Q_flat, K_flat, V_flat, O_flat,
+        Q_flat.stride(0), Q_flat.stride(1), Q_flat.stride(2),
+        K_flat.stride(0), K_flat.stride(1), K_flat.stride(2),
+        V_flat.stride(0), V_flat.stride(1), V_flat.stride(2),
+        O_flat.stride(0), O_flat.stride(1), O_flat.stride(2),
+        seq_len, head_dim,
+        scale,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+    )
+    
+    return O
+
+
+class ModelNew(nn.Module):
+    """
+    Flash Attention FP16 - Optimized with Triton
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+
+    def forward(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, causal: bool = False) -> torch.Tensor:
+        # Ensure inputs are contiguous and on CUDA
+        Q = Q.contiguous()
+        K = K.contiguous()
+        V = V.contiguous()
+        
+        # Convert to float16 if not already
+        if Q.dtype != torch.float16:
+            Q = Q.half()
+            K = K.half()
+            V = V.half()
+        
+        return flash_attention(Q, K, V)
+```
+
+---
+
+# Your Task
+
+Implement the optimization strategy above. Focus on the specific bottleneck identified.
+
+## Key Requirements
+
+1. **Preserve correctness**: Maintain the same input/output behavior
+2. **Apply the optimization**: Follow the implementation plan exactly
+3. **Use valid Triton syntax**:
+   - Every kernel MUST have `@triton.jit` decorator
+   - Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
+   - BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
+   - No `continue`, `break`, `return` inside kernels (use masking)
+   - Prefer `tl.dot(a, b, allow_tf32=True)` for matmul operations
+
+4. **CRITICAL for RNN/GRU/LSTM Persistent Kernels**:
+   - Time loop MUST be inside @triton.jit kernel, NOT in Python forward()
+   - **HYBRID computation strategy** (CRITICAL for performance):
+     * Precompute input-side gates OUTSIDE kernel: `gates_x = (T*B, In) @ W_ih` (ONE large GEMM)
+     * INSIDE kernel: only recurrent-side: `for t: gates_h = h @ W_hh` (T small GEMMs)
+   - CORRECT (FAST - use this):
+     ```python
+     # Python forward():
+     gates_x_all = x.reshape(T*B, In) @ W_ih + b_ih  # ONE large GEMM
+     gates_x_all = gates_x_all.view(T, B, 3*H)
+     gru_persistent_kernel[grid](gates_x_all, h0, W_hh, ...)  # Launch ONCE
+
+     @triton.jit
+     def gru_persistent_kernel(gates_x_ptr, h_ptr, W_hh_ptr, ...):
+         for t in range(T):  # Inside kernel
+             gates_x_t = tl.load(gates_x_ptr + t*...)  # Precomputed
+             gates_h = h @ W_hh  # Only recurrent GEMM
+             h = (1-z)*n + z*h   # Fuse and update
+     ```
+
+5. **Output format**:
+   - Imports: `import torch, torch.nn as nn, triton, triton.language as tl`
+   - `@triton.jit` kernel(s)
+   - Wrapper function(s)
+   - `class ModelNew(nn.Module)` — REQUIRED
+   - NO testing code, NO `if __name__ == "__main__"`
+
+---
+
+Generate the optimized kernel now. Output ONLY the complete Python code.

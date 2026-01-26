@@ -13,7 +13,7 @@
 | 11 | 1.12 | ✅ |
 | 12_Matmul_with_diagonal_matrices | 0 | ✅ |
 | 13_Matmul_for_symmetric_matrices | 0.2 | ✅ |
-| 14_Matmul_for_upper_triangular_matrices | 8.8 | ✅ |
+| 14_Matmul_for_upper_triangular_matrices | 0 | ✅ |
 | 15_Matmul_for_lower_triangular_matrices | 0.88 | ✅ |
 | 16_Matmul_with_transposed_A | 0 | ✅ |
 | 17_Matmul_with_transposed_B | 0.14 | ✅ |

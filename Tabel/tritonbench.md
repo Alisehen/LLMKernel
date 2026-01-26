@@ -1,3 +1,3 @@
-Flash Attention             0.0546 ms    0.0498 ms       1.16x ✅ Success 1.90
-RoPE Embedding              0.1298 ms    0.0699 ms       1.86x ✅ Success 3.5633
-INT8 Dequant MatMul         0.0778 ms    0.0633 ms       1.23x ✅ Success 1.7274
+Flash Attention             0.0552 ms    0.0530 ms       1.04x ✅ Success
+RoPE Embedding              0.1363 ms    0.0716 ms       1.90x ✅ Success
+INT8 Dequant MatMul         0.0795 ms    0.0674 ms       1.18x ✅ Success

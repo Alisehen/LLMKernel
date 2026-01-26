@@ -12,7 +12,7 @@ Kernel Benchmark 统计分析脚本
 import numpy as np
 from pathlib import Path
 
-def calculate_statistics(summary_file='sonnet.md'):
+def calculate_statistics(summary_file='summary_table_level1.md'):
     """从summary_table.md计算统计指标，加速比统计只基于成功生成的案例"""
 
     summary_path = Path(__file__).parent / summary_file
@@ -32,14 +32,17 @@ def calculate_statistics(summary_file='sonnet.md'):
 
         # 检查是否是有效行（包含 kernel 数据）
         # 支持两种格式：
-        # 格式1: | # | Kernel | Speedup | Status | Ref | Triton | (8 parts, score在parts[3])
-        # 格式2: | 算子 | best_score | 状态 | (5 parts, score在parts[2])
+        # 格式1: | # | Kernel | Speedup | Status | Ref | Triton | (8 parts, score在parts[3], status在parts[4])
+        # 格式2: | 算子 | best_score | 状态 | (4或5 parts, score在parts[2], status在parts[3])
+        #        注意：没有✅的行是4个parts（末尾空串），有✅的是5个parts
         if len(parts) >= 8:
             # 格式1: level1/2/3 的详细格式
             score_str = parts[3].strip()
-        elif len(parts) >= 5:
-            # 格式2: summary_table.md 的简化格式
+            status_str = parts[4].strip() if len(parts) > 4 else ''
+        elif len(parts) >= 4:
+            # 格式2: summary_table.md 的简化格式（包括没有✅的情况）
             score_str = parts[2].strip()
+            status_str = parts[3].strip() if len(parts) > 3 else ''
         else:
             continue
 
@@ -52,6 +55,13 @@ def calculate_statistics(summary_file='sonnet.md'):
         try:
             score = float(score_str)
         except:
+            score = 0.0
+
+        # 检查第三列是否有 ✅ 标记来判断是否成功
+        has_check_mark = '✅' in status_str
+
+        # 如果没有 ✅，判定为不成功，记为 0
+        if not has_check_mark:
             score = 0.0
 
         all_scores.append(score)

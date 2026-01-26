@@ -175,6 +175,7 @@ $few_new
 Target:
 ```python
 $kernel_src
+```
 """
     )
 )
