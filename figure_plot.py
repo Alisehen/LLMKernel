@@ -2,7 +2,7 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import MaxNLocator
 
 # 数据
-stages = ["Multi-Seed", "Algo.\nRefinement", "Parallel\nMapping", "Tensor\nTiling", "Memory\nOptimization"]
+stages = ["Multi-Seed", "Algorithmic\nRefinement", "Parallel\nMapping", "Tensor\nTiling", "Memory\nOptimization"]
 speedup = [1, 1.995576768, 2.373665778, 2.630549004, 2.809582724]
 
 # 设置样式 - 针对双栏论文优化
