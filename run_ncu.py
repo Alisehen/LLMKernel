@@ -25,7 +25,7 @@ import tempfile
 import subprocess
 from pathlib import Path
 from datetime import datetime
-from typing import List, Optional, Sequence, Union, Any, Dict
+from typing import List, Optional, Sequence, Union, Any
 import json, math
 import pandas as pd
 import numpy as np
@@ -39,33 +39,8 @@ __all__ = [
     "metrics_to_prompt",
 ]
 
-# Triton-optimized metrics: only include metrics that map to Triton parameters
-# Each metric can be optimized by adjusting BLOCK_M/N/K, num_warps, num_stages, GROUP_SIZE_M
+# Keep only the core "kernel performance related" metrics (aligned with `ncu --metrics`)
 METRICS = ",".join([
-    # === Stage 1: Grid & Parallel ===
-    # SM throughput - optimize via BLOCK_M/N (affects grid size)
-    "sm__throughput.avg.pct_of_peak_sustained_elapsed",
-
-    # Grid size - controlled by BLOCK_M/N in grid calculation
-    "launch__grid_size",
-
-    # === Stage 2: Block Tiling & Occupancy ===
-    # Warp occupancy - optimize via num_warps and BLOCK_M/N/K
-    "sm__warps_active.avg.pct_of_peak_sustained_active",
-
-    # === Stage 3: Memory Access ===
-    # DRAM bandwidth - optimize via BLOCK_K and num_stages
-    "dram__throughput.avg.pct_of_peak_sustained_elapsed",
-
-    # L2 cache hit rate - optimize via block tiling and GROUP_SIZE_M
-    "lts__t_sector_hit_rate.pct",
-
-    # Memory stalls - optimize via num_stages (software pipelining)
-    "smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct",
-])
-
-# Full metric set (23 metrics) - available but not used by default
-METRICS_FULL = ",".join([
     "sm__cycles_active.avg",
     "sm__warps_active.avg.pct_of_peak_sustained_active",
     "launch__occupancy_limit_blocks",
@@ -102,57 +77,33 @@ def profile_bench(
     kernel_names: Optional[List[str]] = None,
     conda_bin: str = "/root/miniconda3/envs/CudaForge/bin",
     out_csv: Union[str, Path] = "ncu_temp.csv",
-    repeat: int = 1,  # Reduced from 10 to 1: NCU uses replay to collect metrics, multiple iterations not needed
-    use_full_metrics: bool = False,  # New: option to use full 23-metric set
-    device_idx: Optional[int] = None,  # GPU device index to use
-    auto_sudo: bool = True,  # Automatically retry with sudo if permission denied
-    ref_file: Optional[str] = None,  # Reference file path (default: ref_0.py)
-    test_file: Optional[str] = None,  # Test file path (default: test_kernel_0.py)
-    timeout: Optional[int] = 300,  # Timeout in seconds (default: 5 minutes)
+    repeat: int = 100,
 ) -> Path:
-    ncu_bin = shutil.which("ncu") or "/usr/local/cuda/bin/ncu"
+    ncu_bin = shutil.which("ncu") or "/usr/bin/ncu"
     csv_path = Path(out_csv).resolve()
 
     env = os.environ.copy()
     env["PATH"] = f"{conda_bin}:{env.get('PATH', '')}"
-
-    # Set CUDA_VISIBLE_DEVICES to isolate GPU device
-    if device_idx is not None:
-        env["CUDA_VISIBLE_DEVICES"] = str(device_idx)
-        print(f"[ncu] Using GPU device {device_idx} (CUDA_VISIBLE_DEVICES={device_idx})")
-
     tmp_ncu_dir = Path.home() / "ncu-tmp"
     tmp_ncu_dir.mkdir(parents=True, exist_ok=True)
     env["TMPDIR"] = str(tmp_ncu_dir)
     tmp_ext = tempfile.mkdtemp(prefix="torch_ext_")
     env["TORCH_EXTENSIONS_DIR"] = tmp_ext
 
-    # Choose metric set based on parameter
-    metrics_to_use = METRICS_FULL if use_full_metrics else METRICS
-
-    # Build bench script arguments (use provided files or defaults)
-    if ref_file is None:
-        ref_file_path = Path.cwd() / "ref_0.py"
-    else:
-        ref_file_path = Path.cwd() / ref_file
-
-    if test_file is None:
-        test_file_path = Path.cwd() / "test_kernel_0.py"
-    else:
-        test_file_path = Path.cwd() / test_file
 
     cmd = [
         ncu_bin,
         "--csv",
         "--page=raw",
+        "--kernel-name-base=demangled",
         "--target-processes=all",
         "--replay-mode=kernel",
         "--profile-from-start=on",
         f"--log-file={str(csv_path)}",
-        f"--metrics={metrics_to_use}",
+        f"--metrics={METRICS}",
+        "--launch-skip=0",
+        "--launch-count=20",
         sys.executable, bench_py,
-        str(ref_file_path),  # reference model
-        str(test_file_path),  # candidate model
         "--repeat", str(repeat),
     ]
 
@@ -160,8 +111,7 @@ def profile_bench(
     if kernel_names:
         names = sorted({k.strip() for k in kernel_names if k and k.strip()})
         if names:
-            # Find the --metrics argument (handle both METRICS and METRICS_FULL)
-            insert_pos = cmd.index(f"--metrics={metrics_to_use}")
+            insert_pos = cmd.index(f"--metrics={METRICS}")
             if len(names) == 1:
                 # Single name: direct match
                 cmd.insert(insert_pos, f"--kernel-name={names[0]}")
@@ -171,125 +121,10 @@ def profile_bench(
                 cmd.insert(insert_pos, f"--kernel-name=::regex:^({pattern})(\\(|$)")
 
     print("[ncu] running:", " ".join(cmd))
-    try:
-        proc = subprocess.run(cmd, env=env, text=True, capture_output=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        print(f"[ncu] ⚠️ Command timed out after {timeout} seconds")
-        csv_path.write_text("", encoding="utf-8")
-        return csv_path
-
-    # Print NCU output for debugging
-    if proc.stdout:
-        print("[ncu stdout]:", proc.stdout[:500])  # Print first 500 chars
-    if proc.stderr:
-        print("[ncu stderr]:", proc.stderr[:500])  # Print first 500 chars
-
-    # Check if no kernels were profiled (likely due to kernel name mismatch)
-    csv_content = csv_path.read_text() if csv_path.exists() else ""
-    if "No kernels were profiled" in csv_content and kernel_names:
-        print("\n⚠️  [ncu] No kernels were profiled with specified names.")
-        print(f"Kernel names specified: {kernel_names}")
-        print("Triton may have mangled the kernel names. Retrying without kernel name filter...")
-
-        # Rebuild command without kernel name filter
-        cmd_no_filter = [
-            ncu_bin,
-            "--csv",
-            "--page=raw",
-            "--kernel-name-base=demangled",
-            "--target-processes=all",
-            "--replay-mode=kernel",
-            "--profile-from-start=on",
-            f"--log-file={str(csv_path)}",
-            f"--metrics={metrics_to_use}",
-            "--launch-skip=0",
-            "--launch-count=1",  # Reduced from 20 to 1 to speed up profiling
-            sys.executable, bench_py,
-            str(ref_file),
-            str(test_file),
-            "--repeat", str(repeat),
-        ]
-
-        print("[ncu] retry running:", " ".join(cmd_no_filter))
-        try:
-            proc = subprocess.run(cmd_no_filter, env=env, text=True, capture_output=True, timeout=timeout)
-        except subprocess.TimeoutExpired:
-            print(f"[ncu] ⚠️ Retry command timed out after {timeout} seconds")
-            csv_path.write_text("", encoding="utf-8")
-            return csv_path
-
-        # Print full output for debugging
-        if proc.stdout:
-            print("[ncu retry stdout]:", proc.stdout)
-        if proc.stderr:
-            print("[ncu retry stderr]:", proc.stderr)
-        print(f"[ncu retry] Return code: {proc.returncode}")
-
-    # Re-read CSV content after retry to check for errors
-    csv_content_final = csv_path.read_text() if csv_path.exists() else ""
-
+    proc = subprocess.run(cmd, env=env, text=True, capture_output=True)
     if proc.returncode != 0:
-        error_msg = f"[ncu] Command failed with return code {proc.returncode}\n"
-        sys.stderr.write(error_msg)
         sys.stderr.write(proc.stderr or "")
-
-        # Check if it's a GPU performance counter permission issue
-        # NCU writes errors to the CSV file with ==ERROR== prefix, not stderr!
-        is_permission_error = (
-            "ERR_NVGPUCTRPERM" in csv_content_final or
-            "ERR_NVGPUCTRPERM" in (proc.stderr or "") or
-            "perf_event_paranoid" in (proc.stderr or "") or
-            "permission" in (proc.stderr or "").lower()
-        )
-
-        # Retry with sudo if it's a permission issue and auto_sudo is enabled
-        if is_permission_error and auto_sudo:
-            print("\n⚠️  NCU permission denied. Attempting to retry with sudo...")
-            print("You may be prompted for your password.")
-
-            # Build sudo command - use cmd_no_filter if it exists (from retry), otherwise use original cmd
-            final_cmd = cmd_no_filter if 'cmd_no_filter' in locals() else cmd
-
-            # Build sudo command
-            sudo_cmd = ["sudo", "-E", "env", f"PATH={env.get('PATH', '')}"]
-
-            # Preserve important environment variables
-            if device_idx is not None:
-                sudo_cmd.append(f"CUDA_VISIBLE_DEVICES={device_idx}")
-
-            sudo_cmd.extend(final_cmd)
-
-            print("[ncu] sudo command:", " ".join(sudo_cmd[:10]) + "...")  # Print first few args
-
-            # Run with sudo (this will prompt for password interactively)
-            try:
-                proc_sudo = subprocess.run(sudo_cmd, env=env, text=True, capture_output=True, timeout=timeout)
-            except subprocess.TimeoutExpired:
-                print(f"[ncu] ⚠️ Sudo command timed out after {timeout} seconds")
-                csv_path.write_text("", encoding="utf-8")
-                return csv_path
-
-            if proc_sudo.stdout:
-                print("[ncu sudo stdout]:", proc_sudo.stdout[:500])
-            if proc_sudo.stderr:
-                print("[ncu sudo stderr]:", proc_sudo.stderr[:500])
-
-            if proc_sudo.returncode == 0:
-                print(f"✓ [ok] NCU succeeded with sudo! CSV written: {csv_path}")
-                return csv_path
-            else:
-                print(f"✗ NCU failed even with sudo (return code {proc_sudo.returncode})")
-                sys.stderr.write(proc_sudo.stderr or "")
-        else:
-            if is_permission_error:
-                print("\n⚠️  NCU profiling failed due to permission issues.")
-                print("Hint: Run the entire program with sudo:")
-                print(f"  sudo -E env PATH=$PATH python main.py ...")
-
-        # Don't exit immediately - let caller handle the error
-        # Create an empty CSV to avoid file not found errors
-        csv_path.write_text("", encoding="utf-8")
-        return csv_path
+        raise SystemExit(proc.returncode)
 
     print(f"[ok] CSV written: {csv_path}")
     return csv_path
@@ -308,11 +143,7 @@ def load_ncu_metrics(
     if not csv_path.exists():
         raise FileNotFoundError(f"CSV not found: {csv_path}")
 
-    try:
-        df = pd.read_csv(csv_path, comment="=", low_memory=False)
-    except pd.errors.EmptyDataError:
-        # CSV is empty (benchmark script failed before NCU could collect data)
-        raise ValueError(f"NCU CSV file is empty (benchmark script likely failed): {csv_path}")
+    df = pd.read_csv(csv_path, comment="=", low_memory=False)
 
     metric_cols = list(columns) if columns is not None else METRIC_COLUMNS
     keep_cols: List[str] = []

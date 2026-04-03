@@ -6,7 +6,7 @@ Adds GPU hardware context and architecture source for better fixes.
 """
 from __future__ import annotations
 from pathlib import Path
-from typing import Optional, Any
+from typing import Optional, Mapping, Any
 from string import Template
 
 # Project roots (adjust if your tree differs)
@@ -16,45 +16,63 @@ HW_FILE = ROOT / "prompts/hardware/gpu_specs.py"
 # Reuse your existing GPU spec loader
 from prompts.generate_custom_cuda import _load_gpu_spec  # noqa: E402
 
+
 COMPILE_ERROR = Template(
-    """Fix the Triton kernel errors. Generate correct code.
+    """You are a senior CUDA-extension developer.
+Your job is to **FIX** the compilation or runtime errors in the Python script
+shown below.
 
-## ERROR LOG
-```
+OUTPUT RULES (STRICT) ────────────────────────────────────────────────────────────────
+1. Inside the block, follow **exactly** this order:
+   1. Imports – `torch`, `torch.nn`, `load_inline`.
+   2. `source` – triple-quoted CUDA string(s) (kernel + host wrapper).
+   3. `cpp_src` – prototypes for *all* kernels you expose.
+   4. **One** `load_inline` call per kernel group.
+   5. `class ModelNew(nn.Module)` – mirrors original inputs/outputs but calls
+      your CUDA kernels.
+2. **Do NOT include** testing code, `if __name__ == "__main__"`, or extra prose.
+
+────────────────────────────────────────────────────────────────
+ERROR LOG
+────────────────────────────────────────────────────────────────
 $ERROR_LOG
-```
-$ERROR_HISTORY
-## Broken Code
-```python
+
+────────────────────────────────────────────────────────────────
+OLD CODE (read-only)
+────────────────────────────────────────────────────────────────
 $OLD_CODE
-```
 
-## CRITICAL — These cause 60%+ of failures:
-1. EVERY kernel function MUST have `@triton.jit` decorator — MANDATORY
-2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
-3. BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
-4. `tl.program_id(axis)` only supports axis = 0, 1, 2
-5. No `continue`, `break`, `return` inside loops — use masking
-6. No tensor indexing with loop vars: `x[:, i]` is INVALID
-7. mask shape MUST match data shape in tl.load/tl.store
-
-## Missing Triton Functions (implement manually):
-- tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
-
-## OUTPUT FORMAT (STRICT):
-1. Imports: torch, torch.nn, triton, triton.language as tl (and math if needed)
-2. @triton.jit decorated kernel function(s)
-3. Wrapper function(s) for grid calculation and kernel launch
-4. class ModelNew(nn.Module) — REQUIRED
-
-Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
+────────────────────────────────────────────────────────────────
+Main Critical Problem
+────────────────────────────────────────────────────────────────
+$Problem
 
 ```python
-# <corrected code>
+# <your corrected code>
 ```
+# ==========================================================
 """
 )
 
+def _escape_template(s: str) -> str:
+    return s.replace("$", "$$")
+
+def _sanitize_text(s: str) -> str:
+    return s.replace("```", "`")
+
+def _format_problem(problem: Optional[Any]) -> str:
+    if problem is None or problem == "":
+        return "No prior critical problem provided."
+    if isinstance(problem, Mapping):
+        # Prefer to concatenate the three key fields into a concise description; otherwise fall back to JSON
+        ci  = str(problem.get("critical_issue", "")).strip()
+        wim = str(problem.get("why_it_matters", "")).strip()
+        mfh = str(problem.get("minimal_fix_hint", "")).strip()
+        if ci or wim or mfh:
+            return f"critical_issue: {ci}\nwhy_it_matters: {wim}\nminimal_fix_hint: {mfh}"
+        return json.dumps(problem, ensure_ascii=False, indent=2)
+    # For other types, simply convert to string
+    return str(problem)
 
 def build_error_prompt(
     *,
@@ -62,11 +80,9 @@ def build_error_prompt(
     error_log: str,
     problem: Optional[Any] = None,
     gpu_name: Optional[str] = None,
-    error_history: str = "",
-    arch_path: Optional[Path] = None,
 ) -> str:
     """
-    Build the error-repair prompt with error history.
+    Build the error-repair prompt with GPU context + architecture source.
 
     Parameters
     ----------
@@ -74,14 +90,11 @@ def build_error_prompt(
         The broken Python script content to show under OLD CODE.
     error_log : str
         The compiler/runtime error text to show under ERROR LOG.
-    problem : Optional[Any]
-        Deprecated, kept for backward compatibility. Ignored.
+    arch_path : Path
+        Path to the reference architecture Python file to display.
     gpu_name : Optional[str]
         Human-readable GPU name key to lookup in gpu_specs.
-    error_history : str
-        History of previous repair attempts (concise summaries).
-    arch_path : Optional[Path]
-        Path to reference PyTorch implementation (currently unused).
+        If None, attempts torch.cuda.get_device_name(0).
 
     Returns
     -------
@@ -105,27 +118,14 @@ def build_error_prompt(
     info = gpu_info[gpu_name]
     gpu_arch = info.get("GPU Architecture", "Unknown")
 
-    # Detect Triton-specific error patterns and provide targeted guidance
-
-    # Load PyTorch reference code if provided
-    pytorch_code = ""
-    if arch_path and arch_path.exists():
-        pytorch_code = arch_path.read_text(encoding="utf-8").strip()
-    else:
-        pytorch_code = "# PyTorch reference code not provided"
-
-    # Format error history if provided (concise format to avoid repeating mistakes)
-    history_section = ""
-    if error_history and error_history.strip():
-        history_section = f"""
-## Previous Failed Attempts (DO NOT repeat these mistakes):
-{error_history.strip()}
-
-"""
-
+    # Bullet list of key specs except the arch line (already printed separately)
+    gpu_items = "\n".join(
+        f"• {k}: {v}" for k, v in info.items() if k != "GPU Architecture"
+    )
+    problem_text = _format_problem(problem)
     # Substitute all fields
     return COMPILE_ERROR.substitute(
-        ERROR_HISTORY=history_section,
         ERROR_LOG=error_log.strip(),
         OLD_CODE=old_code.strip(),
+        Problem=_escape_template(_sanitize_text(problem_text.strip())),
     )

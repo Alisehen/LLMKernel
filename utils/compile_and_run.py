@@ -53,7 +53,7 @@ def _capture_import(path: Path):
 
     Returns
     -------
-    (module, full_log : str, mod_name : str)
+    (module, full_log : str)
 
     Raises
     ------
@@ -109,16 +109,15 @@ def _capture_import(path: Path):
             os.close(old_stderr_fd)
 
     # ---------------- SUCCESS --------------------------------------------
-    return module, py_buf.getvalue() + subproc_log, mod_name
+    return module, py_buf.getvalue() + subproc_log
 
 
 # =========================== timing helpers ===============================
 def _run_once(model: torch.nn.Module,
-              inp: List,
+              inp: List[torch.Tensor],
               dev: torch.device) -> Tuple[torch.Tensor, float]:
     model.to(dev).eval()
-    # Only move tensors to device, leave other types (float, int, etc.) as-is
-    inp = [x.to(dev) if isinstance(x, torch.Tensor) else x for x in inp]
+    inp = [x.to(dev) for x in inp]
 
     if TORCH_DEVICE == "cpu":
         t0 = datetime.now()
@@ -136,13 +135,12 @@ def _run_once(model: torch.nn.Module,
 
 
 def _bench(model: torch.nn.Module,
-           inp: List,
+           inp: List[torch.Tensor],
            dev: torch.device,
            warm: int,
            rep: int) -> List[float]:
     model.to(dev).eval()
-    # Only move tensors to device, leave other types (float, int, etc.) as-is
-    inp = [x.to(dev) if isinstance(x, torch.Tensor) else x for x in inp]
+    inp = [x.to(dev) for x in inp]
 
     for _ in range(warm):
         model(*inp)
@@ -179,27 +177,19 @@ def _seed_everything(seed: int | None, device_idx: int | None = None):
 
     random.seed(seed)
     np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        if device_idx is not None:
+            torch.cuda.set_device(device_idx)
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
 
-    try:
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            if device_idx is not None:
-                torch.cuda.set_device(device_idx)
-            torch.cuda.manual_seed(seed)
-            torch.cuda.manual_seed_all(seed)
-
-            # # 更强可复现（如不需要可注释掉）
-            # os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")  # 或 ":16:8"
-            # torch.backends.cudnn.deterministic = True
-            # torch.backends.cudnn.benchmark = False
-            # # 某些算子无确定性实现时仅告警不报错
-            # torch.use_deterministic_algorithms(True, warn_only=True)
-    except (torch.cuda.CudaError, RuntimeError) as e:
-        # CUDA context 可能已被之前的 kernel 破坏（如 illegal memory access）
-        raise RuntimeError(
-            f"Failed to set random seed. CUDA context may be corrupted from a previous kernel error. "
-            f"Original error: {type(e).__name__}: {str(e)}"
-        ) from e
+        # 更强可复现（如不需要可注释掉）
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")  # 或 ":16:8"
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        # 某些算子无确定性实现时仅告警不报错
+        torch.use_deterministic_algorithms(True, warn_only=True)
 
 
 # ====================== 参数对齐（通用 + 类名/导出名专用） ======================
@@ -452,8 +442,7 @@ def compare_and_bench(
     device_idx: int = 0,
     warmup: int = 5,
     repeat: int = 20,
-    tol: float = 1e-3,
-    rtol: float = 1e-2,
+    tol: float = 1e-4,
     log_dir: str | Path | None = "run/debug",
     seed: int = 100,  # 固定默认 seed；需要环境控制时可改成 None 并用 env 读取
 ) -> Dict[str, Any]:
@@ -471,25 +460,6 @@ def compare_and_bench(
     dev = torch.device(f"cuda:{device_idx}") if TORCH_DEVICE == "cuda" else torch.device("cpu")
     if TORCH_DEVICE == "cuda":
         torch.cuda.set_device(dev)
-        # Clear GPU cache before test to avoid OOM from previous runs
-        # 如果这里失败，说明 CUDA context 已经被破坏，应该立即失败而不是继续
-        try:
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-        except (torch.cuda.CudaError, RuntimeError) as e:
-            # 如果是 illegal memory access 等严重错误，直接抛出
-            if "illegal memory access" in str(e).lower() or "cudaerrorillegaladdress" in str(e).lower():
-                raise RuntimeError(
-                    f"CUDA context is corrupted (likely from a previous kernel error). "
-                    f"Cannot proceed with benchmarking. Original error: {type(e).__name__}: {str(e)}"
-                ) from e
-            # 其他错误（如 OOM）可以继续，但记录警告
-            import warnings
-            warnings.warn(f"Failed to sync/clear CUDA cache: {e}", RuntimeWarning)
-        except Exception as e:
-            # 其他未预期的错误，记录但继续
-            import warnings
-            warnings.warn(f"Unexpected error during CUDA initialization: {e}", RuntimeWarning)
 
     # 若需要通过环境变量控制 seed
     if seed is None:
@@ -497,13 +467,8 @@ def compare_and_bench(
         seed = int(env_seed) if env_seed is not None else None
 
     # ------------ 动态导入 ------------
-    ref_mod, _, ref_mod_name = _capture_import(ref_py)
-    test_mod, _, test_mod_name = _capture_import(test_py)
-
-    # 用于 finally 清理的变量
-    ref_model = None
-    test_model = None
-    inp = None
+    ref_mod, _ = _capture_import(ref_py)
+    test_mod, _ = _capture_import(test_py)
 
     RefModel   = getattr(ref_mod,  "Model",       None)
     get_inputs = getattr(ref_mod,  "get_inputs",  None)
@@ -565,125 +530,50 @@ def compare_and_bench(
             if TORCH_DEVICE == "cuda":
                 torch.cuda.synchronize(dev)
             ref_out,  _ = _run_once(ref_model,  inp, dev)
-            if TORCH_DEVICE == "cuda":
-                torch.cuda.synchronize(dev)
-            # 先提取 tensor，再将 ref_out 移到 CPU，释放 GPU 内存给 test_model
-            ref_out = _first_tensor(ref_out).contiguous()
-            ref_out_cpu = ref_out.cpu()
-            del ref_out
-            torch.cuda.empty_cache()
-
             test_out, _ = _run_once(test_model, inp, dev)
             if TORCH_DEVICE == "cuda":
                 torch.cuda.synchronize(dev)
-            # 恢复 ref_out 引用（现在在 CPU 上）
-            ref_out = ref_out_cpu
 
             # 统一取 Tensor、保证连续
+            ref_out  = _first_tensor(ref_out).contiguous()
             test_out = _first_tensor(test_out).contiguous()
             if ref_out.dtype != test_out.dtype:
                 test_out = test_out.to(ref_out.dtype)
 
-            # Stratified sampling for accuracy check: sample from head/middle/tail to avoid bias
-            # Increased sample size for better error detection (10k -> 100k)
-            SAMPLE_SIZE = 100000  # Compare up to 100k elements (was 10k)
-            FULL_CHECK_THRESHOLD = 1000000  # Check all elements if < 1M (most kernels)
+            # Check memory usage
             ref_out_bytes = ref_out.element_size() * ref_out.nelement()
 
-            # Check if we need to skip accuracy check entirely due to memory constraints
-            skip_accuracy_check = False
             if ref_out_bytes * 8 > 40 * 1024**3:
                 import psutil
                 from utils.print_utils import print_warning
-
+                
+                # Estimate CPU memory needed (3x safety factor for copy + diff)
                 needed_cpu_mem = ref_out_bytes * 3
                 avail_cpu_mem = psutil.virtual_memory().available
-
+                
                 if avail_cpu_mem < needed_cpu_mem:
                     print_warning(f"Skipping precision check: Tensor too large for both GPU and CPU RAM (Need ~{needed_cpu_mem/1024**3:.1f}GB, Avail {avail_cpu_mem/1024**3:.1f}GB)")
-                    skip_accuracy_check = True
+                    check_precision = False
                     # Release tensors to free memory for benchmarking
                     del ref_out, test_out
                     if TORCH_DEVICE == "cuda":
                         torch.cuda.empty_cache()
                 else:
-                    # Stratified sampling: sample from head/middle/tail
-                    print_warning(f"Output tensor size: {ref_out_bytes / 1024**3:.2f} GB. Using stratified sampling with {SAMPLE_SIZE} elements.")
-                    total_elements = ref_out.numel()
-                    sample_size = min(SAMPLE_SIZE, total_elements)
-                    # Sample indices from beginning, middle, and end
-                    third = sample_size // 3
-                    indices = list(range(third)) + \
-                              list(range(total_elements // 2 - third // 2, total_elements // 2 + third // 2)) + \
-                              list(range(total_elements - third, total_elements))
-                    indices = indices[:sample_size]  # Ensure exact sample_size
-                    # Sample and move to CPU, then delete GPU tensors immediately
-                    ref_sample = ref_out.flatten()[indices].cpu()
-                    test_sample = test_out.flatten()[indices].cpu()
-                    del ref_out, test_out  # Release GPU memory NOW
-                    if TORCH_DEVICE == "cuda":
-                        torch.cuda.empty_cache()
-                    ref_out = ref_sample
-                    test_out = test_sample
-            elif ref_out.numel() > FULL_CHECK_THRESHOLD:
-                # For tensors > 1M elements: stratified sampling from head/middle/tail
-                total_elements = ref_out.numel()
-                sample_size = min(SAMPLE_SIZE, total_elements)
-                third = sample_size // 3
-                indices = list(range(third)) + \
-                          list(range(total_elements // 2 - third // 2, total_elements // 2 + third // 2)) + \
-                          list(range(total_elements - third, total_elements))
-                indices = indices[:sample_size]
-                # Sample and move to CPU, then delete GPU tensors immediately
-                ref_sample = ref_out.flatten()[indices].cpu()
-                test_sample = test_out.flatten()[indices].cpu()
-                del ref_out, test_out  # Release GPU memory NOW
-                if TORCH_DEVICE == "cuda":
-                    torch.cuda.empty_cache()
-                ref_out = ref_sample
-                test_out = test_sample
-            else:
-                # Small/medium tensors (< 1M elements): check all elements for maximum accuracy
-                ref_out = ref_out.cpu()
-                test_out = test_out.cpu()
+                    print_warning(f"Warning: Output tensor size is too large ({ref_out_bytes / 1024**3:.2f} GB). Moving to CPU for comparison to avoid OOM.")
+                    ref_out = ref_out.cpu()
+                    test_out = test_out.cpu()
+
 
             # 误差 & allclose
-            if skip_accuracy_check:
-                # Skip accuracy check due to memory constraints
-                max_err = -1.0
-                mean_err = -1.0
-            else:
-                diff = (test_out - ref_out).abs()
-                max_err  = diff.max().item()
-                # Convert to float for mean() if dealing with integer dtypes
-                mean_err = diff.float().mean().item()
+            diff = (test_out - ref_out).abs()
+            max_err  = diff.max().item()
+            mean_err = diff.mean().item()
 
-                # Convert to float for allclose if dealing with integer dtypes
-                ref_cmp = ref_out.float() if ref_out.dtype in (torch.long, torch.int, torch.int32, torch.int64) else ref_out
-                test_cmp = test_out.float() if test_out.dtype in (torch.long, torch.int, torch.int32, torch.int64) else test_out
-                if not torch.allclose(ref_cmp, test_cmp, atol=tol, rtol=rtol):
-                    raise ValueError(
-                        f"Outputs are not close (atol={tol}, rtol={rtol}). "
-                        f"max_abs_err={max_err:.3e}, mean_abs_err={mean_err:.3e}"
-                    )
-
-            # Release output tensors before benchmarking to free GPU memory
-            try:
-                del ref_out
-            except NameError:
-                pass
-            try:
-                del test_out
-            except NameError:
-                pass
-            try:
-                del diff
-            except NameError:
-                pass
-            import gc
-            gc.collect()
-            if TORCH_DEVICE == "cuda":
-                torch.cuda.empty_cache()
+            if not torch.allclose(ref_out, test_out, atol=tol, rtol=tol):
+                raise ValueError(
+                    f"Outputs are not close (atol={tol}, rtol={tol}). "
+                    f"max_abs_err={max_err:.3e}, mean_abs_err={mean_err:.3e}"
+                )
 
             # 计时
             ref_t  = _bench(ref_model,  inp, dev, warmup, repeat)
@@ -696,34 +586,6 @@ def compare_and_bench(
         # 抛出完整 traceback（上层捕获）
         import traceback as _tb
         raise RuntimeError(_tb.format_exc()) from None
-
-    finally:
-        # ============ 内存清理 ============
-        # 1. 删除模型和输入
-        if ref_model is not None:
-            del ref_model
-        if test_model is not None:
-            del test_model
-        if inp is not None:
-            del inp
-
-        # 2. 从 sys.modules 移除导入的模块，避免累积
-        if ref_mod_name in sys.modules:
-            del sys.modules[ref_mod_name]
-        if test_mod_name in sys.modules:
-            del sys.modules[test_mod_name]
-
-        # 3. 强制垃圾回收
-        import gc
-        gc.collect()
-
-        # 4. 清理 GPU 缓存（忽略异步 CUDA 错误）
-        if TORCH_DEVICE == "cuda":
-            try:
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
-            except Exception:
-                pass
 
     # ------------ 结果汇总 ------------
     result: Dict[str, Any] = {

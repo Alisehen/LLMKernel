@@ -1,12 +1,11 @@
 from agents.llm_local import get_llm, GenerationConfig
 import os
-import datetime
 
 from utils.print_utils import print_bold
 
 TOGETHER_KEY = os.environ.get("TOGETHER_API_KEY")
 DEEPSEEK_KEY = os.environ.get("DEEPSEEK_API_KEY")
-OPENAI_KEY = "sk_gSwJZPVjh5gAbSnM4cMrU55nCw8DJ8YblOKGyCjZv-Q"
+OPENAI_KEY = os.environ.get("OPENAI_API_KEY")
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 SGLANG_KEY = os.environ.get("SGLANG_API_KEY")
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY")
@@ -53,75 +52,57 @@ def query_server(
     call_type: str = "unknown",
     round_idx: int = -1,
 ):
-    use_responses_api = False  # Default to Chat Completions API
-
-    match server_type:
-        case "local":
-            llm = get_llm(model_name)  # legacy fallback
-            model = model_name
-
-        case "vllm":
-            llm = get_llm(model_name, server_url=f"http://{server_address}:{server_port}/v1")
-            model = model_name
-
-        case "sglang":
-            from openai import OpenAI
-            url = f"http://{server_address}:{server_port}"
-            # For local SGLang server, use a dummy key if SGLANG_KEY is not set
-            api_key = SGLANG_KEY if SGLANG_KEY else "dummy-sglang-key"
-            client = OpenAI(api_key=api_key, base_url=f"{url}/v1", timeout=None, max_retries=0)
-            model = "default"
-
-        case "deepseek":
-            from openai import OpenAI
-            client = OpenAI(
-                api_key="sk-64705f6bb20d4314a3ea0a049dd2e9a4",
-                base_url="https://api.deepseek.com",
-                timeout=10000000,
-                max_retries=3,
-            )
-            # Use the model_name parameter or default to deepseek-coder (better for code generation)
-            model = "deepseek-reasoner"
-
-        case "fireworks":
-            from openai import OpenAI
-            client = OpenAI(
-                api_key=FIREWORKS_API_KEY,
-                base_url="https://api.fireworks.ai/inference/v1",
-                timeout=10000000,
-                max_retries=3,
-            )
-            model = model_name
-
-        case "anthropic":
-            import anthropic
-            client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-            model = model_name
-
-        case "google":
-            import google.generativeai as genai
-            genai.configure(api_key=GEMINI_KEY)
-            model = model_name
-
-        case "together":
-            from together import Together
-            client = Together(api_key=TOGETHER_KEY)
-            model = model_name
-
-        case "sambanova":
-            from openai import OpenAI
-            client = OpenAI(api_key=SAMBANOVA_API_KEY, base_url="https://api.sambanova.ai/v1")
-            model = model_name
-
-        case "openai":
-            from openai import OpenAI
-            # client = OpenAI(api_key=OPENAI_KEY)
-            client = OpenAI(api_key=OPENAI_KEY, base_url="https://api.jiekou.ai/openai/v1")
-            # model = "gpt-5.1"
-            model="claude-opus-4-5-20251101"
-            # use_responses_api=True
-        case _:
-            raise NotImplementedError(f"Unsupported server_type: {server_type}")
+    if server_type == "local":
+        llm = get_llm(model_name)  # legacy fallback
+        model = model_name
+    elif server_type == "vllm":
+        llm = get_llm(model_name, server_url=f"http://{server_address}:{server_port}/v1")
+        model = model_name
+    elif server_type == "sglang":
+        from openai import OpenAI
+        url = f"http://{server_address}:{server_port}"
+        client = OpenAI(api_key=SGLANG_KEY, base_url=f"{url}/v1", timeout=None, max_retries=0)
+        model = "default"
+    elif server_type == "deepseek":
+        from openai import OpenAI
+        client = OpenAI(
+            api_key=DEEPSEEK_KEY,
+            base_url="https://api.deepseek.com",
+            timeout=10000000,
+            max_retries=3,
+        )
+        model = model_name
+    elif server_type == "fireworks":
+        from openai import OpenAI
+        client = OpenAI(
+            api_key=FIREWORKS_API_KEY,
+            base_url="https://api.fireworks.ai/inference/v1",
+            timeout=10000000,
+            max_retries=3,
+        )
+        model = model_name
+    elif server_type == "anthropic":
+        import anthropic
+        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        model = model_name
+    elif server_type == "google":
+        import google.generativeai as genai
+        genai.configure(api_key=GEMINI_KEY)
+        model = model_name
+    elif server_type == "together":
+        from together import Together
+        client = Together(api_key=TOGETHER_KEY)
+        model = model_name
+    elif server_type == "sambanova":
+        from openai import OpenAI
+        client = OpenAI(api_key=SAMBANOVA_API_KEY, base_url="https://api.sambanova.ai/v1")
+        model = model_name
+    elif server_type == "openai":
+        from openai import OpenAI
+        client = OpenAI(api_key=OPENAI_KEY)
+        model = model_name
+    else:
+        raise NotImplementedError(f"Unsupported server_type: {server_type}")
 
     # ------------------ Local / vLLM --------------------
     if server_type in {"local", "vllm"}:
@@ -156,16 +137,7 @@ def query_server(
             system_instruction=system_prompt,
             generation_config=generation_config,
         )
-        try:
-            response = model.generate_content(prompt)
-        except Exception as e:
-            error_msg = str(e)
-            if "context_length" in error_msg.lower() or "too long" in error_msg.lower() or "token limit" in error_msg.lower():
-                print(f"\n⚠️  Context length exceeded for Google API")
-                print(f"Error: {error_msg}")
-                print(f"Returning truncation notice instead of crashing...")
-                return "[ERROR: Input prompt exceeded model context length. Please reduce prompt size.]"
-            raise
+        response = model.generate_content(prompt)
 
         # Usage logging
         usage_metadata = getattr(response, 'usage_metadata', None)
@@ -177,6 +149,8 @@ def query_server(
             print(usage_str)
             if log_path and log_path != "":
                 try:
+                    import os
+                    import datetime
                     file_exists = os.path.exists(log_path)
                     with open(log_path, "a", encoding="utf-8") as f:
                         if not file_exists:
@@ -203,34 +177,25 @@ def query_server(
 
     elif server_type == "anthropic":
         assert isinstance(prompt, str)
-        try:
-            if is_reasoning_model:
-                response = client.beta.messages.create(
-                    model=model,
-                    system=system_prompt,
-                    messages=[{"role": "user", "content": prompt}],
-                    max_tokens=max_tokens,
-                    thinking={"type": "enabled", "budget_tokens": budget_tokens},
-                    betas=["output-128k-2025-02-19"],
-                )
-            else:
-                response = client.messages.create(
-                    model=model,
-                    system=system_prompt,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=temperature,
-                    top_p=top_p,
-                    top_k=top_k,
-                    max_tokens=max_tokens,
-                )
-        except Exception as e:
-            error_msg = str(e)
-            if "context_length" in error_msg.lower() or "prompt is too long" in error_msg.lower() or "token limit" in error_msg.lower() or "maximum context length" in error_msg.lower():
-                print(f"\n⚠️  Context length exceeded for Anthropic API")
-                print(f"Error: {error_msg}")
-                print(f"Returning truncation notice instead of crashing...")
-                return "[ERROR: Input prompt exceeded model context length. Please reduce prompt size.]"
-            raise
+        if is_reasoning_model:
+            response = client.beta.messages.create(
+                model=model,
+                system=system_prompt,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=max_tokens,
+                thinking={"type": "enabled", "budget_tokens": budget_tokens},
+                betas=["output-128k-2025-02-19"],
+            )
+        else:
+            response = client.messages.create(
+                model=model,
+                system=system_prompt,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                max_tokens=max_tokens,
+            )
         # Usage Logging
         if hasattr(response, 'usage'):
             input_tokens = getattr(response.usage, "input_tokens", None)
@@ -244,6 +209,8 @@ def query_server(
             print(usage_str)
             if log_path and log_path != "":
                 try:
+                    import os
+                    import datetime
                     file_exists = os.path.exists(log_path)
                     with open(log_path, "a", encoding="utf-8") as f:
                         if not file_exists:
@@ -270,133 +237,30 @@ def query_server(
         if finish_reason in {"length", "max_tokens"}:
             print(f"Warning: Output truncated due to max_tokens limit ({max_tokens})")
 
-    elif use_responses_api:
-        # Use Responses API (for api.jiekou.ai with gpt-5.1-codex)
-        import requests
-        assert isinstance(prompt, str), "Only string prompt supported for Responses API"
-
-        # Build input messages (Responses API uses 'input' not 'messages')
-        input_messages = []
-        input_messages.append({"role": "user", "content": prompt})
-
-        # Make request to Responses API
-        url = "https://api.jiekou.ai/openai/v1/responses"
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {OPENAI_KEY}"
-        }
-        payload = {
-            "model": model,
-            "input": input_messages,
-            "max_output_tokens": max_tokens,
-        }
-        # Add system prompt as instructions if provided
-        if system_prompt:
-            payload["instructions"] = system_prompt
-
-        try:
-            resp = requests.post(url, headers=headers, json=payload, timeout=600)
-            if resp.status_code != 200:
-                error_detail = resp.text
-                print(f"\n⚠️  Responses API error (HTTP {resp.status_code}): {error_detail}")
-                raise Exception(f"HTTP {resp.status_code}: {error_detail}")
-            data = resp.json()
-        except requests.exceptions.RequestException as e:
-            error_msg = str(e)
-            if any(keyword in error_msg.lower() for keyword in [
-                "context_length", "context length", "maximum context",
-                "too long", "token limit", "exceeds", "prompt is too large"
-            ]):
-                print(f"\n⚠️  Context length exceeded for {server_type} API")
-                print(f"Error: {error_msg}")
-                print(f"Returning truncation notice instead of crashing...")
-                return "[ERROR: Input prompt exceeded model context length. Please reduce prompt size.]"
-            raise
-
-        # Extract text from response
-        output_text = ""
-        for output_item in data.get("output", []):
-            if output_item.get("type") == "message":
-                for content in output_item.get("content", []):
-                    if content.get("type") == "output_text":
-                        output_text += content.get("text", "")
-
-        # Log usage
-        usage = data.get("usage", {})
-        input_tokens = usage.get("input_tokens", 0)
-        output_tokens = usage.get("output_tokens", 0)
-        total_tokens = usage.get("total_tokens", input_tokens + output_tokens)
-        usage_str = f"Usage: In={input_tokens}, Out={output_tokens}, Total={total_tokens}"
-        print(usage_str)
-
-        if log_path and log_path != "":
-            try:
-                file_exists = os.path.exists(log_path)
-                with open(log_path, "a", encoding="utf-8") as f:
-                    if not file_exists:
-                        f.write("timestamp,round_idx,call_type,input_tokens,output_tokens,total_tokens\n")
-                    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    f.write(f"{timestamp},{round_idx},{call_type},{input_tokens},{output_tokens},{total_tokens}\n")
-            except Exception as e:
-                print(f"Warning: Failed to write usage log to {log_path}: {e}")
-
-        # Check finish reason
-        status = data.get("status", "unknown")
-        print(colorize_finish_reason(status if status != "completed" else "stop"))
-
-        return output_text
-
     else:
         if isinstance(prompt, str):
-            messages = []
-            # Only add system message if system_prompt is not None/empty
-            if system_prompt:
-                messages.append({"role": "system", "content": system_prompt})
-            messages.append({"role": "user", "content": prompt})
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt},
+            ]
         else:
             messages = prompt
-            
-        try:
-            if is_reasoning_model and server_type == "openai":
-                response = client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    reasoning_effort=reasoning_effort,
-                    temperature=0.1,
-                )
-            else:
-                temperature=1
-                max_tokens=8192
-                response = client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    temperature=temperature,
-                    n=num_completions,
-                    max_tokens=max_tokens,
-                    top_p=top_p,
-                )
-        except Exception as e:
-            error_msg = str(e)
-            # Catch context length errors from OpenAI, DeepSeek, SGLang, Together, etc.
-            if any(keyword in error_msg.lower() for keyword in [
-                "context_length", "context length", "maximum context",
-                "too long", "token limit", "exceeds", "prompt is too large"
-            ]):
-                print(f"\n⚠️  Context length exceeded for {server_type} API")
-                print(f"Error: {error_msg}")
-                print(f"Returning truncation notice instead of crashing...")
-                return "[ERROR: Input prompt exceeded model context length. Please reduce prompt size.]"
 
-            # Print detailed error info before re-raising
-            print(f"\n❌ LLM API Error ({server_type})")
-            print(f"Error type: {type(e).__name__}")
-            print(f"Error message: {error_msg}")
-
-            # Print traceback for debugging
-            import traceback
-            traceback.print_exc()
-
-            raise
+        if is_reasoning_model and server_type == "openai":
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                reasoning_effort=reasoning_effort,
+            )
+        else:
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                n=num_completions,
+                max_tokens=max_tokens,
+                top_p=top_p,
+            )
         outputs = []
         for choice in response.choices:
             print(colorize_finish_reason(choice.finish_reason))
@@ -414,6 +278,8 @@ def query_server(
             print(usage_str)
             if log_path and log_path != "":
                 try:
+                    import os
+                    import datetime
                     file_exists = os.path.exists(log_path)
                     with open(log_path, "a", encoding="utf-8") as f:
                         if not file_exists:

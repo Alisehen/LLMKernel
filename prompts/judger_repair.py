@@ -1,99 +1,84 @@
-# prompts/judger_repair.py
+# prompts/error.py
 """
-Prompt template for kernel correctness analysis (repair phase 1).
-Analyzes errors and provides structured problem diagnosis.
+Prompt template for automatic kernel repair.
+Uses `string.Template` to avoid `{}` brace conflicts with C/CUDA code.
+Adds GPU hardware context and architecture source for better fixes.
 """
 from __future__ import annotations
 from pathlib import Path
+from typing import Optional
 from string import Template
 
-ROOT = Path(__file__).resolve().parents[1]
+# Project roots (adjust if your tree differs)
+ROOT = Path(__file__).resolve().parents[1]  # project root
 HW_FILE = ROOT / "prompts/hardware/gpu_specs.py"
 
+# Reuse your existing GPU spec loader
 from prompts.generate_custom_cuda import _load_gpu_spec  # noqa: E402
 
-# Unified prompt template
-unified_prompt_tmpl = Template("""You are a Triton kernel debugging expert. Analyze the error and identify the root cause.
 
-## ERROR LOG
-```
-$ERROR_LOG
-```
+# -----------------------------
+# system_prompt as Template
+# -----------------------------
+system_prompt_tmpl = Template(
+    """You are a senior CUDA + PyTorch correctness auditor. Your job is to read a PyTorch reference and a CUDA candidate and report exactly one most critical correctness issue in the CUDA code that would cause a behavioral mismatch vs. the PyTorch reference. Be terse and precise.
 
-## Expected Behavior (PyTorch Reference)
-```python
-$PYTORCH_CODE
-```
+Rules:
 
-## Current Implementation (Broken Triton Kernel)
-```python
-$CUDA_CODE
-```
+Return one and only one issue — the single highest-impact problem.
 
----
+Prefer semantic/correctness issues over micro-optimizations or style.
 
-## Your Task
+If multiple issues exist, pick the one that most changes outputs or gradients.
 
-Identify the **single most critical issue** that causes the error above.
+If nothing clearly wrong is found, say it explicitly.
 
-### Analysis Guidelines
+Keep each field brief; avoid extra commentary, lists, or alternatives.
 
-1. **Focus on root cause**, not symptoms
-   - Bad: "Output is wrong"
-   - Good: "BLOCK_K loop missing, only processes first 32 elements of K dimension"
-
-2. **Be specific about WHAT and WHERE**
-   - Bad: "Memory access issue"
-   - Good: "Line 45: tl.atomic_add(c_block_ptr, acc) - atomic_add requires scalar pointer, not block_ptr"
-
-3. **Prioritize by impact**
-   - Correctness bugs > Performance issues > Style problems
-   - Algorithm errors > Implementation details
-
-### Output Format
-
-**CRITICAL: You MUST output ONLY valid JSON. No other text allowed.**
-
+Output format (JSON):
 ```json
 {
-  "critical_issue": "<Concise description of THE root cause, max 30 words>",
-  "why_it_matters": "<Why this causes the observed error, max 35 words>",
-  "minimal_fix_hint": "<What needs to change (not how), max 30 words>"
+  "critical_issue": "<max 20 words>",
+  "why_it_matters": "<max 35 words>",
+  "minimal_fix_hint": "<max 20 words>"
 }
 ```
+"""
+)
 
-**Remember**: Output ONLY the JSON block. No explanations, no commentary, no additional text.
-""")
+# -----------------------------
+# instruction as Template
+# -----------------------------
+instruction_tmpl = Template(
+    """You are given:
 
-def build_correctness_prompts(
-    *,
-    error_log: str,
-    arch_path: Path,
-    cuda_code: str,
-) -> str:
+ERROR_LOG:
+$ERROR_LOG
+
+PyTorch reference (ground truth):
+
+$PYTORCH_CODE
+
+CUDA candidate (to audit):
+
+$CUDA_CODE
+
+
+Follow the Rules and produce the JSON exactly in the specified format."""
+)
+
+# -----------------------------
+# Build both at once (returns tuple)
+# -----------------------------
+def build_correctness_prompts(*, error_log: str, arch_path: Path, cuda_code: str):
     """
-    Build unified prompt for kernel correctness analysis.
-
-    Parameters
-    ----------
-    error_log : str
-        Error message from compilation/runtime
-    arch_path : Path
-        Path to PyTorch reference implementation
-    cuda_code : str
-        Broken Triton kernel code to analyze
-
-    Returns
-    -------
-    str
-        Complete prompt ready for LLM
+    Return (system_prompt_str, instruction_str).
     """
-    pytorch_code = Path(arch_path).read_text(encoding="utf-8").strip()
-
-    unified_prompt = unified_prompt_tmpl.substitute(
+    pytorch_code = Path(arch_path).read_text().strip()
+    system_prompt = system_prompt_tmpl.substitute()
+    instruction = instruction_tmpl.substitute(
         ERROR_LOG=error_log.strip(),
-        PYTORCH_CODE=pytorch_code,
+        PYTORCH_CODE=pytorch_code.strip(),
         CUDA_CODE=cuda_code.strip(),
     )
-
-    return unified_prompt
+    return system_prompt, instruction
