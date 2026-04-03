@@ -1,23 +1,18 @@
 # prompts/error.py
-"""
-Prompt template for automatic kernel repair.
-Uses `string.Template` to avoid `{}` brace conflicts with C/CUDA code.
-Adds GPU hardware context and architecture source for better fixes.
-"""
+"""Prompt template for automatic CUDA kernel repair."""
 from __future__ import annotations
-from pathlib import Path
-from typing import Optional, Any
-from string import Template
 
-# Project roots (adjust if your tree differs)
-ROOT = Path(__file__).resolve().parents[1]  # project root
+from pathlib import Path
+from string import Template
+from typing import Any, Optional
+
+ROOT = Path(__file__).resolve().parents[1]
 HW_FILE = ROOT / "prompts/hardware/gpu_specs.py"
 
-# Reuse your existing GPU spec loader
 from prompts.generate_custom_cuda import _load_gpu_spec  # noqa: E402
 
 COMPILE_ERROR = Template(
-    """Fix the Triton kernel errors. Generate correct code.
+    """Fix the CUDA kernel or inline extension errors. Generate correct code.
 
 ## ERROR LOG
 ```
@@ -29,29 +24,29 @@ $ERROR_HISTORY
 $OLD_CODE
 ```
 
-## CRITICAL — These cause 60%+ of failures:
-1. EVERY kernel function MUST have `@triton.jit` decorator — MANDATORY
-2. Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
-3. BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
-4. `tl.program_id(axis)` only supports axis = 0, 1, 2
-5. No `continue`, `break`, `return` inside loops — use masking
-6. No tensor indexing with loop vars: `x[:, i]` is INVALID
-7. mask shape MUST match data shape in tl.load/tl.store
+## Requirements
+1. Return one complete Python module.
+2. Use PyTorch's inline CUDA extension flow (`load_inline`) or equivalent valid CUDA extension code.
+3. Keep `class ModelNew(nn.Module)` and preserve the target behavior.
+4. Every CUDA kernel launch must use valid grid/block dimensions and bounds checks.
+5. Use contiguous inputs or make explicit contiguous copies before launching when needed.
+6. Check launch failures with `C10_CUDA_KERNEL_LAUNCH_CHECK()` when manually launching kernels.
+7. Fix the root cause shown in the error log instead of rewriting unrelated parts.
 
-## Missing Triton Functions (implement manually):
-- tl.tanh, tl.sigmoid, tl.gelu, tl.silu, tl.softmax, tl.mish
+## Common CUDA Failure Sources
+- Wrong tensor dtype/device assumptions in `data_ptr<T>()`
+- Shape/stride mismatch between Python wrapper and CUDA kernel
+- Missing bounds guards
+- Invalid grid/block/shared-memory configuration
+- Missing declarations or exported functions in `load_inline`
+- Incorrect use of contiguous tensors or transposed layouts
 
-## OUTPUT FORMAT (STRICT):
-1. Imports: torch, torch.nn, triton, triton.language as tl (and math if needed)
-2. @triton.jit decorated kernel function(s)
-3. Wrapper function(s) for grid calculation and kernel launch
-4. class ModelNew(nn.Module) — REQUIRED
-
-Do NOT include: testing code, if __name__, get_inputs, get_init_inputs
-
+## OUTPUT FORMAT (STRICT)
 ```python
-# <corrected code>
+# <corrected CUDA extension code>
 ```
+
+Do NOT include testing code, `if __name__ == "__main__"`, `get_inputs`, or `get_init_inputs`.
 """
 )
 
@@ -65,36 +60,13 @@ def build_error_prompt(
     error_history: str = "",
     arch_path: Optional[Path] = None,
 ) -> str:
-    """
-    Build the error-repair prompt with error history.
-
-    Parameters
-    ----------
-    old_code : str
-        The broken Python script content to show under OLD CODE.
-    error_log : str
-        The compiler/runtime error text to show under ERROR LOG.
-    problem : Optional[Any]
-        Deprecated, kept for backward compatibility. Ignored.
-    gpu_name : Optional[str]
-        Human-readable GPU name key to lookup in gpu_specs.
-    error_history : str
-        History of previous repair attempts (concise summaries).
-    arch_path : Optional[Path]
-        Path to reference PyTorch implementation (currently unused).
-
-    Returns
-    -------
-    str
-        The final prompt string to send to the LLM.
-    """
-    # Load the GPU spec dictionary
+    """Build the error-repair prompt with error history."""
     gpu_info = _load_gpu_spec()
 
-    # Resolve GPU name
     if gpu_name is None:
         try:
-            import torch  # local import to avoid hard dependency if CPU-only
+            import torch
+
             gpu_name = torch.cuda.get_device_name(0)
         except Exception as exc:
             raise RuntimeError("CUDA device not found – pass --gpu <name>.") from exc
@@ -102,28 +74,14 @@ def build_error_prompt(
     if gpu_name not in gpu_info:
         raise KeyError(f"{gpu_name} not present in GPU_SPEC_INFO (file: {HW_FILE})")
 
-    info = gpu_info[gpu_name]
-    gpu_arch = info.get("GPU Architecture", "Unknown")
-
-    # Detect Triton-specific error patterns and provide targeted guidance
-
-    # Load PyTorch reference code if provided
-    pytorch_code = ""
-    if arch_path and arch_path.exists():
-        pytorch_code = arch_path.read_text(encoding="utf-8").strip()
-    else:
-        pytorch_code = "# PyTorch reference code not provided"
-
-    # Format error history if provided (concise format to avoid repeating mistakes)
     history_section = ""
     if error_history and error_history.strip():
         history_section = f"""
-## Previous Failed Attempts (DO NOT repeat these mistakes):
+## Previous Failed Attempts (DO NOT repeat these mistakes)
 {error_history.strip()}
 
 """
 
-    # Substitute all fields
     return COMPILE_ERROR.substitute(
         ERROR_HISTORY=history_section,
         ERROR_LOG=error_log.strip(),

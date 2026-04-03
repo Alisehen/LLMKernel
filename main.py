@@ -460,7 +460,7 @@ def _bench_and_score(
     try:
         payload = parent_conn.recv() if parent_conn.poll() else None
     except (EOFError, BrokenPipeError) as e:
-        # Child process crashed (e.g., Triton compiler assertion failure)
+        # Child process crashed (e.g., CUDA extension compiler failure)
         payload = ("err", {"error_type": "ProcessCrashed", "message": f"Child process crashed: {e}"})
     try:
         parent_conn.close()
