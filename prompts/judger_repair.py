@@ -13,7 +13,7 @@ HW_FILE = ROOT / "prompts/hardware/gpu_specs.py"
 from prompts.generate_custom_cuda import _load_gpu_spec  # noqa: E402
 
 # Unified prompt template
-unified_prompt_tmpl = Template("""You are a Triton kernel debugging expert. Analyze the error and identify the root cause.
+unified_prompt_tmpl = Template("""You are a CUDA kernel debugging expert. Analyze the error and identify the root cause.
 
 ## ERROR LOG
 ```
@@ -25,7 +25,7 @@ $ERROR_LOG
 $PYTORCH_CODE
 ```
 
-## Current Implementation (Broken Triton Kernel)
+## Current Implementation (Broken CUDA Candidate)
 ```python
 $CUDA_CODE
 ```
@@ -81,7 +81,7 @@ def build_correctness_prompts(
     arch_path : Path
         Path to PyTorch reference implementation
     cuda_code : str
-        Broken Triton kernel code to analyze
+        Broken CUDA candidate code to analyze
 
     Returns
     -------

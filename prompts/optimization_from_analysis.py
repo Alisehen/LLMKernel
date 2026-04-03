@@ -15,7 +15,7 @@ __all__ = ["build_optimization_from_analysis_prompt"]
 
 optimization_from_analysis_tmpl = Template(
     dedent(
-        """You are optimizing a Triton kernel based on algorithmic analysis.
+        """You are optimizing a CUDA kernel candidate based on algorithmic analysis.
 
 # PyTorch Reference (Target Behavior)
 
@@ -60,15 +60,14 @@ Implement the optimization strategy above. Focus on the specific bottleneck iden
 
 1. **Preserve correctness**: Maintain the same input/output behavior
 2. **Apply the optimization**: Follow the implementation plan exactly
-3. **Use valid Triton syntax**:
-   - Every kernel MUST have `@triton.jit` decorator
-   - Grid size MUST be > 0: use `triton.cdiv(N, BLOCK)` or `max(1, N // BLOCK)`
-   - BLOCK sizes MUST be power-of-2: 16, 32, 64, 128, 256
-   - No `continue`, `break`, `return` inside kernels (use masking)
-   - Prefer `tl.dot(a, b, allow_tf32=True)` for matmul operations
+3. **Use valid CUDA extension structure**:
+   - Build custom kernels with `torch.utils.cpp_extension.load_inline`
+   - Keep launch parameters explicit and valid
+   - Validate tensor device/dtype/contiguity when required
+   - Preserve CPU fallback behavior when the CUDA path is not applicable
 
 4. **CRITICAL for RNN/GRU/LSTM Persistent Kernels**:
-   - Time loop MUST be inside @triton.jit kernel, NOT in Python forward()
+   - Time loop should be inside the CUDA kernel, not in Python forward()
    - **HYBRID computation strategy** (CRITICAL for performance):
      * Precompute input-side gates OUTSIDE kernel: `gates_x = (T*B, In) @ W_ih` (ONE large GEMM)
      * INSIDE kernel: only recurrent-side: `for t: gates_h = h @ W_hh` (T small GEMMs)
@@ -76,21 +75,23 @@ Implement the optimization strategy above. Focus on the specific bottleneck iden
      ```python
      # Python forward():
      gates_x_all = x.reshape(T*B, In) @ W_ih + b_ih  # ONE large GEMM
-     gates_x_all = gates_x_all.view(T, B, 3*H)
-     gru_persistent_kernel[grid](gates_x_all, h0, W_hh, ...)  # Launch ONCE
+     gates_x_all = gates_x_all.view(T, B, 3 * H)
+     gru_persistent_kernel(..., gates_x_all, h0, W_hh)  # Launch ONCE
 
-     @triton.jit
-     def gru_persistent_kernel(gates_x_ptr, h_ptr, W_hh_ptr, ...):
-         for t in range(T):  # Inside kernel
-             gates_x_t = tl.load(gates_x_ptr + t*...)  # Precomputed
-             gates_h = h @ W_hh  # Only recurrent GEMM
-             h = (1-z)*n + z*h   # Fuse and update
+     __global__ void gru_persistent_kernel(...) {
+         for (int t = 0; t < T; ++t) {
+             // load precomputed gates_x_t
+             // compute recurrent-side gates_h
+             // update h in registers/shared memory
+         }
+     }
      ```
 
 5. **Output format**:
-   - Imports: `import torch, torch.nn as nn, triton, triton.language as tl`
-   - `@triton.jit` kernel(s)
-   - Wrapper function(s)
+   - Imports including `load_inline`
+   - CUDA `source` string(s)
+   - `cpp_src` declaration string if needed
+   - `load_inline(...)`
    - `class ModelNew(nn.Module)` — REQUIRED
    - NO testing code, NO `if __name__ == "__main__"`
 

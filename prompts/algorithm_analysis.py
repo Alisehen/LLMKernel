@@ -51,7 +51,7 @@ algorithm_analysis_tmpl = Template(
 $python_code
 ```
 
-# Current Triton Kernel
+# Current CUDA Candidate
 ```python
 $cuda_code
 ```
@@ -139,7 +139,7 @@ def build_algorithm_analysis_prompt(
     Args:
         arch_path: Path to PyTorch reference model
         gpu_name: Target GPU name
-        cuda_code: Current Triton kernel code
+        cuda_code: Current CUDA candidate code
         ncu_metrics_block: NCU profiling metrics (optional, formatted string)
         current_latency_ms: Current kernel latency in ms (optional)
         baseline_latency_ms: PyTorch baseline latency in ms (optional)
@@ -160,7 +160,7 @@ def build_algorithm_analysis_prompt(
 
         performance_section = f"""# Performance
 - **PyTorch baseline**: {baseline_latency_ms:.2f} ms
-- **Current Triton**: {current_latency_ms:.2f} ms
+- **Current CUDA candidate**: {current_latency_ms:.2f} ms
 - **Current speedup**: {speedup:.2f}x ({gap_pct:+.1f}% vs baseline)
 """
     elif ncu_metrics_block:

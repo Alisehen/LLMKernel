@@ -39,8 +39,9 @@ __all__ = [
     "metrics_to_prompt",
 ]
 
-# Triton-optimized metrics: only include metrics that map to Triton parameters
-# Each metric can be optimized by adjusting BLOCK_M/N/K, num_warps, num_stages, GROUP_SIZE_M
+# Default metric set for CUDA kernel tuning in this project.
+# These metrics cover utilization, launch geometry, occupancy, bandwidth, cache behavior,
+# and memory stalls for both custom CUDA extensions and fused kernels.
 METRICS = ",".join([
     # === Stage 1: Grid & Parallel ===
     # SM throughput - optimize via BLOCK_M/N (affects grid size)
@@ -189,7 +190,7 @@ def profile_bench(
     if "No kernels were profiled" in csv_content and kernel_names:
         print("\n⚠️  [ncu] No kernels were profiled with specified names.")
         print(f"Kernel names specified: {kernel_names}")
-        print("Triton may have mangled the kernel names. Retrying without kernel name filter...")
+        print("Kernel names may not match the profiled symbol names. Retrying without kernel name filter...")
 
         # Rebuild command without kernel name filter
         cmd_no_filter = [
@@ -205,8 +206,8 @@ def profile_bench(
             "--launch-skip=0",
             "--launch-count=1",  # Reduced from 20 to 1 to speed up profiling
             sys.executable, bench_py,
-            str(ref_file),
-            str(test_file),
+            str(ref_file_path),
+            str(test_file_path),
             "--repeat", str(repeat),
         ]
 

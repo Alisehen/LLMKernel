@@ -51,19 +51,19 @@ from string import Template
 # system_prompt_tmpl = Template(
 #     dedent(
 #         """
-# You are a senior Triton kernel optimization engineer. Read the target GPU spec, the PyTorch
-# reference code, the current Triton candidate, and the Nsight Compute
+# You are a senior CUDA kernel optimization engineer. Read the target GPU spec, the PyTorch
+# reference code, the current CUDA candidate, and the Nsight Compute
 # metrics. Then identify **exactly one** highest-impact speed bottleneck, propose **exactly one** optimisation method and propose a
 # modification plan. Be surgical and metrics-driven.
 
 # Rules:
 # - Return **one and only one** optimisation method — the largest expected speedup.
-# - Focus on Triton-specific optimizations:
-#   * **BLOCK_M/N/K tuning**: Adjust tile sizes to optimize data reuse and cache efficiency
-#   * **num_warps**: Control occupancy (2/4/8 warps per block)
-#   * **num_stages**: Enable software pipelining (2-4 stages for memory-bound kernels)
-#   * **Memory access patterns**: Optimize coalescing, use tl.trans() for layout changes
-#   * **Grid configuration**: Adjust program_id mapping and workload distribution
+# - Focus on CUDA-specific optimizations:
+#   * thread/block mapping
+#   * tile sizing
+#   * register/shared-memory balance
+#   * memory access patterns
+#   * launch reduction or fusion
 # - Prefer changes that directly address measured bottlenecks from NCU metrics:
 #   * High DRAM throughput → Increase BLOCK size for data reuse
 #   * Low cache hit rate → Adjust BLOCK size for better locality
@@ -87,7 +87,7 @@ from string import Template
 
 instruction_tmpl = Template(
     dedent(
-        """You are a senior Triton kernel optimization engineer. Read the target GPU spec, the PyTorch reference code, the current Triton candidate, and the Nsight Compute metrics. Then identify **exactly one** highest-impact speed bottleneck, propose **exactly one** optimisation method and propose a modification plan. Be surgical and metrics-driven.
+        """You are a senior CUDA kernel optimization engineer. Read the target GPU spec, the PyTorch reference code, the current CUDA candidate, and the Nsight Compute metrics. Then identify **exactly one** highest-impact speed bottleneck, propose **exactly one** optimisation method and propose a modification plan. Be surgical and metrics-driven.
 
 
 
@@ -95,7 +95,7 @@ instruction_tmpl = Template(
 $python_code
 
 
-# Current Triton Kernel
+# Current CUDA Candidate
 ```python
 $CUDA_CODE
 ```
@@ -109,12 +109,12 @@ $BASELINE_COMPARISON
 
 Rules:
 - Return **one and only one** optimisation method — the largest expected speedup.
-- Focus on Triton-specific optimizations:
-  * **BLOCK_M/N/K tuning**: Adjust tile sizes to optimize data reuse and cache efficiency
-  * **num_warps**: Control occupancy (2/4/8 warps per block)
-  * **num_stages**: Enable software pipelining (2-4 stages for memory-bound kernels)
-  * **Memory access patterns**: Optimize coalescing, use tl.trans() for layout changes
-  * **Grid configuration**: Adjust program_id mapping and workload distribution
+- Focus on CUDA-specific optimizations:
+  * **thread/block mapping**: Adjust launch geometry to improve utilization
+  * **tile sizing**: Tune per-block work for reuse and occupancy
+  * **register/shared-memory balance**: Avoid spilling and wasted shared memory
+  * **memory access patterns**: Improve coalescing and reduce redundant traffic
+  * **kernel fusion or launch reduction**: Remove unnecessary intermediates where justified
 - Prefer changes that directly address measured bottlenecks from NCU metrics:
   * High DRAM throughput → Increase BLOCK size for data reuse
   * Low cache hit rate → Adjust BLOCK size for better locality

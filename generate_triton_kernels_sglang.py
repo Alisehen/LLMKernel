@@ -13,13 +13,13 @@ CONCURRENT_REQUESTS = 8 # Set concurrency level to 8
 # python -m sglang.launch_server --model-path <your_model_path> --port 30000
 
 # --- Prompt Templates (as provided by the user) ---
-PROBLEM_STATEMENT = """You are given a pytorch function, and your task is to write the same triton implementation for it.
-The triton implementation should change the name from Model to ModelNew, and have same input and output as the pytorch function."""
-PROBLEM_INSTRUCTION = """Optimize the architecture with custom Triton kernels! Name your optimized output architecture ModelNew. Output the new code in codeblocks. Please generate real code, NOT pseudocode, make sure the code compiles and is fully functional. Just output the new model code, no input and init function, no other text, and NO testing code! **Remember to Name your optimized output architecture ModelNew, do not use Model again!**"""
+PROBLEM_STATEMENT = """You are given a pytorch function, and your task is to write an equivalent custom CUDA implementation for it.
+The implementation should rename Model to ModelNew and preserve the same inputs and outputs as the original pytorch function."""
+PROBLEM_INSTRUCTION = """Optimize the architecture with custom CUDA kernels built through torch.utils.cpp_extension.load_inline. Name your optimized output architecture ModelNew. Output the new code in codeblocks. Please generate real code, NOT pseudocode, make sure the code compiles and is fully functional. Just output the new model code, no input and init function, no other text, and NO testing code. Remember to name your optimized output architecture ModelNew."""
 
 def generate_for_file(client, file_path, output_path):
     """
-    Reads a file, generates the Triton kernel using the model, and saves it.
+    Reads a file, generates the CUDA kernel implementation using the model, and saves it.
     """
     print(f"--- Processing: {file_path} ---")
     
@@ -32,7 +32,7 @@ def generate_for_file(client, file_path, output_path):
 
     # Construct the prompt
     prompt = f"""{PROBLEM_STATEMENT} {PROBLEM_INSTRUCTION}
-Now, you need to write the triton implementation for the following pytorch code:
+Now, you need to write the CUDA implementation for the following pytorch code:
 ```
 {arc_src}
 ``` """
@@ -87,9 +87,9 @@ Now, you need to write the triton implementation for the following pytorch code:
 
 def main():
     """
-    Main function to iterate through KernelBench and generate Triton kernels concurrently.
+    Main function to iterate through KernelBench and generate CUDA kernels concurrently.
     """
-    print("Starting Triton kernel generation script with concurrency...")
+    print("Starting CUDA kernel generation script with concurrency...")
     
     # Initialize OpenAI client to connect to the SGLang server
     client = openai.OpenAI(

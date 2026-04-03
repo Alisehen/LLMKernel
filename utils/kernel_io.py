@@ -135,13 +135,17 @@ def save_prompt_text(text: str, out_dir: Path, *, tag: str = "repair") -> Path:
     return path
 
 def extract_cuda_kernel_names(py_path: Path) -> List[str]:
-    """Extract CUDA kernel names from a .py file (works for both CUDA and Triton)."""
+    """Extract kernel names from a candidate file.
+
+    Prefers custom CUDA kernels and keeps a legacy Triton fallback so older artifacts
+    can still be profiled.
+    """
     try:
         src = py_path.read_text(encoding="utf-8", errors="ignore")
     except Exception:
         return []
 
-    # Try to detect if this is Triton code
+    # Legacy fallback for older Triton-generated artifacts
     if "import triton" in src or "@triton.jit" in src:
         return extract_triton_kernel_names(src)
 
